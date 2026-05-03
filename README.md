@@ -6,9 +6,6 @@ with the entire target Lean project, so each chapter's output lands directly in
 the Lean repo and subsequent chapters automatically see prior chapters' Lean
 code as context.
 
-See `SDK-reference.md` for a captured copy of the `aristotlelib` Python SDK
-documentation.
-
 ## Setup
 
 Prerequisites: [`uv`](https://docs.astral.sh/uv/) and an Aristotle API key.
@@ -215,7 +212,6 @@ whose recorded status is `COMPLETE` and retries everything else — including
   - `state.py` — `marathon-state.json` reader/writer
   - `prompts/skeleton.md` — prompt template (edit freely; substitutions are
     `{input_file}` and `{output_path}`)
-- `SDK-reference.md` — captured Aristotle SDK reference
 - `pyproject.toml`, `uv.lock` — dependency manifest
 
 ## Known unknowns to verify on the first real run
