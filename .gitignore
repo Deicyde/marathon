@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store
+.python-version
+
+# Captured copy of Aristotle's authenticated SDK docs. Kept locally for
+# reference but not redistributed publicly.
+SDK-reference.md
