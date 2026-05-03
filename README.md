@@ -1,31 +1,39 @@
 # marathon
 
 A driver for the [Aristotle](https://aristotle.harmonic.fun) (Harmonic)
-automated theorem-proving API. Submits a textbook chapter by chapter, bundling
-a target Lean project as context, so each chapter's output lands directly in
-the project and subsequent chapters automatically see prior chapters' Lean
-code.
+automated theorem-proving API. Two subcommands:
+
+- **`skeleton`** — submit a textbook chapter by chapter, bundling a target
+  Lean project as context, so each chapter's output lands directly in the
+  project and subsequent chapters automatically see prior chapters' Lean code.
+- **`refine`** — iteratively improve an existing Lean folder. Claude reviews
+  the current state and drafts a prompt for Aristotle; Marathon submits and
+  extracts the result back in place; the loop repeats up to `--max-iterations`.
 
 ## Setup
 
 Prerequisites: [`uv`](https://docs.astral.sh/uv/) and an Aristotle API key.
+The `refine` subcommand additionally needs an Anthropic API key.
 
 ```bash
 uv sync                          # install dependencies into .venv/
 echo $ARISTOTLE_API_KEY          # confirm the env var is set
 ```
 
-Mint a key at https://aristotle.harmonic.fun/dashboard/keys, then add this to
-`~/.zshrc` (edit the file directly — pasting at the prompt logs it in shell
-history):
+Mint an Aristotle key at https://aristotle.harmonic.fun/dashboard/keys, and
+(for `refine`) an Anthropic key at https://console.anthropic.com/settings/keys.
+Add both to `~/.zshrc` by editing the file directly — pasting at the prompt
+logs them in shell history:
 
 ```bash
 export ARISTOTLE_API_KEY="arstl_..."
+export ANTHROPIC_API_KEY="sk-ant-..."   # only needed for `refine`
 ```
 
-Marathon refuses to run if the variable isn't set, and never logs the value.
+Marathon refuses to run if the variable it needs isn't set, and never logs
+the values.
 
-## Usage
+## `marathon skeleton`
 
 ```bash
 uv run python -m marathon skeleton <input-folder> \
@@ -133,6 +141,67 @@ caffeinate -i uv run python -m marathon skeleton <input-folder> \
     --repo-dir <lean-repo> --output-base <relative-path>
 # detach: Ctrl-B then D    |    reattach: tmux attach -t marathon
 ```
+
+## `marathon refine`
+
+Iteratively improves an existing Lean folder. Each iteration runs one Claude
+call (review + draft an Aristotle prompt) followed by one Aristotle
+submission (with retries). Loops up to `--max-iterations` times.
+
+```bash
+uv run python -m marathon refine <target-lean-folder> \
+    --repo-dir <lean-repo> \
+    [--tex <tex-file>] \
+    [--workdir <dir>] \
+    [--max-iterations 3] [--max-retries 2]
+```
+
+- **`<target-lean-folder>`** — a folder inside `--repo-dir`. Aristotle's
+  output overwrites this folder in place each iteration.
+- **`--repo-dir`** — the Lean project repo (must be a git repo). Bundled
+  into every Aristotle submission, gitignore-filtered.
+- **`--tex`** (optional) — a `.tex` reference file the user supplies for
+  Aristotle. Bundled at the top level of every Aristotle submission. **Claude
+  is never given its contents** — only Aristotle sees it.
+- **`--workdir`** (optional, default: cwd) — where Marathon writes
+  `marathon-refine-state.json` and `marathon-refine-log.md`, and reads
+  `marathon.md` from if present.
+- **`--max-iterations N`** (default: 3) — total number of refinement
+  iterations. Each iteration costs one Claude call (Opus 4.7 with adaptive
+  thinking + `xhigh` effort) plus one or more Aristotle submissions.
+- **`--max-retries N`** (default: 2) — per-iteration: extra Aristotle
+  attempts on `COMPLETE_WITH_ERRORS` / `FAILED`. Same semantics as
+  `skeleton`.
+- **`--dry-run`** — print the resolved configuration and exit without
+  calling Claude or Aristotle.
+
+### Per-iteration flow
+
+1. Claude reads the current state of the target folder, every other Lean
+   file in the repo (gitignore-filtered), `marathon.md` from the workdir
+   (if present), and the past refinement log. It does **not** read any
+   `.tex` file.
+2. Claude writes a prompt for Aristotle directly — the response is sent
+   verbatim, no parsing. Marathon appends a "where to put output" trailer.
+3. Marathon submits to Aristotle with the repo + `--tex` file (if any) +
+   `marathon.md` bundled.
+4. Standard retry/reattach machinery applies (same as `skeleton`).
+5. Aristotle's output replaces the contents of `<target-lean-folder>`.
+6. The Claude prompt and Aristotle outcome are appended to
+   `marathon-refine-log.md`. Subsequent iterations read this log so Claude
+   knows what's been tried.
+
+The loop ends when `--max-iterations` is reached, when an iteration's
+Aristotle attempts hit `RETRIES_EXHAUSTED`, or on `OUT_OF_BUDGET` /
+`CANCELED`.
+
+### How Claude is configured
+
+`claude-opus-4-7`, adaptive thinking, `effort=xhigh`, prompt caching on the
+system rubric and the repo context (so iteration 2+ pays mostly cache reads
+on those, dwarfed by the small dynamic suffix). Streaming, max output
+~32K tokens. Editable in `marathon/claude_review.py` and
+`marathon/prompts/review.md`.
 
 ## State
 

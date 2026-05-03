@@ -46,5 +46,34 @@ def save_state(path: Path, state: RunState) -> None:
     tmp.replace(path)
 
 
+@dataclass
+class RefineState:
+    """Persistent state for a single ``marathon refine`` target."""
+
+    target_folder: str
+    iterations_completed: int = 0
+    current_iteration_idx: int = 0
+    project_id: Optional[str] = None
+    status: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    attempts: int = 0
+    output_path: Optional[str] = None
+    note: Optional[str] = None
+
+
+def load_refine_state(path: Path) -> Optional[RefineState]:
+    if not path.is_file():
+        return None
+    raw = json.loads(path.read_text())
+    return RefineState(**raw)
+
+
+def save_refine_state(path: Path, state: RefineState) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(asdict(state), indent=2))
+    tmp.replace(path)
+
+
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
