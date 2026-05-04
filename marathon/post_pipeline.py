@@ -36,9 +36,37 @@ class PipelineConfig:
     auto_rate: bool = False
     build_timeout: int = 600
     ratings_path: Optional[Path] = None
+    # When True, the auto-commit trailer also credits Claude (in addition to
+    # Aristotle). Set by refine, not by skeleton — refine drafts each Aristotle
+    # prompt via Claude, skeleton uses a static template.
+    claude_in_loop: bool = False
 
     def has_any(self) -> bool:
         return self.auto_build or self.auto_commit or self.auto_push or self.auto_rate
+
+
+ARISTOTLE_COAUTHOR_TRAILER = (
+    "Co-authored-by: Aristotle (Harmonic) <aristotle-harmonic@harmonic.fun>"
+)
+CLAUDE_COAUTHOR_TRAILER = "Co-authored-by: Claude <noreply@anthropic.com>"
+
+
+def _build_commit_message(
+    short_message: str,
+    project_id: Optional[str],
+    claude_in_loop: bool,
+) -> str:
+    """Build a commit message body with project URL and co-author trailers."""
+    parts = [short_message]
+    if project_id:
+        parts.append(
+            f"Project: aristotle.harmonic.fun/dashboard/requests/{project_id}"
+        )
+    trailer_lines = [ARISTOTLE_COAUTHOR_TRAILER]
+    if claude_in_loop:
+        trailer_lines.append(CLAUDE_COAUTHOR_TRAILER)
+    parts.append("\n".join(trailer_lines))
+    return "\n\n".join(parts)
 
 
 @dataclass
@@ -129,10 +157,14 @@ def run_git_commit(
     repo_dir: Path,
     target_path: Path,
     message: str,
+    project_id: Optional[str] = None,
+    claude_in_loop: bool = False,
 ) -> CommitResult:
     """Stage ``target_path`` (and ``PromptLog.md`` if it exists and is
-    dirty) and commit. Skips silently if the index is busy or there's
-    nothing to commit."""
+    dirty) and commit. The final commit message includes a project URL
+    line (when ``project_id`` is set) and a Co-authored-by trailer block
+    crediting Aristotle (and Claude, when ``claude_in_loop`` is True).
+    Skips silently if the index is busy or there's nothing to commit."""
     try:
         rel = target_path.relative_to(repo_dir)
     except ValueError:
@@ -161,8 +193,9 @@ def run_git_commit(
     if diff_proc.returncode == 0:
         return CommitResult(skipped_reason="nothing to commit")
 
+    full_message = _build_commit_message(message, project_id, claude_in_loop)
     commit_proc = subprocess.run(
-        ["git", "commit", "-m", message],
+        ["git", "commit", "-m", full_message],
         cwd=str(repo_dir),
         capture_output=True,
         text=True,
@@ -334,7 +367,13 @@ def run_post_pipeline(
         if project_id:
             msg_parts.append(f"(project={project_id[:8]})")
         message = " ".join(msg_parts)
-        c = run_git_commit(repo_dir, target_path, message)
+        c = run_git_commit(
+            repo_dir,
+            target_path,
+            message,
+            project_id=project_id,
+            claude_in_loop=config.claude_in_loop,
+        )
         out["commit"] = c
         if c.sha:
             print(f"  commit: {c.sha}  message=\"{message}\"")

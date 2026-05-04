@@ -509,6 +509,7 @@ async def refine_command(args) -> None:
         auto_rate=args.auto_rate,
         build_timeout=args.build_timeout,
         ratings_path=workdir / "marathon-ratings.jsonl",
+        claude_in_loop=True,  # refine drafts each prompt via Claude
     )
     if pipeline_config.has_any():
         flags = [
