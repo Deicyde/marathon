@@ -172,6 +172,12 @@ uv run python -m marathon refine <target-lean-folder> \
 - **`--max-retries N`** (default: 2) — per-iteration: extra Aristotle
   attempts on `COMPLETE_WITH_ERRORS` / `FAILED`. Same semantics as
   `skeleton`.
+- **`--skeleton`** — skeleton mode. Instructs Aristotle to keep every
+  theorem / lemma / proposition / corollary body as `sorry` (no proofs)
+  and switches Claude's reviewer rubric to focus on signature and
+  definition quality: correctness, future-proofness, and idiomatic
+  Mathlib style. Use this to iterate on the scaffold before filling in
+  any proofs.
 - **`--dry-run`** — print the resolved configuration and exit without
   calling Claude or Aristotle.
 

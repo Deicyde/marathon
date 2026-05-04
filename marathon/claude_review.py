@@ -31,8 +31,9 @@ def _ensure_claude_key() -> None:
         )
 
 
-def _read_review_prompt() -> str:
-    path = Path(__file__).parent / "prompts" / "review.md"
+def _read_review_prompt(skeleton_mode: bool) -> str:
+    name = "review_skeleton.md" if skeleton_mode else "review.md"
+    path = Path(__file__).parent / "prompts" / name
     if not path.is_file():
         sys.exit(f"review prompt template missing: {path}")
     return path.read_text()
@@ -80,10 +81,11 @@ def review_and_draft_prompt(
     refine_log: str,
     iteration_idx: int,
     max_iterations: int,
+    skeleton_mode: bool = False,
 ) -> str:
     """Call Claude. Return the response text (sent verbatim to Aristotle)."""
     _ensure_claude_key()
-    system_prompt = _read_review_prompt()
+    system_prompt = _read_review_prompt(skeleton_mode)
 
     target_content = _read_lean_files(target_folder)
     if not target_content:

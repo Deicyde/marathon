@@ -162,6 +162,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Seconds between Aristotle status checks (default: 60).",
     )
     p_refine.add_argument(
+        "--skeleton",
+        action="store_true",
+        help=(
+            "Skeleton mode: instruct Aristotle to keep every theorem/lemma/"
+            "proposition/corollary body as `sorry` (no proofs), and switch "
+            "Claude's reviewer rubric to focus on signature/definition "
+            "correctness, future-proofness, and idiomatic Mathlib style. "
+            "Use this to iterate on the scaffold quality before filling in "
+            "any proofs."
+        ),
+    )
+    p_refine.add_argument(
         "--dry-run",
         action="store_true",
         help=(

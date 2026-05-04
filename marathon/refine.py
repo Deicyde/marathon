@@ -67,6 +67,31 @@ Append a section for this refinement iteration recording naming conventions,
 design choices, and notes for future iterations. Preserve all prior entries.
 """
 
+SKELETON_OUTPUT_REQUIREMENTS_TRAILER = """
+
+---
+
+## Output requirements (added by Marathon, skeleton mode)
+
+This is a **skeleton refinement** iteration: every theorem, lemma,
+proposition, and corollary body must remain `sorry`. **Do not attempt to
+prove anything**, even one-line tactic proofs you think will succeed. Your
+job is to improve signatures, definitions, names, and structure — not to
+fill in proofs. If existing code in the target folder contains non-`sorry`
+proof bodies, revert them to `sorry`.
+
+Place every Lean file you produce at the relative path `{output_path}/` in
+your response. This path has multiple components; preserve each one as a
+nested directory — do not flatten it. Marathon extracts that directory
+tree back into the user's repo at the same relative path. Do not modify
+or recreate files outside `{output_path}/`.
+
+Update `marathon.md` at the root of your response (a single top-level
+file). Append a section for this refinement iteration recording naming
+conventions, design choices, and notes for future iterations. Preserve all
+prior entries.
+"""
+
 
 def _build_refine_submission_dir(
     repo_dir: Path,
@@ -376,6 +401,8 @@ async def refine_command(args) -> None:
     print(f"workdir:          {workdir}")
     print(f"max iterations:   {args.max_iterations}")
     print(f"max retries/iter: {args.max_retries}")
+    if args.skeleton:
+        print("mode:             skeleton (no proofs; sorry-only)")
 
     if args.dry_run:
         print(
@@ -406,6 +433,7 @@ async def refine_command(args) -> None:
                 refine_log=refine_log_text,
                 iteration_idx=iteration_idx,
                 max_iterations=args.max_iterations,
+                skeleton_mode=args.skeleton,
             )
 
             print("\n--- Claude's drafted prompt (sent verbatim to Aristotle) ---")
@@ -413,7 +441,12 @@ async def refine_command(args) -> None:
             print("--- end ---\n")
             _append_refine_log(log_path, iteration_idx, claude_response)
 
-            full_prompt = claude_response + OUTPUT_REQUIREMENTS_TRAILER.format(
+            trailer_template = (
+                SKELETON_OUTPUT_REQUIREMENTS_TRAILER
+                if args.skeleton
+                else OUTPUT_REQUIREMENTS_TRAILER
+            )
+            full_prompt = claude_response + trailer_template.format(
                 output_path=output_path_str
             )
 
