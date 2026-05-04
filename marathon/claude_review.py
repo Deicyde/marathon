@@ -132,10 +132,14 @@ def review_and_draft_prompt(
     )
     combined = "\n\n---\n\n".join(sections)
 
+    # Note: we previously passed `--bare` here for "skip auto-discovery /
+    # CI-friendly" behavior, but it also skips reading the keychain OAuth
+    # token, which broke Max auth. `--tools ""` still disables the agent
+    # tool surface; we accept the slight risk of cwd-local .claude/ files
+    # affecting the call.
     cmd = [
         claude_path,
         "-p", combined,
-        "--bare",
         "--model", CLAUDE_MODEL,
         "--tools", "",
         "--output-format", "text",
