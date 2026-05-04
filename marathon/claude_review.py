@@ -26,6 +26,7 @@ provides on the command line goes straight into the Aristotle bundle and
 never enters this module.
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -145,12 +146,20 @@ def review_and_draft_prompt(
         f"{len(combined):,} chars)"
     )
 
+    # Scrub ANTHROPIC_API_KEY from the subprocess env so claude falls back
+    # to its keychain-stored Max OAuth instead of routing through the API
+    # billing path. Users who actually want the API can edit this module to
+    # remove the scrub or pass env=os.environ.
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
+
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             check=False,
+            env=env,
         )
     except OSError as e:
         sys.exit(
