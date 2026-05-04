@@ -54,13 +54,17 @@ OUTPUT_REQUIREMENTS_TRAILER = """
 
 ## Output requirements (added by Marathon)
 
-Place every Lean file you produce inside the directory `{output_path}/`.
-Marathon will extract that folder and discard anything else inside it.
-Do not modify or recreate any files outside this directory.
+Place every Lean file you produce at the relative path `{output_path}/` in
+your response. This path has multiple components; preserve each one as a
+nested directory — do not flatten it. If the path is `Foo/Bar/Baz`, your
+output should contain `Foo/Bar/Baz/<your-files>.lean`, not `Baz/<your-files>.lean`
+and not `Foo-Bar-Baz/...`. Marathon extracts that directory tree back into
+the user's repo at the same relative path. Do not modify or recreate files
+outside `{output_path}/`.
 
-Update `marathon.md` at the top level of your response. Append a section for
-this refinement iteration recording naming conventions, design choices, and
-notes for future iterations. Preserve all prior entries.
+Update `marathon.md` at the root of your response (a single top-level file).
+Append a section for this refinement iteration recording naming conventions,
+design choices, and notes for future iterations. Preserve all prior entries.
 """
 
 
@@ -92,14 +96,23 @@ def _build_refine_submission_dir(
 
 
 async def _try_reattach(state: RefineState) -> Optional[Project]:
-    """If state has an in-flight project, return it. Otherwise None."""
-    if not state.project_id or state.status not in IN_FLIGHT_STATUS_VALUES:
+    """Reattach to a project from a previous run if it's still in flight, or
+    if it terminated but Marathon failed to extract its output. Returns None
+    when no reattach is applicable."""
+    if not state.project_id:
+        return None
+    reason = None
+    if state.status in IN_FLIGHT_STATUS_VALUES:
+        reason = "in-flight"
+    elif state.status == "OUTPUT_FOLDER_MISSING":
+        reason = "previous extraction failure"
+    if reason is None:
         return None
     try:
         candidate = await Project.from_id(state.project_id)
         await candidate.refresh()
         print(
-            f"  reattaching to in-flight project from previous run: "
+            f"  reattaching ({reason}) to project "
             f"project_id={state.project_id}, status={candidate.status.value}"
         )
         return candidate
@@ -208,7 +221,7 @@ async def _run_refine_attempt(
 
         if result is not None:
             log_dest = workdir_log if workdir_log is not None else Path(dl_tmp) / "_unused.md"
-            found, log_updated, unexpected_count = _extract_solution(
+            found, log_updated, unexpected = _extract_solution(
                 Path(result), expected_path, repo_dir, log_dest
             )
             if found:
@@ -216,18 +229,18 @@ async def _run_refine_attempt(
                 notes: list[str] = []
                 if not log_updated:
                     notes.append(f"warning: {LOG_FILENAME} not updated by Aristotle")
-                if unexpected_count:
+                if unexpected:
                     notes.append(
-                        f"note: {unexpected_count} unexpected top-level entries "
-                        f"(mostly echoed input)"
+                        f"note: {len(unexpected)} unexpected top-level entries "
+                        f"(mostly echoed input): {unexpected}"
                     )
                 if notes:
                     state.note = "; ".join(notes)
             else:
                 state.status = "OUTPUT_FOLDER_MISSING"
                 state.note = (
-                    f"expected path {output_path_str!r} not in solution tar "
-                    f"(unexpected top-level entries: {unexpected_count})"
+                    f"expected path {output_path_str!r} not in solution tar; "
+                    f"top-level entries: {unexpected}"
                 )
                 save_refine_state(state_path, state)
                 return None

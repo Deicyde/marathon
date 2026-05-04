@@ -27,12 +27,16 @@ structures) into Lean 4 / Mathlib4 with signatures only, bodies as `sorry`.
 Use names consistent with the existing project.{additional_instructions}{retry_context}
 
 ## Output
-- **Place every Lean file you produce inside the directory `{output_path}/`**
-  (a relative path within the Lean project, e.g.
-  `GeometricAnalysis/LeeSM/Chapter12`). Do not create or modify files outside
-  that directory.
-- **Update `marathon.md` at the top level** of your response (alongside
-  `{input_file}` in the bundle layout). Append a new section for this chapter
+- **Place every Lean file you produce at the relative path `{output_path}/`**
+  (a relative path within the Lean project tree, e.g.
+  `GeometricAnalysis/LeeSM/Chapter12`). This path has multiple components;
+  preserve each one as a nested directory — do not flatten it to just the
+  leaf name and do not collapse the slashes. Concretely, if the path is
+  `Foo/Bar/Baz`, your output should contain `Foo/Bar/Baz/<your-files>.lean`
+  (not `Baz/<your-files>.lean` and not `Foo-Bar-Baz/...`). Do not create or
+  modify files outside `{output_path}/`.
+- **Update `marathon.md`** at the root of your response (a single file at
+  the top of your output tree). Append a new section for this chapter
   recording naming conventions you adopted, design choices, ambiguities you
   flagged, and anything you couldn't finish. Preserve all prior entries —
   they are how future legs learn from yours.

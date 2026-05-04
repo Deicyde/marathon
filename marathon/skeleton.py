@@ -153,53 +153,110 @@ def _extract_solution(
     expected_path: PurePosixPath,
     repo_dir: Path,
     log_dest: Path,
-) -> tuple[bool, bool, int]:
+) -> tuple[bool, bool, list[str]]:
     """Extract ``expected_path/`` from the tar into ``repo_dir/expected_path/``,
     and a top-level ``marathon.md`` into ``log_dest``.
 
+    If the tar wraps everything in a single top-level directory (Aristotle
+    has been observed using ``submission_aristotle/`` for this), that wrapper
+    is detected and stripped before matching ``expected_path``. The
+    ``marathon.md`` lookup also moves to the same level.
+
     Stale contents of ``repo_dir/expected_path`` are wiped first.
 
-    Returns ``(folder_found, log_updated, count_of_unexpected_top_levels)``.
+    Returns ``(folder_found, log_updated, sorted_unexpected_top_levels)``.
     """
+    expected_parts = tuple(expected_path.parts)
+
     found = False
     log_updated = False
     unexpected_top: set[str] = set()
 
-    expected_parts = expected_path.parts
-    target_dir = repo_dir / Path(*expected_parts)
-    if target_dir.exists():
-        shutil.rmtree(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-
     with tarfile.open(tar_path, "r:*") as tf:
-        for m in tf.getmembers():
-            name_parts = Path(m.name).parts
-            if not name_parts:
+        members = tf.getmembers()
+
+        # Determine whether to strip a wrapper directory. Try the tar root
+        # first; if the expected path doesn't match anywhere, see if exactly
+        # one top-level directory contains everything and try stripping that.
+        candidate_prefixes: list[tuple[str, ...]] = [()]
+        top_levels = sorted({
+            tuple(Path(m.name).parts[:1])[0]
+            for m in members
+            if m.name and Path(m.name).parts
+        })
+        if (
+            len(top_levels) == 1
+            and (not expected_parts or top_levels[0] != expected_parts[0])
+        ):
+            candidate_prefixes.append((top_levels[0],))
+
+        chosen_prefix: tuple[str, ...] = ()
+        for prefix in candidate_prefixes:
+            full = prefix + expected_parts
+            n = len(full)
+            for m in members:
+                parts = tuple(Path(m.name).parts)
+                if len(parts) >= n and parts[:n] == full:
+                    chosen_prefix = prefix
+                    break
+            else:
                 continue
-            if any(p == ".." for p in name_parts) or Path(m.name).is_absolute():
+            break
+        else:
+            chosen_prefix = ()  # no match anywhere; will leave found=False
+
+        prefix_skip = len(chosen_prefix)
+        full_expected = chosen_prefix + expected_parts
+
+        target_dir = repo_dir / Path(*expected_parts)
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+
+        for m in members:
+            parts = tuple(Path(m.name).parts)
+            if not parts:
+                continue
+            if any(p == ".." for p in parts) or Path(m.name).is_absolute():
                 continue
 
-            # Member under expected output path?
+            # Member under expected output path (after stripping wrapper)?
             if (
-                len(name_parts) >= len(expected_parts)
-                and tuple(name_parts[: len(expected_parts)]) == expected_parts
+                len(parts) >= len(full_expected)
+                and parts[: len(full_expected)] == full_expected
             ):
                 found = True
-                tf.extract(m, path=repo_dir)
+                if m.isfile():
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    inner_parts = parts[prefix_skip:]
+                    out_path = repo_dir / Path(*inner_parts)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_bytes(f.read())
                 continue
 
-            # Top-level marathon.md?
-            if len(name_parts) == 1 and name_parts[0] == LOG_FILENAME and m.isfile():
+            # marathon.md at the wrapper-stripped root (or true root).
+            if (
+                len(parts) == prefix_skip + 1
+                and parts[:prefix_skip] == chosen_prefix
+                and parts[-1] == LOG_FILENAME
+                and m.isfile()
+            ):
                 log_updated = True
                 f = tf.extractfile(m)
                 if f is not None:
                     log_dest.write_bytes(f.read())
                 continue
 
-            # Otherwise: track top-level entry as "unexpected" (mostly echoed input).
-            unexpected_top.add(name_parts[0])
+            # Otherwise: track top-level entry (after wrapper-strip) as "unexpected".
+            if prefix_skip > 0 and parts[:prefix_skip] == chosen_prefix:
+                if len(parts) > prefix_skip:
+                    unexpected_top.add(parts[prefix_skip])
+            else:
+                unexpected_top.add(parts[0])
 
-    return found, log_updated, len(unexpected_top)
+    return found, log_updated, sorted(unexpected_top)
 
 
 def _build_targets_block(entry: OrderEntry) -> str:
@@ -363,7 +420,7 @@ async def _run_one_attempt(
 
         if result is not None:
             log_dest = folder / LOG_FILENAME
-            found, log_updated, unexpected_count = _extract_solution(
+            found, log_updated, unexpected = _extract_solution(
                 Path(result), expected_path, repo_dir, log_dest
             )
             if found:
@@ -371,18 +428,18 @@ async def _run_one_attempt(
                 notes: list[str] = []
                 if not log_updated:
                     notes.append(f"warning: {LOG_FILENAME} not updated by Aristotle")
-                if unexpected_count:
+                if unexpected:
                     notes.append(
-                        f"note: {unexpected_count} unexpected top-level entries "
-                        f"(mostly echoed input)"
+                        f"note: {len(unexpected)} unexpected top-level entries "
+                        f"(mostly echoed input): {unexpected}"
                     )
                 if notes:
                     chapter.note = "; ".join(notes)
             else:
                 chapter.status = "OUTPUT_FOLDER_MISSING"
                 chapter.note = (
-                    f"expected path {output_path_str!r} not in solution tar "
-                    f"(unexpected top-level entries: {unexpected_count})"
+                    f"expected path {output_path_str!r} not in solution tar; "
+                    f"top-level entries: {unexpected}"
                 )
                 save_state(state_path, state)
                 return None
@@ -414,16 +471,23 @@ async def _run_chapter(
     print(f"\n=== {entry.input_file} -> {output_path_str} ===")
 
     # If a previous Marathon run died with this chapter still in flight on
-    # Aristotle's side, reattach to that project rather than submitting a
-    # duplicate.
+    # Aristotle's side, OR finished but couldn't extract the output, reattach
+    # rather than submitting a duplicate. The "in flight" case keeps polling;
+    # the "extraction failure" case re-extracts using the current code.
     existing_project: Project | None = None
-    if chapter.project_id and chapter.status in IN_FLIGHT_STATUS_VALUES:
+    reattach_reason = None
+    if chapter.project_id:
+        if chapter.status in IN_FLIGHT_STATUS_VALUES:
+            reattach_reason = "in-flight"
+        elif chapter.status == "OUTPUT_FOLDER_MISSING":
+            reattach_reason = "previous extraction failure"
+    if reattach_reason is not None:
         try:
             candidate = await Project.from_id(chapter.project_id)
             await candidate.refresh()
             existing_project = candidate
             print(
-                f"  reattaching to in-flight project from previous run: "
+                f"  reattaching ({reattach_reason}) to project "
                 f"project_id={chapter.project_id}, status={candidate.status.value}"
             )
         except AristotleAPIError as e:
