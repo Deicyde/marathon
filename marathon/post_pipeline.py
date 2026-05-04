@@ -67,7 +67,8 @@ class RatingResult:
 
 
 PROMPTLOG_FILENAME = "PromptLog.md"
-ARISTOTLE_DASHBOARD_URL = "https://aristotle.harmonic.fun/dashboard/requests/{project_id}"
+# Bare host + path (no scheme); matches the user's existing PromptLog convention.
+ARISTOTLE_DASHBOARD_URL = "aristotle.harmonic.fun/dashboard/requests/{project_id}"
 
 
 def append_promptlog_url(repo_dir: Path, project_id: str) -> bool:
