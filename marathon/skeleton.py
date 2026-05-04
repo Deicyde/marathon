@@ -615,6 +615,7 @@ async def skeleton_command(args) -> None:
     pipeline_config = PipelineConfig(
         auto_build=args.auto_build,
         auto_commit=args.auto_commit,
+        auto_push=args.auto_push,
         auto_rate=args.auto_rate,
         build_timeout=args.build_timeout,
         ratings_path=folder / "marathon-ratings.jsonl",
@@ -624,6 +625,7 @@ async def skeleton_command(args) -> None:
             name for name, on in [
                 ("auto-build", pipeline_config.auto_build),
                 ("auto-commit", pipeline_config.auto_commit),
+                ("auto-push", pipeline_config.auto_push),
                 ("auto-rate", pipeline_config.auto_rate),
             ] if on
         ]

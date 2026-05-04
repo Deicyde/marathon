@@ -236,7 +236,8 @@ each successful extraction. All default off.
 | Flag | What it does |
 |---|---|
 | `--auto-build` | Runs `lake build` in `--repo-dir`. Captures exit code + log tail. Build failure does **not** abort the pipeline. Configurable timeout via `--build-timeout SECONDS` (default 600 = 10 min); on timeout the build is killed and recorded as `TIMED OUT`. |
-| `--auto-commit` | Stages just the chapter's output folder (`git add <output-path>`) and `git commit`s with an auto message including build status (if known) and the project ID. No push. Skipped with a warning if the git index is busy or there's nothing to commit. |
+| `--auto-commit` | Stages the chapter's output folder *and* `PromptLog.md` (if dirty), then `git commit`s with an auto message including build status (if known) and the project ID. Skipped with a warning if the git index is busy or there's nothing to commit. |
+| `--auto-push` | After each successful auto-commit, runs `git push` to send the current branch to its remote. Requires `--auto-commit`. Failures (e.g. non-fast-forward) are printed but don't abort the pipeline. |
 | `--auto-rate` | Spawns Claude (Max-billed subprocess) to rate the code 1–5 across `quality`, `math_correctness`, `generality`, `api_coverage`, `modern_lean4`, with a one-paragraph note. Appends one JSON line per rating to `<workdir>/marathon-ratings.jsonl`. |
 
 Per-chapter / per-iteration output:

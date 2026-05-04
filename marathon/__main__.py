@@ -216,8 +216,17 @@ def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help=(
             "After each successful extraction, stage the chapter's output "
-            "folder and `git commit` with an auto message. No push. Skipped "
-            "with a warning if the git index is busy. Default: off."
+            "folder (plus PromptLog.md if dirty) and `git commit` with an "
+            "auto message. No push by default; pair with --auto-push to push. "
+            "Skipped with a warning if the git index is busy. Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--auto-push",
+        action="store_true",
+        help=(
+            "After each successful auto-commit, run `git push` to send the "
+            "current branch to its remote. Requires --auto-commit. Default: off."
         ),
     )
     parser.add_argument(

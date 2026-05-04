@@ -32,12 +32,13 @@ from typing import Optional
 class PipelineConfig:
     auto_build: bool = False
     auto_commit: bool = False
+    auto_push: bool = False
     auto_rate: bool = False
     build_timeout: int = 600
     ratings_path: Optional[Path] = None
 
     def has_any(self) -> bool:
-        return self.auto_build or self.auto_commit or self.auto_rate
+        return self.auto_build or self.auto_commit or self.auto_push or self.auto_rate
 
 
 @dataclass
@@ -129,15 +130,21 @@ def run_git_commit(
     target_path: Path,
     message: str,
 ) -> CommitResult:
-    """Stage just ``target_path`` and commit. Skips silently if the index
-    is busy or there's nothing to commit."""
+    """Stage ``target_path`` (and ``PromptLog.md`` if it exists and is
+    dirty) and commit. Skips silently if the index is busy or there's
+    nothing to commit."""
     try:
         rel = target_path.relative_to(repo_dir)
     except ValueError:
         return CommitResult(skipped_reason=f"{target_path} not under repo {repo_dir}")
 
+    paths_to_stage = [str(rel)]
+    promptlog = repo_dir / PROMPTLOG_FILENAME
+    if promptlog.is_file():
+        paths_to_stage.append(PROMPTLOG_FILENAME)
+
     add_proc = subprocess.run(
-        ["git", "add", str(rel)],
+        ["git", "add", "--", *paths_to_stage],
         cwd=str(repo_dir),
         capture_output=True,
         text=True,
@@ -175,6 +182,22 @@ def run_git_commit(
     )
     sha = sha_proc.stdout.strip()[:8] if sha_proc.returncode == 0 else None
     return CommitResult(sha=sha)
+
+
+def run_git_push(repo_dir: Path) -> tuple[bool, str]:
+    """Run ``git push`` from ``repo_dir``. Returns ``(ok, message)``."""
+    proc = subprocess.run(
+        ["git", "push"],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return False, ((proc.stderr or proc.stdout) or "unknown error").strip()
+    out = ((proc.stderr or proc.stdout) or "").strip()
+    short = out.splitlines()[-1] if out else "ok"
+    return True, short
 
 
 def call_claude_rater(
@@ -317,6 +340,13 @@ def run_post_pipeline(
             print(f"  commit: {c.sha}  message=\"{message}\"")
         else:
             print(f"  commit: skipped — {c.skipped_reason}")
+
+        if config.auto_push and c.sha:
+            ok, push_msg = run_git_push(repo_dir)
+            if ok:
+                print(f"  push: ok ({push_msg})")
+            else:
+                print(f"  push: failed — {push_msg}")
 
     if config.auto_rate:
         r = call_claude_rater(target_path, out["build"])
