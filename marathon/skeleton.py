@@ -430,7 +430,7 @@ async def _run_one_attempt(
                     notes.append(f"warning: {LOG_FILENAME} not updated by Aristotle")
                 if unexpected:
                     notes.append(
-                        f"note: {len(unexpected)} unexpected top-level entries "
+                        f"{len(unexpected)} unexpected top-level entries "
                         f"(mostly echoed input): {unexpected}"
                     )
                 if notes:
