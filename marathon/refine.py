@@ -28,7 +28,11 @@ from typing import Optional
 from aristotlelib import AristotleAPIError, Project, ProjectStatus
 
 from marathon.claude_review import review_and_draft_prompt
-from marathon.post_pipeline import PipelineConfig, run_post_pipeline
+from marathon.post_pipeline import (
+    PipelineConfig,
+    append_promptlog_url,
+    run_post_pipeline,
+)
 from marathon.skeleton import (
     IN_FLIGHT_STATUS_VALUES,
     LOG_FILENAME,
@@ -189,6 +193,8 @@ async def _submit_fresh_refine(
     state.started_at = now_iso()
     save_refine_state(state_path, state)
     print(f"    submitted: project_id={project.project_id}")
+    if append_promptlog_url(repo_dir, project.project_id):
+        print(f"    PromptLog.md updated")
     return project
 
 

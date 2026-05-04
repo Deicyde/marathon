@@ -252,6 +252,20 @@ Mix-and-match: `--auto-commit` alone (no build, no rating) just snapshots
 each chapter to git. `--auto-rate` alone (no commit) collects quality data
 without touching git.
 
+### `PromptLog.md` (auto-appended if present)
+
+If a file named `PromptLog.md` exists at the root of `--repo-dir`, every
+successful Aristotle submission appends one dashboard URL line to it:
+
+```
+https://aristotle.harmonic.fun/dashboard/requests/<project_id>
+```
+
+This keeps an at-a-glance record of every project Marathon has launched,
+linkable directly to the Aristotle dashboard. No flag — Marathon
+auto-detects the file and stays silent if it isn't there. Move or
+delete the file to disable.
+
 ## State
 
 Marathon writes `<input-folder>/marathon-state.json` with one entry per

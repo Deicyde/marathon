@@ -28,7 +28,11 @@ import aristotlelib
 from aristotlelib import AristotleAPIError, Project, ProjectStatus
 
 from marathon.order import OrderEntry, parse_order_file
-from marathon.post_pipeline import PipelineConfig, run_post_pipeline
+from marathon.post_pipeline import (
+    PipelineConfig,
+    append_promptlog_url,
+    run_post_pipeline,
+)
 from marathon.state import (
     ChapterState,
     RunState,
@@ -366,6 +370,8 @@ async def _submit_fresh(
     chapter.started_at = now_iso()
     save_state(state_path, state)
     print(f"    submitted: project_id={project.project_id}")
+    if append_promptlog_url(repo_dir, project.project_id):
+        print(f"    PromptLog.md updated")
     return project
 
 
