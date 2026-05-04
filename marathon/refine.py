@@ -40,6 +40,8 @@ from marathon.skeleton import (
 )
 from marathon.state import (
     RefineState,
+    compute_duration_seconds,
+    format_duration,
     load_refine_state,
     now_iso,
     save_refine_state,
@@ -243,6 +245,9 @@ async def _run_refine_attempt(
         await project.refresh()
         state.status = project.status.value
         state.completed_at = now_iso()
+        state.duration_seconds = compute_duration_seconds(
+            state.started_at, state.completed_at
+        )
 
         if result is not None:
             log_dest = workdir_log if workdir_log is not None else Path(dl_tmp) / "_unused.md"
@@ -489,8 +494,10 @@ async def refine_command(args) -> None:
 
         state.iterations_completed = iteration_idx
         save_refine_state(state_path, state)
+        duration = format_duration(state.duration_seconds)
         print(
-            f"  iteration {iteration_idx} complete  output={state.output_path}"
+            f"  iteration {iteration_idx} complete  duration={duration}  "
+            f"output={state.output_path}"
         )
         if state.note:
             print(f"  note: {state.note}")

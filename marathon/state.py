@@ -15,6 +15,7 @@ class ChapterState:
     status: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
+    duration_seconds: Optional[float] = None
     output_path: Optional[str] = None
     note: Optional[str] = None
     attempts: int = 0
@@ -57,6 +58,7 @@ class RefineState:
     status: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
+    duration_seconds: Optional[float] = None
     attempts: int = 0
     output_path: Optional[str] = None
     note: Optional[str] = None
@@ -77,3 +79,25 @@ def save_refine_state(path: Path, state: RefineState) -> None:
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def compute_duration_seconds(
+    started_at: Optional[str], completed_at: Optional[str]
+) -> Optional[float]:
+    if not started_at or not completed_at:
+        return None
+    return (
+        datetime.fromisoformat(completed_at) - datetime.fromisoformat(started_at)
+    ).total_seconds()
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "?"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    return f"{h}h {m}m"

@@ -28,7 +28,15 @@ import aristotlelib
 from aristotlelib import AristotleAPIError, Project, ProjectStatus
 
 from marathon.order import OrderEntry, parse_order_file
-from marathon.state import ChapterState, RunState, load_state, now_iso, save_state
+from marathon.state import (
+    ChapterState,
+    RunState,
+    compute_duration_seconds,
+    format_duration,
+    load_state,
+    now_iso,
+    save_state,
+)
 
 LOG_FILENAME = "marathon.md"
 MACROS_FILENAME = "macros.sty"
@@ -417,6 +425,9 @@ async def _run_one_attempt(
         await project.refresh()
         chapter.status = project.status.value
         chapter.completed_at = now_iso()
+        chapter.duration_seconds = compute_duration_seconds(
+            chapter.started_at, chapter.completed_at
+        )
 
         if result is not None:
             log_dest = folder / LOG_FILENAME
@@ -595,7 +606,11 @@ async def skeleton_command(args) -> None:
 
         status = chapter.status
         if status in RESUMABLE_SUCCESS_STATUS_VALUES:
-            print(f"  done: {status}  output={chapter.output_path}")
+            duration = format_duration(chapter.duration_seconds)
+            print(
+                f"  done: {status}  duration={duration}  "
+                f"output={chapter.output_path}"
+            )
             if chapter.note:
                 print(f"  note: {chapter.note}")
             continue
