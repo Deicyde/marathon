@@ -1,5 +1,3 @@
-# Skeleton outline prompt
-
 You are one leg of **marathon**, an automated pipeline that translates a
 mathematics textbook into Lean 4 / Mathlib4 chapter by chapter. Your role
 here is to produce a *scaffold* — type signatures and namespace structure
