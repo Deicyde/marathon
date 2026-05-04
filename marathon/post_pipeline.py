@@ -67,14 +67,12 @@ class RatingResult:
 
 
 PROMPTLOG_FILENAME = "PromptLog.md"
-# Bare host + path (no scheme); matches the user's existing PromptLog convention.
-ARISTOTLE_DASHBOARD_URL = "aristotle.harmonic.fun/dashboard/requests/{project_id}"
 
 
 def append_promptlog_url(repo_dir: Path, project_id: str) -> bool:
     """If ``PromptLog.md`` exists at the root of ``repo_dir``, append a
-    blank line plus the Aristotle dashboard URL for ``project_id``. Skips
-    silently if the file doesn't exist or ``project_id`` is empty.
+    blank line plus a ``<timestamp>  <project_id>`` entry. Skips silently
+    if the file doesn't exist or ``project_id`` is empty.
 
     Returns True if the file was appended to, False if skipped.
     """
@@ -83,11 +81,13 @@ def append_promptlog_url(repo_dir: Path, project_id: str) -> bool:
     log_path = repo_dir / PROMPTLOG_FILENAME
     if not log_path.is_file():
         return False
-    url = ARISTOTLE_DASHBOARD_URL.format(project_id=project_id)
+    # Local import to avoid a top-level circular dep with marathon.state.
+    from marathon.state import now_iso
+    line = f"{now_iso()}  {project_id}"
     existing = log_path.read_text()
     sep = "" if existing.endswith("\n\n") else ("\n" if existing.endswith("\n") else "\n\n")
     with log_path.open("a") as f:
-        f.write(f"{sep}{url}\n")
+        f.write(f"{sep}{line}\n")
     return True
 
 
