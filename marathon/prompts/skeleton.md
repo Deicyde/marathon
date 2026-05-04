@@ -1,10 +1,17 @@
 # Skeleton outline prompt
 
 You are one leg of **marathon**, an automated pipeline that translates a
-mathematics textbook into Lean 4 / Mathlib4 chapter by chapter. You are not
-expected to formalize the whole book or finish every theorem in this chapter —
-make concrete, useful progress. Prefer `sorry` over inventing content;
-subsequent legs build on what you produce.
+mathematics textbook into Lean 4 / Mathlib4 chapter by chapter. Your role at
+this stage is to produce a *scaffold* — correct type signatures, statement
+bodies, and namespace structure — **not proofs**. A separate refinement
+stage fills in proofs afterward; the skeleton stage exists to lay out names
+and types for that stage to operate on. `sorry` is the expected proof body
+here, not a fallback.
+
+**Do not attempt to prove any theorem, lemma, proposition, or corollary,
+even ones you think you can solve in a single tactic.** A clean chapter of
+correct signatures with `sorry` bodies is the goal; attempted proofs that
+turn out wrong or break the file are worse than `sorry`.
 
 ## Inputs (top level of this submission)
 - `{input_file}` — the LaTeX chapter to outline.
@@ -21,10 +28,20 @@ subsequent legs build on what you produce.
   whenever `{input_file}` references prior results.
 
 ## Task
-Produce a skeletal Lean outline of `{input_file}`: translate every formal
-statement (definitions, theorems, lemmas, propositions, corollaries,
-structures) into Lean 4 / Mathlib4 with signatures only, bodies as `sorry`.
-Use names consistent with the existing project.{additional_instructions}{retry_context}
+For every formal statement in `{input_file}`:
+
+- **Theorems, lemmas, propositions, corollaries:** translate the statement
+  into a Lean signature, then use `:= sorry` or `by sorry` for the body.
+  Do not write proofs.
+- **Definitions:** if the chapter specifies the body concretely (an explicit
+  formula, constructor, or set-builder), transcribe it. If the body is
+  given only informally or abstractly, use `sorry`.
+- **Structures and classes:** define them with their fields and required
+  type information. Skip complex instance derivations.
+
+Preserve the chapter's section/subsection structure using `namespace` blocks
+or section comments. Use names consistent with the existing Lean files in
+the project.{additional_instructions}{retry_context}
 
 ## Output
 - **Place every Lean file you produce at the relative path `{output_path}/`**
