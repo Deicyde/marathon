@@ -1,8 +1,24 @@
-"""Claude API wrapper for the ``marathon refine`` command.
+"""Claude Code subprocess wrapper for the ``marathon refine`` command.
 
-One Claude call per refinement iteration: hand Claude the target folder,
-the rest of the repo's Lean files, ``marathon.md``, and the past refinement
-log; receive back a prompt for Aristotle.
+Invokes the ``claude`` CLI (Claude Code) as a subprocess for each
+refinement iteration, instead of calling the Anthropic API directly. This
+lets users with a Claude Max subscription pay for refine via their existing
+subscription rather than prepaid API credits.
+
+**Trade-offs vs the API path:**
+
+- Authentication: uses the user's existing ``claude`` login (Max OAuth via
+  keychain). No ``ANTHROPIC_API_KEY`` env var needed if the user has signed
+  in interactively.
+- Prompt caching: not exposed via the Claude Code CLI, so every call pays
+  full token cost. Free for Max users (flat-rate); would matter if you
+  flipped back to API billing.
+- Multi-block prompt structure: the CLI takes one prompt argument. We
+  combine the reviewer rubric and the per-iteration context into a single
+  string with markdown headers. The semantic distinction between system
+  prompt and user prompt is lost but doesn't materially affect output.
+- Tool surface: disabled via ``--tools ""`` and ``--bare`` so the agent loop
+  can't fire — we want a single completion.
 
 **Claude is never given LaTeX files.** ``.tex`` content under the repo is
 filtered out before assembling the prompt; the ``--tex`` file the user
@@ -10,25 +26,26 @@ provides on the command line goes straight into the Aristotle bundle and
 never enters this module.
 """
 
-import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
 
-import anthropic
-from anthropic import APIError
-
 CLAUDE_MODEL = "claude-opus-4-7"
-CLAUDE_MAX_TOKENS = 32000
 
 
-def _ensure_claude_key() -> None:
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+def _ensure_claude_cli() -> str:
+    path = shutil.which("claude")
+    if not path:
         sys.exit(
-            "ANTHROPIC_API_KEY not set. Add `export ANTHROPIC_API_KEY=sk-ant-...` "
-            "to ~/.zshrc and re-source. (Distinct from ARISTOTLE_API_KEY.)"
+            "claude (Claude Code CLI) not found on PATH. Install via "
+            "https://claude.com/product/claude-code/, then run `claude` once "
+            "interactively to authenticate with your Max subscription. "
+            "(The `marathon refine` command shells out to `claude` so it can "
+            "use your Max subscription instead of pay-per-token API credits.)"
         )
+    return path
 
 
 def _read_review_prompt(skeleton_mode: bool) -> str:
@@ -83,8 +100,8 @@ def review_and_draft_prompt(
     max_iterations: int,
     skeleton_mode: bool = False,
 ) -> str:
-    """Call Claude. Return the response text (sent verbatim to Aristotle)."""
-    _ensure_claude_key()
+    """Call Claude Code. Return the response text (sent verbatim to Aristotle)."""
+    claude_path = _ensure_claude_cli()
     system_prompt = _read_review_prompt(skeleton_mode)
 
     target_content = _read_lean_files(target_folder)
@@ -95,63 +112,60 @@ def review_and_draft_prompt(
         )
     repo_context = _read_repo_lean_context(repo_dir, target_folder)
 
-    user_blocks: list[dict] = [
-        {
-            "type": "text",
-            "text": (
-                "# Repo context (Lean files outside the target folder)\n\n"
-                + (repo_context or "(none)")
-            ),
-            "cache_control": {"type": "ephemeral"},
-        },
-    ]
-    if marathon_md:
-        user_blocks.append({
-            "type": "text",
-            "text": f"# marathon.md (project notebook)\n\n{marathon_md}",
-        })
-    user_blocks.append({
-        "type": "text",
-        "text": (
-            f"# Target folder (`{target_folder}`) — current state\n\n"
-            f"{target_content}\n\n"
-            f"# Past refinement log\n\n{refine_log or '(no prior iterations)'}\n\n"
-            f"This is iteration {iteration_idx} of up to {max_iterations}. "
-            "Write the prompt for Aristotle now."
-        ),
-    })
-
-    client = anthropic.Anthropic()
-    try:
-        with client.messages.stream(
-            model=CLAUDE_MODEL,
-            max_tokens=CLAUDE_MAX_TOKENS,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "xhigh"},
-            system=[{
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }],
-            messages=[{"role": "user", "content": user_blocks}],
-        ) as stream:
-            message = stream.get_final_message()
-    except APIError as e:
-        sys.exit(f"Claude API error (status {getattr(e, 'status_code', '?')}): {e}")
-
-    text_parts: list[str] = []
-    for block in message.content:
-        if block.type == "text":
-            text_parts.append(block.text)
-    response = "\n".join(text_parts).strip()
-    if not response:
-        sys.exit("Claude returned no text content.")
-
-    cache_read = getattr(message.usage, "cache_read_input_tokens", 0) or 0
-    cache_create = getattr(message.usage, "cache_creation_input_tokens", 0) or 0
-    print(
-        f"  Claude usage: input={message.usage.input_tokens} "
-        f"(cache read {cache_read}, write {cache_create}), "
-        f"output={message.usage.output_tokens}"
+    sections: list[str] = ["# Reviewer rubric (your role and priorities)\n\n" + system_prompt]
+    sections.append(
+        "# Repo context (Lean files outside the target folder)\n\n"
+        + (repo_context or "(none)")
     )
+    if marathon_md:
+        sections.append(f"# marathon.md (project notebook)\n\n{marathon_md}")
+    sections.append(
+        f"# Target folder (`{target_folder}`) — current state\n\n{target_content}"
+    )
+    sections.append(
+        f"# Past refinement log\n\n{refine_log or '(no prior iterations)'}"
+    )
+    sections.append(
+        f"This is iteration {iteration_idx} of up to {max_iterations}. "
+        "Write the prompt for Aristotle now."
+    )
+    combined = "\n\n---\n\n".join(sections)
+
+    cmd = [
+        claude_path,
+        "-p", combined,
+        "--bare",
+        "--model", CLAUDE_MODEL,
+        "--tools", "",
+        "--output-format", "text",
+    ]
+
+    print(
+        f"  invoking Claude Code via subprocess (prompt size: "
+        f"{len(combined):,} chars)"
+    )
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as e:
+        sys.exit(
+            f"could not exec claude (errno {e.errno}: {e.strerror}). "
+            f"If errno is 7 (E2BIG), the combined prompt exceeded the OS argv "
+            f"limit ({len(combined):,} chars); split the refinement target or "
+            "fall back to the API path."
+        )
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip() or "(no output)"
+        sys.exit(f"claude exited with code {proc.returncode}:\n{err}")
+
+    response = proc.stdout.strip()
+    if not response:
+        sys.exit("claude returned empty stdout.")
+
     return response

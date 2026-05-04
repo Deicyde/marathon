@@ -12,26 +12,34 @@ automated theorem-proving API. Two subcommands:
 
 ## Setup
 
-Prerequisites: [`uv`](https://docs.astral.sh/uv/) and an Aristotle API key.
-The `refine` subcommand additionally needs an Anthropic API key.
+Prerequisites:
+
+- [`uv`](https://docs.astral.sh/uv/) for Python deps.
+- An **Aristotle API key** for `skeleton` and `refine` (both submit to
+  Aristotle).
+- The **Claude Code CLI** (`claude`) for `refine` only — it's invoked as a
+  subprocess for the Claude review step, so refine bills against your
+  Claude Max subscription instead of pay-per-token API credits. Install per
+  https://claude.com/product/claude-code/ and run `claude` once
+  interactively to authenticate.
 
 ```bash
 uv sync                          # install dependencies into .venv/
 echo $ARISTOTLE_API_KEY          # confirm the env var is set
+which claude                     # confirm the CLI is on PATH (refine only)
 ```
 
-Mint an Aristotle key at https://aristotle.harmonic.fun/dashboard/keys, and
-(for `refine`) an Anthropic key at https://console.anthropic.com/settings/keys.
-Add both to `~/.zshrc` by editing the file directly — pasting at the prompt
-logs them in shell history:
+Mint an Aristotle key at https://aristotle.harmonic.fun/dashboard/keys and
+add it to `~/.zshrc` — edit the file directly, pasting at the prompt logs
+it in shell history:
 
 ```bash
 export ARISTOTLE_API_KEY="arstl_..."
-export ANTHROPIC_API_KEY="sk-ant-..."   # only needed for `refine`
 ```
 
-Marathon refuses to run if the variable it needs isn't set, and never logs
-the values.
+Marathon refuses to run if `ARISTOTLE_API_KEY` isn't set, and never logs
+the value. The `claude` CLI uses its own keychain-based OAuth from your
+Max login — no env var required.
 
 ## `marathon skeleton`
 
@@ -203,11 +211,18 @@ Aristotle attempts hit `RETRIES_EXHAUSTED`, or on `OUT_OF_BUDGET` /
 
 ### How Claude is configured
 
-`claude-opus-4-7`, adaptive thinking, `effort=xhigh`, prompt caching on the
-system rubric and the repo context (so iteration 2+ pays mostly cache reads
-on those, dwarfed by the small dynamic suffix). Streaming, max output
-~32K tokens. Editable in `marathon/claude_review.py` and
-`marathon/prompts/review.md`.
+Refine invokes the **Claude Code CLI** (`claude`) as a subprocess, billed
+against your Max subscription. Each call uses `claude-opus-4-7` with
+`--bare --tools ""` (no agent loop, no tool use — pure single-shot
+completion). The system rubric is in `marathon/prompts/review.md` (or
+`review_skeleton.md` with `--skeleton`); both rubric and per-iteration
+context are concatenated into one `-p` prompt.
+
+Trade-off vs the API path: prompt caching isn't exposed via the CLI, so
+each iteration pays full token cost. Free for Max users; would matter if
+you flipped back to API billing. To switch to direct API calls instead,
+edit `marathon/claude_review.py` to use the `anthropic` SDK and add it
+back to `pyproject.toml`.
 
 ## State
 
