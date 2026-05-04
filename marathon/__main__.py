@@ -83,6 +83,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "retried. Default: 2."
         ),
     )
+    _add_pipeline_flags(p_skel)
 
     p_refine = subparsers.add_parser(
         "refine",
@@ -193,8 +194,54 @@ def _build_parser() -> argparse.ArgumentParser:
             "or Aristotle. Useful for first-time use."
         ),
     )
+    _add_pipeline_flags(p_refine)
 
     return parser
+
+
+def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
+    """Adds --auto-build, --auto-commit, --auto-rate, --build-timeout to a
+    subparser. Each flag is independent and defaults off."""
+    parser.add_argument(
+        "--auto-build",
+        action="store_true",
+        help=(
+            "After each successful extraction, run `lake build` in --repo-dir. "
+            "Captures exit code and a tail of the build log. Build failures do "
+            "not abort the pipeline. Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--auto-commit",
+        action="store_true",
+        help=(
+            "After each successful extraction, stage the chapter's output "
+            "folder and `git commit` with an auto message. No push. Skipped "
+            "with a warning if the git index is busy. Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--auto-rate",
+        action="store_true",
+        help=(
+            "After each successful extraction, spawn a Claude subprocess to "
+            "rate the code 1–5 across quality / math_correctness / generality "
+            "/ api_coverage / modern_lean4. Appends one JSON line per rating "
+            "to <workdir>/marathon-ratings.jsonl. Uses your Max subscription. "
+            "Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--build-timeout",
+        type=int,
+        default=600,
+        metavar="SECONDS",
+        help=(
+            "Wall-clock timeout for `lake build` in --auto-build (default: 600 "
+            "= 10 minutes). On timeout the build is killed and recorded as "
+            "TIMED OUT; the rest of the pipeline still runs."
+        ),
+    )
 
 
 def main() -> None:

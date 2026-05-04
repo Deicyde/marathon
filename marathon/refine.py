@@ -28,6 +28,7 @@ from typing import Optional
 from aristotlelib import AristotleAPIError, Project, ProjectStatus
 
 from marathon.claude_review import review_and_draft_prompt
+from marathon.post_pipeline import PipelineConfig, run_post_pipeline
 from marathon.skeleton import (
     IN_FLIGHT_STATUS_VALUES,
     LOG_FILENAME,
@@ -203,6 +204,9 @@ async def _run_refine_attempt(
     state_path: Path,
     attempt_idx: int,
     max_retries: int,
+    pipeline_config: PipelineConfig,
+    iteration_idx: int,
+    target_folder_name: str,
     existing_project: Optional[Project] = None,
 ) -> Optional[ProjectStatus]:
     """Run one Aristotle attempt for the current iteration. Returns the
@@ -276,6 +280,21 @@ async def _run_refine_attempt(
                 return None
 
     save_refine_state(state_path, state)
+
+    if (
+        state.output_path is not None
+        and project.status == ProjectStatus.COMPLETE
+        and pipeline_config.has_any()
+    ):
+        run_post_pipeline(
+            config=pipeline_config,
+            repo_dir=repo_dir,
+            target_path=Path(state.output_path),
+            chapter_label=target_folder_name,
+            iteration=iteration_idx,
+            project_id=state.project_id,
+        )
+
     return project.status
 
 
@@ -289,6 +308,8 @@ async def _run_iteration(
     prompt: Optional[str],
     polling_interval: int,
     max_retries: int,
+    pipeline_config: PipelineConfig,
+    target_folder_name: str,
     state: RefineState,
     state_path: Path,
     existing_project: Optional[Project],
@@ -309,6 +330,9 @@ async def _run_iteration(
             state_path=state_path,
             attempt_idx=attempt_idx,
             max_retries=max_retries,
+            pipeline_config=pipeline_config,
+            iteration_idx=iteration_idx,
+            target_folder_name=target_folder_name,
             existing_project=existing_project if attempt_idx == 0 else None,
         )
         existing_project = None  # only used on first iteration
@@ -411,6 +435,23 @@ async def refine_command(args) -> None:
     if args.max_prompt_words is not None:
         print(f"max prompt words: {args.max_prompt_words}")
 
+    pipeline_config = PipelineConfig(
+        auto_build=args.auto_build,
+        auto_commit=args.auto_commit,
+        auto_rate=args.auto_rate,
+        build_timeout=args.build_timeout,
+        ratings_path=workdir / "marathon-ratings.jsonl",
+    )
+    if pipeline_config.has_any():
+        flags = [
+            name for name, on in [
+                ("auto-build", pipeline_config.auto_build),
+                ("auto-commit", pipeline_config.auto_commit),
+                ("auto-rate", pipeline_config.auto_rate),
+            ] if on
+        ]
+        print(f"post-extraction:  {', '.join(flags)}")
+
     if args.dry_run:
         print(
             "\n[dry-run] would loop up to "
@@ -480,6 +521,8 @@ async def refine_command(args) -> None:
             prompt=full_prompt,
             polling_interval=args.polling_interval,
             max_retries=args.max_retries,
+            pipeline_config=pipeline_config,
+            target_folder_name=target_folder.name,
             state=state,
             state_path=state_path,
             existing_project=existing_project,

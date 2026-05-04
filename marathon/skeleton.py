@@ -28,6 +28,7 @@ import aristotlelib
 from aristotlelib import AristotleAPIError, Project, ProjectStatus
 
 from marathon.order import OrderEntry, parse_order_file
+from marathon.post_pipeline import PipelineConfig, run_post_pipeline
 from marathon.state import (
     ChapterState,
     RunState,
@@ -381,6 +382,7 @@ async def _run_one_attempt(
     state_path: Path,
     attempt_idx: int,
     max_retries: int,
+    pipeline_config: PipelineConfig,
     existing_project: Project | None = None,
 ) -> ProjectStatus | None:
     """Run a single attempt. If ``existing_project`` is provided, skip submission
@@ -456,6 +458,22 @@ async def _run_one_attempt(
                 return None
 
     save_state(state_path, state)
+
+    # Post-extraction pipeline (no-op if no flags set).
+    if (
+        chapter.output_path is not None
+        and project.status == ProjectStatus.COMPLETE
+        and pipeline_config.has_any()
+    ):
+        run_post_pipeline(
+            config=pipeline_config,
+            repo_dir=repo_dir,
+            target_path=Path(chapter.output_path),
+            chapter_label=entry.input_file,
+            iteration=None,
+            project_id=chapter.project_id,
+        )
+
     return project.status
 
 
@@ -467,6 +485,7 @@ async def _run_chapter(
     output_base: PurePosixPath,
     polling_interval: int,
     max_retries: int,
+    pipeline_config: PipelineConfig,
     state: RunState,
     state_path: Path,
 ) -> ChapterState:
@@ -521,6 +540,7 @@ async def _run_chapter(
             state_path=state_path,
             attempt_idx=attempt_idx,
             max_retries=max_retries,
+            pipeline_config=pipeline_config,
             existing_project=existing_project if attempt_idx == 0 else None,
         )
         existing_project = None
@@ -586,6 +606,23 @@ async def skeleton_command(args) -> None:
     prompt_template = _read_prompt_template()
     state = load_state(state_path)
 
+    pipeline_config = PipelineConfig(
+        auto_build=args.auto_build,
+        auto_commit=args.auto_commit,
+        auto_rate=args.auto_rate,
+        build_timeout=args.build_timeout,
+        ratings_path=folder / "marathon-ratings.jsonl",
+    )
+    if pipeline_config.has_any():
+        flags = [
+            name for name, on in [
+                ("auto-build", pipeline_config.auto_build),
+                ("auto-commit", pipeline_config.auto_commit),
+                ("auto-rate", pipeline_config.auto_rate),
+            ] if on
+        ]
+        print(f"post-extraction pipeline: {', '.join(flags)}")
+
     for entry in entries:
         existing = state.find(entry.input_file)
         if existing and existing.status in RESUMABLE_SUCCESS_STATUS_VALUES:
@@ -600,6 +637,7 @@ async def skeleton_command(args) -> None:
             output_base=output_base,
             polling_interval=args.polling_interval,
             max_retries=args.max_retries,
+            pipeline_config=pipeline_config,
             state=state,
             state_path=state_path,
         )

@@ -228,6 +228,30 @@ you flipped back to API billing. To switch to direct API calls instead,
 edit `marathon/claude_review.py` to use the `anthropic` SDK and add it
 back to `pyproject.toml`.
 
+## Post-extraction pipeline (optional)
+
+Both `skeleton` and `refine` accept three independent flags that run after
+each successful extraction. All default off.
+
+| Flag | What it does |
+|---|---|
+| `--auto-build` | Runs `lake build` in `--repo-dir`. Captures exit code + log tail. Build failure does **not** abort the pipeline. Configurable timeout via `--build-timeout SECONDS` (default 600 = 10 min); on timeout the build is killed and recorded as `TIMED OUT`. |
+| `--auto-commit` | Stages just the chapter's output folder (`git add <output-path>`) and `git commit`s with an auto message including build status (if known) and the project ID. No push. Skipped with a warning if the git index is busy or there's nothing to commit. |
+| `--auto-rate` | Spawns Claude (Max-billed subprocess) to rate the code 1–5 across `quality`, `math_correctness`, `generality`, `api_coverage`, `modern_lean4`, with a one-paragraph note. Appends one JSON line per rating to `<workdir>/marathon-ratings.jsonl`. |
+
+Per-chapter / per-iteration output:
+```
+done: COMPLETE  duration=42.3m  output=...
+build: OK (24s)
+commit: a3f8c12  message="marathon: Chapter12 [build:OK] (project=db243d68)"
+rating: q=4 m=5 g=3 api=3 lean4=4
+notes: "Statements are accurate but several lemmas could be generalized..."
+```
+
+Mix-and-match: `--auto-commit` alone (no build, no rating) just snapshots
+each chapter to git. `--auto-rate` alone (no commit) collects quality data
+without touching git.
+
 ## State
 
 Marathon writes `<input-folder>/marathon-state.json` with one entry per
