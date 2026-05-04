@@ -186,6 +186,10 @@ uv run python -m marathon refine <target-lean-folder> \
   definition quality: correctness, future-proofness, and idiomatic
   Mathlib style. Use this to iterate on the scaffold before filling in
   any proofs.
+- **`--max-prompt-words N`** — constrain Claude's drafted Aristotle prompt
+  to roughly N words. Tells Claude to cut redundant prose, prefer short
+  bullets, and trim long code blocks. Useful for A/B-testing how prompt
+  length affects Aristotle's behavior. Default: no limit.
 - **`--dry-run`** — print the resolved configuration and exit without
   calling Claude or Aristotle.
 

@@ -403,6 +403,8 @@ async def refine_command(args) -> None:
     print(f"max retries/iter: {args.max_retries}")
     if args.skeleton:
         print("mode:             skeleton (no proofs; sorry-only)")
+    if args.max_prompt_words is not None:
+        print(f"max prompt words: {args.max_prompt_words}")
 
     if args.dry_run:
         print(
@@ -434,6 +436,7 @@ async def refine_command(args) -> None:
                 iteration_idx=iteration_idx,
                 max_iterations=args.max_iterations,
                 skeleton_mode=args.skeleton,
+                max_prompt_words=args.max_prompt_words,
             )
 
             print("\n--- Claude's drafted prompt (sent verbatim to Aristotle) ---")

@@ -100,10 +100,23 @@ def review_and_draft_prompt(
     iteration_idx: int,
     max_iterations: int,
     skeleton_mode: bool = False,
+    max_prompt_words: Optional[int] = None,
 ) -> str:
     """Call Claude Code. Return the response text (sent verbatim to Aristotle)."""
     claude_path = _ensure_claude_cli()
     system_prompt = _read_review_prompt(skeleton_mode)
+
+    if max_prompt_words is not None:
+        system_prompt = (
+            system_prompt
+            + "\n\n## Length constraint\n\n"
+            + f"Keep your response to {max_prompt_words} words or fewer. Cut "
+              "redundant phrasing, multi-paragraph asides, and prose Aristotle "
+              "can infer from context. Prefer short bullets over paragraphs. "
+              "Do not include code blocks longer than what's strictly necessary "
+              "to communicate a fix; reference declarations by name and trust "
+              "Aristotle to fill in mechanics it already knows."
+        )
 
     target_content = _read_lean_files(target_folder)
     if not target_content:

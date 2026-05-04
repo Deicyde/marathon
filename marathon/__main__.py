@@ -174,6 +174,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_refine.add_argument(
+        "--max-prompt-words",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Constrain Claude's drafted Aristotle prompt to roughly N words. "
+            "Tells Claude to cut redundant prose, prefer short bullets, and "
+            "trim long code blocks. Useful for A/B-testing how prompt length "
+            "affects Aristotle's behavior. Default: no limit."
+        ),
+    )
+    p_refine.add_argument(
         "--dry-run",
         action="store_true",
         help=(
