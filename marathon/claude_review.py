@@ -101,8 +101,16 @@ def review_and_draft_prompt(
     max_iterations: int,
     skeleton_mode: bool = False,
     max_prompt_words: Optional[int] = None,
+    attempt_idx: int = 0,
+    max_retries: int = 0,
+    previous_status: Optional[str] = None,
 ) -> str:
-    """Call Claude Code. Return the response text (sent verbatim to Aristotle)."""
+    """Call Claude Code. Return the response text (sent verbatim to Aristotle).
+
+    On retry attempts (``attempt_idx > 0``), the user message includes a
+    "Continuation context" section telling Claude the previous attempt's
+    status so it can write a freshly-targeted prompt.
+    """
     claude_path = _ensure_claude_cli()
     system_prompt = _read_review_prompt(skeleton_mode)
 
@@ -139,8 +147,21 @@ def review_and_draft_prompt(
     sections.append(
         f"# Past refinement log\n\n{refine_log or '(no prior iterations)'}"
     )
+    if attempt_idx > 0:
+        sections.append(
+            "# Continuation context\n\n"
+            f"This is **retry attempt {attempt_idx}** within iteration "
+            f"{iteration_idx} (up to {max_retries} retries per iteration). The "
+            f"previous attempt ended with status `{previous_status or 'unknown'}`. "
+            "If that attempt produced partial output, the target folder above "
+            "now reflects that — review the **current** state of the code (not "
+            "what you remember asking for) and write a freshly-targeted prompt "
+            "to push Aristotle further from where it stopped. Be more specific "
+            "about what wasn't done; Aristotle has another shot."
+        )
     sections.append(
-        f"This is iteration {iteration_idx} of up to {max_iterations}. "
+        f"This is iteration {iteration_idx} of up to {max_iterations}, "
+        f"attempt {attempt_idx + 1} of up to {max_retries + 1}. "
         "Write the prompt for Aristotle now."
     )
     combined = "\n\n---\n\n".join(sections)
