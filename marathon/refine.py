@@ -455,8 +455,10 @@ async def refine_command(args) -> None:
         sys.exit(f"--repo-dir is not a git repo: {repo_dir}")
 
     workdir: Path = (args.workdir or Path.cwd()).resolve()
-    if not workdir.is_dir():
-        sys.exit(f"--workdir not found: {workdir}")
+    try:
+        workdir.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        sys.exit(f"--workdir path exists but is not a directory: {workdir}")
 
     tex_path: Optional[Path] = None
     if args.tex is not None:
