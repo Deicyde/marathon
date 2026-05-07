@@ -104,6 +104,7 @@ def review_and_draft_prompt(
     attempt_idx: int = 0,
     max_retries: int = 0,
     previous_status: Optional[str] = None,
+    referee_md: Optional[str] = None,
 ) -> str:
     """Call Claude Code. Return the response text (sent verbatim to Aristotle).
 
@@ -135,6 +136,17 @@ def review_and_draft_prompt(
     repo_context = _read_repo_lean_context(repo_dir, target_folder)
 
     sections: list[str] = ["# Reviewer rubric (your role and priorities)\n\n" + system_prompt]
+    if referee_md:
+        sections.append(
+            "# Project-specific reviewer notes (referee.md)\n\n"
+            "These notes were written by an outside reviewer (human or AI) to "
+            "course-correct your reviews on this project. Treat them as a layer "
+            "of project-specific priorities **on top of** the rubric above. If "
+            "the rubric and these notes conflict, the rubric wins on output "
+            "style (second person, no preamble, specific replacements); these "
+            "notes win on what to look at and how hard to push.\n\n"
+            + referee_md
+        )
     sections.append(
         "# Repo context (Lean files outside the target folder)\n\n"
         + (repo_context or "(none)")

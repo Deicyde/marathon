@@ -124,6 +124,19 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_refine.add_argument(
+        "--referee",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help=(
+            "Path to a markdown file with project-specific reviewer notes "
+            "that Claude should layer on top of its rubric. If this flag "
+            "is omitted, Marathon auto-detects <repo-dir>/referee.md. The "
+            "file is given only to Claude (the reviewer); it is excluded "
+            "from the Aristotle bundle."
+        ),
+    )
+    p_refine.add_argument(
         "--workdir",
         type=Path,
         default=None,

@@ -160,6 +160,7 @@ submission (with retries). Loops up to `--max-iterations` times.
 uv run python -m marathon refine <target-lean-folder> \
     --repo-dir <lean-repo> \
     [--tex <tex-file>] \
+    [--referee <notes-file>] \
     [--workdir <dir>] \
     [--max-iterations 3] [--max-retries 2]
 ```
@@ -171,6 +172,13 @@ uv run python -m marathon refine <target-lean-folder> \
 - **`--tex`** (optional) — a `.tex` reference file the user supplies for
   Aristotle. Bundled at the top level of every Aristotle submission. **Claude
   is never given its contents** — only Aristotle sees it.
+- **`--referee`** (optional) — a markdown file with project-specific
+  reviewer notes that Claude layers on top of its rubric (e.g., recurring
+  failure modes, project-specific priorities, or course corrections from
+  an outside human/AI reviewer). Auto-detected at `<repo-dir>/referee.md`
+  if the flag is omitted. **Aristotle is never given its contents** —
+  only Claude sees it. Re-read each iteration, so edits land on the next
+  Claude call.
 - **`--workdir`** (optional, default: cwd) — where Marathon writes
   `marathon-refine-state.json` and `marathon-refine-log.md`, and reads
   `marathon.md` from if present.
@@ -197,8 +205,8 @@ uv run python -m marathon refine <target-lean-folder> \
 
 1. Claude reads the current state of the target folder, every other Lean
    file in the repo (gitignore-filtered), `marathon.md` from the workdir
-   (if present), and the past refinement log. It does **not** read any
-   `.tex` file.
+   (if present), the `--referee` notes file (if present), and the past
+   refinement log. It does **not** read any `.tex` file.
 2. Claude writes a prompt for Aristotle directly — the response is sent
    verbatim, no parsing. Marathon appends a "where to put output" trailer.
 3. Marathon submits to Aristotle with the repo + `--tex` file (if any) +

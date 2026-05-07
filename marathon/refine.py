@@ -105,14 +105,23 @@ def _build_refine_submission_dir(
     tex_path: Optional[Path],
     workdir_log: Optional[Path],
     work_dir: Path,
+    referee_path: Optional[Path] = None,
 ) -> Path:
-    """Stage the Aristotle submission tree."""
+    """Stage the Aristotle submission tree.
+
+    ``referee_path``, if given, is excluded from the bundle: those notes
+    are reviewer-only direction for Claude and should not reach Aristotle.
+    """
     staged = work_dir / "submission"
     staged.mkdir()
+
+    referee_resolved = referee_path.resolve() if referee_path else None
 
     for rel in _list_repo_files(repo_dir):
         src = repo_dir / rel
         if not src.is_file():
+            continue
+        if referee_resolved is not None and src.resolve() == referee_resolved:
             continue
         dst = staged / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -165,6 +174,7 @@ async def _submit_fresh_refine(
     state_path: Path,
     attempt_idx: int,
     max_retries: int,
+    referee_path: Optional[Path] = None,
 ) -> Optional[Project]:
     state.attempts += 1
     state.output_path = None
@@ -179,6 +189,7 @@ async def _submit_fresh_refine(
             tex_path=tex_path,
             workdir_log=workdir_log,
             work_dir=Path(stage_tmp),
+            referee_path=referee_path,
         )
         try:
             project = await Project.create_from_directory(prompt=prompt, project_dir=staged)
@@ -214,6 +225,7 @@ async def _run_refine_attempt(
     iteration_idx: int,
     target_folder_name: str,
     existing_project: Optional[Project] = None,
+    referee_path: Optional[Path] = None,
 ) -> Optional[ProjectStatus]:
     """Run one Aristotle attempt for the current iteration. Returns the
     terminal ``ProjectStatus``, or ``None`` for Marathon-level errors."""
@@ -235,6 +247,7 @@ async def _run_refine_attempt(
             state_path=state_path,
             attempt_idx=attempt_idx,
             max_retries=max_retries,
+            referee_path=referee_path,
         )
         if project is None:
             return None
@@ -323,6 +336,7 @@ async def _run_iteration(
     state: RefineState,
     state_path: Path,
     existing_project: Optional[Project],
+    referee_path: Optional[Path] = None,
 ) -> bool:
     """Run a single refinement iteration. Each attempt (other than a
     reattach to an in-flight project) gets its own Claude review against
@@ -345,6 +359,11 @@ async def _run_iteration(
 
             marathon_md = workdir_log.read_text() if workdir_log and workdir_log.is_file() else None
             refine_log_text = log_path.read_text() if log_path.is_file() else ""
+            referee_md = (
+                referee_path.read_text()
+                if referee_path and referee_path.is_file()
+                else None
+            )
 
             claude_response = review_and_draft_prompt(
                 target_folder=target_folder,
@@ -358,6 +377,7 @@ async def _run_iteration(
                 attempt_idx=attempt_idx,
                 max_retries=max_retries,
                 previous_status=last_status,
+                referee_md=referee_md,
             )
 
             print("\n--- Claude's drafted prompt (sent verbatim to Aristotle) ---")
@@ -390,6 +410,7 @@ async def _run_iteration(
             iteration_idx=iteration_idx,
             target_folder_name=target_folder_name,
             existing_project=existing_project if use_existing else None,
+            referee_path=referee_path,
         )
         existing_project = None
 
@@ -466,6 +487,16 @@ async def refine_command(args) -> None:
         if not tex_path.is_file():
             sys.exit(f"--tex file not found: {tex_path}")
 
+    referee_path: Optional[Path] = None
+    if args.referee is not None:
+        referee_path = args.referee.resolve()
+        if not referee_path.is_file():
+            sys.exit(f"--referee file not found: {referee_path}")
+    else:
+        candidate = repo_dir / "referee.md"
+        if candidate.is_file():
+            referee_path = candidate.resolve()
+
     try:
         rel_to_repo = target_folder.relative_to(repo_dir)
     except ValueError:
@@ -496,6 +527,8 @@ async def refine_command(args) -> None:
     print(f"output path:      {output_path_str}")
     if tex_path is not None:
         print(f"tex file:         {tex_path}")
+    if referee_path is not None:
+        print(f"referee notes:    {referee_path}")
     print(f"workdir:          {workdir}")
     print(f"max iterations:   {args.max_iterations}")
     print(f"max retries/iter: {args.max_retries}")
@@ -574,6 +607,7 @@ async def refine_command(args) -> None:
             state=state,
             state_path=state_path,
             existing_project=existing_project,
+            referee_path=referee_path,
         )
 
         if not ok:
