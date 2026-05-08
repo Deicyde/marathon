@@ -57,7 +57,17 @@ Heuristics for classifying changes when reading the diff:
   removing unused hypotheses, tightening a `decide` to a named lemma.
 
 If a build status (PASS / FAIL) is provided, factor compile-time
-correctness into your `quality` and `math_correctness` ratings.
+correctness into your `quality` and `math_correctness` ratings. When the
+build is FAIL or TIMED OUT and a build-log tail is included, identify
+the actual error class (missing import, type mismatch, elaboration
+timeout, deterministic timeout) in your `notes` paragraph instead of
+just citing "build failed."
+
+If a "Project-specific reviewer priorities" section is included
+(referee.md), use it as context for what counts as a structural fix on
+this project. A diff that closes a referee item is unambiguously
+structural regardless of textual size; absence of referee items in the
+diff is not itself a deduction — the main rubric still drives scoring.
 
 Return **ONLY a single-line JSON object**, no preamble, no markdown fences,
 no commentary outside the JSON. Schema:
