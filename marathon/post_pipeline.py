@@ -91,6 +91,7 @@ class RatingResult:
     generality: Optional[int] = None
     api_coverage: Optional[int] = None
     modern_lean4: Optional[int] = None
+    structural_focus: Optional[int] = None
     notes: Optional[str] = None
     parse_error: Optional[str] = None
 
@@ -233,9 +234,43 @@ def run_git_push(repo_dir: Path) -> tuple[bool, str]:
     return True, short
 
 
+def _compute_iteration_diff(
+    repo_dir: Path,
+    target_path: Path,
+    head_sha: str,
+) -> Optional[str]:
+    """Diff the target path between ``head_sha`` and its parent commit.
+
+    Returns the diff text if both commits exist and the diff is non-empty,
+    otherwise None. Truncates very long diffs to the first ~80,000 chars
+    to keep the rater prompt within reasonable size.
+    """
+    try:
+        rel = target_path.relative_to(repo_dir)
+    except ValueError:
+        return None
+    proc = subprocess.run(
+        ["git", "diff", f"{head_sha}^..{head_sha}", "--", str(rel)],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    diff = proc.stdout or ""
+    if not diff.strip():
+        return None
+    if len(diff) > 80_000:
+        diff = diff[:80_000] + "\n\n... (diff truncated at 80,000 chars)"
+    return diff
+
+
 def call_claude_rater(
     target_path: Path,
     build_result: Optional[BuildResult],
+    repo_dir: Optional[Path] = None,
+    iteration_commit_sha: Optional[str] = None,
 ) -> RatingResult:
     claude_path = shutil.which("claude")
     if not claude_path:
@@ -250,11 +285,20 @@ def call_claude_rater(
     if not code:
         return RatingResult(parse_error=f"no .lean files under {target_path}")
 
+    diff: Optional[str] = None
+    if repo_dir is not None and iteration_commit_sha:
+        diff = _compute_iteration_diff(repo_dir, target_path, iteration_commit_sha)
+
     parts = [rubric]
     if build_result is not None and build_result.ok is not None:
         status = "PASS" if build_result.ok else ("TIMED OUT" if build_result.timed_out else "FAIL")
         parts.append(f"## Build status\n\n{status}")
-    parts.append(f"## Code under review\n\n{code}")
+    if diff is not None:
+        parts.append(
+            "## Diff under review (this iteration's changes)\n\n"
+            "```diff\n" + diff + "\n```"
+        )
+    parts.append(f"## Code under review (current state)\n\n{code}")
     prompt = "\n\n---\n\n".join(parts)
 
     env = os.environ.copy()
@@ -297,6 +341,7 @@ def call_claude_rater(
         generality=_coerce_int(data.get("generality")),
         api_coverage=_coerce_int(data.get("api_coverage")),
         modern_lean4=_coerce_int(data.get("modern_lean4")),
+        structural_focus=_coerce_int(data.get("structural_focus")),
         notes=data.get("notes") if isinstance(data.get("notes"), str) else None,
     )
 
@@ -388,14 +433,21 @@ def run_post_pipeline(
                 print(f"  push: failed — {push_msg}")
 
     if config.auto_rate:
-        r = call_claude_rater(target_path, out["build"])
+        commit_sha = out["commit"].sha if out["commit"] else None
+        r = call_claude_rater(
+            target_path,
+            out["build"],
+            repo_dir=repo_dir,
+            iteration_commit_sha=commit_sha,
+        )
         out["rating"] = r
         if r.parse_error:
             print(f"  rating: parse error — {r.parse_error}")
         else:
+            sf = r.structural_focus if r.structural_focus is not None else "—"
             print(
                 f"  rating: q={r.quality} m={r.math_correctness} g={r.generality} "
-                f"api={r.api_coverage} lean4={r.modern_lean4}"
+                f"api={r.api_coverage} lean4={r.modern_lean4} struct={sf}"
             )
             if r.notes:
                 print(f"  notes: {r.notes}")
