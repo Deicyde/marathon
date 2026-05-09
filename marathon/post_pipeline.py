@@ -125,6 +125,79 @@ def append_promptlog_url(repo_dir: Path, project_id: str) -> bool:
     return True
 
 
+_SORRY_WARNING_RE = re.compile(r"^warning: .*: declaration uses `sorry`\s*$")
+# Lake error-summary lines that don't add information once the per-file
+# `error:` lines are surfaced.
+_GENERIC_BUILD_ERROR_LINES = {
+    "error: build failed",
+    "Some required targets logged failures:",
+}
+
+
+def _summarize_build_log(stdout: str, stderr: str) -> str:
+    """Build a concise log_tail that surfaces real errors instead of being
+    drowned in `declaration uses sorry` warnings.
+
+    Strategy:
+      1. Walk every line of stdout+stderr.
+      2. Pull out lines starting with `error:` or `error.*:`, plus the
+         immediately-following continuation lines (Lean follow-ups like
+         "Note: ..." or stacktrace context — non-blank, non-warning lines).
+      3. Drop the per-declaration `declaration uses 'sorry'` warnings (they
+         repeat hundreds of times in skeleton mode and crowd out the cause).
+      4. Append a short tail of remaining lines for context.
+    """
+    combined = []
+    if stdout:
+        combined.append(stdout)
+    if stderr.strip():
+        combined.append("--- stderr ---")
+        combined.append(stderr)
+    lines = "\n".join(combined).splitlines()
+
+    errors: list[str] = []
+    other: list[str] = []
+    in_error_block = False
+    for raw in lines:
+        line = raw.rstrip()
+        if not line:
+            in_error_block = False
+            continue
+        # Lake build summary lines: keep but don't treat as the marquee error.
+        is_error_line = (
+            line.startswith("error:")
+            or " error: " in line
+            or "Lean exited with code" in line
+        )
+        if is_error_line and line not in _GENERIC_BUILD_ERROR_LINES:
+            errors.append(line)
+            in_error_block = True
+            continue
+        if in_error_block:
+            # Capture follow-up context (Note:, stacktrace) until a blank or warning
+            if _SORRY_WARNING_RE.match(line) or line.startswith("warning:"):
+                in_error_block = False
+            else:
+                errors.append("  " + line)
+                continue
+        if _SORRY_WARNING_RE.match(line):
+            continue
+        other.append(line)
+
+    parts: list[str] = []
+    if errors:
+        parts.append("ERRORS:\n" + "\n".join(errors))
+    if other:
+        tail = other[-30:]
+        parts.append("TAIL (warnings + other, sorry-noise stripped):\n" + "\n".join(tail))
+    summary = "\n\n".join(parts).strip()
+    if not summary:
+        return ""
+    if len(summary) > 4_000:
+        summary = summary[:4_000] + "\n... (truncated)"
+    return summary
+
+
 def run_lake_build(repo_dir: Path, timeout: int) -> BuildResult:
     if not shutil.which("lake"):
         return BuildResult(skipped_reason="lake CLI not on PATH")
@@ -148,9 +221,7 @@ def run_lake_build(repo_dir: Path, timeout: int) -> BuildResult:
         )
 
     elapsed = (datetime.now() - started).total_seconds()
-    out_tail = (proc.stdout or "")[-1500:]
-    err_tail = (proc.stderr or "")[-1500:]
-    log_tail = (out_tail + ("\n---\n" + err_tail if err_tail.strip() else "")).strip()
+    log_tail = _summarize_build_log(proc.stdout or "", proc.stderr or "")
     return BuildResult(
         ok=proc.returncode == 0,
         duration_seconds=elapsed,
