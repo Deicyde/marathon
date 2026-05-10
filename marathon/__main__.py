@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from marathon.refine import refine_command
+from marathon.referee import referee_command
 from marathon.skeleton import skeleton_command
 
 
@@ -188,6 +189,23 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_refine.add_argument(
+        "--auto-referee-every",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "After every N successfully-completed iterations of this refine "
+            "invocation, automatically run the referee agent to refresh the "
+            "machine-managed tail of referee.md (and commit it). 0 (default) "
+            "disables. Typical: 1 to run after every iteration, 3 to run "
+            "once per chapter at the end. The referee scans the repo, "
+            "per-chapter workdirs (siblings of --workdir), and the current "
+            "referee.md; the agent's output replaces the section between "
+            "the `BEGIN: Marathon-managed referee tail` sentinels. The "
+            "user-managed header above the sentinel is preserved untouched."
+        ),
+    )
+    p_refine.add_argument(
         "--no-cross-chapter",
         action="store_true",
         help=(
@@ -220,6 +238,71 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_pipeline_flags(p_refine)
+
+    p_ref = subparsers.add_parser(
+        "referee",
+        help=(
+            "Run the referee agent: scan the repo + per-chapter workdirs and "
+            "refresh the machine-managed tail of referee.md."
+        ),
+        description=(
+            "One-shot pass of the referee agent. Reads the current "
+            "referee.md (split into user-managed header above the BEGIN "
+            "sentinel and machine-managed tail below), the reviewer rubrics "
+            "(to deduplicate), the repo's Lean files, all per-chapter "
+            "marathon.md / ratings.jsonl / refine-log.md under "
+            "--workdirs-parent, and the recent git log. The agent emits a "
+            "fresh machine-managed tail; Marathon reassembles the file with "
+            "the user header preserved verbatim and either overwrites "
+            "referee.md (default, with an auto-commit) or writes "
+            "referee.md.proposed (with --review)."
+        ),
+    )
+    p_ref.add_argument(
+        "--repo-dir",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Lean repo containing referee.md (must be a git repo).",
+    )
+    p_ref.add_argument(
+        "--referee",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help=(
+            "Path to the referee.md file to update. Defaults to "
+            "<repo-dir>/referee.md."
+        ),
+    )
+    p_ref.add_argument(
+        "--workdirs-parent",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Parent directory containing per-chapter marathon refine workdirs "
+            "(subdirs with marathon-refine-state.json). The referee aggregates "
+            "their marathon.md, ratings, and refine-log files for context. "
+            "Without this flag the agent only sees the repo state."
+        ),
+    )
+    p_ref.add_argument(
+        "--review",
+        action="store_true",
+        help=(
+            "Don't overwrite referee.md. Write the new content to "
+            "referee.md.proposed for manual review. Implies --no-commit."
+        ),
+    )
+    p_ref.add_argument(
+        "--no-commit",
+        action="store_true",
+        help=(
+            "Write referee.md but don't auto-commit. Useful when you want "
+            "to inspect the change before committing manually."
+        ),
+    )
 
     return parser
 
@@ -301,6 +384,12 @@ def main() -> None:
                 "Aristotle project).",
                 file=sys.stderr,
             )
+            sys.exit(130)
+    elif args.command == "referee":
+        try:
+            referee_command(args)
+        except KeyboardInterrupt:
+            print("\ninterrupted", file=sys.stderr)
             sys.exit(130)
 
 

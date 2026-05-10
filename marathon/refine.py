@@ -803,6 +803,42 @@ async def refine_command(args) -> None:
         if state.note:
             print(f"  note: {state.note}")
 
+        # Auto-referee trigger: after every Nth iteration of this refine
+        # invocation, run the referee agent to refresh referee.md.
+        if (
+            args.auto_referee_every > 0
+            and iteration_idx % args.auto_referee_every == 0
+        ):
+            from marathon.referee import update_referee
+            ref_path = (
+                referee_path
+                if referee_path is not None
+                else (repo_dir / "referee.md")
+            )
+            print(
+                f"\n  auto-referee: triggered after iteration "
+                f"{iteration_idx} (every {args.auto_referee_every}); "
+                "scanning repo + sibling workdirs..."
+            )
+            ref_result = update_referee(
+                repo_dir=repo_dir,
+                referee_path=ref_path,
+                workdirs_parent=workdir.parent if workdir.parent.is_dir() else None,
+                auto_commit=True,
+                write_to_proposed_only=False,
+            )
+            if ref_result.error:
+                print(f"  auto-referee: ERROR — {ref_result.error}")
+            elif ref_result.ok:
+                tail_info = (
+                    f"  auto-referee: wrote {ref_result.output_path.name}"
+                )
+                if ref_result.diff_summary:
+                    tail_info += f"  ({ref_result.diff_summary})"
+                if ref_result.commit_sha:
+                    tail_info += f"  commit={ref_result.commit_sha}"
+                print(tail_info)
+
     print(
         f"\nrefine batch finished. {state.iterations_completed} "
         f"iteration(s) completed."

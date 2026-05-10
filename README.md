@@ -230,7 +230,80 @@ The loop ends when `--max-iterations` is reached, when an iteration's
 Aristotle attempts hit `RETRIES_EXHAUSTED`, or on `OUT_OF_BUDGET` /
 `CANCELED`.
 
-### How Claude is configured
+## `marathon referee`
+
+A Claude agent that maintains the **machine-managed tail** of
+`referee.md` — the project-specific reviewer rubric that Hermes layers
+on top of the generic rubric. The agent scans the repo, per-chapter
+workdirs (`marathon.md`, `marathon-ratings.jsonl`, `marathon-refine-log.md`),
+and the current `referee.md`, and rewrites the section between the
+`BEGIN: Marathon-managed referee tail` sentinels with the most pressing
+project-specific issues.
+
+```bash
+uv run python -m marathon referee \
+    --repo-dir <lean-repo> \
+    [--referee <path-to-referee.md>] \
+    [--workdirs-parent <dir-with-chapter-workdirs>] \
+    [--review] [--no-commit]
+```
+
+- **`--repo-dir`** — Lean repo containing `referee.md` (must be a git repo).
+- **`--referee FILE`** (optional) — defaults to `<repo-dir>/referee.md`.
+- **`--workdirs-parent DIR`** (optional) — parent directory containing
+  per-chapter refine workdirs (subdirs with `marathon-refine-state.json`).
+  Without this flag the agent only sees the repo state; with it, the agent
+  aggregates per-chapter `marathon.md`, rater notes, and Hermes' historical
+  drafted prompts.
+- **`--review`** — write to `referee.md.proposed` instead of overwriting,
+  for manual diff/merge.
+- **`--no-commit`** — overwrite but skip the auto-commit.
+
+The agent is instructed to be **conservative** (keep existing items
+unless clearly resolved by recent commits), **concrete** (each item
+names specific declarations/files/patterns), and **non-duplicative**
+with the generic rubric.
+
+### Layout: user header + machine tail
+
+`referee.md` is split into a user-managed header and a machine-managed
+tail by sentinel comments. The user can pin items above the sentinel
+and the agent never touches them. On first run (no sentinel), the
+existing file content becomes the user header and an empty machine tail
+is appended.
+
+```markdown
+[user-managed: hand-pinned project priorities]
+
+<!-- BEGIN: Marathon-managed referee tail (do not edit below this line; use `marathon referee` to refresh) -->
+
+[machine-managed: agent rewrites this section every pass]
+
+<!-- END: Marathon-managed referee tail -->
+```
+
+### Trigger from inside `refine`
+
+`refine` accepts `--auto-referee-every N` to run the referee after every
+`N` successfully-completed iterations of the current refine invocation
+(without leaving the loop). Combined with the existing per-chapter
+batch pattern, this gives a recurring "scan + refresh" rhythm:
+
+```bash
+for chap in c12 c14 c15 c16; do
+    marathon refine .../Chapter$num \
+        --workdir .../may10-r1/$chap \
+        --auto-referee-every 3 \
+        ...
+done
+```
+
+With `--auto-referee-every 3` and `--max-iterations 3`, the referee
+runs once at the end of each chapter, picking up that chapter's
+ratings before the next chapter starts. The next chapter's Hermes
+re-reads `referee.md` at iteration time and gets the fresh priorities.
+
+## How Claude is configured
 
 Refine invokes the **Claude Code CLI** (`claude`) as a subprocess, billed
 against your Max subscription. Each call uses `claude-opus-4-7` with
