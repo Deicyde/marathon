@@ -54,6 +54,33 @@ from marathon.state import (
 
 REFINE_STATE_FILENAME = "marathon-refine-state.json"
 REFINE_LOG_FILENAME = "marathon-refine-log.md"
+RATINGS_FILENAME = "marathon-ratings.jsonl"
+
+
+def _read_latest_rating_note(workdir: Path) -> Optional[str]:
+    """Return the most-recent rating's `notes` paragraph from the workdir's
+    ratings log, or None if the file is missing/empty/malformed.
+
+    Used to feed the previous iteration's auto-rater diagnosis back into
+    the next iteration's Claude review (closes the rater→reviewer loop).
+    """
+    import json
+    path = workdir / RATINGS_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        last_line = ""
+        for line in path.read_text().splitlines():
+            if line.strip():
+                last_line = line
+        if not last_line:
+            return None
+        data = json.loads(last_line)
+        rating = data.get("rating") or {}
+        notes = rating.get("notes")
+        return notes if isinstance(notes, str) and notes.strip() else None
+    except (OSError, ValueError):
+        return None
 
 OUTPUT_REQUIREMENTS_TRAILER = """
 
@@ -336,6 +363,7 @@ async def _run_iteration(
     state: RefineState,
     state_path: Path,
     existing_project: Optional[Project],
+    workdir: Path,
     referee_path: Optional[Path] = None,
 ) -> bool:
     """Run a single refinement iteration. Each attempt (other than a
@@ -364,6 +392,10 @@ async def _run_iteration(
                 if referee_path and referee_path.is_file()
                 else None
             )
+            # Re-read the latest rater note on every attempt (including
+            # retries) so a fresh Claude review sees the latest available
+            # diagnosis even if a retry follows a partial pipeline run.
+            previous_rating_note = _read_latest_rating_note(workdir)
 
             claude_response = review_and_draft_prompt(
                 target_folder=target_folder,
@@ -378,6 +410,7 @@ async def _run_iteration(
                 max_retries=max_retries,
                 previous_status=last_status,
                 referee_md=referee_md,
+                previous_rating_note=previous_rating_note,
             )
 
             print("\n--- Claude's drafted prompt (sent verbatim to Aristotle) ---")
@@ -608,6 +641,7 @@ async def refine_command(args) -> None:
             state=state,
             state_path=state_path,
             existing_project=existing_project,
+            workdir=workdir,
             referee_path=referee_path,
         )
 

@@ -31,12 +31,26 @@ Dimension describing **this iteration's changes** (only meaningful when a
     lemmas added, new typeclass / instance arguments. Cosmetic changes are
     incidental.
   - 4 = mostly structural with some cosmetic spillover.
-  - 3 = a roughly even mix of structural and cosmetic.
+  - 3 = a roughly even mix of structural and cosmetic, OR one clean
+    structural move (e.g. a single new bridging declaration that closes a
+    referee item) accompanied by light prose/attribute polish. **A new
+    `def` or `theorem` that adds previously-missing API surface counts as
+    structural and lands the iteration here at minimum, even if its body
+    is `sorry`.**
   - 2 = mostly cosmetic (renames, docstring rewrites, `@[simp]` /
     `@[mk_iff]` / `@[ext]` attribute hooks added, `simp` set tweaks,
-    unused-binder cleanup) with one or two structural touches.
+    unused-binder cleanup) with **at most one minor structural touch
+    that does not add new API surface** (e.g. dropping `private` from
+    one helper, lifting a `variable` block).
   - 1 = essentially all cosmetic; no signatures changed, no predicates
     unified, no new API surface introduced.
+
+  **Do not weight textual change size.** A 10-line diff that introduces a
+  new canonical declaration replacing a sorry-stubbed forward-reference
+  in another chapter is a structural-3 minimum, not a structural-2,
+  regardless of how few lines it touches. Weight by *what the move
+  accomplishes*, not by line count or whether bodies are `sorry`.
+
   Set to `null` if no diff is provided (e.g. iteration 1 with no prior
   state available, or auto-rate without auto-commit).
 

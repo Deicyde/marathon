@@ -105,6 +105,7 @@ def review_and_draft_prompt(
     max_retries: int = 0,
     previous_status: Optional[str] = None,
     referee_md: Optional[str] = None,
+    previous_rating_note: Optional[str] = None,
 ) -> str:
     """Call Claude Code. Return the response text (sent verbatim to Aristotle).
 
@@ -159,6 +160,21 @@ def review_and_draft_prompt(
     sections.append(
         f"# Past refinement log\n\n{refine_log or '(no prior iterations)'}"
     )
+    if previous_rating_note:
+        sections.append(
+            "# Previous iteration's auto-rater diagnosis\n\n"
+            "An independent reviewer scored the previous iteration's diff "
+            "across quality / math correctness / generality / api coverage / "
+            "modern Lean 4 / structural focus. Its note enumerates the "
+            "structural and cosmetic moves it observed, plus the referee "
+            "items it judged still on the table. Use this to: (a) avoid "
+            "regressions the rater flagged, (b) re-flag referee items the "
+            "rater says weren't addressed, (c) calibrate whether your prior "
+            "drafted prompt actually translated into structural change "
+            "(low `structural_focus` means your last prompt didn't land "
+            "structurally — open this iteration with something heavier).\n\n"
+            + previous_rating_note
+        )
     if attempt_idx > 0:
         sections.append(
             "# Continuation context\n\n"
