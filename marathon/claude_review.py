@@ -106,6 +106,7 @@ def review_and_draft_prompt(
     previous_status: Optional[str] = None,
     referee_md: Optional[str] = None,
     previous_rating_note: Optional[str] = None,
+    cross_chapter_md: Optional[str] = None,
 ) -> str:
     """Call Claude Code. Return the response text (sent verbatim to Aristotle).
 
@@ -160,6 +161,23 @@ def review_and_draft_prompt(
     sections.append(
         f"# Past refinement log\n\n{refine_log or '(no prior iterations)'}"
     )
+    if cross_chapter_md:
+        sections.append(
+            "# Cross-chapter context (sibling chapters in this batch)\n\n"
+            "These are other chapters being refined in the same batch as the "
+            "target. Each block shows that chapter's latest design notes "
+            "(from its `marathon.md`) and its most recent auto-rater "
+            "diagnosis. Use this to coordinate cross-chapter structural "
+            "decisions: if a sibling already exposes a canonical predicate "
+            "or scaffolding lemma, demand the target reuse it; if a "
+            "sibling's rater flagged an item that the target chapter is "
+            "the canonical home for (e.g. a predicate spelled inline that "
+            "lives in this chapter's namespace), demand the fix here. "
+            "Treat this as authoritative on what other chapters claim to "
+            "expose; verify against the bundled Lean code before "
+            "demanding code changes.\n\n"
+            + cross_chapter_md
+        )
     if previous_rating_note:
         sections.append(
             "# Previous iteration's auto-rater diagnosis\n\n"

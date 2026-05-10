@@ -194,6 +194,15 @@ uv run python -m marathon refine <target-lean-folder> \
   definition quality: correctness, future-proofness, and idiomatic
   Mathlib style. Use this to iterate on the scaffold before filling in
   any proofs.
+- **`--no-cross-chapter`** — disable cross-chapter context aggregation.
+  Normally Marathon scans the parent of `--workdir` for sibling chapter
+  workdirs (subdirs containing `marathon-refine-state.json`) and splices
+  their latest `marathon.md` tails + auto-rater notes into Hermes' prompt
+  as a "Cross-chapter context" section. Lets chapters in the same batch
+  coordinate structural decisions: c14's reviewer sees that c15 already
+  exposes a canonical predicate, c16 sees what c12 declared in its
+  pullback API, etc. Auto-enabled when siblings exist; pass this flag
+  for solo refines where sibling workdirs are unrelated.
 - **`--max-prompt-words N`** — constrain Claude's drafted Aristotle prompt
   to roughly N words. Tells Claude to cut redundant prose, prefer short
   bullets, and trim long code blocks. Useful for A/B-testing how prompt

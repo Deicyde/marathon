@@ -188,6 +188,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_refine.add_argument(
+        "--no-cross-chapter",
+        action="store_true",
+        help=(
+            "Disable cross-chapter context aggregation. Normally Marathon "
+            "scans the parent of --workdir for sibling chapter workdirs and "
+            "splices their latest marathon.md tails + auto-rater notes into "
+            "Hermes' prompt, so chapters in the same batch can coordinate "
+            "structural decisions. Pass this flag for solo / standalone "
+            "refines where sibling workdirs are unrelated."
+        ),
+    )
+    p_refine.add_argument(
         "--max-prompt-words",
         type=int,
         default=None,

@@ -82,6 +82,128 @@ def _read_latest_rating_note(workdir: Path) -> Optional[str]:
     except (OSError, ValueError):
         return None
 
+
+def _read_latest_rating_summary(workdir: Path) -> Optional[dict]:
+    """Return the latest rating's full record (with build status, struct
+    score, project_id, notes) from the workdir's ratings log."""
+    import json
+    path = workdir / RATINGS_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        last_line = ""
+        for line in path.read_text().splitlines():
+            if line.strip():
+                last_line = line
+        if not last_line:
+            return None
+        return json.loads(last_line)
+    except (OSError, ValueError):
+        return None
+
+
+def _trim_marathon_md_tail(text: str, max_chars: int = 4_000) -> str:
+    """Return the last ``max_chars`` of a marathon.md (preferring whole
+    section blocks). Aristotle's marathon.md grows monotonically across
+    iterations; we want the tail (most recent design notes), not the head.
+    """
+    if len(text) <= max_chars:
+        return text
+    tail = text[-max_chars:]
+    # Try to start at the next section header to avoid mid-paragraph cuts.
+    idx = tail.find("\n## ")
+    if 0 < idx < max_chars - 200:
+        return tail[idx + 1:]
+    return "... (earlier marathon.md content trimmed)\n" + tail
+
+
+def _collect_sibling_chapter_context(workdir: Path) -> Optional[str]:
+    """Aggregate marathon.md tails + latest rater notes from sibling
+    chapter workdirs (subdirs of ``workdir.parent`` other than ``workdir``
+    that look like marathon refine workdirs).
+
+    Returns a markdown block to splice into the next Hermes prompt, or
+    None when no siblings are found. Scoped to the immediate parent so
+    cross-batch directories (e.g. ``may7-r1/`` vs ``may9-r1/``) don't
+    bleed into each other.
+    """
+    import json
+    parent = workdir.parent
+    if not parent.is_dir():
+        return None
+    self_resolved = workdir.resolve()
+    siblings: list[Path] = []
+    for entry in sorted(parent.iterdir()):
+        if not entry.is_dir():
+            continue
+        try:
+            if entry.resolve() == self_resolved:
+                continue
+        except OSError:
+            continue
+        if (entry / REFINE_STATE_FILENAME).is_file():
+            siblings.append(entry)
+    if not siblings:
+        return None
+
+    blocks: list[str] = []
+    for sib in siblings:
+        # Pull state for chapter label + status line.
+        state_path = sib / REFINE_STATE_FILENAME
+        try:
+            state = json.loads(state_path.read_text())
+        except (OSError, ValueError):
+            continue
+        target = state.get("target_folder") or ""
+        chap_label = Path(target).name if target else sib.name
+
+        status = state.get("status") or "?"
+        iters = state.get("iterations_completed")
+        cur = state.get("current_iteration_idx")
+
+        # Pull last rating summary.
+        rating = _read_latest_rating_summary(sib) or {}
+        rating_data = rating.get("rating") or {}
+        build = rating.get("build") or {}
+        if build.get("ok"):
+            build_status = "OK"
+        elif build.get("timed_out"):
+            build_status = "TIMEOUT"
+        elif build:
+            build_status = "FAIL"
+        else:
+            build_status = "—"
+        struct = rating_data.get("structural_focus")
+        struct = struct if struct is not None else "—"
+        last_iter = rating.get("iteration") or "—"
+
+        # Pull marathon.md tail.
+        marathon_md_path = sib / LOG_FILENAME  # marathon.md
+        marathon_md_section: Optional[str] = None
+        if marathon_md_path.is_file():
+            try:
+                marathon_md_section = _trim_marathon_md_tail(marathon_md_path.read_text())
+            except OSError:
+                marathon_md_section = None
+
+        notes = rating_data.get("notes") if isinstance(rating_data.get("notes"), str) else None
+
+        block_lines = [
+            f"## {chap_label} — status: {status}, iterations: {iters}/{cur}, "
+            f"last build: {build_status}, last struct: {struct} (rated iter {last_iter})"
+        ]
+        if marathon_md_section:
+            block_lines.append("### marathon.md (tail)")
+            block_lines.append(marathon_md_section.strip())
+        if notes:
+            block_lines.append("### Last auto-rater diagnosis")
+            block_lines.append(notes.strip())
+        blocks.append("\n\n".join(block_lines))
+
+    if not blocks:
+        return None
+    return "\n\n---\n\n".join(blocks)
+
 OUTPUT_REQUIREMENTS_TRAILER = """
 
 ---
@@ -365,6 +487,7 @@ async def _run_iteration(
     existing_project: Optional[Project],
     workdir: Path,
     referee_path: Optional[Path] = None,
+    cross_chapter: bool = True,
 ) -> bool:
     """Run a single refinement iteration. Each attempt (other than a
     reattach to an in-flight project) gets its own Claude review against
@@ -396,6 +519,9 @@ async def _run_iteration(
             # retries) so a fresh Claude review sees the latest available
             # diagnosis even if a retry follows a partial pipeline run.
             previous_rating_note = _read_latest_rating_note(workdir)
+            cross_chapter_md = (
+                _collect_sibling_chapter_context(workdir) if cross_chapter else None
+            )
 
             claude_response = review_and_draft_prompt(
                 target_folder=target_folder,
@@ -411,6 +537,7 @@ async def _run_iteration(
                 previous_status=last_status,
                 referee_md=referee_md,
                 previous_rating_note=previous_rating_note,
+                cross_chapter_md=cross_chapter_md,
             )
 
             print("\n--- Claude's drafted prompt (sent verbatim to Aristotle) ---")
@@ -563,6 +690,19 @@ async def refine_command(args) -> None:
     if referee_path is not None:
         print(f"referee notes:    {referee_path}")
     print(f"workdir:          {workdir}")
+    if not args.no_cross_chapter:
+        sibling_count = sum(
+            1 for entry in workdir.parent.iterdir()
+            if entry.is_dir()
+            and entry.resolve() != workdir.resolve()
+            and (entry / REFINE_STATE_FILENAME).is_file()
+        ) if workdir.parent.is_dir() else 0
+        if sibling_count:
+            print(f"cross-chapter:    auto ({sibling_count} sibling(s) under {workdir.parent})")
+        else:
+            print(f"cross-chapter:    auto (no siblings detected)")
+    else:
+        print(f"cross-chapter:    disabled")
     print(f"max iterations:   {args.max_iterations}")
     print(f"max retries/iter: {args.max_retries}")
     if args.skeleton:
@@ -643,6 +783,7 @@ async def refine_command(args) -> None:
             existing_project=existing_project,
             workdir=workdir,
             referee_path=referee_path,
+            cross_chapter=not args.no_cross_chapter,
         )
 
         if not ok:
