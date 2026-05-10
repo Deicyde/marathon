@@ -94,6 +94,7 @@ class RatingResult:
     math_correctness: Optional[int] = None
     generality: Optional[int] = None
     api_coverage: Optional[int] = None
+    concision: Optional[int] = None
     modern_lean4: Optional[int] = None
     structural_focus: Optional[int] = None
     notes: Optional[str] = None
@@ -438,6 +439,7 @@ def call_claude_rater(
         math_correctness=_coerce_int(data.get("math_correctness")),
         generality=_coerce_int(data.get("generality")),
         api_coverage=_coerce_int(data.get("api_coverage")),
+        concision=_coerce_int(data.get("concision")),
         modern_lean4=_coerce_int(data.get("modern_lean4")),
         structural_focus=_coerce_int(data.get("structural_focus")),
         notes=data.get("notes") if isinstance(data.get("notes"), str) else None,
@@ -544,9 +546,10 @@ def run_post_pipeline(
             print(f"  rating: parse error — {r.parse_error}")
         else:
             sf = r.structural_focus if r.structural_focus is not None else "—"
+            con = r.concision if r.concision is not None else "—"
             print(
                 f"  rating: q={r.quality} m={r.math_correctness} g={r.generality} "
-                f"api={r.api_coverage} lean4={r.modern_lean4} struct={sf}"
+                f"api={r.api_coverage} con={con} lean4={r.modern_lean4} struct={sf}"
             )
             if r.notes:
                 print(f"  notes: {r.notes}")

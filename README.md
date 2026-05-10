@@ -255,14 +255,14 @@ each successful extraction. All default off.
 | `--auto-build` | Runs `lake build` in `--repo-dir`. Captures exit code + log tail. Build failure does **not** abort the pipeline. Configurable timeout via `--build-timeout SECONDS` (default 600 = 10 min); on timeout the build is killed and recorded as `TIMED OUT`. |
 | `--auto-commit` | Stages the chapter's output folder *and* `PromptLog.md` (if dirty), then `git commit`s with an auto message including build status (if known) and the project ID. Skipped with a warning if the git index is busy or there's nothing to commit. |
 | `--auto-push` | After each successful auto-commit, runs `git push` to send the current branch to its remote. Requires `--auto-commit`. Failures (e.g. non-fast-forward) are printed but don't abort the pipeline. |
-| `--auto-rate` | Spawns Claude (Max-billed subprocess) to rate the code 1–5 across `quality`, `math_correctness`, `generality`, `api_coverage`, `modern_lean4`, plus `structural_focus` (a measure of whether *this iteration's edits* prioritized structural moves over cosmetic polish), with a one-paragraph note. Appends one JSON line per rating to `<workdir>/marathon-ratings.jsonl`. When paired with `--auto-commit`, the rater also receives the unified diff for the just-committed iteration so it can score `structural_focus` against actual changes; without a diff, `structural_focus` is reported as `null`. |
+| `--auto-rate` | Spawns Claude (Max-billed subprocess) to rate the code 1–5 across `quality`, `math_correctness`, `generality`, `api_coverage`, `concision` (in tension with `api_coverage` to penalize bloat), `modern_lean4`, plus `structural_focus` (a measure of whether *this iteration's edits* prioritized structural moves over cosmetic polish), with a one-paragraph note. Appends one JSON line per rating to `<workdir>/marathon-ratings.jsonl`. When paired with `--auto-commit`, the rater also receives the unified diff for the just-committed iteration so it can score `structural_focus` against actual changes; without a diff, `structural_focus` is reported as `null`. |
 
 Per-chapter / per-iteration output:
 ```
 done: COMPLETE  duration=42.3m  output=...
 build: OK (24s)
 commit: a3f8c12  message="marathon: Chapter12 [build:OK] (project=db243d68)"
-rating: q=4 m=5 g=3 api=3 lean4=4 struct=4
+rating: q=4 m=5 g=3 api=3 con=4 lean4=4 struct=4
 notes: "Statements are accurate but several lemmas could be generalized..."
 ```
 

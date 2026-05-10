@@ -61,7 +61,25 @@ Address issues by descending importance:
      dependency is explicit.
    - If the surrounding signature is wrong, fix that before filling.
 
-4. **Future-proofness and Mathlib style.**
+4. **Concision — make every declaration earn its keep.**
+   - Before approving a new declaration, ask: does a more general lemma
+     already in Mathlib (or this repo) subsume it? Would `@[simp]`
+     propagation handle this case automatically? Are three parallel
+     `_zero` / `_add` / `_smul` lemmas all needed when one
+     typeclass-polymorphic family would do?
+   - Mechanical alias chains (`foo_apply` plus `foo_apply_zero`,
+     `foo_apply_add`, `foo_apply_smul` when `foo_apply` already unfolds
+     and the linearity is automatic) are bloat. Pick one canonical
+     simp form.
+   - Parallel families across namespace triples (covariant / contravariant /
+     mixed and the like) often hide consolidation opportunities — push
+     for a typeclass-polymorphic version when the lemmas are isomorphic
+     mod naming.
+   - Demand deletions and consolidations, not just additions. If
+     iteration N grew the file by 200 lines and iteration N+1 has
+     nothing structural to add, find 200 lines to consolidate or remove.
+
+5. **Future-proofness and Mathlib style.**
    - **Add scaffolding lemmas now, not when needed.** For each main
      theorem, ask what helpers the eventual proof requires; add their
      signatures with `sorry` bodies if missing. Don't wait for the proof

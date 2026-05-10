@@ -16,6 +16,27 @@ Dimensions describing the **current state** of the code:
   specialized; right typeclass constraints
 - **api_coverage** — are the right helper lemmas / instances / API exposed
   for downstream use
+- **concision** — does the iteration earn its line count? Score the
+  *current state*, not just this iteration's diff.
+  - 5 = every declaration is justified; no redundant aliases, no
+    declarations a more general lemma could subsume, no decoration
+    without purpose. Length grows only when needed.
+  - 4 = mostly tight, with one or two declarations that could be
+    consolidated (e.g. `_apply_zero` redundant with `_apply` + standard
+    `simp` propagation).
+  - 3 = neutral — neither bloated nor unusually tight.
+  - 2 = bloated in places: mechanical aliases (e.g. 24 `val_*`
+    lemmas across three parallel namespaces when 8 + a generic lifting
+    helper would do), parallel families that should be one
+    typeclass-polymorphic family, restated lemmas that already exist
+    with `@[simp]` form.
+  - 1 = systematically bloated; substantial deletions or consolidations
+    should precede any further additions.
+
+  This is in tension with `api_coverage` on purpose. A chapter exposing
+  30 declarations where 12 well-chosen ones would cover the same
+  downstream use cases scores **high on api_coverage but low on
+  concision**. The right design wins on both.
 - **modern_lean4** — use of current Lean 4 / Mathlib best practices (right
   tactics, current naming conventions, appropriate use of `simp` / `aesop` /
   attributes)
@@ -87,7 +108,7 @@ Return **ONLY a single-line JSON object**, no preamble, no markdown fences,
 no commentary outside the JSON. Schema:
 
 ```
-{"quality": N, "math_correctness": N, "generality": N, "api_coverage": N, "modern_lean4": N, "structural_focus": N, "notes": "one-paragraph rationale touching each dimension; if a diff is provided, the structural_focus sentence must enumerate the specific structural moves and the specific cosmetic moves you saw"}
+{"quality": N, "math_correctness": N, "generality": N, "api_coverage": N, "concision": N, "modern_lean4": N, "structural_focus": N, "notes": "one-paragraph rationale touching each dimension; if a diff is provided, the structural_focus sentence must enumerate the specific structural moves and the specific cosmetic moves you saw; the concision sentence must call out specific declarations that could be consolidated or removed if the score is below 4"}
 ```
 
 Use `null` for `structural_focus` (not a number) if no diff was provided.
