@@ -428,13 +428,13 @@ def call_claude_rater(
     if not response:
         return RatingResult(parse_error="claude returned empty stdout")
 
-    try:
-        json_text = _extract_json_object(response)
-        data = json.loads(json_text)
-    except (json.JSONDecodeError, ValueError) as e:
-        return RatingResult(parse_error=f"could not parse JSON: {e}; raw: {response[:300]}")
+    data, partial_warning = _extract_rating_lenient(response)
+    if data is None:
+        return RatingResult(
+            parse_error=f"could not extract any rating fields; raw: {response[:300]}"
+        )
 
-    return RatingResult(
+    result = RatingResult(
         quality=_coerce_int(data.get("quality")),
         math_correctness=_coerce_int(data.get("math_correctness")),
         generality=_coerce_int(data.get("generality")),
@@ -444,6 +444,12 @@ def call_claude_rater(
         structural_focus=_coerce_int(data.get("structural_focus")),
         notes=data.get("notes") if isinstance(data.get("notes"), str) else None,
     )
+    # Surface partial extractions as a soft warning in parse_error so the
+    # jsonl entry records what wasn't recovered, while still preserving
+    # whatever scores we did get.
+    if partial_warning:
+        result.parse_error = partial_warning
+    return result
 
 
 def append_rating(
@@ -592,6 +598,72 @@ def _extract_json_object(text: str) -> str:
     if bare:
         return bare.group(0)
     raise ValueError("no JSON object found in response")
+
+
+_RATING_SCORE_FIELDS = (
+    "quality", "math_correctness", "generality", "api_coverage",
+    "concision", "modern_lean4", "structural_focus",
+)
+
+
+def _extract_rating_lenient(response: str) -> tuple[Optional[dict], Optional[str]]:
+    """Tolerant extraction of a rating from a Claude response.
+
+    Tries strict ``json.loads`` on the extracted JSON-shaped substring
+    first. If that fails (typically because the ``notes`` string contains
+    an unescaped quote, control character, or other JSON-hostile
+    sequence), falls back to regex-extracting each known score field
+    independently. This recovers numeric scores even when the notes
+    string is malformed.
+
+    Returns ``(data, partial_warning)``:
+      - ``(dict, None)`` on clean strict parse;
+      - ``(dict, "warning text")`` on partial extraction (e.g. scores
+        extracted but notes string couldn't be recovered);
+      - ``(None, None)`` if no fields could be extracted at all.
+    """
+    # First try strict parse via the existing extractor.
+    try:
+        json_text = _extract_json_object(response)
+        return json.loads(json_text), None
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Fallback: regex-extract each score field independently.
+    data: dict = {}
+    missing_score_fields: list[str] = []
+    for field in _RATING_SCORE_FIELDS:
+        m = re.search(rf'"{field}"\s*:\s*(\d+|null)\b', response)
+        if m:
+            v = m.group(1)
+            data[field] = None if v == "null" else int(v)
+        else:
+            missing_score_fields.append(field)
+
+    # Notes: best-effort. Lazy match up to the first `"` followed by `,` or `}`.
+    notes_m = re.search(r'"notes"\s*:\s*"([\s\S]*?)"\s*[},]', response)
+    if notes_m:
+        raw_notes = notes_m.group(1)
+        # Unescape basic JSON escapes; leave other content alone.
+        data["notes"] = (
+            raw_notes
+            .replace(r"\n", "\n")
+            .replace(r'\"', '"')
+            .replace(r"\\", "\\")
+        )
+        notes_recovered = True
+    else:
+        notes_recovered = False
+
+    if not data:
+        return None, None
+
+    parts = ["lenient-parse fallback used (strict json.loads failed)"]
+    if missing_score_fields:
+        parts.append(f"missing score fields: {','.join(missing_score_fields)}")
+    if not notes_recovered:
+        parts.append("notes string could not be recovered")
+    return data, "; ".join(parts)
 
 
 def _coerce_int(v) -> Optional[int]:
