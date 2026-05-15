@@ -26,16 +26,15 @@ wheels = [
 
 [[package]]
 name = "aristotlelib"
-version = "1.0.1"
+version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "pathspec" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3b/1c/2c4c8f866ad5f694e462930e8b8242200f4974a13df4145ec1d40da28859/aristotlelib-1.0.1.tar.gz", hash = "sha256:14e374b678025a809b2ce24f0310fdb8ea35599160db6339d5c9e62b044c961a", size = 19036, upload-time = "2026-04-07T21:09:56.377Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cb/a1/f655928ceda88d67edd3f094248e3ea3438295a95afd49e40514fb489536/aristotlelib-1.0.1-py3-none-any.whl", hash = "sha256:7de71c0d647bb87863decf5445280ca9f31bf2586756a740e5da2a434298d998", size = 22833, upload-time = "2026-04-07T21:09:55.42Z" },
+    { url = "https://files.pythonhosted.org/packages/64/09/31d4a2c9a50dcea2fb13ca34b4c6acb81c66d445a713738a14c4105bf1c0/aristotlelib-2.0.0-py3-none-any.whl", hash = "sha256:7ded8cfa471aa7029a203ea79e92b9adfba21148457fc967d4d2d65b51afffe2", size = 28242, upload-time = "2026-05-14T20:03:11.157Z" },
 ]
 
 [[package]]
@@ -102,7 +101,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "aristotlelib", specifier = ">=1.0.1" }]
+requires-dist = [{ name = "aristotlelib", specifier = ">=2.0.0" }]
 
 [[package]]
 name = "pathspec"

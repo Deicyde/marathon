@@ -120,6 +120,26 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
     p_stop.add_argument("--chapter", type=int, required=True)
     p_stop.set_defaults(func=r.cmd_refine_stop)
 
+    # The daemon is normally launched indirectly via ``reject`` or
+    # ``refine-start``, but is also exposed here as a top-level coreview
+    # subcommand so the consumer-repo shim at
+    # ``.marathon/coreview/refine_runner.py`` has a stable console entry
+    # point. Same args as ``python -m marathon.coreview.daemon``.
+    p_daemon = cv_sub.add_parser(
+        "daemon",
+        help=(
+            "Run the auto-refine daemon directly (normally launched "
+            "indirectly via `reject` or `refine-start`)."
+        ),
+    )
+    p_daemon.add_argument("--chapter", type=int, required=True)
+    p_daemon.add_argument(
+        "--once",
+        action="store_true",
+        help="Process queue once then exit (legacy semantics).",
+    )
+    p_daemon.set_defaults(func=_run_daemon_subcommand)
+
     # --- subissues bulk operations -------------------------------------
     p_subs = cv_sub.add_parser(
         "subissues",
@@ -160,6 +180,15 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     p_sub_refresh.set_defaults(func=r.cmd_subissues_refresh)
+
+
+def _run_daemon_subcommand(args) -> None:
+    """Dispatch ``marathon coreview daemon ...`` into the daemon module."""
+    from marathon.coreview.daemon import run_daemon
+    sys_exit = run_daemon(chapter=args.chapter, once=args.once)
+    if sys_exit:
+        import sys
+        sys.exit(sys_exit)
 
 
 def coreview_command(args) -> None:

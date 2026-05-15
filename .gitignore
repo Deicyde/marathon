@@ -8,3 +8,4 @@ __pycache__/
 # Captured copy of Aristotle's authenticated SDK docs. Kept locally for
 # reference but not redistributed publicly.
 SDK-reference.md
+build/

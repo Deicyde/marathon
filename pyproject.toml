@@ -10,5 +10,9 @@ dependencies = [
     "aristotlelib>=2.0.0",
 ]
 
-[tool.uv]
-package = false
+[project.scripts]
+# Exposes a ``marathon`` console script. After ``uv tool install
+# /path/to/marathon`` (or ``pipx install -e .``), ``marathon coreview ...``
+# is on PATH and the coreview shims at <repo>/.marathon/coreview/*.py
+# dispatch to it cleanly.
+marathon = "marathon.__main__:main"
