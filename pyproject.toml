@@ -16,3 +16,17 @@ dependencies = [
 # is on PATH and the coreview shims at <repo>/.marathon/coreview/*.py
 # dispatch to it cleanly.
 marathon = "marathon.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Ship the marathon/ package AND its prompts/ subdirectory. Without
+# this, `uv tool install` produces a wheel without prompts/*.md and
+# marathon refine / referee / hermes_watcher exit with
+# "review prompt template missing".
+packages = ["marathon"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"marathon/prompts" = "marathon/prompts"
