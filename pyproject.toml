@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Driver for the Aristotle (Harmonic) automated theorem proving API. Submits Lean / TeX projects in dependency order."
 requires-python = ">=3.11"
 dependencies = [
-    "aristotlelib>=1.0.1",
+    # 2.0 split Project's end-to-end wait_for_completion into Project +
+    # AgentTask + Event; marathon.aristotle_runtime wraps that back into
+    # Marathon's lifecycle shape.
+    "aristotlelib>=2.0.0",
 ]
 
 [tool.uv]
