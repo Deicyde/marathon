@@ -28,9 +28,13 @@ from typing import Optional
 from aristotlelib import AgentTask, AristotleAPIError, Project, TaskStatus
 
 from marathon.aristotle_runtime import (
+    CONTINUABLE_STATUS_VALUES,
+    CONTINUABLE_STATUSES,
     IN_FLIGHT_STATUS_VALUES,
+    IN_FLIGHT_STATUSES,
     NON_RETRYABLE_FAILURE_STATUSES,
     RETRYABLE_STATUSES,
+    continue_via_ask,
     download_result,
     reattach_project_and_task,
     run_task_to_completion,
@@ -291,24 +295,29 @@ def _build_refine_submission_dir(
     return staged
 
 
-async def _try_reattach(
+async def _try_reattach_or_continue(
     state: RefineState,
-) -> tuple[Optional[Project], Optional[AgentTask]]:
-    """Reattach to a project from a previous run if it's still in flight, or
-    if it terminated but Marathon failed to extract its output.
+    *,
+    continue_on_review: bool = True,
+) -> tuple[Optional[Project], Optional[AgentTask], Optional[str]]:
+    """Decide what to do given the state's recorded prior project/task.
 
-    Returns ``(project, task)``; both ``None`` when no reattach is applicable
-    or the API can't load the prior project.
+    Returns ``(project, task, mode)`` where mode is one of:
+
+    * ``"reattach"`` — prior task is still QUEUED/IN_PROGRESS, or it
+      terminated but Marathon's extraction failed (OUTPUT_FOLDER_MISSING).
+      Caller should poll/re-extract the existing task; no new prompt.
+    * ``"continue"`` — prior task is in a ``CONTINUABLE_STATUSES`` state
+      (Aristotle "Review Suggested" / "Out of Budget"); the server-side
+      session is preserved. Caller should call Hermes in
+      ``continuation_mode=True`` and dispatch via ``project.ask(...)``
+      instead of fresh-submitting. Suppressed when
+      ``continue_on_review=False``.
+    * ``None`` — no reattach or continuation applies; caller should
+      submit a fresh project.
     """
     if not state.project_id:
-        return None, None
-    reason = None
-    if state.status in IN_FLIGHT_STATUS_VALUES:
-        reason = "in-flight"
-    elif state.status == "OUTPUT_FOLDER_MISSING":
-        reason = "previous extraction failure"
-    if reason is None:
-        return None, None
+        return None, None, None
 
     project, task = await reattach_project_and_task(
         project_id=state.project_id,
@@ -319,14 +328,38 @@ async def _try_reattach(
             f"  could not reattach to project_id={state.project_id}; "
             "will submit fresh instead"
         )
-        return None, None
+        return None, None, None
 
-    print(
-        f"  reattaching ({reason}) to project "
-        f"project_id={state.project_id} task_id={task.agent_task_id} "
-        f"status={task.status.value}"
-    )
-    return project, task
+    if state.status in IN_FLIGHT_STATUS_VALUES or task.status in IN_FLIGHT_STATUSES:
+        reason = "in-flight"
+        print(
+            f"  reattaching ({reason}) to project "
+            f"project_id={state.project_id} task_id={task.agent_task_id} "
+            f"status={task.status.value}"
+        )
+        return project, task, "reattach"
+
+    if state.status == "OUTPUT_FOLDER_MISSING":
+        # Prior task terminated but extraction failed; we want to re-extract,
+        # not continue. Treat as reattach so the caller re-runs extraction
+        # against the existing terminal task.
+        print(
+            f"  reattaching (previous extraction failure) to project "
+            f"project_id={state.project_id} task_id={task.agent_task_id} "
+            f"status={task.status.value}"
+        )
+        return project, task, "reattach"
+
+    if continue_on_review and task.status in CONTINUABLE_STATUSES:
+        print(
+            f"  continuing project_id={state.project_id} via project.ask() — "
+            f"prior task {task.agent_task_id} ended {task.status.value} "
+            "(session preserved server-side; will dispatch Hermes' "
+            "continuation prompt via ask())"
+        )
+        return project, task, "continue"
+
+    return None, None, None
 
 
 async def _submit_fresh_refine(
@@ -374,6 +407,49 @@ async def _submit_fresh_refine(
     return project, task
 
 
+async def _submit_continuation_via_ask(
+    project: Project,
+    prompt: str,
+    state: RefineState,
+    state_path: Path,
+    attempt_idx: int,
+    max_retries: int,
+) -> Optional[AgentTask]:
+    """Send a continuation prompt to ``project`` via ``project.ask(...)``.
+
+    Used when the previous task left the project in a ``CONTINUABLE_STATUSES``
+    state. Updates ``state.agent_task_id``/``status``/``started_at`` for the
+    new task and persists. Returns the new task, or ``None`` if ``ask()``
+    fails (in which case the caller should fall back to fresh submit).
+    """
+    state.attempts += 1
+    state.output_path = None
+    state.note = None
+
+    label = "attempt" if attempt_idx == 0 else f"retry {attempt_idx}"
+    print(
+        f"  {label} ({attempt_idx + 1}/{max_retries + 1}) "
+        f"continuing project_id={project.project_id} via project.ask()"
+    )
+
+    try:
+        task = await continue_via_ask(project, prompt)
+    except AristotleAPIError as e:
+        state.status = "ASK_FAILED"
+        state.note = f"project.ask error (status {e.status_code}): {e}"
+        save_refine_state(state_path, state)
+        return None
+
+    state.agent_task_id = task.agent_task_id
+    state.status = task.status.value if task.status else TaskStatus.QUEUED.value
+    state.started_at = now_iso()
+    state.completed_at = None
+    state.duration_seconds = None
+    save_refine_state(state_path, state)
+    print(f"    new task: task_id={task.agent_task_id}")
+    return task
+
+
 async def _run_refine_attempt(
     prompt: Optional[str],
     repo_dir: Path,
@@ -391,27 +467,54 @@ async def _run_refine_attempt(
     target_folder_name: str,
     existing_project: Optional[Project] = None,
     existing_task: Optional[AgentTask] = None,
+    existing_mode: Optional[str] = None,
     referee_path: Optional[Path] = None,
     watcher_factory=None,
 ) -> Optional[TaskStatus]:
     """Run one Aristotle attempt for the current iteration. Returns the
     terminal ``TaskStatus``, or ``None`` for Marathon-level errors.
 
+    ``existing_mode`` is one of ``"reattach"`` / ``"continue"`` / ``None``:
+
+    * ``"reattach"`` — poll ``existing_task`` directly (no new prompt,
+      no submission). Used for tasks that died mid-flight or whose
+      extraction we need to redo.
+    * ``"continue"`` — dispatch ``prompt`` via ``project.ask()`` on
+      ``existing_project`` to spawn a new continuation task on the same
+      preserved Aristotle session (the SDK's intended path for
+      ``COMPLETE_WITH_ERRORS`` / ``OUT_OF_BUDGET``).
+    * ``None`` — submit a fresh project from the staging bundle.
+
     ``watcher_factory``, if provided, is called as ``watcher_factory(state,
     iteration_idx)`` to construct an :class:`EventWatcher` for this
     attempt; the watcher polls the event stream alongside the status loop
     (used by the Hermes live-steering flow).
     """
-    if existing_project is not None and existing_task is not None:
+    if existing_mode == "reattach" and existing_project is not None and existing_task is not None:
         project = existing_project
         task = existing_task
         state.output_path = None
         state.note = None
         save_refine_state(state_path, state)
         print(
-            f"  reattached: continuing project_id={project.project_id} "
+            f"  reattached: polling project_id={project.project_id} "
             f"task_id={task.agent_task_id}"
         )
+    elif existing_mode == "continue" and existing_project is not None:
+        if prompt is None:
+            sys.exit("internal error: prompt required for continuation submit")
+        project = existing_project
+        new_task = await _submit_continuation_via_ask(
+            project=project,
+            prompt=prompt,
+            state=state,
+            state_path=state_path,
+            attempt_idx=attempt_idx,
+            max_retries=max_retries,
+        )
+        if new_task is None:
+            return None
+        task = new_task
     else:
         if prompt is None:
             sys.exit("internal error: prompt required for fresh submit")
@@ -530,30 +633,79 @@ async def _run_iteration(
     state_path: Path,
     existing_project: Optional[Project],
     existing_task: Optional[AgentTask],
+    existing_mode: Optional[str],
     workdir: Path,
     referee_path: Optional[Path] = None,
     cross_chapter: bool = True,
     watcher_factory=None,
+    continue_on_review: bool = True,
 ) -> bool:
-    """Run a single refinement iteration. Each attempt (other than a
-    reattach to an in-flight project) gets its own Claude review against
-    the current target-folder state. Returns True on success, False if
-    the iteration failed permanently."""
+    """Run a single refinement iteration. Each attempt (other than a pure
+    ``reattach`` reentry) gets its own Claude review against the current
+    target-folder state. Returns True on success, False if the iteration
+    failed permanently.
+
+    ``existing_mode`` is the mode handed in from :func:`_try_reattach_or_continue`:
+
+    * ``"reattach"`` — the prior task is mid-flight or its extraction
+      failed; poll/re-extract without re-calling Hermes.
+    * ``"continue"`` — the prior task ended in ``CONTINUABLE_STATUSES``;
+      Hermes drafts a *continuation* prompt that we dispatch via
+      ``project.ask()``.
+    * ``None`` — start fresh.
+    """
     last_status: Optional[str] = None
+    previous_output_summary: Optional[str] = None
+    if existing_task is not None and existing_mode == "continue":
+        previous_output_summary = existing_task.output_summary
+        last_status = existing_task.status.value if existing_task.status else None
 
     for attempt_idx in range(max_retries + 1):
-        use_existing = (
-            existing_project is not None
-            and existing_task is not None
-            and attempt_idx == 0
-        )
+        # Pick the mode for THIS attempt.
+        #   - attempt 0: honors the caller-supplied existing_mode.
+        #   - attempts 1+ (retries): if the previous attempt's last_status
+        #     is CONTINUABLE and continue_on_review is on, switch to
+        #     continuation via ask(); otherwise fresh.
+        if attempt_idx == 0:
+            attempt_mode = existing_mode
+            attempt_project: Optional[Project] = existing_project
+            attempt_task: Optional[AgentTask] = existing_task
+        else:
+            existing_project = None
+            existing_task = None
+            if (
+                continue_on_review
+                and last_status in CONTINUABLE_STATUS_VALUES
+                and state.project_id is not None
+            ):
+                # The previous attempt's project_id is still our project; reattach
+                # to it explicitly to get a Project handle (the task object is
+                # already terminal so we don't reuse it).
+                proj, _prev_task = await reattach_project_and_task(
+                    project_id=state.project_id,
+                    agent_task_id=state.agent_task_id,
+                )
+                if proj is not None and _prev_task is not None:
+                    attempt_mode = "continue"
+                    attempt_project = proj
+                    attempt_task = _prev_task
+                    previous_output_summary = _prev_task.output_summary
+                else:
+                    attempt_mode = None
+                    attempt_project = None
+                    attempt_task = None
+            else:
+                attempt_mode = None
+                attempt_project = None
+                attempt_task = None
 
-        if use_existing:
+        if attempt_mode == "reattach":
             full_prompt: Optional[str] = None
         else:
             label = "attempt 1" if attempt_idx == 0 else f"retry {attempt_idx}"
+            label_suffix = " (continuation)" if attempt_mode == "continue" else ""
             print(
-                f"  iteration {iteration_idx} {label} "
+                f"  iteration {iteration_idx} {label}{label_suffix} "
                 f"({attempt_idx + 1}/{max_retries + 1}): "
                 "calling Claude for review + drafted prompt..."
             )
@@ -588,6 +740,8 @@ async def _run_iteration(
                 referee_md=referee_md,
                 previous_rating_note=previous_rating_note,
                 cross_chapter_md=cross_chapter_md,
+                continuation_mode=(attempt_mode == "continue"),
+                previous_output_summary=previous_output_summary,
             )
 
             print("\n--- Claude's drafted prompt (sent verbatim to Aristotle) ---")
@@ -619,13 +773,12 @@ async def _run_iteration(
             pipeline_config=pipeline_config,
             iteration_idx=iteration_idx,
             target_folder_name=target_folder_name,
-            existing_project=existing_project if use_existing else None,
-            existing_task=existing_task if use_existing else None,
+            existing_project=attempt_project,
+            existing_task=attempt_task,
+            existing_mode=attempt_mode,
             referee_path=referee_path,
             watcher_factory=watcher_factory,
         )
-        existing_project = None
-        existing_task = None
 
         if status is None:
             return False
@@ -636,7 +789,13 @@ async def _run_iteration(
         if status in RETRYABLE_STATUSES:
             last_status = status.value
             if attempt_idx < max_retries:
-                print(f"    {status.value} — will retry with a fresh Claude review")
+                if continue_on_review and status in CONTINUABLE_STATUSES:
+                    print(
+                        f"    {status.value} — will retry via project.ask() "
+                        "continuation (session preserved)"
+                    )
+                else:
+                    print(f"    {status.value} — will retry with a fresh Claude review")
                 continue
             state.status = "RETRIES_EXHAUSTED"
             state.note = (
@@ -813,9 +972,12 @@ async def refine_command(args) -> None:
         state.current_iteration_idx = iteration_idx
         save_refine_state(state_path, state)
 
-        existing_project, existing_task = await _try_reattach(state)
+        continue_on_review = not getattr(args, "no_continue_on_review", False)
+        existing_project, existing_task, existing_mode = await _try_reattach_or_continue(
+            state, continue_on_review=continue_on_review,
+        )
 
-        if existing_project is None or existing_task is None:
+        if existing_mode is None:
             print(f"\n=== iteration {iteration_idx}/{args.max_iterations} ===")
             # Reset state for a fresh iteration. Claude is called inside
             # _run_iteration (per attempt), not here.
@@ -829,6 +991,11 @@ async def refine_command(args) -> None:
             state.output_path = None
             state.note = None
             save_refine_state(state_path, state)
+        elif existing_mode == "continue":
+            print(
+                f"\n=== iteration {iteration_idx}/{args.max_iterations} "
+                "(continuation via project.ask) ==="
+            )
         else:
             print(f"\n=== iteration {iteration_idx}/{args.max_iterations} (resumed) ===")
 
@@ -852,10 +1019,12 @@ async def refine_command(args) -> None:
             state_path=state_path,
             existing_project=existing_project,
             existing_task=existing_task,
+            existing_mode=existing_mode,
             workdir=workdir,
             referee_path=referee_path,
             cross_chapter=not args.no_cross_chapter,
             watcher_factory=watcher_factory,
+            continue_on_review=continue_on_review,
         )
 
         if not ok:

@@ -107,12 +107,24 @@ def review_and_draft_prompt(
     referee_md: Optional[str] = None,
     previous_rating_note: Optional[str] = None,
     cross_chapter_md: Optional[str] = None,
+    continuation_mode: bool = False,
+    previous_output_summary: Optional[str] = None,
 ) -> str:
     """Call Claude Code. Return the response text (sent verbatim to Aristotle).
 
     On retry attempts (``attempt_idx > 0``), the user message includes a
     "Continuation context" section telling Claude the previous attempt's
     status so it can write a freshly-targeted prompt.
+
+    When ``continuation_mode=True``, the prompt is instead framed as a
+    **session continuation**: Marathon will dispatch the result via
+    ``project.ask(...)`` to the same Aristotle session that ran the prior
+    task, so Hermes should write a SHORT, surgical continuation prompt
+    rather than an ab-initio instruction. Aristotle already knows what
+    it did; the rubric's "no preamble, no rubric recap" guidance is
+    extra important here. ``previous_output_summary`` (Aristotle's own
+    description of what its prior task accomplished) is folded into the
+    context when supplied.
     """
     claude_path = _ensure_claude_cli()
     system_prompt = _read_review_prompt(skeleton_mode)
@@ -193,7 +205,41 @@ def review_and_draft_prompt(
             "structurally — open this iteration with something heavier).\n\n"
             + previous_rating_note
         )
-    if attempt_idx > 0:
+    if continuation_mode:
+        ctx = (
+            "# Continuation mode (session preserved)\n\n"
+            f"The previous Aristotle task ended with status "
+            f"`{previous_status or 'unknown'}` (Aristotle's UI labels this "
+            "\"Review Suggested\" / \"Out of Budget\"). Marathon will send your "
+            "drafted prompt to the **same Aristotle session** via "
+            "`project.ask(...)` — Aristotle keeps its sandbox, file context, "
+            "and reasoning state intact. **Do NOT re-explain the task from "
+            "scratch.** Aristotle already knows what it was doing; you are "
+            "giving it a short, surgical nudge to refine or extend its "
+            "partial output.\n\n"
+            "Concrete guidance for continuation prompts:\n"
+            "* Lead with the gap you want closed (one sentence): "
+            "\"Please now also handle X.\" / \"Please replace the placeholder "
+            "in Foo with the proper definition.\"\n"
+            "* If Aristotle's `output_summary` claims something is done that "
+            "the target-folder code shows is NOT done, point at the specific "
+            "file and declaration.\n"
+            "* If the rater (above) flagged structural issues the partial "
+            "output didn't address, demand them in this continuation rather "
+            "than waiting for the next iteration.\n"
+            "* Keep the prompt to roughly 100–300 words. Continuation prompts "
+            "should be much shorter than fresh-task prompts."
+        )
+        if previous_output_summary:
+            ctx += (
+                "\n\n## Aristotle's own summary of what its prior task did\n\n"
+                "(Verbatim from the previous task's `output_summary` field. "
+                "Treat as Aristotle's claim about what it accomplished; "
+                "verify against the target folder code before believing it.)\n\n"
+                + previous_output_summary
+            )
+        sections.append(ctx)
+    elif attempt_idx > 0:
         sections.append(
             "# Continuation context\n\n"
             f"This is **retry attempt {attempt_idx}** within iteration "
@@ -207,8 +253,9 @@ def review_and_draft_prompt(
         )
     sections.append(
         f"This is iteration {iteration_idx} of up to {max_iterations}, "
-        f"attempt {attempt_idx + 1} of up to {max_retries + 1}. "
-        "Write the prompt for Aristotle now."
+        f"attempt {attempt_idx + 1} of up to {max_retries + 1}"
+        + (" (session continuation)." if continuation_mode else ".")
+        + " Write the prompt for Aristotle now."
     )
     combined = "\n\n---\n\n".join(sections)
 

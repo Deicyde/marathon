@@ -51,9 +51,30 @@ RETRYABLE_STATUSES: frozenset[TaskStatus] = frozenset({
 })
 
 NON_RETRYABLE_FAILURE_STATUSES: frozenset[TaskStatus] = frozenset({
-    TaskStatus.OUT_OF_BUDGET,
     TaskStatus.CANCELED,
 })
+
+# Statuses where Aristotle's server-side session is preserved and the
+# next iteration / attempt should **continue** it via ``project.ask(...)``
+# rather than submit a fresh project. The Aristotle web UI labels these
+# "Review Suggested" (COMPLETE_WITH_ERRORS) and "Out of Budget"; both
+# are documented by the SDK as resumable. Marathon's auto-continue
+# path drafts a Hermes continuation prompt and sends it via ``ask()``.
+#
+# NB: ``FAILED`` is intentionally absent — it represents an internal
+# Aristotle error where the session is likely lost, so fresh submission
+# is safer. ``COMPLETE_WITH_ERRORS`` appears in BOTH this set and
+# ``RETRYABLE_STATUSES``; when both flags fire, the continuation path
+# is preferred. ``OUT_OF_BUDGET`` used to live in
+# ``NON_RETRYABLE_FAILURE_STATUSES`` (treated as a hard terminal); it
+# was promoted to continuable in line with the SDK's "Resume by telling
+# Aristotle to continue" docstring.
+CONTINUABLE_STATUSES: frozenset[TaskStatus] = frozenset({
+    TaskStatus.COMPLETE_WITH_ERRORS,
+    TaskStatus.OUT_OF_BUDGET,
+})
+
+CONTINUABLE_STATUS_VALUES: frozenset[str] = frozenset(s.value for s in CONTINUABLE_STATUSES)
 
 # Statuses meaning the task is still running on Aristotle's side.
 IN_FLIGHT_STATUSES: frozenset[TaskStatus] = frozenset({
@@ -127,6 +148,25 @@ async def submit_from_directory(
     project = await Project.create_from_directory(prompt=prompt, project_dir=project_dir)
     task = await get_latest_task(project)
     return project, task
+
+
+async def continue_via_ask(
+    project: Project,
+    prompt: str,
+) -> AgentTask:
+    """Send a continuation prompt to an existing project via ``project.ask``.
+
+    Used after the project's prior task left it in a ``CONTINUABLE_STATUSES``
+    state (``COMPLETE_WITH_ERRORS`` / ``OUT_OF_BUDGET``). Aristotle's
+    server-side session is still alive; ``ask()`` starts a follow-up task
+    on the same project with full session continuity instead of paying the
+    cost of a fresh bundle upload and a cold-start sandbox.
+
+    The returned task's ``agent_task_id`` is the new task ID; callers
+    should update their state and poll/refresh that task. Raises
+    ``AristotleAPIError`` on transport failure.
+    """
+    return await project.ask(prompt)
 
 
 async def reattach_project_and_task(

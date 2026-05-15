@@ -247,6 +247,23 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_refine.add_argument(
+        "--no-continue-on-review",
+        action="store_true",
+        help=(
+            "Disable the auto-continuation protocol. By default, when an "
+            "Aristotle task ends in COMPLETE_WITH_ERRORS (Aristotle's UI "
+            "labels this \"Review Suggested\") or OUT_OF_BUDGET, Marathon "
+            "dispatches the next iteration / retry via `project.ask(...)` "
+            "on the same project to preserve Aristotle's server-side "
+            "session, instead of uploading a fresh bundle. Hermes drafts a "
+            "continuation prompt framed as \"refine what you've done\" "
+            "rather than a from-scratch task, and the previous task's "
+            "output_summary is folded into the review context. Pass this "
+            "flag to fall back to the old fresh-project-each-iteration "
+            "behavior."
+        ),
+    )
+    p_refine.add_argument(
         "--dry-run",
         action="store_true",
         help=(
