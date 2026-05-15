@@ -12,6 +12,14 @@ class ChapterState:
     input_file: str
     output_folder: str
     project_id: Optional[str] = None
+    # The currently-tracked AgentTask under ``project_id``. Aristotle SDK 2.x
+    # split the old project-level status into a coarse project status
+    # (RUNNING/IDLE) plus a per-task TaskStatus. Marathon tracks the latest
+    # task to know what to wait on / what to download.
+    agent_task_id: Optional[str] = None
+    # String form of the *task* status (TaskStatus.value), e.g. "COMPLETE",
+    # "IN_PROGRESS". Same vocabulary as the SDK 1.x ProjectStatus, so legacy
+    # state files just keep working.
     status: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -36,7 +44,11 @@ def load_state(path: Path) -> RunState:
     if not path.is_file():
         return RunState()
     raw = json.loads(path.read_text())
-    chapters = [ChapterState(**c) for c in raw.get("chapters", [])]
+    known = {f for f in ChapterState.__dataclass_fields__}
+    chapters = [
+        ChapterState(**{k: v for k, v in c.items() if k in known})
+        for c in raw.get("chapters", [])
+    ]
     return RunState(chapters=chapters)
 
 
@@ -55,6 +67,8 @@ class RefineState:
     iterations_completed: int = 0
     current_iteration_idx: int = 0
     project_id: Optional[str] = None
+    # See ``ChapterState.agent_task_id`` — SDK 2.x decouples project from task.
+    agent_task_id: Optional[str] = None
     status: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -68,7 +82,9 @@ def load_refine_state(path: Path) -> Optional[RefineState]:
     if not path.is_file():
         return None
     raw = json.loads(path.read_text())
-    return RefineState(**raw)
+    # Drop unknown keys so old state files survive future field additions.
+    known = {f for f in RefineState.__dataclass_fields__}
+    return RefineState(**{k: v for k, v in raw.items() if k in known})
 
 
 def save_refine_state(path: Path, state: RefineState) -> None:

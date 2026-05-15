@@ -25,8 +25,18 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 import aristotlelib
-from aristotlelib import AristotleAPIError, Project, ProjectStatus
+from aristotlelib import AgentTask, AristotleAPIError, Project, TaskStatus
 
+from marathon.aristotle_runtime import (
+    IN_FLIGHT_STATUS_VALUES,
+    NON_RETRYABLE_FAILURE_STATUSES,
+    RESUMABLE_SUCCESS_STATUS_VALUES,
+    RETRYABLE_STATUSES,
+    download_result,
+    reattach_project_and_task,
+    run_task_to_completion,
+    submit_from_directory,
+)
 from marathon.order import OrderEntry, parse_order_file
 from marathon.post_pipeline import (
     PipelineConfig,
@@ -46,28 +56,17 @@ from marathon.state import (
 LOG_FILENAME = "marathon.md"
 MACROS_FILENAME = "macros.sty"
 
-RETRYABLE_STATUSES = {
-    ProjectStatus.COMPLETE_WITH_ERRORS,
-    ProjectStatus.FAILED,
-}
-NON_RETRYABLE_FAILURE_STATUSES = {
-    ProjectStatus.OUT_OF_BUDGET,
-    ProjectStatus.CANCELED,
-}
-# What state-file status values count as "this chapter is done; skip on re-run."
-# Only COMPLETE counts. COMPLETE_WITH_ERRORS is treated as "needs another shot"
-# both within the current invocation (retry loop) and across invocations.
-RESUMABLE_SUCCESS_STATUS_VALUES = {
-    ProjectStatus.COMPLETE.value,
-}
-
-# Statuses that mean the project is still running on Aristotle's side. If we
-# find a chapter with one of these in marathon-state.json, we try to reattach
-# to it via Project.from_id rather than submitting a fresh project.
-IN_FLIGHT_STATUS_VALUES = {
-    ProjectStatus.QUEUED.value,
-    ProjectStatus.IN_PROGRESS.value,
-}
+# Re-exported for refine.py + future callers. Authoritative definitions
+# live in marathon.aristotle_runtime; we just surface them here so the old
+# import paths keep working.
+__all__ = [
+    "LOG_FILENAME",
+    "MACROS_FILENAME",
+    "RETRYABLE_STATUSES",
+    "NON_RETRYABLE_FAILURE_STATUSES",
+    "RESUMABLE_SUCCESS_STATUS_VALUES",
+    "IN_FLIGHT_STATUS_VALUES",
+]
 
 
 def _read_prompt_template() -> str:
@@ -324,13 +323,15 @@ async def _submit_fresh(
     state_path: Path,
     attempt_idx: int,
     max_retries: int,
-) -> Project | None:
+) -> tuple[Project, AgentTask] | None:
     """Build the bundle, build the prompt, and submit a new Aristotle project.
-    On success, returns the ``Project``. On submit failure, mutates ``chapter``
-    to SUBMIT_FAILED and returns None.
+
+    On success returns ``(project, agent_task)`` — the freshly-created
+    project plus its first task (the thing we poll for status). On submit
+    failure, mutates ``chapter`` to SUBMIT_FAILED and returns None.
     """
     has_partial = chapter.output_path is not None and chapter.status in {
-        ProjectStatus.COMPLETE_WITH_ERRORS.value,
+        TaskStatus.COMPLETE_WITH_ERRORS.value,
     }
     targets_block = _build_targets_block(entry)
     retry_block = _build_retry_block(
@@ -358,7 +359,7 @@ async def _submit_fresh(
     with tempfile.TemporaryDirectory(prefix="marathon-stage-") as stage_tmp:
         staged = _build_submission_dir(folder, entry, repo_dir, Path(stage_tmp))
         try:
-            project = await Project.create_from_directory(prompt=prompt, project_dir=staged)
+            project, task = await submit_from_directory(prompt=prompt, project_dir=staged)
         except AristotleAPIError as e:
             chapter.status = "SUBMIT_FAILED"
             chapter.note = f"submit error (status {e.status_code}): {e}"
@@ -366,13 +367,14 @@ async def _submit_fresh(
             return None
 
     chapter.project_id = project.project_id
-    chapter.status = project.status.value if project.status else "QUEUED"
+    chapter.agent_task_id = task.agent_task_id
+    chapter.status = task.status.value if task.status else TaskStatus.QUEUED.value
     chapter.started_at = now_iso()
     save_state(state_path, state)
-    print(f"    submitted: project_id={project.project_id}")
+    print(f"    submitted: project_id={project.project_id} task_id={task.agent_task_id}")
     if append_promptlog_url(repo_dir, project.project_id):
         print(f"    PromptLog.md updated")
-    return project
+    return project, task
 
 
 async def _run_one_attempt(
@@ -390,19 +392,25 @@ async def _run_one_attempt(
     max_retries: int,
     pipeline_config: PipelineConfig,
     existing_project: Project | None = None,
-) -> ProjectStatus | None:
-    """Run a single attempt. If ``existing_project`` is provided, skip submission
-    and poll that project (used for reattaching to a previous run's in-flight
-    project). Mutates ``chapter``. Returns the terminal ``ProjectStatus`` or
-    ``None`` for Marathon-level errors (submit/poll/missing output folder)."""
-    if existing_project is not None:
+    existing_task: AgentTask | None = None,
+) -> TaskStatus | None:
+    """Run a single attempt. If ``existing_project``/``existing_task`` are
+    provided, skip submission and poll that task (used for reattaching to a
+    previous run's in-flight task). Mutates ``chapter``. Returns the terminal
+    ``TaskStatus`` or ``None`` for Marathon-level errors (submit/poll/missing
+    output folder)."""
+    if existing_project is not None and existing_task is not None:
         project = existing_project
+        task = existing_task
         chapter.output_path = None
         chapter.note = None
         save_state(state_path, state)
-        print(f"  reattached: continuing project_id={project.project_id}")
+        print(
+            f"  reattached: continuing project_id={project.project_id} "
+            f"task_id={task.agent_task_id}"
+        )
     else:
-        project = await _submit_fresh(
+        submitted = await _submit_fresh(
             folder=folder,
             entry=entry,
             prompt_template=prompt_template,
@@ -414,33 +422,50 @@ async def _run_one_attempt(
             attempt_idx=attempt_idx,
             max_retries=max_retries,
         )
-        if project is None:
+        if submitted is None:
             return None
+        project, task = submitted
 
-    with tempfile.TemporaryDirectory(prefix="marathon-dl-") as dl_tmp:
-        download_path = Path(dl_tmp) / "solution.tar.gz"
-        try:
-            result = await project.wait_for_completion(
-                destination=str(download_path),
-                polling_interval_seconds=polling_interval,
-            )
-        except AristotleAPIError as e:
-            chapter.status = "POLL_FAILED"
-            chapter.note = f"poll error (status {e.status_code}): {e}"
-            save_state(state_path, state)
-            return None
-
-        await project.refresh()
-        chapter.status = project.status.value
-        chapter.completed_at = now_iso()
-        chapter.duration_seconds = compute_duration_seconds(
-            chapter.started_at, chapter.completed_at
+    try:
+        await run_task_to_completion(
+            task=task,
+            project=project,
+            polling_interval=polling_interval,
+            watcher=None,
         )
+    except AristotleAPIError as e:
+        chapter.status = "POLL_FAILED"
+        chapter.note = f"poll error (status {e.status_code}): {e}"
+        save_state(state_path, state)
+        return None
 
-        if result is not None:
+    chapter.status = task.status.value
+    chapter.completed_at = now_iso()
+    chapter.duration_seconds = compute_duration_seconds(
+        chapter.started_at, chapter.completed_at
+    )
+
+    # Download the result only if the task produced output. ``get_files``
+    # falls back to the input tarball if there's no result, which we don't
+    # want; gate on a successful-or-partial status.
+    if task.status in {
+        TaskStatus.COMPLETE,
+        TaskStatus.COMPLETE_WITH_ERRORS,
+        TaskStatus.OUT_OF_BUDGET,
+    }:
+        with tempfile.TemporaryDirectory(prefix="marathon-dl-") as dl_tmp:
+            download_path = Path(dl_tmp) / "solution.tar.gz"
+            try:
+                result_path = await download_result(project, download_path)
+            except AristotleAPIError as e:
+                chapter.status = "POLL_FAILED"
+                chapter.note = f"download error (status {e.status_code}): {e}"
+                save_state(state_path, state)
+                return None
+
             log_dest = folder / LOG_FILENAME
             found, log_updated, unexpected = _extract_solution(
-                Path(result), expected_path, repo_dir, log_dest
+                Path(result_path), expected_path, repo_dir, log_dest
             )
             if found:
                 chapter.output_path = str(repo_dir / Path(*expected_path.parts))
@@ -468,7 +493,7 @@ async def _run_one_attempt(
     # Post-extraction pipeline (no-op if no flags set).
     if (
         chapter.output_path is not None
-        and project.status == ProjectStatus.COMPLETE
+        and task.status == TaskStatus.COMPLETE
         and pipeline_config.has_any()
     ):
         run_post_pipeline(
@@ -480,7 +505,7 @@ async def _run_one_attempt(
             project_id=chapter.project_id,
         )
 
-    return project.status
+    return task.status
 
 
 async def _run_chapter(
@@ -511,6 +536,7 @@ async def _run_chapter(
     # rather than submitting a duplicate. The "in flight" case keeps polling;
     # the "extraction failure" case re-extracts using the current code.
     existing_project: Project | None = None
+    existing_task: AgentTask | None = None
     reattach_reason = None
     if chapter.project_id:
         if chapter.status in IN_FLIGHT_STATUS_VALUES:
@@ -518,18 +544,22 @@ async def _run_chapter(
         elif chapter.status == "OUTPUT_FOLDER_MISSING":
             reattach_reason = "previous extraction failure"
     if reattach_reason is not None:
-        try:
-            candidate = await Project.from_id(chapter.project_id)
-            await candidate.refresh()
-            existing_project = candidate
+        project, task = await reattach_project_and_task(
+            project_id=chapter.project_id,
+            agent_task_id=chapter.agent_task_id,
+        )
+        if project is not None and task is not None:
+            existing_project = project
+            existing_task = task
             print(
                 f"  reattaching ({reattach_reason}) to project "
-                f"project_id={chapter.project_id}, status={candidate.status.value}"
+                f"project_id={chapter.project_id} task_id={task.agent_task_id} "
+                f"status={task.status.value}"
             )
-        except AristotleAPIError as e:
+        else:
             print(
-                f"  could not reattach to project_id={chapter.project_id} "
-                f"(status {e.status_code}: {e}); will submit fresh instead"
+                f"  could not reattach to project_id={chapter.project_id}; "
+                "will submit fresh instead"
             )
 
     for attempt_idx in range(max_retries + 1):
@@ -548,8 +578,10 @@ async def _run_chapter(
             max_retries=max_retries,
             pipeline_config=pipeline_config,
             existing_project=existing_project if attempt_idx == 0 else None,
+            existing_task=existing_task if attempt_idx == 0 else None,
         )
         existing_project = None
+        existing_task = None
 
         # Marathon-level error (submit, poll, missing folder) — chapter.status
         # already records it. Don't retry: these are infrastructure problems,
@@ -557,7 +589,7 @@ async def _run_chapter(
         if status is None:
             return chapter
 
-        if status == ProjectStatus.COMPLETE:
+        if status == TaskStatus.COMPLETE:
             return chapter
 
         if status in RETRYABLE_STATUSES:

@@ -25,8 +25,17 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Optional
 
-from aristotlelib import AristotleAPIError, Project, ProjectStatus
+from aristotlelib import AgentTask, AristotleAPIError, Project, TaskStatus
 
+from marathon.aristotle_runtime import (
+    IN_FLIGHT_STATUS_VALUES,
+    NON_RETRYABLE_FAILURE_STATUSES,
+    RETRYABLE_STATUSES,
+    download_result,
+    reattach_project_and_task,
+    run_task_to_completion,
+    submit_from_directory,
+)
 from marathon.claude_review import review_and_draft_prompt
 from marathon.post_pipeline import (
     PipelineConfig,
@@ -34,10 +43,7 @@ from marathon.post_pipeline import (
     run_post_pipeline,
 )
 from marathon.skeleton import (
-    IN_FLIGHT_STATUS_VALUES,
     LOG_FILENAME,
-    NON_RETRYABLE_FAILURE_STATUSES,
-    RETRYABLE_STATUSES,
     _ensure_api_key,
     _extract_solution,
     _list_repo_files,
@@ -285,33 +291,42 @@ def _build_refine_submission_dir(
     return staged
 
 
-async def _try_reattach(state: RefineState) -> Optional[Project]:
+async def _try_reattach(
+    state: RefineState,
+) -> tuple[Optional[Project], Optional[AgentTask]]:
     """Reattach to a project from a previous run if it's still in flight, or
-    if it terminated but Marathon failed to extract its output. Returns None
-    when no reattach is applicable."""
+    if it terminated but Marathon failed to extract its output.
+
+    Returns ``(project, task)``; both ``None`` when no reattach is applicable
+    or the API can't load the prior project.
+    """
     if not state.project_id:
-        return None
+        return None, None
     reason = None
     if state.status in IN_FLIGHT_STATUS_VALUES:
         reason = "in-flight"
     elif state.status == "OUTPUT_FOLDER_MISSING":
         reason = "previous extraction failure"
     if reason is None:
-        return None
-    try:
-        candidate = await Project.from_id(state.project_id)
-        await candidate.refresh()
+        return None, None
+
+    project, task = await reattach_project_and_task(
+        project_id=state.project_id,
+        agent_task_id=state.agent_task_id,
+    )
+    if project is None or task is None:
         print(
-            f"  reattaching ({reason}) to project "
-            f"project_id={state.project_id}, status={candidate.status.value}"
+            f"  could not reattach to project_id={state.project_id}; "
+            "will submit fresh instead"
         )
-        return candidate
-    except AristotleAPIError as e:
-        print(
-            f"  could not reattach to project_id={state.project_id} "
-            f"(status {e.status_code}: {e}); will submit fresh instead"
-        )
-        return None
+        return None, None
+
+    print(
+        f"  reattaching ({reason}) to project "
+        f"project_id={state.project_id} task_id={task.agent_task_id} "
+        f"status={task.status.value}"
+    )
+    return project, task
 
 
 async def _submit_fresh_refine(
@@ -324,7 +339,7 @@ async def _submit_fresh_refine(
     attempt_idx: int,
     max_retries: int,
     referee_path: Optional[Path] = None,
-) -> Optional[Project]:
+) -> Optional[tuple[Project, AgentTask]]:
     state.attempts += 1
     state.output_path = None
     state.note = None
@@ -341,7 +356,7 @@ async def _submit_fresh_refine(
             referee_path=referee_path,
         )
         try:
-            project = await Project.create_from_directory(prompt=prompt, project_dir=staged)
+            project, task = await submit_from_directory(prompt=prompt, project_dir=staged)
         except AristotleAPIError as e:
             state.status = "SUBMIT_FAILED"
             state.note = f"submit error (status {e.status_code}): {e}"
@@ -349,13 +364,14 @@ async def _submit_fresh_refine(
             return None
 
     state.project_id = project.project_id
-    state.status = project.status.value if project.status else "QUEUED"
+    state.agent_task_id = task.agent_task_id
+    state.status = task.status.value if task.status else TaskStatus.QUEUED.value
     state.started_at = now_iso()
     save_refine_state(state_path, state)
-    print(f"    submitted: project_id={project.project_id}")
+    print(f"    submitted: project_id={project.project_id} task_id={task.agent_task_id}")
     if append_promptlog_url(repo_dir, project.project_id):
         print(f"    PromptLog.md updated")
-    return project
+    return project, task
 
 
 async def _run_refine_attempt(
@@ -374,20 +390,32 @@ async def _run_refine_attempt(
     iteration_idx: int,
     target_folder_name: str,
     existing_project: Optional[Project] = None,
+    existing_task: Optional[AgentTask] = None,
     referee_path: Optional[Path] = None,
-) -> Optional[ProjectStatus]:
+    watcher_factory=None,
+) -> Optional[TaskStatus]:
     """Run one Aristotle attempt for the current iteration. Returns the
-    terminal ``ProjectStatus``, or ``None`` for Marathon-level errors."""
-    if existing_project is not None:
+    terminal ``TaskStatus``, or ``None`` for Marathon-level errors.
+
+    ``watcher_factory``, if provided, is called as ``watcher_factory(state,
+    iteration_idx)`` to construct an :class:`EventWatcher` for this
+    attempt; the watcher polls the event stream alongside the status loop
+    (used by the Hermes live-steering flow).
+    """
+    if existing_project is not None and existing_task is not None:
         project = existing_project
+        task = existing_task
         state.output_path = None
         state.note = None
         save_refine_state(state_path, state)
-        print(f"  reattached: continuing project_id={project.project_id}")
+        print(
+            f"  reattached: continuing project_id={project.project_id} "
+            f"task_id={task.agent_task_id}"
+        )
     else:
         if prompt is None:
             sys.exit("internal error: prompt required for fresh submit")
-        project = await _submit_fresh_refine(
+        submitted = await _submit_fresh_refine(
             prompt=prompt,
             repo_dir=repo_dir,
             tex_path=tex_path,
@@ -398,33 +426,49 @@ async def _run_refine_attempt(
             max_retries=max_retries,
             referee_path=referee_path,
         )
-        if project is None:
+        if submitted is None:
             return None
+        project, task = submitted
 
-    with tempfile.TemporaryDirectory(prefix="marathon-refine-dl-") as dl_tmp:
-        download_path = Path(dl_tmp) / "solution.tar.gz"
-        try:
-            result = await project.wait_for_completion(
-                destination=str(download_path),
-                polling_interval_seconds=polling_interval,
-            )
-        except AristotleAPIError as e:
-            state.status = "POLL_FAILED"
-            state.note = f"poll error (status {e.status_code}): {e}"
-            save_refine_state(state_path, state)
-            return None
+    watcher = watcher_factory(state, iteration_idx) if watcher_factory else None
 
-        await project.refresh()
-        state.status = project.status.value
-        state.completed_at = now_iso()
-        state.duration_seconds = compute_duration_seconds(
-            state.started_at, state.completed_at
+    try:
+        await run_task_to_completion(
+            task=task,
+            project=project,
+            polling_interval=polling_interval,
+            watcher=watcher,
         )
+    except AristotleAPIError as e:
+        state.status = "POLL_FAILED"
+        state.note = f"poll error (status {e.status_code}): {e}"
+        save_refine_state(state_path, state)
+        return None
 
-        if result is not None:
+    state.status = task.status.value
+    state.completed_at = now_iso()
+    state.duration_seconds = compute_duration_seconds(
+        state.started_at, state.completed_at
+    )
+
+    if task.status in {
+        TaskStatus.COMPLETE,
+        TaskStatus.COMPLETE_WITH_ERRORS,
+        TaskStatus.OUT_OF_BUDGET,
+    }:
+        with tempfile.TemporaryDirectory(prefix="marathon-refine-dl-") as dl_tmp:
+            download_path = Path(dl_tmp) / "solution.tar.gz"
+            try:
+                result_path = await download_result(project, download_path)
+            except AristotleAPIError as e:
+                state.status = "POLL_FAILED"
+                state.note = f"download error (status {e.status_code}): {e}"
+                save_refine_state(state_path, state)
+                return None
+
             log_dest = workdir_log if workdir_log is not None else Path(dl_tmp) / "_unused.md"
             found, log_updated, unexpected = _extract_solution(
-                Path(result), expected_path, repo_dir, log_dest
+                Path(result_path), expected_path, repo_dir, log_dest
             )
             if found:
                 state.output_path = str(repo_dir / Path(*expected_path.parts))
@@ -451,7 +495,7 @@ async def _run_refine_attempt(
 
     if (
         state.output_path is not None
-        and project.status == ProjectStatus.COMPLETE
+        and task.status == TaskStatus.COMPLETE
         and pipeline_config.has_any()
     ):
         run_post_pipeline(
@@ -463,7 +507,7 @@ async def _run_refine_attempt(
             project_id=state.project_id,
         )
 
-    return project.status
+    return task.status
 
 
 async def _run_iteration(
@@ -485,9 +529,11 @@ async def _run_iteration(
     state: RefineState,
     state_path: Path,
     existing_project: Optional[Project],
+    existing_task: Optional[AgentTask],
     workdir: Path,
     referee_path: Optional[Path] = None,
     cross_chapter: bool = True,
+    watcher_factory=None,
 ) -> bool:
     """Run a single refinement iteration. Each attempt (other than a
     reattach to an in-flight project) gets its own Claude review against
@@ -496,7 +542,11 @@ async def _run_iteration(
     last_status: Optional[str] = None
 
     for attempt_idx in range(max_retries + 1):
-        use_existing = existing_project is not None and attempt_idx == 0
+        use_existing = (
+            existing_project is not None
+            and existing_task is not None
+            and attempt_idx == 0
+        )
 
         if use_existing:
             full_prompt: Optional[str] = None
@@ -570,14 +620,17 @@ async def _run_iteration(
             iteration_idx=iteration_idx,
             target_folder_name=target_folder_name,
             existing_project=existing_project if use_existing else None,
+            existing_task=existing_task if use_existing else None,
             referee_path=referee_path,
+            watcher_factory=watcher_factory,
         )
         existing_project = None
+        existing_task = None
 
         if status is None:
             return False
 
-        if status == ProjectStatus.COMPLETE:
+        if status == TaskStatus.COMPLETE:
             return True
 
         if status in RETRYABLE_STATUSES:
@@ -731,6 +784,22 @@ async def refine_command(args) -> None:
         ]
         print(f"post-extraction:  {', '.join(flags)}")
 
+    # Construct the Hermes live-steering watcher factory if requested. The
+    # factory is called once per attempt so the watcher can pick up the
+    # current iteration index for its decision log. Built BEFORE the
+    # dry-run early-exit so the dry-run summary surfaces the flag.
+    watcher_factory = None
+    if getattr(args, "live_steering", False):
+        from marathon.hermes_watcher import build_watcher_factory
+        watcher_factory = build_watcher_factory(
+            workdir=workdir,
+            target_folder=target_folder,
+            repo_dir=repo_dir,
+            referee_path=referee_path,
+            skeleton_mode=args.skeleton,
+        )
+        print("live-steering:   on (Hermes will inspect each EDITING_FILE event)")
+
     if args.dry_run:
         print(
             "\n[dry-run] would loop up to "
@@ -744,14 +813,15 @@ async def refine_command(args) -> None:
         state.current_iteration_idx = iteration_idx
         save_refine_state(state_path, state)
 
-        existing_project = await _try_reattach(state)
+        existing_project, existing_task = await _try_reattach(state)
 
-        if existing_project is None:
+        if existing_project is None or existing_task is None:
             print(f"\n=== iteration {iteration_idx}/{args.max_iterations} ===")
             # Reset state for a fresh iteration. Claude is called inside
             # _run_iteration (per attempt), not here.
             state.attempts = 0
             state.project_id = None
+            state.agent_task_id = None
             state.status = None
             state.started_at = None
             state.completed_at = None
@@ -781,9 +851,11 @@ async def refine_command(args) -> None:
             state=state,
             state_path=state_path,
             existing_project=existing_project,
+            existing_task=existing_task,
             workdir=workdir,
             referee_path=referee_path,
             cross_chapter=not args.no_cross_chapter,
+            watcher_factory=watcher_factory,
         )
 
         if not ok:
