@@ -1,4 +1,4 @@
-"""Bulk-create and bulk-refresh coreview sub-issues from a drafts file.
+"""Bulk-create and bulk-refresh review sub-issues from a drafts file.
 
 Two modes:
 
@@ -19,12 +19,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from marathon.coreview.config import CoreviewConfig
-from marathon.coreview.drafts import detect_chapter, parse_drafts
-from marathon.coreview.github import gh
+from marathon.review.config import ReviewConfig
+from marathon.review.drafts import detect_chapter, parse_drafts
+from marathon.review.github import gh
 
 
-COREVIEW_LABEL = "coreview"
+REVIEW_LABEL = "review"
 
 
 def _chapter_label(chapter: int) -> str:
@@ -32,7 +32,7 @@ def _chapter_label(chapter: int) -> str:
 
 
 def create_subissue(
-    cfg: CoreviewConfig,
+    cfg: ReviewConfig,
     title: str,
     body_path: Path,
     chapter: int,
@@ -46,7 +46,7 @@ def create_subissue(
         "--repo", cfg.github_repo,
         "--title", title,
         "--body-file", str(body_path),
-        "--label", COREVIEW_LABEL,
+        "--label", REVIEW_LABEL,
         "--label", _chapter_label(chapter),
     )
     url = cp.stdout.strip().splitlines()[-1]
@@ -64,7 +64,7 @@ def create_subissue(
 
 
 def create_subissues_from_drafts(
-    cfg: CoreviewConfig,
+    cfg: ReviewConfig,
     drafts_path: Path,
     skip: Optional[set[int]] = None,
     tmp_dir: Path = Path("/tmp"),
@@ -89,7 +89,7 @@ def create_subissues_from_drafts(
         if n in skip:
             print(f"[{n:2d}] SKIP (--skip)")
             continue
-        body_path = tmp_dir / f"coreview-draft-{n}-body.md"
+        body_path = tmp_dir / f"review-draft-{n}-body.md"
         body_path.write_text(body)
         print(f"[{n:2d}] creating: {title[:80]}")
         try:
@@ -112,7 +112,7 @@ def create_subissues_from_drafts(
 
 
 def refresh_subissue_bodies(
-    cfg: CoreviewConfig,
+    cfg: ReviewConfig,
     drafts_path: Path,
     only: Optional[set[int]] = None,
     tmp_dir: Path = Path("/tmp"),
@@ -145,7 +145,7 @@ def refresh_subissue_bodies(
             skipped += 1
             continue
         title, body = drafts[entry_idx]
-        body_path = tmp_dir / f"coreview-refresh-{issue_num}-body.md"
+        body_path = tmp_dir / f"review-refresh-{issue_num}-body.md"
         body_path.write_text(body)
         print(f"  refresh #{issue_num} (entry {entry_idx}): {title[:60]}")
         cp = gh(

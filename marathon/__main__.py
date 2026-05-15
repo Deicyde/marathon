@@ -5,8 +5,8 @@ import asyncio
 import sys
 from pathlib import Path
 
-from marathon.coreview.cli import add_subparser as _add_coreview_subparser
-from marathon.coreview.cli import coreview_command
+from marathon.review.cli import add_subparser as _add_review_subparser
+from marathon.review.cli import review_command
 from marathon.refine import refine_command
 from marathon.referee import referee_command
 from marathon.skeleton import skeleton_command
@@ -329,9 +329,9 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # Coreview tree: `marathon coreview list/next/show/verify/reject/...`
-    # Project-specific settings come from <repo>/.marathon/coreview/config.toml.
-    _add_coreview_subparser(subparsers)
+    # Review tree: `marathon review list/next/show/verify/reject/...`
+    # Project-specific settings come from <repo>/.marathon/review/config.toml.
+    _add_review_subparser(subparsers)
 
     return parser
 
@@ -420,9 +420,9 @@ def main() -> None:
         except KeyboardInterrupt:
             print("\ninterrupted", file=sys.stderr)
             sys.exit(130)
-    elif args.command == "coreview":
+    elif args.command == "review":
         try:
-            coreview_command(args)
+            review_command(args)
         except KeyboardInterrupt:
             print("\ninterrupted", file=sys.stderr)
             sys.exit(130)

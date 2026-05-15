@@ -1,4 +1,4 @@
-"""Parse ``drafts/<Chapter>.md`` files used by coreview.
+"""Parse ``drafts/<Chapter>.md`` files used by review.
 
 The drafts file is the human-authored markdown one section per
 declaration. ``create_subissues`` reads it to bulk-create GitHub issues;

@@ -1,4 +1,4 @@
-"""Thin wrapper around the ``gh`` CLI used by the coreview commands."""
+"""Thin wrapper around the ``gh`` CLI used by the review commands."""
 
 from __future__ import annotations
 

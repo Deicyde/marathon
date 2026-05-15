@@ -1,6 +1,6 @@
 """Append rejection bullets to referee.md's user-managed header.
 
-The auto-refine daemon (``marathon.coreview.daemon``) hashes the header
+The auto-refine daemon (``marathon.review.daemon``) hashes the header
 above the ``BEGIN: Marathon-managed referee tail`` sentinel; when the
 hash changes, it fires a new ``marathon refine`` iteration. Appending a
 rejection bullet here is the canonical way to queue a fix.
@@ -15,7 +15,7 @@ SENTINEL = "<!-- BEGIN: Marathon-managed referee tail"
 
 
 def append_rejection_bullet(referee_path: Path, issue_num: int, notes: str) -> bool:
-    """Append a ``- **Coreview #<num> REJECTED**`` block to the user header.
+    """Append a ``- **Review #<num> REJECTED**`` block to the user header.
 
     Returns True on success, False if ``referee_path`` doesn't exist
     (caller should warn). If the sentinel isn't present in the file, the
@@ -28,7 +28,7 @@ def append_rejection_bullet(referee_path: Path, issue_num: int, notes: str) -> b
 
     text = referee_path.read_text()
     bullet = (
-        f"\n- **Coreview #{issue_num} REJECTED**\n"
+        f"\n- **Review #{issue_num} REJECTED**\n"
         + "\n".join(
             f"  {line}" if line.strip() else line for line in notes.splitlines()
         )

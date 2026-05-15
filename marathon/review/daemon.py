@@ -1,6 +1,6 @@
-"""Single-flight auto-refine daemon for the coreview rejection queue.
+"""Single-flight auto-refine daemon for the review rejection queue.
 
-Triggered indirectly by ``reject`` (via ``marathon coreview reject``) when
+Triggered indirectly by ``reject`` (via ``marathon review reject``) when
 no other daemon is active for the chapter. While the daemon is alive,
 subsequent rejections just append to ``referee.md``'s user-managed
 header (the queue); the daemon's next loop iteration picks them up.
@@ -12,7 +12,7 @@ Loop semantics::
     (safety cap at ``MAX_LOOPS_ONCE`` in one-shot mode.)
 
 Per-chapter lock file lives at
-``<repo>/.marathon/coreview/runner-locks/refine-c<N>.lock`` and contains
+``<repo>/.marathon/review/runner-locks/refine-c<N>.lock`` and contains
 the daemon's PID. Cleaned up on exit.
 """
 
@@ -29,8 +29,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from marathon.coreview.config import CoreviewConfig, load_config
-from marathon.coreview.referee_queue import SENTINEL
+from marathon.review.config import ReviewConfig, load_config
+from marathon.review.referee_queue import SENTINEL
 
 # Polling interval (seconds) when the runner is in daemon mode and the
 # queue is currently drained.
@@ -42,7 +42,7 @@ POLL_INTERVAL_SECONDS = 60
 MAX_LOOPS_ONCE = 5
 
 # Default ``marathon refine`` flags the daemon uses. Each value can be
-# overridden via the ``[daemon.refine_args]`` table in coreview config
+# overridden via the ``[daemon.refine_args]`` table in review config
 # (not currently wired — left as a hook for future tuning).
 DEFAULT_REFINE_ARGS: list[str] = [
     "--skeleton", "--max-iterations", "1", "--max-retries", "3",
@@ -65,11 +65,11 @@ def _handle_stop_signal(signum, frame) -> None:
     )
 
 
-def lock_path(cfg: CoreviewConfig, chapter: int) -> Path:
+def lock_path(cfg: ReviewConfig, chapter: int) -> Path:
     return cfg.runner_lock_dir / f"refine-c{chapter}.lock"
 
 
-def hash_user_header(cfg: CoreviewConfig) -> str:
+def hash_user_header(cfg: ReviewConfig) -> str:
     """SHA256 of ``referee.md``'s user-managed header (above the BEGIN
     sentinel). Returns '' if the file doesn't exist."""
     if not cfg.referee_path.is_file():
@@ -88,7 +88,7 @@ def process_alive(pid: int) -> bool:
         return False
 
 
-def acquire_lock(cfg: CoreviewConfig, chapter: int) -> bool:
+def acquire_lock(cfg: ReviewConfig, chapter: int) -> bool:
     """Try to acquire the per-chapter runner lock.
 
     Returns False if another *live* daemon is already active for this
@@ -108,7 +108,7 @@ def acquire_lock(cfg: CoreviewConfig, chapter: int) -> bool:
     return True
 
 
-def release_lock(cfg: CoreviewConfig, chapter: int) -> None:
+def release_lock(cfg: ReviewConfig, chapter: int) -> None:
     lock = lock_path(cfg, chapter)
     try:
         if lock.is_file():
@@ -123,10 +123,10 @@ def release_lock(cfg: CoreviewConfig, chapter: int) -> None:
 # Desktop (matches the old refine_runner.py default). Could be made
 # configurable later.
 def _workdir_parent() -> Path:
-    return Path.home() / "Desktop" / "marathon-runs" / "coreview-fixes"
+    return Path.home() / "Desktop" / "marathon-runs" / "review-fixes"
 
 
-def run_one_refine(cfg: CoreviewConfig, chapter: int) -> int:
+def run_one_refine(cfg: ReviewConfig, chapter: int) -> int:
     """Run a single ``marathon refine`` iteration for the chapter.
 
     Returns the subprocess exit code. Invokes ``python -m marathon refine``
@@ -169,7 +169,7 @@ def run_daemon(chapter: int, once: bool = False) -> int:
 
     mode = "one-shot" if once else "daemon"
     print(
-        f"=== coreview refine daemon chapter={chapter} pid={os.getpid()} "
+        f"=== review refine daemon chapter={chapter} pid={os.getpid()} "
         f"mode={mode} starting {datetime.now().isoformat()} ===",
         flush=True,
     )
@@ -220,7 +220,7 @@ def run_daemon(chapter: int, once: bool = False) -> int:
     finally:
         release_lock(cfg, chapter)
         print(
-            f"\n=== coreview refine daemon chapter={chapter} done "
+            f"\n=== review refine daemon chapter={chapter} done "
             f"{datetime.now().isoformat()} (ran {iteration_count} iteration(s)) ===",
             flush=True,
         )
@@ -229,10 +229,10 @@ def run_daemon(chapter: int, once: bool = False) -> int:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    """Standalone entry point. ``marathon coreview daemon`` wires this up.
+    """Standalone entry point. ``marathon review daemon`` wires this up.
 
     Also used by the backward-compat shim at
-    ``<repo>/.marathon/coreview/refine_runner.py``.
+    ``<repo>/.marathon/review/refine_runner.py``.
     """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--chapter", type=int, required=True)

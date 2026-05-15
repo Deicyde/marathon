@@ -1,12 +1,12 @@
-"""Coreview configuration loader.
+"""Review configuration loader.
 
-The previously-bundled scripts under ``.marathon/coreview/`` hardcoded a
+The previously-bundled scripts under ``.marathon/review/`` hardcoded a
 handful of project-specific values: the GitHub repo name, the parent
 issue number, the target-path template, per-chapter registries.
 Pulling them into a config file lets the same package serve any number
 of projects.
 
-Config file location: ``<repo>/.marathon/coreview/config.toml``.
+Config file location: ``<repo>/.marathon/review/config.toml``.
 
 Example::
 
@@ -17,9 +17,9 @@ Example::
     tracker_section_pattern = "### Chapter {chapter}:"
 
     [labels]
-    verified = "coreview:verified"
-    rejected = "coreview:rejected"
-    inflight = "coreview:in-flight-fix"
+    verified = "review:verified"
+    rejected = "review:rejected"
+    inflight = "review:in-flight-fix"
 
     [[chapters]]
     chapter = 14
@@ -29,7 +29,7 @@ Example::
       # ...
     ]
 
-The chapter-registry format mirrors the old ``COREVIEW_REGISTRY`` dict
+The chapter-registry format mirrors the old ``REVIEW_REGISTRY`` dict
 from ``review.py``: each entry is ``[issue_num, tracker_substring]`` in
 LeeSM logical order. The substring must match exactly one line in the
 chapter's section of the parent issue's body.
@@ -44,14 +44,14 @@ from pathlib import Path
 from typing import Optional
 
 
-CONFIG_RELPATH = Path(".marathon/coreview/config.toml")
+CONFIG_RELPATH = Path(".marathon/review/config.toml")
 
 
 @dataclass(frozen=True)
-class CoreviewLabels:
-    verified: str = "coreview:verified"
-    rejected: str = "coreview:rejected"
-    inflight: str = "coreview:in-flight-fix"
+class ReviewLabels:
+    verified: str = "review:verified"
+    rejected: str = "review:rejected"
+    inflight: str = "review:in-flight-fix"
 
 
 @dataclass(frozen=True)
@@ -90,8 +90,8 @@ class ChapterRegistry:
 
 
 @dataclass(frozen=True)
-class CoreviewConfig:
-    """Parsed ``coreview/config.toml`` plus paths derived from the repo
+class ReviewConfig:
+    """Parsed ``review/config.toml`` plus paths derived from the repo
     root the config was found under."""
 
     repo_dir: Path
@@ -102,27 +102,27 @@ class CoreviewConfig:
     referee_path: Path
     target_path_template: str
     tracker_section_pattern: str
-    labels: CoreviewLabels
+    labels: ReviewLabels
 
     # Loaded chapter registries, keyed by chapter number.
     chapters: dict[int, ChapterRegistry] = field(default_factory=dict)
 
-    # Coreview support directory paths — derived from repo_dir.
+    # Review support directory paths — derived from repo_dir.
     @property
-    def coreview_dir(self) -> Path:
-        return self.repo_dir / ".marathon" / "coreview"
+    def review_dir(self) -> Path:
+        return self.repo_dir / ".marathon" / "review"
 
     @property
     def drafts_dir(self) -> Path:
-        return self.coreview_dir / "drafts"
+        return self.review_dir / "drafts"
 
     @property
     def runner_lock_dir(self) -> Path:
-        return self.coreview_dir / "runner-locks"
+        return self.review_dir / "runner-locks"
 
     @property
     def runner_log_dir(self) -> Path:
-        return self.coreview_dir / "runner-logs"
+        return self.review_dir / "runner-logs"
 
     def chapter_of_issue(self, issue_num: int) -> Optional[int]:
         for chap, registry in self.chapters.items():
@@ -147,20 +147,20 @@ class CoreviewConfig:
 
 def find_repo_dir(start: Optional[Path] = None) -> Path:
     """Walk up from ``start`` (default: cwd) to find a directory with a
-    ``.git`` entry. Used so ``marathon coreview ...`` can be run from
+    ``.git`` entry. Used so ``marathon review ...`` can be run from
     any subdir of the consumer repo."""
     cur = (start or Path.cwd()).resolve()
     for candidate in [cur, *cur.parents]:
         if (candidate / ".git").exists():
             return candidate
     sys.exit(
-        f"no git repo found above {cur}; run `marathon coreview ...` "
+        f"no git repo found above {cur}; run `marathon review ...` "
         "from inside the consumer repo"
     )
 
 
-def load_config(repo_dir: Optional[Path] = None) -> CoreviewConfig:
-    """Load ``<repo>/.marathon/coreview/config.toml``.
+def load_config(repo_dir: Optional[Path] = None) -> ReviewConfig:
+    """Load ``<repo>/.marathon/review/config.toml``.
 
     ``repo_dir`` defaults to the result of :func:`find_repo_dir`.
     """
@@ -169,8 +169,8 @@ def load_config(repo_dir: Optional[Path] = None) -> CoreviewConfig:
     config_path = repo_dir / CONFIG_RELPATH
     if not config_path.is_file():
         sys.exit(
-            f"coreview config not found at {config_path}. Create it — see "
-            "the docstring of `marathon.coreview.config` for the schema."
+            f"review config not found at {config_path}. Create it — see "
+            "the docstring of `marathon.review.config` for the schema."
         )
 
     with config_path.open("rb") as f:
@@ -191,10 +191,10 @@ def load_config(repo_dir: Optional[Path] = None) -> CoreviewConfig:
     )
 
     labels_raw = data.get("labels", {})
-    labels = CoreviewLabels(
-        verified=labels_raw.get("verified", "coreview:verified"),
-        rejected=labels_raw.get("rejected", "coreview:rejected"),
-        inflight=labels_raw.get("inflight", "coreview:in-flight-fix"),
+    labels = ReviewLabels(
+        verified=labels_raw.get("verified", "review:verified"),
+        rejected=labels_raw.get("rejected", "review:rejected"),
+        inflight=labels_raw.get("inflight", "review:in-flight-fix"),
     )
 
     chapters: dict[int, ChapterRegistry] = {}
@@ -211,7 +211,7 @@ def load_config(repo_dir: Optional[Path] = None) -> CoreviewConfig:
             parsed.append((int(row[0]), str(row[1])))
         chapters[chap] = ChapterRegistry(chapter=chap, entries=parsed)
 
-    return CoreviewConfig(
+    return ReviewConfig(
         repo_dir=repo_dir,
         config_path=config_path,
         github_repo=github_repo,

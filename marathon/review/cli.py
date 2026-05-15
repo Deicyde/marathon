@@ -1,7 +1,7 @@
-"""Argparse wiring for ``marathon coreview <subcmd>``.
+"""Argparse wiring for ``marathon review <subcmd>``.
 
 Exposes :func:`add_subparser` for ``marathon/__main__.py`` to call when
-building the top-level argparser, and :func:`coreview_command` as the
+building the top-level argparser, and :func:`review_command` as the
 top-level handler.
 """
 
@@ -9,27 +9,27 @@ from __future__ import annotations
 
 import argparse
 
-from marathon.coreview import review as r
+from marathon.review import review as r
 
 
 def add_subparser(subparsers: argparse._SubParsersAction) -> None:
-    """Register the ``coreview`` subparser tree on ``subparsers``."""
+    """Register the ``review`` subparser tree on ``subparsers``."""
     p_cv = subparsers.add_parser(
-        "coreview",
+        "review",
         help=(
             "Per-declaration final review pass: walk through sub-issues, "
             "record VERIFIED / REJECTED verdicts, queue fixes for the "
-            "auto-refine daemon. Reads <repo>/.marathon/coreview/config.toml "
+            "auto-refine daemon. Reads <repo>/.marathon/review/config.toml "
             "for project-specific settings."
         ),
         description=(
-            "Coreview is the human-in-the-loop mathematical-accuracy check "
+            "Review is the human-in-the-loop mathematical-accuracy check "
             "before proofs land on a skeleton chapter. Each declaration has "
             "a sub-issue; this command lets you list/show/verify/reject them "
             "in textbook order, with rejections queued via referee.md."
         ),
     )
-    cv_sub = p_cv.add_subparsers(dest="coreview_cmd", required=True)
+    cv_sub = p_cv.add_subparsers(dest="review_cmd", required=True)
 
     p_list = cv_sub.add_parser(
         "list",
@@ -121,10 +121,10 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
     p_stop.set_defaults(func=r.cmd_refine_stop)
 
     # The daemon is normally launched indirectly via ``reject`` or
-    # ``refine-start``, but is also exposed here as a top-level coreview
+    # ``refine-start``, but is also exposed here as a top-level review
     # subcommand so the consumer-repo shim at
-    # ``.marathon/coreview/refine_runner.py`` has a stable console entry
-    # point. Same args as ``python -m marathon.coreview.daemon``.
+    # ``.marathon/review/refine_runner.py`` has a stable console entry
+    # point. Same args as ``python -m marathon.review.daemon``.
     p_daemon = cv_sub.add_parser(
         "daemon",
         help=(
@@ -183,14 +183,14 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _run_daemon_subcommand(args) -> None:
-    """Dispatch ``marathon coreview daemon ...`` into the daemon module."""
-    from marathon.coreview.daemon import run_daemon
+    """Dispatch ``marathon review daemon ...`` into the daemon module."""
+    from marathon.review.daemon import run_daemon
     sys_exit = run_daemon(chapter=args.chapter, once=args.once)
     if sys_exit:
         import sys
         sys.exit(sys_exit)
 
 
-def coreview_command(args) -> None:
-    """Top-level handler dispatched from ``marathon coreview <subcmd>``."""
+def review_command(args) -> None:
+    """Top-level handler dispatched from ``marathon review <subcmd>``."""
     args.func(args)

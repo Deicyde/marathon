@@ -7,19 +7,19 @@ because rejection is queued and not yet applied), this module patches
 the corresponding line in the parent issue body.
 
 The mapping between a sub-issue and its line is via the substring
-recorded in :class:`marathon.coreview.config.ChapterRegistry`.
+recorded in :class:`marathon.review.config.ChapterRegistry`.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from marathon.coreview.config import CoreviewConfig
-from marathon.coreview.github import gh, issue_body
+from marathon.review.config import ReviewConfig
+from marathon.review.github import gh, issue_body
 
 
 def update_tracker_emoji(
-    cfg: CoreviewConfig,
+    cfg: ReviewConfig,
     issue_num: int,
     new_emoji: str,
     *,
@@ -68,7 +68,7 @@ def update_tracker_emoji(
         )
 
     new_body = body[:chap_start] + "\n".join(new_lines) + body[chap_end:]
-    tmp_path = tmp_dir / f"coreview-tracker-body-{issue_num}.md"
+    tmp_path = tmp_dir / f"review-tracker-body-{issue_num}.md"
     tmp_path.write_text(new_body)
     gh(
         "issue", "edit", str(cfg.parent_issue),

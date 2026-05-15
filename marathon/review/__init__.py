@@ -1,6 +1,6 @@
-"""Coreview — final mathematical-accuracy check before proofs land.
+"""Review — final mathematical-accuracy check before proofs land.
 
-Coreview is the human-in-the-loop final review pass: each formalized
+Review is the human-in-the-loop final review pass: each formalized
 declaration in a skeleton chapter gets a sub-issue paired with a
 plaintext rendering, mechanical-accuracy notes, and a verification
 checklist. The reviewer compares each entry against its textbook source
@@ -9,31 +9,31 @@ REJECTED. Rejections are queued via referee.md and picked up by the
 auto-refine daemon.
 
 This subpackage absorbs the previously-standalone scripts under
-``<repo>/.marathon/coreview/*.py`` into the Marathon framework so they
+``<repo>/.marathon/review/*.py`` into the Marathon framework so they
 can be reused across projects. Project-specific facts (repo name,
 parent issue, target path template, per-chapter registry) live in a
-``config.toml`` under each repo's ``.marathon/coreview/`` directory.
+``config.toml`` under each repo's ``.marathon/review/`` directory.
 
 Public surface:
 
-* :class:`CoreviewConfig` — loaded config object
-* :func:`load_config` — read ``<repo>/.marathon/coreview/config.toml``
+* :class:`ReviewConfig` — loaded config object
+* :func:`load_config` — read ``<repo>/.marathon/review/config.toml``
 * :func:`gh` — thin wrapper around the ``gh`` CLI
-* :mod:`marathon.coreview.review` — CLI command handlers
-* :mod:`marathon.coreview.daemon` — refine-on-reject single-flight daemon
-* :mod:`marathon.coreview.subissues` — bulk-create and bulk-refresh helpers
+* :mod:`marathon.review.review` — CLI command handlers
+* :mod:`marathon.review.daemon` — refine-on-reject single-flight daemon
+* :mod:`marathon.review.subissues` — bulk-create and bulk-refresh helpers
 """
 
-from marathon.coreview.config import (
-    CoreviewConfig,
+from marathon.review.config import (
+    ReviewConfig,
     ChapterRegistry,
     load_config,
     find_repo_dir,
 )
-from marathon.coreview.github import gh
+from marathon.review.github import gh
 
 __all__ = [
-    "CoreviewConfig",
+    "ReviewConfig",
     "ChapterRegistry",
     "load_config",
     "find_repo_dir",

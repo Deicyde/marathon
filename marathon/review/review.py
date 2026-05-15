@@ -1,12 +1,12 @@
-"""Coreview review-loop command handlers.
+"""Review review-loop command handlers.
 
 These are the per-sub-issue review commands: ``list`` / ``next`` /
 ``show`` / ``verify`` / ``reject`` / ``refine-status`` / ``refine-start``
 / ``refine-stop``. Each takes a parsed ``argparse`` namespace and
-operates against a ``CoreviewConfig`` loaded from the current repo.
+operates against a ``ReviewConfig`` loaded from the current repo.
 
-The command wiring lives in ``marathon.coreview.cli`` (which is
-invoked by ``marathon coreview ...``); this module holds the logic so
+The command wiring lives in ``marathon.review.cli`` (which is
+invoked by ``marathon review ...``); this module holds the logic so
 it can also be tested / scripted directly.
 """
 
@@ -20,16 +20,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from marathon.coreview.config import CoreviewConfig, load_config
-from marathon.coreview.github import gh, issue_labels, issue_title
-from marathon.coreview.referee_queue import append_rejection_bullet
-from marathon.coreview.tracker import update_tracker_emoji
+from marathon.review.config import ReviewConfig, load_config
+from marathon.review.github import gh, issue_labels, issue_title
+from marathon.review.referee_queue import append_rejection_bullet
+from marathon.review.tracker import update_tracker_emoji
 
 
 # --- Status reporting --------------------------------------------------------
 
 
-def get_issue_status(cfg: CoreviewConfig, num: int) -> Optional[str]:
+def get_issue_status(cfg: ReviewConfig, num: int) -> Optional[str]:
     """Returns 'verified', 'rejected', 'inflight', or None (unreviewed)."""
     labels = issue_labels(num, cfg.github_repo)
     if labels is None:
@@ -50,7 +50,7 @@ def cmd_list(args) -> None:
     cfg = load_config()
     registry = cfg.chapter_registry(args.chapter)
     print(
-        f"Sub-issues of #{cfg.parent_issue} in coreview order "
+        f"Sub-issues of #{cfg.parent_issue} in review order "
         f"(chapter {args.chapter}):\n"
     )
     print(f"  {'idx':>3}  {'issue':>6}  {'status':<10}  title")
@@ -74,7 +74,7 @@ def cmd_next(args) -> None:
     print(f"All chapter {args.chapter} sub-issues are reviewed. 🎉")
 
 
-def _show_issue(cfg: CoreviewConfig, num: int) -> None:
+def _show_issue(cfg: ReviewConfig, num: int) -> None:
     cp = gh("issue", "view", str(num), "--repo", cfg.github_repo)
     print(cp.stdout)
 
@@ -183,17 +183,17 @@ def _process_alive(pid: int) -> bool:
         return False
 
 
-def _runner_lock_path(cfg: CoreviewConfig, chapter: int) -> Path:
+def _runner_lock_path(cfg: ReviewConfig, chapter: int) -> Path:
     return cfg.runner_lock_dir / f"refine-c{chapter}.lock"
 
 
-def _launch_or_queue_refine(cfg: CoreviewConfig, chapter: int) -> None:
+def _launch_or_queue_refine(cfg: ReviewConfig, chapter: int) -> None:
     """Single-flight launch of the auto-refine daemon per chapter.
 
     If a daemon is already alive for this chapter, just print a note
     that the rejection is queued (the daemon picks it up via referee.md
     on its next loop iteration). Otherwise spawn ``python -m
-    marathon.coreview.daemon --chapter N`` in a detached subprocess.
+    marathon.review.daemon --chapter N`` in a detached subprocess.
     """
     lock = _runner_lock_path(cfg, chapter)
     if lock.is_file():
@@ -218,7 +218,7 @@ def _launch_or_queue_refine(cfg: CoreviewConfig, chapter: int) -> None:
     )
     log_fh = log_path.open("w")
     proc = subprocess.Popen(
-        [sys.executable, "-m", "marathon.coreview.daemon", "--chapter", str(chapter)],
+        [sys.executable, "-m", "marathon.review.daemon", "--chapter", str(chapter)],
         stdout=log_fh,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -291,8 +291,8 @@ def cmd_refine_start(args) -> None:
 
 
 def cmd_subissues_create(args) -> None:
-    """``marathon coreview subissues create <drafts.md> [--skip N,M]``."""
-    from marathon.coreview.subissues import create_subissues_from_drafts
+    """``marathon review subissues create <drafts.md> [--skip N,M]``."""
+    from marathon.review.subissues import create_subissues_from_drafts
     cfg = load_config()
     drafts_path = Path(args.drafts_file)
     if not drafts_path.is_file():
@@ -302,8 +302,8 @@ def cmd_subissues_create(args) -> None:
 
 
 def cmd_subissues_refresh(args) -> None:
-    """``marathon coreview subissues refresh <drafts.md> [--only N,M]``."""
-    from marathon.coreview.subissues import refresh_subissue_bodies
+    """``marathon review subissues refresh <drafts.md> [--only N,M]``."""
+    from marathon.review.subissues import refresh_subissue_bodies
     cfg = load_config()
     drafts_path = Path(args.drafts_file)
     if not drafts_path.is_file():
