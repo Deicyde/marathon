@@ -55,8 +55,14 @@ from marathon.aristotle_runtime import (
 # Same model as the iteration reviewer and auto-rater.
 CLAUDE_MODEL = "claude-opus-4-7"
 
-# Steering-log filename in the workdir.
+# Steering-log filename in the workdir (one JSONL line per Hermes call).
 STEERING_LOG_FILENAME = "marathon-steering-log.jsonl"
+
+# Persistent-memory filename in the workdir. Append-only markdown; Hermes
+# writes one bullet per call (when its ``memory_note`` is non-empty) and
+# every subsequent Hermes call reads the tail. Survives across iterations
+# of the same refine target (since the workdir is shared).
+MEMORY_FILENAME = "hermes-memory.md"
 
 # How often the watcher polls for new events (seconds). Distinct from the
 # refine status-poll interval; the event watcher polls faster because edits
@@ -64,12 +70,23 @@ STEERING_LOG_FILENAME = "marathon-steering-log.jsonl"
 EVENT_POLL_INTERVAL = 5
 
 # How many recent events to feed Hermes for context, on top of the
-# specific edit it's judging.
-RECENT_EVENTS_CONTEXT = 6
+# specific edit it's judging. Was 6 originally; bumped so a longer edit
+# burst doesn't push earlier events out of the window mid-task.
+RECENT_EVENTS_CONTEXT = 20
 
 # How many past steering decisions Hermes sees, so it doesn't re-steer on
-# the same issue. We pass titles + reasons, not full prompts.
-STEERING_HISTORY_CONTEXT = 8
+# the same issue. We pass verdicts + reasons, not full prompts. Was 8.
+STEERING_HISTORY_CONTEXT = 30
+
+# Max chars of ``hermes-memory.md`` tail to splice into the prompt. The
+# file itself can grow unbounded — only this trailing window is part of
+# context on each call.
+MEMORY_TAIL_CHARS = 4_000
+
+# Soft cap on a single memory_note's length when persisting to disk; runs
+# protect against a Hermes call returning a 10 KB "note" that blows up
+# the file.
+MAX_MEMORY_NOTE_CHARS = 400
 
 
 @dataclass
@@ -79,6 +96,10 @@ class SteeringDecision:
     steer: bool
     reason: str
     prompt: Optional[str] = None
+    # Optional one-line "save this for future Hermes calls" note. Empty /
+    # None means nothing worth remembering — most no-op skips populate
+    # this with None.
+    memory_note: Optional[str] = None
     parse_error: Optional[str] = None
     raw_response: Optional[str] = None
 
@@ -173,7 +194,20 @@ def _parse_decision(raw: str) -> SteeringDecision:
         prompt = str(prompt).strip()
         if not prompt:
             prompt = None
-    return SteeringDecision(steer=steer, reason=reason, prompt=prompt, raw_response=raw)
+    memory_note = data.get("memory_note")
+    if memory_note is not None:
+        memory_note = str(memory_note).strip()
+        if not memory_note:
+            memory_note = None
+        elif len(memory_note) > MAX_MEMORY_NOTE_CHARS:
+            memory_note = memory_note[:MAX_MEMORY_NOTE_CHARS] + " …[trimmed]"
+    return SteeringDecision(
+        steer=steer,
+        reason=reason,
+        prompt=prompt,
+        memory_note=memory_note,
+        raw_response=raw,
+    )
 
 
 class HermesWatcher:
@@ -206,6 +240,12 @@ class HermesWatcher:
         self.poll_interval = poll_interval
 
         self.steering_log_path = workdir / STEERING_LOG_FILENAME
+        # ``hermes-memory.md`` survives across iterations of the same
+        # refine target — the workdir is shared. Today's section header
+        # disambiguates iteration / attempt so older notes don't fool
+        # future Hermes calls about what context they belong to.
+        self.memory_log_path = workdir / MEMORY_FILENAME
+        self._memory_section_written = False
         self.seen_event_ids: set[str] = set()
         self.recent_events: list[Event] = []
         self.steering_history: list[SteeringDecision] = []
@@ -367,6 +407,10 @@ class HermesWatcher:
             except OSError:
                 referee_md = "(could not read referee.md)"
 
+        # Persistent memory tail: notes from prior Hermes calls in this
+        # workdir, possibly including prior iterations.
+        memory_block = self._read_memory_tail()
+
         # Task description (the original prompt that kicked off this task)
         # gives Hermes the goal so it knows what "on-course" means.
         task_desc = _truncate(task.description, 1_500) if task.description else "(unknown)"
@@ -382,6 +426,8 @@ class HermesWatcher:
             f"## Target folder\n\n`{target_rel}/`\n\n"
             f"## Skeleton mode\n\n{self.skeleton_mode}\n\n"
             f"## Referee notes (project-level reviewer guidance)\n\n{referee_md}\n\n"
+            f"## Persistent memory (your own notes from prior Hermes calls in "
+            f"this refine target)\n\n{memory_block}\n\n"
             f"## Recent events (most recent last)\n\n{ctx_block}\n\n"
             f"## Steering decisions so far this attempt\n\n{history_block}\n\n"
             f"## THE EDIT TO JUDGE\n\n{edit_md}\n\n"
@@ -435,6 +481,7 @@ class HermesWatcher:
             "steer": decision.steer,
             "reason": decision.reason,
             "prompt": decision.prompt,
+            "memory_note": decision.memory_note,
             "sent": sent,
             "new_task_id_after_ask": new_task_id,
             "parse_error": decision.parse_error,
@@ -445,6 +492,71 @@ class HermesWatcher:
         except OSError as e:
             # Non-fatal — log to stdout and keep going.
             print(f"  hermes-watcher: WARN could not append steering log: {e}")
+
+        if decision.memory_note:
+            self._append_memory_line(event, decision)
+
+    def _read_memory_tail(self) -> str:
+        """Return the last ``MEMORY_TAIL_CHARS`` of ``hermes-memory.md``,
+        or a placeholder if the file is empty / missing.
+
+        We re-read on every call (cheap), so notes appended mid-attempt
+        — including by *this* watcher — are visible to subsequent calls.
+        """
+        if not self.memory_log_path.is_file():
+            return "(no prior Hermes memory in this workdir)"
+        try:
+            text = self.memory_log_path.read_text()
+        except OSError:
+            return "(could not read hermes-memory.md)"
+        if not text.strip():
+            return "(empty)"
+        if len(text) <= MEMORY_TAIL_CHARS:
+            return text
+        tail = text[-MEMORY_TAIL_CHARS:]
+        # Try to start at the next bullet / header so we don't slice
+        # mid-line.
+        idx = tail.find("\n")
+        if 0 < idx < MEMORY_TAIL_CHARS - 100:
+            tail = tail[idx + 1:]
+        return "... (earlier memory trimmed)\n" + tail
+
+    def _ensure_memory_section_header(self) -> None:
+        """Lazily write the section header for this attempt the first
+        time we append a memory line.
+
+        Lazy because most attempts won't produce any memory_note at all
+        — we don't want empty section headers cluttering the file."""
+        if self._memory_section_written:
+            return
+        ts = datetime.now().astimezone().isoformat(timespec="seconds")
+        header = (
+            f"\n## Iteration {self.iteration_idx} — {ts}\n"
+            f"(target: `{self._target_relpath()}/`, "
+            f"skeleton_mode={self.skeleton_mode})\n\n"
+        )
+        try:
+            with self.memory_log_path.open("a") as f:
+                f.write(header)
+            self._memory_section_written = True
+        except OSError as e:
+            print(f"  hermes-watcher: WARN could not write memory header: {e}")
+
+    def _append_memory_line(self, event: Event, decision: SteeringDecision) -> None:
+        """Append one bullet to ``hermes-memory.md`` recording the
+        verdict + Hermes' note. Called only when memory_note is non-empty."""
+        if not decision.memory_note:
+            return
+        self._ensure_memory_section_header()
+        ts = datetime.now().astimezone().strftime("%H:%M:%S")
+        verdict = "STEER" if decision.steer else "skip"
+        file_part = f" `{event.file_path}`" if event.file_path else ""
+        line = f"- {ts} {verdict}{file_part}: {decision.memory_note}\n"
+        try:
+            with self.memory_log_path.open("a") as f:
+                f.write(line)
+        except OSError as e:
+            print(f"  hermes-watcher: WARN could not append memory line: {e}")
 
     def _target_relpath(self) -> str:
         try:

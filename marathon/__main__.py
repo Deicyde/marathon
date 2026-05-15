@@ -240,7 +240,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "and, on every EDITING_FILE event, asks Claude whether Aristotle "
             "is going off-course. If so, it sends a steering prompt via "
             "project.ask(...). Each decision is logged to "
-            "<workdir>/marathon-steering-log.jsonl. Default: off."
+            "<workdir>/marathon-steering-log.jsonl; Hermes' own running "
+            "notes accumulate in <workdir>/hermes-memory.md, which each "
+            "subsequent Hermes call reads so it doesn't re-flag resolved "
+            "issues or forget what it asked Aristotle for. Default: off."
         ),
     )
     p_refine.add_argument(

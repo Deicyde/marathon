@@ -38,12 +38,13 @@ right now**. Concretely:
    uses an API or pattern those notes call out as forbidden — e.g. a
    convention the team decided against, a deprecated lemma name, a
    typeclass assumption the team agreed to drop — steer.
-4. **A clear, named API mistake.** E.g. using `Real.exp` when the
-   project's convention is `Real.exp`; using `Nat.lt_irrefl` when the
-   target uses `Nat.lt_asymm`; or writing a wedge-product equation
-   pointwise via `Fin.cast` when the codebase already has
-   `domDomCongr`. The bar: a Mathlib-fluent reviewer would say "no,
-   that's the wrong API for this codebase" within one breath.
+4. **A clear, named API mistake.** E.g. writing a wedge-product
+   equation pointwise via `Fin.cast` when the codebase already has
+   `ContinuousAlternatingMap.domDomCongr`; using a `Set`-level
+   definition when the codebase uses the `Submodule`-level one; using
+   a `[CompleteSpace 𝕜]` typeclass that referee.md explicitly says to
+   drop. The bar: a Mathlib-fluent reviewer would say "no, that's the
+   wrong API for this codebase" within one breath.
 
 ## When NOT to steer (the bar is very high)
 
@@ -59,29 +60,69 @@ right now**. Concretely:
   body is still `sorry` — that's normal. Don't pre-emptively complain
   about an in-progress sequence.
 * **Repeated steering on the same issue.** If you already steered on
-  this issue in this task (check the steering-log tail below), do not
+  this issue (check the **Persistent memory** section *and* the
+  **Steering decisions so far this attempt** section below), do not
   re-steer on the same point — Aristotle has the prompt; double-prompting
-  is noise.
+  is noise. Persistent memory carries notes across attempts and
+  iterations of the same refine, so a steer from an earlier iteration
+  still counts.
 
 ## Output format
 
 Respond with a SINGLE JSON object on one line, no markdown, no prose
-before or after:
+before or after. Three fields:
+
+* `steer` — boolean.
+* `reason` — one sentence; what you saw, and (if steer=false) why it
+  was fine.
+* `prompt` — the message to send Aristotle, present only when
+  steer=true; addressed to it directly ("Please <do X>...").
+* `memory_note` — optional one-line note for FUTURE Hermes calls in
+  this same refine workdir. The next Hermes call (on the next edit
+  event, or in the next iteration) will see your `memory_note` under
+  a "Persistent memory" section. Use it when the call carries
+  information worth carrying forward; leave it as an empty string
+  (or omit it) when nothing is worth saving.
+
+Examples:
 
 ```
-{"steer": false, "reason": "<one sentence why this edit looked fine>"}
+{"steer": false, "reason": "in-target file, body is `sorry`, fine", "memory_note": ""}
 ```
 
-or:
+```
+{"steer": true, "reason": "wrote a proof body in skeleton mode", "prompt": "Please revert the proof in `WedgeProduct.lean:Prop_14_11_a` and leave the body as `by sorry`. The skeleton stage forbids proofs.", "memory_note": "asked Aristotle to keep Prop_14_11_a body as `sorry` (skeleton mode)"}
+```
 
 ```
-{"steer": true, "reason": "<one sentence why this needs steering>", "prompt": "<the message to send Aristotle, addressed to it directly: 'Please <do X>...'>"}
+{"steer": false, "reason": "Aristotle's edit complies with my earlier steer about domDomCongr", "memory_note": "Aristotle now uses domDomCongr in Prop_14_11_b (the fix I asked for earlier)"}
 ```
 
 The `prompt` field, when present, is sent verbatim to Aristotle. Keep
 it under 100 words. Be direct, specific, and actionable. Address
 Aristotle in the second person. Cite the exact file and pattern when
 helpful.
+
+### When to populate memory_note
+
+GOOD uses (write a memory_note):
+
+* You steered: record what you asked for and why. The next call sees
+  "I steered X to do Y" and won't re-steer if Aristotle's next edit
+  complies.
+* You DIDN'T steer but you noticed Aristotle complying with one of
+  your earlier steers — record the compliance signal so future calls
+  know that issue is resolved.
+* You noticed a pattern across multiple edits (e.g. "Aristotle is
+  consistently using `Fin.cast` in this iteration") — record it
+  even when you don't steer.
+
+BAD uses (leave memory_note empty):
+
+* Echoing the rubric.
+* Restating the obvious ("this was an edit to a Lean file").
+* Long explanations — keep it under 200 chars, terse, like a git
+  commit summary.
 
 ## Steering prompt style
 
