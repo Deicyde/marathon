@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-REFEREE_FILENAME = "referee.md"
+REFEREE_FILENAME = ".marathon/referee.md"
 REFEREE_PROPOSED_SUFFIX = ".proposed"
 REFEREE_MODEL = "claude-opus-4-7"
 

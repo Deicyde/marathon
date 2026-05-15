@@ -653,7 +653,7 @@ async def refine_command(args) -> None:
         if not referee_path.is_file():
             sys.exit(f"--referee file not found: {referee_path}")
     else:
-        candidate = repo_dir / "referee.md"
+        candidate = repo_dir / ".marathon" / "referee.md"
         if candidate.is_file():
             referee_path = candidate.resolve()
 
@@ -813,7 +813,7 @@ async def refine_command(args) -> None:
             ref_path = (
                 referee_path
                 if referee_path is not None
-                else (repo_dir / "referee.md")
+                else (repo_dir / ".marathon" / "referee.md")
             )
             print(
                 f"\n  auto-referee: triggered after iteration "

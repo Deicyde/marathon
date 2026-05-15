@@ -175,7 +175,7 @@ uv run python -m marathon refine <target-lean-folder> \
 - **`--referee`** (optional) — a markdown file with project-specific
   reviewer notes that Claude layers on top of its rubric (e.g., recurring
   failure modes, project-specific priorities, or course corrections from
-  an outside human/AI reviewer). Auto-detected at `<repo-dir>/referee.md`
+  an outside human/AI reviewer). Auto-detected at `<repo-dir>/.marathon/referee.md`
   if the flag is omitted. **Aristotle is never given its contents** —
   only Claude sees it. Re-read each iteration, so edits land on the next
   Claude call.
@@ -249,7 +249,7 @@ uv run python -m marathon referee \
 ```
 
 - **`--repo-dir`** — Lean repo containing `referee.md` (must be a git repo).
-- **`--referee FILE`** (optional) — defaults to `<repo-dir>/referee.md`.
+- **`--referee FILE`** (optional) — defaults to `<repo-dir>/.marathon/referee.md`.
 - **`--workdirs-parent DIR`** (optional) — parent directory containing
   per-chapter refine workdirs (subdirs with `marathon-refine-state.json`).
   Without this flag the agent only sees the repo state; with it, the agent

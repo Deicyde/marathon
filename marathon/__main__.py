@@ -132,7 +132,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Path to a markdown file with project-specific reviewer notes "
             "that Claude should layer on top of its rubric. If this flag "
-            "is omitted, Marathon auto-detects <repo-dir>/referee.md. The "
+            "is omitted, Marathon auto-detects <repo-dir>/.marathon/referee.md. The "
             "file is given only to Claude (the reviewer); it is excluded "
             "from the Aristotle bundle."
         ),
@@ -272,7 +272,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help=(
             "Path to the referee.md file to update. Defaults to "
-            "<repo-dir>/referee.md."
+            "<repo-dir>/.marathon/referee.md."
         ),
     )
     p_ref.add_argument(
