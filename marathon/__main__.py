@@ -303,6 +303,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "to inspect the change before committing manually."
         ),
     )
+    p_ref.add_argument(
+        "--push",
+        action="store_true",
+        help=(
+            "After auto-committing, also `git push` the current branch. "
+            "Default: off. Ignored under --review or --no-commit."
+        ),
+    )
 
     return parser
 

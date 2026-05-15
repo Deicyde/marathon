@@ -47,6 +47,8 @@ class RefereeResult:
     commit_sha: Optional[str] = None
     diff_summary: Optional[str] = None  # short stats: lines +/-
     machine_tail_len: Optional[int] = None
+    pushed: Optional[bool] = None  # None = not attempted; True/False = outcome
+    push_message: Optional[str] = None
     skipped_reason: Optional[str] = None  # if we declined to run
     error: Optional[str] = None  # if Claude failed / output unparseable
 
@@ -280,6 +282,7 @@ def update_referee(
     referee_path: Path,
     workdirs_parent: Optional[Path] = None,
     auto_commit: bool = True,
+    auto_push: bool = False,
     write_to_proposed_only: bool = False,
 ) -> RefereeResult:
     """Run one referee agent pass to refresh the machine-managed tail of
@@ -376,10 +379,19 @@ def update_referee(
     if auto_commit and not write_to_proposed_only:
         commit_sha = _commit_referee(repo_dir, output_path)
 
+    # 12. Optional push (only when we actually landed a commit).
+    pushed: Optional[bool] = None
+    push_message: Optional[str] = None
+    if auto_push and commit_sha is not None:
+        from marathon.post_pipeline import run_git_push
+        pushed, push_message = run_git_push(repo_dir)
+
     return RefereeResult(
         ok=True,
         output_path=output_path,
         commit_sha=commit_sha,
+        pushed=pushed,
+        push_message=push_message,
         diff_summary=diff_summary,
         machine_tail_len=len(new_machine_tail.splitlines()),
     )
@@ -462,22 +474,27 @@ def referee_command(args) -> None:
             sys.exit(f"--workdirs-parent not a directory: {workdirs_parent}")
 
     auto_commit = not (args.review or args.no_commit)
+    auto_push = bool(args.push) and auto_commit
+
+    mode_str = (
+        "REVIEW (write to .proposed only)" if args.review
+        else ("WRITE (no commit)" if args.no_commit
+              else ("WRITE + auto-commit + auto-push" if auto_push
+                    else "WRITE + auto-commit"))
+    )
 
     print(f"repo dir:           {repo_dir}")
     print(f"referee path:       {referee_path}")
     if workdirs_parent is not None:
         print(f"workdirs parent:    {workdirs_parent}")
-    print(
-        f"mode:               "
-        + ("REVIEW (write to .proposed only)" if args.review
-           else ("WRITE (no commit)" if args.no_commit else "WRITE + auto-commit"))
-    )
+    print(f"mode:               {mode_str}")
 
     result = update_referee(
         repo_dir=repo_dir,
         referee_path=referee_path,
         workdirs_parent=workdirs_parent,
         auto_commit=auto_commit,
+        auto_push=auto_push,
         write_to_proposed_only=args.review,
     )
 
@@ -495,3 +512,7 @@ def referee_command(args) -> None:
         print(f"  new machine tail: {result.machine_tail_len} lines")
     if result.commit_sha:
         print(f"  commit: {result.commit_sha}")
+    if result.pushed is True:
+        print(f"  push: ok ({result.push_message})")
+    elif result.pushed is False:
+        print(f"  push: failed — {result.push_message}")

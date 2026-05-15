@@ -825,6 +825,10 @@ async def refine_command(args) -> None:
                 referee_path=ref_path,
                 workdirs_parent=workdir.parent if workdir.parent.is_dir() else None,
                 auto_commit=True,
+                # Mirror --auto-push: when the user has it on for chapter
+                # commits, push the auto-referee commits too so the next
+                # chapter's bundle sees the refreshed referee.md remotely.
+                auto_push=bool(args.auto_push),
                 write_to_proposed_only=False,
             )
             if ref_result.error:
@@ -837,6 +841,10 @@ async def refine_command(args) -> None:
                     tail_info += f"  ({ref_result.diff_summary})"
                 if ref_result.commit_sha:
                     tail_info += f"  commit={ref_result.commit_sha}"
+                if ref_result.pushed is True:
+                    tail_info += "  push=ok"
+                elif ref_result.pushed is False:
+                    tail_info += f"  push=FAIL({ref_result.push_message})"
                 print(tail_info)
 
     print(

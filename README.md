@@ -245,7 +245,7 @@ uv run python -m marathon referee \
     --repo-dir <lean-repo> \
     [--referee <path-to-referee.md>] \
     [--workdirs-parent <dir-with-chapter-workdirs>] \
-    [--review] [--no-commit]
+    [--review] [--no-commit] [--push]
 ```
 
 - **`--repo-dir`** — Lean repo containing `referee.md` (must be a git repo).
@@ -258,6 +258,8 @@ uv run python -m marathon referee \
 - **`--review`** — write to `referee.md.proposed` instead of overwriting,
   for manual diff/merge.
 - **`--no-commit`** — overwrite but skip the auto-commit.
+- **`--push`** — after auto-committing, also `git push` the current branch.
+  Default off. Ignored under `--review` or `--no-commit`.
 
 The agent is instructed to be **conservative** (keep existing items
 unless clearly resolved by recent commits), **concrete** (each item
@@ -302,6 +304,11 @@ With `--auto-referee-every 3` and `--max-iterations 3`, the referee
 runs once at the end of each chapter, picking up that chapter's
 ratings before the next chapter starts. The next chapter's Hermes
 re-reads `referee.md` at iteration time and gets the fresh priorities.
+
+The auto-referee respects `--auto-push`: when the user passes it for
+per-iteration chapter commits, the same flag also pushes the referee's
+auto-commit, so subsequent chapters' Aristotle bundles see the refreshed
+`referee.md` on origin.
 
 ## How Claude is configured
 
