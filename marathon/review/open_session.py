@@ -244,8 +244,12 @@ def build_open_prompt(
 
     apply_section = (
         "## On human go-ahead\n\n"
-        f"Verify: `marathon review verify {issue_num} --comment '…'` "
-        "(add `--close` only if no remaining sorries).\n"
+        f"Verify: `marathon review verify {issue_num} --comment '…'`. "
+        "**Never pass `--close`** unless the human explicitly tells you to "
+        "close the issue. Sorry-free does not mean nothing more can be "
+        "improved (naming, generality, Mathlib-PR-readiness, downstream "
+        "consumer ergonomics); the issue stays OPEN as a tracking handle "
+        "until the human says otherwise.\n"
         f"Reject: write `/tmp/issue{issue_num}-reject-notes.md` first, "
         f"then `marathon review reject {issue_num} --notes "
         f"/tmp/issue{issue_num}-reject-notes.md --comment '…'`.\n\n"
