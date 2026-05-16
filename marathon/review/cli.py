@@ -82,6 +82,63 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
     )
     p_open.set_defaults(func=r.cmd_open)
 
+    p_bootstrap = cv_sub.add_parser(
+        "bootstrap-chapter",
+        help=(
+            "One-time setup pass: open a chapter-bootstrap coreviewer "
+            "session in VS Code that drafts a `Chapter{N}.md` drafts "
+            "file from the chapter's Lean code + a user-supplied "
+            "informal-statements file, proposes the full sub-issue "
+            "list, and waits for human go-ahead before creating any "
+            "GitHub issues."
+        ),
+    )
+    p_bootstrap.add_argument("--chapter", type=int, required=True)
+    p_bootstrap.add_argument(
+        "--informal-statements",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Path to a markdown file holding the human's informal "
+            "statements, one section per named textbook result. If "
+            "omitted, the coreviewer will LLM-render statements with "
+            "a `⚠️ verification pending` marker on each."
+        ),
+    )
+    p_bootstrap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Write the briefing file to .marathon/review/sessions/ and "
+            "print the resulting URI without invoking the platform's "
+            "URL opener. Useful for inspecting the briefing before "
+            "launching."
+        ),
+    )
+    p_bootstrap.set_defaults(func=r.cmd_bootstrap_chapter)
+
+    p_audit = cv_sub.add_parser(
+        "audit-chapter",
+        help=(
+            "Maintenance pass: open a chapter-audit coreviewer session "
+            "in VS Code that cross-references every existing sub-issue "
+            "body against current code, identifies drift / coverage "
+            "gaps / readability passes, proposes a unified edit set, "
+            "and waits for human go-ahead."
+        ),
+    )
+    p_audit.add_argument("--chapter", type=int, required=True)
+    p_audit.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Write the briefing file to .marathon/review/sessions/ and "
+            "print the resulting URI without invoking the platform's "
+            "URL opener."
+        ),
+    )
+    p_audit.set_defaults(func=r.cmd_audit_chapter)
+
     p_v = cv_sub.add_parser(
         "verify",
         help=(

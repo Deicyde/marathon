@@ -132,6 +132,84 @@ def cmd_open(args) -> None:
             print(f"    {m}")
 
 
+# --- bootstrap-chapter / audit-chapter (chapter-scale sessions) ---------------
+
+
+def cmd_bootstrap_chapter(args) -> None:
+    """``marathon review bootstrap-chapter --chapter N [--informal-statements F]``
+
+    One-time setup pass: opens a chapter-bootstrap coreviewer session in
+    VS Code that drafts a `Chapter{N}.md` drafts file by pairing every
+    Lean declaration in the chapter folder with sections of the
+    user-supplied informal-statements file (or LLM-rendered statements
+    if none is provided). The agent proposes the full sub-issue list
+    and waits for human go-ahead before creating any GitHub issues."""
+    from marathon.review.chapter_sessions import open_chapter_session
+    cfg = load_config()
+    informal: Optional[Path] = None
+    if args.informal_statements:
+        informal = Path(args.informal_statements)
+        if not informal.is_file():
+            sys.exit(f"informal-statements file not found: {informal}")
+    try:
+        result = open_chapter_session(
+            cfg, args.chapter, "bootstrap",
+            informal_statements_path=informal,
+            dry_run=args.dry_run,
+        )
+    except RuntimeError as e:
+        sys.exit(str(e))
+
+    if args.dry_run:
+        print(f"# dry-run for `marathon review bootstrap-chapter --chapter {args.chapter}`")
+        print(f"# briefing written to: {result.briefing_path}")
+        print(f"# pointer prompt_chars = {result.prompt_chars} / 5000")
+        print()
+        print(result.uri)
+        return
+
+    print(f"opened chapter-bootstrap session for chapter {args.chapter}")
+    print(f"  briefing: {result.briefing_path}")
+    print(f"  pointer prompt_chars: {result.prompt_chars} / 5000")
+    if informal is None:
+        print(
+            "  note: no --informal-statements file was provided; the "
+            "coreviewer will LLM-render Informal Statements with the "
+            "`⚠️ verification pending` marker. Pass --informal-statements "
+            "<file> next time to skip that."
+        )
+
+
+def cmd_audit_chapter(args) -> None:
+    """``marathon review audit-chapter --chapter N``
+
+    Maintenance pass: opens a chapter-audit coreviewer session that
+    cross-references every existing sub-issue body against current code,
+    identifies drift / coverage gaps / readability passes, proposes a
+    unified edit set, and waits for human go-ahead."""
+    from marathon.review.chapter_sessions import open_chapter_session
+    cfg = load_config()
+    try:
+        result = open_chapter_session(
+            cfg, args.chapter, "audit",
+            dry_run=args.dry_run,
+        )
+    except RuntimeError as e:
+        sys.exit(str(e))
+
+    if args.dry_run:
+        print(f"# dry-run for `marathon review audit-chapter --chapter {args.chapter}`")
+        print(f"# briefing written to: {result.briefing_path}")
+        print(f"# pointer prompt_chars = {result.prompt_chars} / 5000")
+        print()
+        print(result.uri)
+        return
+
+    print(f"opened chapter-audit session for chapter {args.chapter}")
+    print(f"  briefing: {result.briefing_path}")
+    print(f"  pointer prompt_chars: {result.prompt_chars} / 5000")
+
+
 # --- verify ------------------------------------------------------------------
 
 
