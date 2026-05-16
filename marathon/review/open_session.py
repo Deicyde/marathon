@@ -174,8 +174,10 @@ def build_open_prompt(
     chapter = cfg.chapter_of_issue(issue_num)
     repo = cfg.github_repo
 
+    issue_url = f"https://github.com/{repo}/issues/{issue_num}"
+
     role = (
-        f"# You are the coreviewer — marathon review session, issue #{issue_num}\n\n"
+        f"# You are the coreviewer — marathon review session, [#{issue_num}]({issue_url})\n\n"
         f"**Title**: {title}  •  **Repo**: {repo}\n"
         f"**Status**: {status_line}"
         + (f"  •  **Chapter**: {chapter}" if chapter is not None else "")
@@ -189,7 +191,9 @@ def build_open_prompt(
     workflow = (
         "## Workflow\n\n"
         f"1. **Read the issue.** `gh issue view {issue_num} --repo {repo} "
-        "--comments` — body, labels, recent comments.\n"
+        "--comments` — body, labels, recent comments. Include the issue "
+        f"URL [#{issue_num}]({issue_url}) verbatim in your first "
+        "message so the human can click straight through.\n"
         "2. **Inspect the cited code.** Match the issue's claimed "
         "signatures / line ranges against the actual file. Focus on: "
         "statement correctness, hypothesis tightness, naming, "
@@ -223,9 +227,15 @@ def build_open_prompt(
 
     output_format = (
         "## Output format (concise — humans move fast, read slowly)\n\n"
-        "* **TL;DR** (one line): proposed verdict + single load-bearing reason.\n"
+        f"* **TL;DR** (one line): proposed verdict + single load-bearing "
+        f"reason. Begin with the issue link [#{issue_num}]({issue_url}) "
+        f"so the human can jump straight to GitHub.\n"
         "* **Findings** (≤5 bullets): each cites a specific declaration "
-        "/ line range. No stylistic nitpicks unless load-bearing.\n"
+        "with a clickable VS Code link in the form "
+        "`[file.lean:NN-MM](path/to/file.lean#LNN-LMM)` — VS Code "
+        "renders these as direct jumps to the line range. Always use "
+        "markdown link syntax, never bare backticks for file refs. "
+        "No stylistic nitpicks unless load-bearing.\n"
         "* **Recommended action** (one line): exact marathon CLI command "
         "you'd run, with proposed `--comment` text.\n"
         "* **Then stop.** Don't run the CLI yet. Don't iterate "
