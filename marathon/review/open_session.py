@@ -46,7 +46,7 @@ from typing import Optional
 from urllib.parse import quote
 
 from marathon.review.config import ReviewConfig
-from marathon.review.github import gh, issue_labels, issue_title
+from marathon.review.github import issue_labels, issue_title
 from marathon.review.state import load_state, pending_rejections
 
 
@@ -57,7 +57,6 @@ PROMPT_CHAR_BUDGET = 5_000
 
 # Per-section soft budgets. Sum is ≤ PROMPT_CHAR_BUDGET with margin.
 _BUDGET_HEADER = 700
-_BUDGET_BODY_EXCERPT = 600
 _BUDGET_QUEUE = 500
 _BUDGET_FILES = 300
 
@@ -96,20 +95,6 @@ def _truncate(text: str, budget: int, marker: str = "…[trimmed]…") -> tuple[
         return text, False
     head_budget = max(budget - len(marker), 0)
     return text[:head_budget] + marker, True
-
-
-def _fetch_issue_body(num: int, repo: str) -> str:
-    """Best-effort fetch of the issue body. Returns '' on failure."""
-    cp = gh(
-        "issue", "view", str(num),
-        "--repo", repo,
-        "--json", "body",
-        "--jq", ".body",
-        check=False,
-    )
-    if cp.returncode != 0:
-        return ""
-    return cp.stdout.strip()
 
 
 def _current_status(cfg: ReviewConfig, num: int) -> str:
@@ -194,13 +179,20 @@ def build_open_prompt(
         "--comments` — body, labels, recent comments. Include the issue "
         f"URL [#{issue_num}]({issue_url}) verbatim in your first "
         "message so the human can click straight through.\n"
-        "2. **Inspect the cited code.** Match the issue's claimed "
-        "signatures / line ranges against the actual file. Focus on: "
-        "statement correctness, hypothesis tightness, naming, "
-        "downstream consumers. Skeleton-mode `sorry` bodies are "
-        "expected (don't reject for sorries alone).\n"
-        "3. **Recommend a verdict.** Concise, verdict-forward bullets "
-        "with line citations. Then *stop and wait* for the human.\n"
+        "2. **Inspect the cited code; flag body drift.** Match the "
+        "issue's claimed signatures / line ranges / code snippets "
+        "against the file *right now*. Focus: statement correctness, "
+        "hypothesis tightness, naming, downstream consumers. Also "
+        "note any stale snippets / shifted line refs, or an *Informal "
+        "Statement* still marked `⚠️ LLM-rendered … verification "
+        "pending`. Drift is common after a reject — `marathon review "
+        "reject N` launches a refine daemon that may run multiple "
+        "Aristotle iterations against the code.\n"
+        "3. **Recommend a verdict.** Concise verdict-forward bullets "
+        "with line citations. If the *Informal Statement* is "
+        "unverified, ask the human to approve or correct it first — "
+        "math-correctness needs an accurate baseline. Then "
+        "*stop and wait*.\n"
         "4. **Apply only on explicit human go-ahead.** When (and only "
         "when) the human says \"verify\", \"reject with these notes\", "
         "or similar, run the corresponding `marathon review` CLI. If "
@@ -209,11 +201,12 @@ def build_open_prompt(
 
     rubric = (
         "## Decision rubric (three-axis critique)\n\n"
-        "1. **Math correctness vs Lee.** Lean statement matches what "
-        "Lee asserts? Caveats / strengthenings / outright deviations? "
-        "(You cannot read `LeeSM-LaTeX/*.tex` — copyrighted — but the "
-        "issue's *Informal Statement* section usually summarises Lee "
-        "faithfully.)\n"
+        "1. **Math correctness vs the textbook reference.** Lean "
+        "statement matches what the source asserts? Caveats / "
+        "strengthenings / deviations? (Use the issue's *Informal "
+        "Statement* — ideally human-approved per workflow step 3 — "
+        "since the textbook source itself may not be on disk or may be "
+        "copyrighted.)\n"
         "2. **Lean style / readability.** Idiomatic, variable-block "
         "discipline, `@[simp]`/`@[ext]`/`@[fun_prop]` hooks, no `▸` "
         "ghosts, no `(M := M)` spam, no iteration-changelog docstrings.\n"
@@ -245,38 +238,32 @@ def build_open_prompt(
     apply_section = (
         "## On human go-ahead\n\n"
         f"Verify: `marathon review verify {issue_num} --comment '…'`. "
-        "**Never pass `--close`** unless the human explicitly tells you to "
-        "close the issue. Sorry-free does not mean nothing more can be "
-        "improved (naming, generality, Mathlib-PR-readiness, downstream "
-        "consumer ergonomics); the issue stays OPEN as a tracking handle "
-        "until the human says otherwise.\n"
+        "**Never pass `--close`** unless the human explicitly tells you "
+        "to close the issue. Sorry-free ≠ unimprovable (naming, "
+        "generality, Mathlib-PR-readiness, downstream ergonomics); the "
+        "issue stays OPEN as a tracking handle until the human says "
+        "otherwise.\n"
         f"Reject: write `/tmp/issue{issue_num}-reject-notes.md` first, "
         f"then `marathon review reject {issue_num} --notes "
         f"/tmp/issue{issue_num}-reject-notes.md --comment '…'`.\n\n"
+        "**Body sync**: if step 2 surfaced drift (stale snippets, "
+        "wrong line refs, or an Informal Statement the human just "
+        "approved/rewrote), update the issue body **as part of the "
+        "same verdict step** — `gh issue view N --json body --jq .body "
+        "> /tmp/body.md`, edit, `gh issue edit N --body-file "
+        "/tmp/body.md`. Body must reflect the code at the commit "
+        "you're verifying/rejecting. Expect another body sync after a "
+        "reject-then-refine cycle's daemon iteration converges.\n\n"
         "**Thread hygiene**: one one-line verdict comment per state "
         "transition (✅/❌/🟢/🟠); one substantive iteration comment "
         "per re-verify after a fix. No multi-paragraph verdicts, no "
-        "duplicating the body, no @-tags. Mirror the style of the most "
-        "recent prior verdict comment on this issue if any.\n"
+        "duplicating the body, no @-tags.\n"
     )
 
-    body_excerpt_raw = _fetch_issue_body(issue_num, repo)
-    body_section_truncated = False
-    if body_excerpt_raw:
-        body_excerpt, body_section_truncated = _truncate(
-            body_excerpt_raw, _BUDGET_BODY_EXCERPT,
-        )
-        body_section = (
-            "## Issue body excerpt (pre-fetched for fast orientation)\n\n"
-            f"{body_excerpt}\n"
-        )
-    else:
-        body_section = (
-            "## Issue body\n\n"
-            f"(pre-fetch failed; run `gh issue view {issue_num} "
-            f"--repo {repo}` first)\n"
-        )
-
+    # The full issue body is fetched fresh by the coreviewer via
+    # `gh issue view` per workflow step 1; we don't pre-inline an
+    # excerpt here because it duplicates the header (title + status)
+    # and the Lean snippet portion almost always gets clipped.
     queue_section_truncated = False
     pending = pending_rejections(cfg, chapter)
     if pending and chapter is not None:
@@ -314,14 +301,13 @@ def build_open_prompt(
         rubric,
         output_format,
         apply_section,
-        body_section,
         queue_section,
         files_block,
         tail,
     ]
     prompt = "\n".join(s for s in sections if s)
 
-    truncated = body_section_truncated or queue_section_truncated
+    truncated = queue_section_truncated
     if len(prompt) > PROMPT_CHAR_BUDGET:
         prompt, hard_trimmed = _truncate(prompt, PROMPT_CHAR_BUDGET)
         truncated = truncated or hard_trimmed
