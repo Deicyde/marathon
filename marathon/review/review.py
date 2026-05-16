@@ -84,6 +84,54 @@ def cmd_show(args) -> None:
     _show_issue(cfg, args.issue_num)
 
 
+# --- open (interactive Claude Code session in VS Code) -----------------------
+
+
+def cmd_open(args) -> None:
+    """``marathon review open <issue_num>`` — spawn an interactive Claude
+    Code chat in the user's VS Code via the URI handler, pre-populated
+    with the issue's context + chapter queue + `@`-mention list."""
+    from marathon.review.open_session import open_session_for_issue
+
+    cfg = load_config()
+    num = args.issue_num
+    try:
+        result = open_session_for_issue(
+            cfg, num,
+            include_file_mentions=not args.no_attach,
+            dry_run=args.dry_run,
+        )
+    except RuntimeError as e:
+        sys.exit(str(e))
+
+    if args.dry_run:
+        print(f"# dry-run for `marathon review open {num}`")
+        print(f"# prompt_chars = {result.prompt_chars} / 5000")
+        print(f"# files listed = {result.files_listed!r}")
+        if result.truncated:
+            print(
+                "# note: prompt was trimmed to fit the 5000-char "
+                "VS Code URI ceiling"
+            )
+        print()
+        print(result.uri)
+        return
+
+    print(f"opened interactive Claude Code session for #{num}")
+    print(f"  prompt_chars = {result.prompt_chars} / 5000")
+    if result.truncated:
+        print(
+            "  note: the issue body and/or pending-queue section was "
+            "trimmed (with a `…[trimmed]…` marker) to fit the 5000-char "
+            "VS Code URI ceiling. Use `gh issue view {num}` once the chat "
+            "opens to inspect the full body if needed."
+        )
+    if result.files_listed:
+        print("  files to @-mention once the chat opens:")
+        for m in result.files_listed:
+            print(f"    {m}")
+
+
 # --- verify ------------------------------------------------------------------
 
 
