@@ -107,6 +107,13 @@ class ReviewConfig:
     # Loaded chapter registries, keyed by chapter number.
     chapters: dict[int, ChapterRegistry] = field(default_factory=dict)
 
+    # Additional writable-path whitelist for `marathon refine`'s
+    # extractor (beyond the primary chapter folder + other registered
+    # chapter folders). Use this for vendor directories the project
+    # permits Aristotle to write into (e.g. backport vendor files under
+    # ``Mathlib_4_30/``). Paths are repo-relative POSIX paths.
+    extra_writable_paths: list[Path] = field(default_factory=list)
+
     # Review support directory paths — derived from repo_dir.
     @property
     def review_dir(self) -> Path:
@@ -217,6 +224,23 @@ def load_config(repo_dir: Optional[Path] = None) -> ReviewConfig:
             parsed.append((int(row[0]), str(row[1])))
         chapters[chap] = ChapterRegistry(chapter=chap, entries=parsed)
 
+    extra_raw = data.get("extra_writable_paths", []) or []
+    if not isinstance(extra_raw, list):
+        sys.exit(
+            f"{config_path}: `extra_writable_paths` must be a list of "
+            "repo-relative path strings"
+        )
+    extra_writable_paths: list[Path] = []
+    for p in extra_raw:
+        if not isinstance(p, str):
+            sys.exit(
+                f"{config_path}: each entry in `extra_writable_paths` "
+                f"must be a string; got {p!r}"
+            )
+        # Store as a Path with no leading slash; the extractor builds
+        # POSIX path tuples for tar-member comparison.
+        extra_writable_paths.append(Path(p.lstrip("/").rstrip("/")))
+
     return ReviewConfig(
         repo_dir=repo_dir,
         config_path=config_path,
@@ -227,4 +251,5 @@ def load_config(repo_dir: Optional[Path] = None) -> ReviewConfig:
         tracker_section_pattern=tracker_section_pattern,
         labels=labels,
         chapters=chapters,
+        extra_writable_paths=extra_writable_paths,
     )

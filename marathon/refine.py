@@ -67,6 +67,64 @@ REFINE_LOG_FILENAME = "marathon-refine-log.md"
 RATINGS_FILENAME = "marathon-ratings.jsonl"
 
 
+def _load_additional_writable_paths(
+    repo_dir: Path, expected_path: PurePosixPath
+) -> list[PurePosixPath]:
+    """Compute the cross-chapter / vendor writable whitelist for the
+    extractor. Returns a list of repo-relative POSIX paths the
+    extractor may write into (in addition to the primary
+    ``expected_path``).
+
+    Sources:
+
+    * Every registered chapter path under
+      ``.marathon/review/config.toml``'s ``[[chapters]]`` block,
+      EXCEPT the primary chapter ``expected_path`` (which the
+      extractor already handles separately with wipe-and-replace).
+    * Every entry of the top-level ``extra_writable_paths`` config
+      array (typically vendor directories such as ``Mathlib_4_30/``).
+
+    Gracefully returns ``[]`` when the consumer repo isn't using the
+    review workflow (no ``config.toml``) — preserves the historical
+    chapter-scoped extractor behavior in that case.
+    """
+    try:
+        from marathon.review.config import load_config
+    except ImportError:
+        return []
+    config_path = repo_dir / ".marathon" / "review" / "config.toml"
+    if not config_path.is_file():
+        return []
+    try:
+        cfg = load_config(repo_dir=repo_dir)
+    except SystemExit:
+        return []
+
+    expected_parts = tuple(expected_path.parts)
+    out: list[PurePosixPath] = []
+    seen: set[tuple[str, ...]] = {expected_parts}
+    for chap in cfg.chapters:
+        chap_path = cfg.target_path(chap)
+        try:
+            rel = chap_path.relative_to(cfg.repo_dir)
+        except ValueError:
+            continue
+        ppp = PurePosixPath(*rel.parts)
+        parts = tuple(ppp.parts)
+        if parts in seen:
+            continue
+        seen.add(parts)
+        out.append(ppp)
+    for p in cfg.extra_writable_paths:
+        ppp = PurePosixPath(*p.parts)
+        parts = tuple(ppp.parts)
+        if parts in seen:
+            continue
+        seen.add(parts)
+        out.append(ppp)
+    return out
+
+
 def _load_pending_rejections_md(
     repo_dir: Path,
     target_folder: Path,
@@ -615,8 +673,17 @@ async def _run_refine_attempt(
                 return None
 
             log_dest = workdir_log if workdir_log is not None else Path(dl_tmp) / "_unused.md"
-            found, log_updated, unexpected = _extract_solution(
-                Path(result_path), expected_path, repo_dir, log_dest
+            # Compute the cross-chapter / vendor writable whitelist
+            # from .marathon/review/config.toml (every registered
+            # chapter folder other than the primary one, plus any
+            # `extra_writable_paths` entries). Gracefully no-ops when
+            # the project isn't using the review workflow.
+            additional_writable = _load_additional_writable_paths(
+                repo_dir, expected_path,
+            )
+            found, log_updated, unexpected, cross_writes = _extract_solution(
+                Path(result_path), expected_path, repo_dir, log_dest,
+                additional_writable_paths=additional_writable,
             )
             if found:
                 state.output_path = str(repo_dir / Path(*expected_path.parts))
@@ -628,6 +695,25 @@ async def _run_refine_attempt(
                         f"{len(unexpected)} unexpected top-level entries "
                         f"(mostly echoed input): {unexpected}"
                     )
+                if cross_writes:
+                    # Cross-chapter writes are a *positive* event when
+                    # the reject-notes asked for cross-chapter work
+                    # (the bug-report scenario the widening was added
+                    # for). Surface them loudly so the iteration log
+                    # actually shows what landed beyond the primary
+                    # chapter.
+                    notes.append(
+                        f"{len(cross_writes)} cross-chapter write(s) "
+                        f"into additional writable paths: {cross_writes}"
+                    )
+                    print(
+                        f"  cross-chapter writes accepted: "
+                        f"{len(cross_writes)} file(s) outside the primary "
+                        f"chapter scope:",
+                        flush=True,
+                    )
+                    for w in cross_writes:
+                        print(f"    {w}", flush=True)
                 if notes:
                     state.note = "; ".join(notes)
             else:

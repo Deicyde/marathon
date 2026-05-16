@@ -23,6 +23,7 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path, PurePosixPath
+from typing import Optional, Sequence
 
 import aristotlelib
 from aristotlelib import AgentTask, AristotleAPIError, Project, TaskStatus
@@ -165,7 +166,8 @@ def _extract_solution(
     expected_path: PurePosixPath,
     repo_dir: Path,
     log_dest: Path,
-) -> tuple[bool, bool, list[str]]:
+    additional_writable_paths: Optional[Sequence[PurePosixPath]] = None,
+) -> tuple[bool, bool, list[str], list[str]]:
     """Extract ``expected_path/`` from the tar into ``repo_dir/expected_path/``,
     and a top-level ``marathon.md`` into ``log_dest``.
 
@@ -174,15 +176,47 @@ def _extract_solution(
     is detected and stripped before matching ``expected_path``. The
     ``marathon.md`` lookup also moves to the same level.
 
-    Stale contents of ``repo_dir/expected_path`` are wiped first.
+    **Primary chapter** (``expected_path``) gets wipe-and-replace
+    semantics: stale contents of ``repo_dir/expected_path`` are wiped
+    before extracting any tar member under that path. This propagates
+    Aristotle's deletes for the chapter that was the focal subject of
+    the refine call.
 
-    Returns ``(folder_found, log_updated, sorted_unexpected_top_levels)``.
+    **Additional writable paths** (``additional_writable_paths``) get
+    *overlay-extract* semantics: tar members under these paths are
+    written to disk, but the existing repo files outside the tar
+    member set are kept. This supports cross-chapter refactors
+    (where Aristotle's reject-notes told it to also edit a sibling
+    chapter, e.g. moving a block of declarations) and vendor-file
+    backports — both workflows are project-supported per
+    ``.marathon/referee.md``'s rubric items, but previously broke
+    silently because the extractor scope was hard-coded to one
+    chapter. See ``/tmp/marathon-refine-chapter-scope-bug.md`` for
+    the failure mode this addresses.
+
+    Returns ``(folder_found, log_updated, sorted_unexpected_top_levels,
+    sorted_cross_chapter_writes)`` where ``cross_chapter_writes`` is
+    the list of *repo-relative POSIX paths of files extracted into
+    additional writable paths* — surfaced to the caller so it can
+    distinguish "echoed input" (the existing unexpected-top warning)
+    from "Aristotle actually wrote outside the primary chapter and
+    we accepted it." This avoids the previous silent-loss failure
+    mode where cross-chapter writes were thrown away and reported
+    only as a generic "unexpected top-level entries" note.
     """
     expected_parts = tuple(expected_path.parts)
+    extra_paths_parts: list[tuple[str, ...]] = []
+    for p in additional_writable_paths or ():
+        # Skip the primary expected_path if it shows up in extras (a
+        # caller bug; would otherwise double-wipe).
+        pp = tuple(p.parts)
+        if pp and pp != expected_parts:
+            extra_paths_parts.append(pp)
 
     found = False
     log_updated = False
     unexpected_top: set[str] = set()
+    cross_chapter_writes: set[str] = set()
 
     with tarfile.open(tar_path, "r:*") as tf:
         members = tf.getmembers()
@@ -219,7 +253,9 @@ def _extract_solution(
 
         prefix_skip = len(chosen_prefix)
         full_expected = chosen_prefix + expected_parts
+        full_extras = [chosen_prefix + ep for ep in extra_paths_parts]
 
+        # Primary chapter: wipe-and-replace semantics.
         target_dir = repo_dir / Path(*expected_parts)
         if target_dir.exists():
             shutil.rmtree(target_dir)
@@ -248,6 +284,32 @@ def _extract_solution(
                     out_path.write_bytes(f.read())
                 continue
 
+            # Member under any of the additional writable paths?
+            # Overlay-extract (no wipe) so we preserve any files in the
+            # path that Aristotle didn't echo. Cross-chapter deletes
+            # are not propagated this way; that's an acceptable
+            # tradeoff for safety — the common workflow is add /
+            # modify in the cross-chapter scope, not delete.
+            matched_extra: Optional[tuple[str, ...]] = None
+            for full_extra in full_extras:
+                if (
+                    len(parts) >= len(full_extra)
+                    and parts[: len(full_extra)] == full_extra
+                ):
+                    matched_extra = full_extra
+                    break
+            if matched_extra is not None:
+                if m.isfile():
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    inner_parts = parts[prefix_skip:]
+                    out_path = repo_dir / Path(*inner_parts)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_bytes(f.read())
+                    cross_chapter_writes.add("/".join(inner_parts))
+                continue
+
             # marathon.md at the wrapper-stripped root (or true root).
             if (
                 len(parts) == prefix_skip + 1
@@ -268,7 +330,12 @@ def _extract_solution(
             else:
                 unexpected_top.add(parts[0])
 
-    return found, log_updated, sorted(unexpected_top)
+    return (
+        found,
+        log_updated,
+        sorted(unexpected_top),
+        sorted(cross_chapter_writes),
+    )
 
 
 def _build_targets_block(entry: OrderEntry) -> str:
@@ -464,8 +531,12 @@ async def _run_one_attempt(
                 return None
 
             log_dest = folder / LOG_FILENAME
-            found, log_updated, unexpected = _extract_solution(
-                Path(result_path), expected_path, repo_dir, log_dest
+            # Skeleton's normal flow has no cross-chapter writes: each
+            # chapter is independent. Pass no additional writable paths
+            # — keeps the skeleton extraction strictly scoped, matching
+            # historical behavior.
+            found, log_updated, unexpected, cross_writes = _extract_solution(
+                Path(result_path), expected_path, repo_dir, log_dest,
             )
             if found:
                 chapter.output_path = str(repo_dir / Path(*expected_path.parts))
@@ -476,6 +547,14 @@ async def _run_one_attempt(
                     notes.append(
                         f"{len(unexpected)} unexpected top-level entries "
                         f"(mostly echoed input): {unexpected}"
+                    )
+                if cross_writes:
+                    # Should not happen in skeleton mode (no additional
+                    # writable paths configured), but surfaced loudly if
+                    # it does so behavior is visible.
+                    notes.append(
+                        f"{len(cross_writes)} cross-chapter writes "
+                        "(unexpected in skeleton mode): " + ", ".join(cross_writes)
                     )
                 if notes:
                     chapter.note = "; ".join(notes)
