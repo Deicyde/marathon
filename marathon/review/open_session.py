@@ -1,5 +1,5 @@
-"""Open an interactive Claude Code session in the user's VS Code IDE
-for a specific review sub-issue.
+"""Open an interactive *coreviewer* Claude Code session in the user's
+VS Code IDE for a specific review sub-issue.
 
 The Claude Code VS Code extension registers the URI handler
 ``vscode://anthropic.claude-code/open`` with two query parameters:
@@ -11,17 +11,20 @@ The Claude Code VS Code extension registers the URI handler
   ``~/.claude/projects/<slug>/`` to resume.
 
 This module builds the ``prompt`` URI for a given review sub-issue and
-shells out to the platform's URL opener. The prompt is structured so
-the user lands in a fresh chat with:
+shells out to the platform's URL opener. The prompt instantiates **the
+coreviewer**: a role distinct from the *Hermes* live-steerer used
+during ``marathon refine``. The coreviewer is a thinking partner — it
+reads the issue, identifies the relevant code, forms an opinion on
+correctness / style / completeness, and recommends a verdict. The
+human stays in the loop: nothing is applied without the human signal.
+When the human green-lights a verdict, the coreviewer applies it by
+invoking ``marathon review verify N`` or ``marathon review reject N
+--notes file``, following the project's GitHub-thread hygiene
+conventions.
 
-* The issue's title and current verdict status
-* The chapter's pending-rejections queue (so they see what's outstanding
-  *project-wide* before discussing the focal issue)
-* A ``@``-mention list for the target Lean folder + key adjacent
-  context files so the user only needs to accept the file-attach
-  prompts after pressing Enter
-* A role directive telling Claude what kind of conversation this is
-  (review-pass, not refinement)
+Output expectation: concise — verdict-forward, structured bullets,
+citations to specific declarations and lines. Human reviewers move
+fast and read slowly.
 
 Programmatic file pre-attachment isn't supported by the extension's
 URI handler at the time of writing; ``@``-mentions are the closest
@@ -48,16 +51,15 @@ from marathon.review.state import load_state, pending_rejections
 
 
 # Per the VS Code extension's parser. The URI launcher silently
-# truncates beyond this; we cap with a budget split so the role
-# directive + file mentions don't get clipped.
+# truncates beyond this; we cap with a budget split so the role spec
+# + the load-bearing "wait for human" directive don't get clipped.
 PROMPT_CHAR_BUDGET = 5_000
 
 # Per-section soft budgets. Sum is ≤ PROMPT_CHAR_BUDGET with margin.
-_BUDGET_HEADER = 800
-_BUDGET_BODY_EXCERPT = 1_500
-_BUDGET_QUEUE = 1_400
-_BUDGET_FILES = 600
-_BUDGET_TAIL = 400
+_BUDGET_HEADER = 700
+_BUDGET_BODY_EXCERPT = 600
+_BUDGET_QUEUE = 500
+_BUDGET_FILES = 300
 
 
 @dataclass
@@ -170,37 +172,95 @@ def build_open_prompt(
     title = issue_title(issue_num, cfg.github_repo) or "(title unavailable)"
     status_line = _current_status(cfg, issue_num)
     chapter = cfg.chapter_of_issue(issue_num)
+    repo = cfg.github_repo
 
-    header = (
-        f"# Marathon review session — issue #{issue_num}\n\n"
-        f"**Title**: {title}\n"
-        f"**Status**: {status_line}\n"
-        + (f"**Chapter**: {chapter}\n" if chapter is not None else "")
-        + "\n"
-        "You are joining a per-issue review conversation in the marathon "
-        "workflow. Your role this turn is the **reviewer**, not the "
-        "refiner: read the issue, inspect the cited Lean code (see "
-        "`@`-mentions below), and discuss findings with me before I run "
-        "`marathon review verify N` or `marathon review reject N --notes …`. "
-        "Stay close to (1) math correctness vs the textbook reference, "
-        "(2) Lean-style / readability, (3) Mathlib PR-readiness — the "
-        "project's standing critique rubric. Don't draft a refinement "
-        "prompt; that's a different tool.\n"
+    role = (
+        f"# You are the coreviewer — marathon review session, issue #{issue_num}\n\n"
+        f"**Title**: {title}  •  **Repo**: {repo}\n"
+        f"**Status**: {status_line}"
+        + (f"  •  **Chapter**: {chapter}" if chapter is not None else "")
+        + "\n\n"
+        "You are *the coreviewer* — a thinking partner for the human "
+        "running marathon's per-sub-issue review pass. You read, "
+        "inspect, opine, and recommend. You **never** apply a verdict on "
+        "your own. Apply happens only after the human says go.\n"
     )
 
-    body_excerpt_raw = _fetch_issue_body(issue_num, cfg.github_repo)
+    workflow = (
+        "## Workflow\n\n"
+        f"1. **Read the issue.** `gh issue view {issue_num} --repo {repo} "
+        "--comments` — body, labels, recent comments.\n"
+        "2. **Inspect the cited code.** Match the issue's claimed "
+        "signatures / line ranges against the actual file. Focus on: "
+        "statement correctness, hypothesis tightness, naming, "
+        "downstream consumers. Skeleton-mode `sorry` bodies are "
+        "expected (don't reject for sorries alone).\n"
+        "3. **Recommend a verdict.** Concise, verdict-forward bullets "
+        "with line citations. Then *stop and wait* for the human.\n"
+        "4. **Apply only on explicit human go-ahead.** When (and only "
+        "when) the human says \"verify\", \"reject with these notes\", "
+        "or similar, run the corresponding `marathon review` CLI. If "
+        "they push back, keep discussing — don't pre-empt.\n"
+    )
+
+    rubric = (
+        "## Decision rubric (three-axis critique)\n\n"
+        "1. **Math correctness vs Lee.** Lean statement matches what "
+        "Lee asserts? Caveats / strengthenings / outright deviations? "
+        "(You cannot read `LeeSM-LaTeX/*.tex` — copyrighted — but the "
+        "issue's *Informal Statement* section usually summarises Lee "
+        "faithfully.)\n"
+        "2. **Lean style / readability.** Idiomatic, variable-block "
+        "discipline, `@[simp]`/`@[ext]`/`@[fun_prop]` hooks, no `▸` "
+        "ghosts, no `(M := M)` spam, no iteration-changelog docstrings.\n"
+        "3. **Mathlib PR-readiness.** Naming convention, level of "
+        "generality, no hypothesis bloat reinventing existing predicates.\n\n"
+        "**Reject for**: wrong statement, dishonest return type, missing "
+        "scaffolding, cross-chapter duplication, naming inconsistency, "
+        "hypothesis-too-weak. **Not** for `sorry`s alone — the 🟡 marker "
+        "already advertises skeleton-with-sorries.\n"
+    )
+
+    output_format = (
+        "## Output format (concise — humans move fast, read slowly)\n\n"
+        "* **TL;DR** (one line): proposed verdict + single load-bearing reason.\n"
+        "* **Findings** (≤5 bullets): each cites a specific declaration "
+        "/ line range. No stylistic nitpicks unless load-bearing.\n"
+        "* **Recommended action** (one line): exact marathon CLI command "
+        "you'd run, with proposed `--comment` text.\n"
+        "* **Then stop.** Don't run the CLI yet. Don't iterate "
+        "speculatively. **Stopping is the load-bearing step.**\n"
+    )
+
+    apply_section = (
+        "## On human go-ahead\n\n"
+        f"Verify: `marathon review verify {issue_num} --comment '…'` "
+        "(add `--close` only if no remaining sorries).\n"
+        f"Reject: write `/tmp/issue{issue_num}-reject-notes.md` first, "
+        f"then `marathon review reject {issue_num} --notes "
+        f"/tmp/issue{issue_num}-reject-notes.md --comment '…'`.\n\n"
+        "**Thread hygiene**: one one-line verdict comment per state "
+        "transition (✅/❌/🟢/🟠); one substantive iteration comment "
+        "per re-verify after a fix. No multi-paragraph verdicts, no "
+        "duplicating the body, no @-tags. Mirror the style of the most "
+        "recent prior verdict comment on this issue if any.\n"
+    )
+
+    body_excerpt_raw = _fetch_issue_body(issue_num, repo)
     body_section_truncated = False
     if body_excerpt_raw:
-        body_excerpt, body_section_truncated = _truncate(body_excerpt_raw, _BUDGET_BODY_EXCERPT)
+        body_excerpt, body_section_truncated = _truncate(
+            body_excerpt_raw, _BUDGET_BODY_EXCERPT,
+        )
         body_section = (
-            f"## Issue #{issue_num} body (current GitHub state)\n\n"
+            "## Issue body excerpt (pre-fetched for fast orientation)\n\n"
             f"{body_excerpt}\n"
         )
     else:
         body_section = (
-            f"## Issue #{issue_num} body\n\n"
-            f"(could not fetch from GitHub; run `gh issue view {issue_num}` "
-            "after the session opens)\n"
+            "## Issue body\n\n"
+            f"(pre-fetch failed; run `gh issue view {issue_num} "
+            f"--repo {repo}` first)\n"
         )
 
     queue_section_truncated = False
@@ -209,50 +269,41 @@ def build_open_prompt(
         queue_lines = [
             f"## Chapter {chapter} pending-rejection queue ({len(pending)} open)",
             "",
-            f"This issue (#{issue_num}) is one of several still-open rejections "
-            "in this chapter; awareness of the others may inform the discussion.",
-            "",
         ]
         for num, st in pending:
             marker = " ← current focus" if num == issue_num else ""
             first_line = (st.notes or "").splitlines()[0] if st.notes else "(no notes)"
             queue_lines.append(
-                f"- **#{num}**{marker} — rejected {st.verdict_ts}\n"
-                f"  {first_line}"
+                f"- **#{num}**{marker} — rejected {st.verdict_ts}: {first_line[:120]}"
             )
         queue_text = "\n".join(queue_lines) + "\n"
         queue_section, queue_section_truncated = _truncate(queue_text, _BUDGET_QUEUE)
     else:
-        queue_section = (
-            f"## Chapter {chapter} pending-rejection queue\n\n"
-            "(empty — no open rejections in this chapter)\n"
-        )
+        queue_section = ""  # silent when empty — saves prompt budget
 
     files_listed: list[str] = []
     if include_file_mentions and chapter is not None:
         files_listed = _file_mentions_for_chapter(cfg, chapter)
         files_block = (
-            "## Files to attach (use `@`-mentions in chat — accept each chip)\n\n"
+            "## Context files (`@`-mention to load — accept each chip)\n\n"
             + "\n".join(f"- {m}" for m in files_listed)
             + "\n"
         )
     else:
         files_block = ""
 
-    tail = (
-        "\n---\n\n"
-        "Confirm you've read this brief, then ask whatever you need to "
-        "form a verdict. End the turn with one of: \"verify\", \"reject "
-        "(with these notes …)\", or \"need more info\". I'll run the "
-        "marathon CLI on my side once you signal.\n"
-    )
+    tail = "\n---\n\nGo. Read, inspect, opine, recommend — then **stop**.\n"
 
     sections = [
-        _truncate(header, _BUDGET_HEADER)[0],
+        _truncate(role, _BUDGET_HEADER)[0],
+        workflow,
+        rubric,
+        output_format,
+        apply_section,
         body_section,
         queue_section,
         files_block,
-        _truncate(tail, _BUDGET_TAIL)[0],
+        tail,
     ]
     prompt = "\n".join(s for s in sections if s)
 
