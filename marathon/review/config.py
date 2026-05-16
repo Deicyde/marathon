@@ -113,6 +113,12 @@ class ReviewConfig:
         return self.repo_dir / ".marathon" / "review"
 
     @property
+    def state_path(self) -> Path:
+        """Per-issue rejection state JSON (see ``marathon.review.state``).
+        Always ``<repo>/.marathon/review/state.json``."""
+        return self.review_dir / "state.json"
+
+    @property
     def drafts_dir(self) -> Path:
         return self.review_dir / "drafts"
 

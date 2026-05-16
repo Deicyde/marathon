@@ -2,12 +2,13 @@
 
 Triggered indirectly by ``reject`` (via ``marathon review reject``) when
 no other daemon is active for the chapter. While the daemon is alive,
-subsequent rejections just append to ``referee.md``'s user-managed
-header (the queue); the daemon's next loop iteration picks them up.
+subsequent rejections write to ``.marathon/review/state.json``; the
+daemon's next loop iteration picks them up by re-hashing the file's
+pending-rejection entries for this chapter.
 
 Loop semantics::
 
-    while user-header hash changed since previous iteration started:
+    while pending-rejections hash changed since previous iteration started:
         run one `marathon refine --skeleton --max-iterations 1` iteration
     (safety cap at ``MAX_LOOPS_ONCE`` in one-shot mode.)
 
@@ -19,7 +20,6 @@ the daemon's PID. Cleaned up on exit.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import signal
 import subprocess
@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 from marathon.review.config import ReviewConfig, load_config
-from marathon.review.referee_queue import SENTINEL
+from marathon.review.state import hash_pending
 
 # Polling interval (seconds) when the runner is in daemon mode and the
 # queue is currently drained.
@@ -69,15 +69,15 @@ def lock_path(cfg: ReviewConfig, chapter: int) -> Path:
     return cfg.runner_lock_dir / f"refine-c{chapter}.lock"
 
 
-def hash_user_header(cfg: ReviewConfig) -> str:
-    """SHA256 of ``referee.md``'s user-managed header (above the BEGIN
-    sentinel). Returns '' if the file doesn't exist."""
-    if not cfg.referee_path.is_file():
-        return ""
-    text = cfg.referee_path.read_text()
-    idx = text.find(SENTINEL)
-    user_header = text[:idx] if idx >= 0 else text
-    return hashlib.sha256(user_header.encode()).hexdigest()
+def hash_user_header(cfg: ReviewConfig, chapter: Optional[int] = None) -> str:
+    """SHA256 of the pending-rejections content for ``chapter`` (or all
+    chapters when None). Returns '' when there are no pending rejections.
+
+    Name retained for callsite compatibility; the underlying source is
+    now ``.marathon/review/state.json`` (per-issue queue) instead of
+    ``referee.md``'s user-managed header. ``referee.md`` is back to
+    being purely the project rubric layer."""
+    return hash_pending(cfg, chapter)
 
 
 def process_alive(pid: int) -> bool:
@@ -179,20 +179,21 @@ def run_daemon(chapter: int, once: bool = False) -> int:
 
     try:
         while not _STOP_REQUESTED:
-            current_hash = hash_user_header(cfg)
+            current_hash = hash_user_header(cfg, chapter)
 
             if current_hash != last_processed_hash:
                 iteration_count += 1
                 print(
-                    f"\n=== iteration {iteration_count}: referee.md user-header "
-                    f"changed (hash={current_hash[:8]}); firing marathon refine ===",
+                    f"\n=== iteration {iteration_count}: state.json pending-rejections "
+                    f"changed (hash={current_hash[:8] or '(empty)'}); "
+                    "firing marathon refine ===",
                     flush=True,
                 )
                 run_one_refine(cfg, chapter)
-                # Re-hash AFTER the run; new bullets that arrived during
-                # the run cause the next loop iteration to fire again
-                # immediately with no sleep.
-                last_processed_hash = hash_user_header(cfg)
+                # Re-hash AFTER the run; new rejections that arrived
+                # during the run cause the next loop iteration to fire
+                # again immediately with no sleep.
+                last_processed_hash = hash_user_header(cfg, chapter)
                 if once and iteration_count >= MAX_LOOPS_ONCE:
                     print(
                         f"\n=== one-shot mode: safety cap of {MAX_LOOPS_ONCE} "

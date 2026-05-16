@@ -67,6 +67,44 @@ REFINE_LOG_FILENAME = "marathon-refine-log.md"
 RATINGS_FILENAME = "marathon-ratings.jsonl"
 
 
+def _load_pending_rejections_md(
+    repo_dir: Path, target_folder: Path
+) -> Optional[str]:
+    """Load the pending-rejection queue for the chapter ``target_folder``
+    belongs to, rendered as Markdown for Hermes's prompt context. Returns
+    ``None`` if there's no review config, no pending rejections, or the
+    target folder doesn't map to any registered chapter.
+
+    Gracefully no-ops when the consumer repo isn't using the review
+    workflow (`.marathon/review/config.toml` absent), so callers that
+    don't care about the queue don't break.
+    """
+    try:
+        from marathon.review.config import load_config
+        from marathon.review.state import render_pending_rejections_md
+    except ImportError:
+        return None
+    config_path = repo_dir / ".marathon" / "review" / "config.toml"
+    if not config_path.is_file():
+        return None
+    try:
+        cfg = load_config(repo_dir=repo_dir)
+    except SystemExit:
+        # load_config sys.exits on missing required fields; treat as
+        # "no review config available" rather than crashing refine.
+        return None
+    # Map target_folder back to a chapter via the template.
+    chapter: Optional[int] = None
+    target_resolved = target_folder.resolve()
+    for cand_chapter in cfg.chapters.keys():
+        if cfg.target_path(cand_chapter).resolve() == target_resolved:
+            chapter = cand_chapter
+            break
+    # If we can't identify the chapter, fall back to project-wide pending
+    # rejections rather than dropping them entirely.
+    return render_pending_rejections_md(cfg, chapter)
+
+
 def _read_latest_rating_note(workdir: Path) -> Optional[str]:
     """Return the most-recent rating's `notes` paragraph from the workdir's
     ratings log, or None if the file is missing/empty/malformed.
@@ -717,6 +755,13 @@ async def _run_iteration(
                 if referee_path and referee_path.is_file()
                 else None
             )
+            # Per-iteration rejection queue: load pending rejections from
+            # `.marathon/review/state.json` (decoupled from referee.md as
+            # of the L refactor). Filter to the chapter our target folder
+            # belongs to, so cross-chapter rejections don't bleed in.
+            pending_rejections_md = _load_pending_rejections_md(
+                repo_dir, target_folder
+            )
             # Re-read the latest rater note on every attempt (including
             # retries) so a fresh Claude review sees the latest available
             # diagnosis even if a retry follows a partial pipeline run.
@@ -738,6 +783,7 @@ async def _run_iteration(
                 max_retries=max_retries,
                 previous_status=last_status,
                 referee_md=referee_md,
+                pending_rejections_md=pending_rejections_md,
                 previous_rating_note=previous_rating_note,
                 cross_chapter_md=cross_chapter_md,
                 continuation_mode=(attempt_mode == "continue"),

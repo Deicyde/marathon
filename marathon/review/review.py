@@ -22,7 +22,7 @@ from typing import Optional
 
 from marathon.review.config import ReviewConfig, load_config
 from marathon.review.github import gh, issue_labels, issue_title
-from marathon.review.referee_queue import append_rejection_bullet
+from marathon.review.state import record_rejection, record_verification
 from marathon.review.tracker import update_tracker_emoji
 
 
@@ -114,6 +114,10 @@ def cmd_verify(args) -> None:
         "--remove-label", cfg.labels.rejected,
         check=False,
     )
+    # Clear any prior rejection queue entry for this issue. Idempotent
+    # if there was no prior rejection.
+    record_verification(cfg, num)
+
     if args.close:
         gh("issue", "close", str(num), "--repo", cfg.github_repo)
         print(f"✅ #{num} verified + closed (fully implemented), tracker → 🟡.")
@@ -147,21 +151,19 @@ def cmd_reject(args) -> None:
 
     print(f"Marking #{num} as REJECTED...")
     comment = args.comment or (
-        "❌ REJECTED — see body for findings; fix bullet queued in "
-        "`.marathon/referee.md` user-managed header."
+        "❌ REJECTED — see body for findings; fix queued in "
+        "`.marathon/review/state.json` (`marathon review reject` queue)."
     )
     gh("issue", "comment", str(num), "--repo", cfg.github_repo, "--body", comment)
     gh(
         "issue", "edit", str(num),
         "--repo", cfg.github_repo,
         "--add-label", cfg.labels.rejected,
+        "--remove-label", cfg.labels.verified,
+        check=False,
     )
-    if append_rejection_bullet(cfg.referee_path, num, notes_text):
-        print(f"  appended rejection bullet to {cfg.referee_path}")
-    else:
-        print(
-            f"  warning: {cfg.referee_path} not found; skipping referee.md append"
-        )
+    record_rejection(cfg, num, notes_text)
+    print(f"  recorded rejection at {cfg.state_path}")
     print(f"❌ #{num} rejected and queued for refinement.")
 
     if not args.no_refine:
@@ -203,7 +205,7 @@ def _launch_or_queue_refine(cfg: ReviewConfig, chapter: int) -> None:
                 print(
                     f"  refine daemon already active for c{chapter} "
                     f"(pid {pid}); this rejection will be picked up on the "
-                    "daemon's next loop iteration (referee.md is re-hashed "
+                    "daemon's next loop iteration (state.json is re-hashed "
                     "before each marathon refine call)"
                 )
                 return

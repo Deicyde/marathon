@@ -105,6 +105,7 @@ def review_and_draft_prompt(
     max_retries: int = 0,
     previous_status: Optional[str] = None,
     referee_md: Optional[str] = None,
+    pending_rejections_md: Optional[str] = None,
     previous_rating_note: Optional[str] = None,
     cross_chapter_md: Optional[str] = None,
     continuation_mode: bool = False,
@@ -150,15 +151,34 @@ def review_and_draft_prompt(
     repo_context = _read_repo_lean_context(repo_dir, target_folder)
 
     sections: list[str] = ["# Reviewer rubric (your role and priorities)\n\n" + system_prompt]
+    if pending_rejections_md:
+        sections.append(
+            "# Actionable review queue — pending rejections for THIS iteration\n\n"
+            "Each top-level bullet below corresponds to a sub-issue that the "
+            "human reviewer rejected and explicitly queued for fixing. **These "
+            "are the structural tasks Aristotle must address this iteration** — "
+            "they outrank everything else in this prompt, including your own "
+            "cross-chapter consistency findings and the rubric's general "
+            "priorities. Lead the drafted prompt to Aristotle with the first "
+            "pending rejection; if multiple are pending, address them in the "
+            "order listed. Do not silently downgrade or skip a queued item in "
+            "favour of an issue you spotted yourself — surface your own "
+            "findings after the queued items, if at all.\n\n"
+            + pending_rejections_md
+        )
     if referee_md:
         sections.append(
             "# Project-specific reviewer notes (referee.md)\n\n"
-            "These notes were written by an outside reviewer (human or AI) to "
-            "course-correct your reviews on this project. Treat them as a layer "
-            "of project-specific priorities **on top of** the rubric above. If "
-            "the rubric and these notes conflict, the rubric wins on output "
-            "style (second person, no preamble, specific replacements); these "
-            "notes win on what to look at and how hard to push.\n\n"
+            "These notes are the project's *rubric layer* — long-lived "
+            "directives written by an outside reviewer (human or AI) to "
+            "course-correct your reviews on this project. They are NOT a "
+            "queue; per-iteration rejection tasks come from the "
+            "*Actionable review queue* section above (if any). Treat these "
+            "notes as a layer of project-specific priorities **on top of** "
+            "the rubric. If the rubric and these notes conflict, the rubric "
+            "wins on output style (second person, no preamble, specific "
+            "replacements); these notes win on what to look at and how hard "
+            "to push.\n\n"
             + referee_md
         )
     sections.append(
