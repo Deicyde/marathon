@@ -3,14 +3,27 @@
 Triggered indirectly by ``reject`` (via ``marathon review reject``) when
 no other daemon is active for the chapter. While the daemon is alive,
 subsequent rejections write to ``.marathon/review/state.json``; the
-daemon's next loop iteration picks them up by re-hashing the file's
-pending-rejection entries for this chapter.
+daemon's next loop iteration picks them up by polling
+``pending_rejections_needing_iteration`` for this chapter.
 
-Loop semantics::
+Loop semantics — *one rejection per iteration, dispatched explicitly*::
 
-    while pending-rejections hash changed since previous iteration started:
-        run one `marathon refine --skeleton --max-iterations 1` iteration
-    (safety cap at ``MAX_LOOPS_ONCE`` in one-shot mode.)
+    while a pending rejection still needs iteration:
+        pick the oldest one (by verdict_ts)
+        run one `marathon refine --skeleton --max-iterations 1 \\
+            --review-rejection <issue_num>` iteration
+        record_iteration(<issue_num>)   # mark as iterated regardless of
+                                        # success — the human re-rejects
+                                        # to re-queue on failure
+    sleep, then re-poll.
+
+The earlier single-hash design treated the whole pending-rejection
+set as one batch and marked every rejection "processed" after one
+iteration that often addressed only one of them — see
+``/tmp/marathon-daemon-queue-bug.md`` (now resolved). The current
+per-issue dispatch eliminates that failure mode at both layers: the
+daemon picks exactly one, and Hermes' prompt contains exactly that
+one in its "Actionable review queue" section.
 
 Per-chapter lock file lives at
 ``<repo>/.marathon/review/runner-locks/refine-c<N>.lock`` and contains
@@ -30,7 +43,11 @@ from pathlib import Path
 from typing import Optional
 
 from marathon.review.config import ReviewConfig, load_config
-from marathon.review.state import hash_pending
+from marathon.review.state import (
+    hash_pending,
+    pending_rejections_needing_iteration,
+    record_iteration,
+)
 
 # Polling interval (seconds) when the runner is in daemon mode and the
 # queue is currently drained.
@@ -126,15 +143,24 @@ def _workdir_parent() -> Path:
     return Path.home() / "Desktop" / "marathon-runs" / "review-fixes"
 
 
-def run_one_refine(cfg: ReviewConfig, chapter: int) -> int:
-    """Run a single ``marathon refine`` iteration for the chapter.
+def run_one_refine(
+    cfg: ReviewConfig, chapter: int, focus_issue: int
+) -> int:
+    """Run a single ``marathon refine`` iteration for the chapter,
+    focused on a single pending rejection.
 
-    Returns the subprocess exit code. Invokes ``python -m marathon refine``
-    from the current environment so the daemon and Marathon share an
-    aristotlelib version.
+    ``focus_issue`` is forwarded as ``--review-rejection N`` so the
+    refine command filters its pending-rejections context down to that
+    one issue; Hermes then sees a queue of exactly one rejection in
+    its prompt, removing the prior "Aristotle picks one and silently
+    ignores the rest" failure mode.
+
+    Returns the subprocess exit code. Invokes ``python -m marathon
+    refine`` from the current environment so the daemon and Marathon
+    share an aristotlelib version.
     """
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    workdir = _workdir_parent() / f"c{chapter}-{ts}"
+    workdir = _workdir_parent() / f"c{chapter}-i{focus_issue}-{ts}"
     workdir.mkdir(parents=True, exist_ok=True)
     target = cfg.target_path(chapter)
 
@@ -143,9 +169,13 @@ def run_one_refine(cfg: ReviewConfig, chapter: int) -> int:
         str(target),
         "--repo-dir", str(cfg.repo_dir),
         "--workdir", str(workdir),
+        "--review-rejection", str(focus_issue),
         *DEFAULT_REFINE_ARGS,
     ]
-    print(f"\n--- marathon refine starting: workdir={workdir.name} ---")
+    print(
+        f"\n--- marathon refine starting (focus #{focus_issue}): "
+        f"workdir={workdir.name} ---"
+    )
     print(f"    target = {target}")
     print(f"    cmd    = {' '.join(cmd)}")
     sys.stdout.flush()
@@ -157,7 +187,16 @@ def run_one_refine(cfg: ReviewConfig, chapter: int) -> int:
 
 
 def run_daemon(chapter: int, once: bool = False) -> int:
-    """Run the daemon loop for ``chapter``. Returns final exit code."""
+    """Run the daemon loop for ``chapter``. Returns final exit code.
+
+    Per-issue dispatch loop (see module docstring for the rationale):
+    on each tick, pick the oldest pending rejection that still needs
+    an iteration (``last_iteration_ts is None`` or older than
+    ``verdict_ts``), dispatch a single ``marathon refine`` with
+    ``--review-rejection N``, and mark the issue iterated regardless of
+    refine outcome. The human re-rejects to re-queue if an iteration
+    didn't actually fix things.
+    """
     cfg = load_config()
 
     if not acquire_lock(cfg, chapter):
@@ -174,26 +213,36 @@ def run_daemon(chapter: int, once: bool = False) -> int:
         flush=True,
     )
 
-    last_processed_hash: Optional[str] = None
     iteration_count = 0
 
     try:
         while not _STOP_REQUESTED:
-            current_hash = hash_user_header(cfg, chapter)
+            queue = pending_rejections_needing_iteration(cfg, chapter)
 
-            if current_hash != last_processed_hash:
+            if queue:
+                target_issue, target_state = queue[0]
                 iteration_count += 1
                 print(
-                    f"\n=== iteration {iteration_count}: state.json pending-rejections "
-                    f"changed (hash={current_hash[:8] or '(empty)'}); "
-                    "firing marathon refine ===",
+                    f"\n=== iteration {iteration_count}: dispatching for "
+                    f"#{target_issue} (verdict {target_state.verdict_ts}; "
+                    f"{len(queue) - 1} other rejection(s) queued behind) ===",
                     flush=True,
                 )
-                run_one_refine(cfg, chapter)
-                # Re-hash AFTER the run; new rejections that arrived
-                # during the run cause the next loop iteration to fire
-                # again immediately with no sleep.
-                last_processed_hash = hash_user_header(cfg, chapter)
+                exit_code = run_one_refine(cfg, chapter, focus_issue=target_issue)
+                # Mark iterated regardless of exit code. A failed
+                # iteration leaves the issue marked iterated; the human
+                # re-rejects (which clears last_iteration_ts) to re-queue.
+                # This avoids an infinite retry loop on a persistent
+                # submit failure or build failure.
+                record_iteration(cfg, target_issue)
+                if exit_code != 0:
+                    print(
+                        f"--- iteration for #{target_issue} exited "
+                        f"non-zero ({exit_code}); marked iterated to "
+                        "avoid retry loop. Re-reject the issue to "
+                        "re-queue.",
+                        flush=True,
+                    )
                 if once and iteration_count >= MAX_LOOPS_ONCE:
                     print(
                         f"\n=== one-shot mode: safety cap of {MAX_LOOPS_ONCE} "
@@ -201,16 +250,18 @@ def run_daemon(chapter: int, once: bool = False) -> int:
                         flush=True,
                     )
                     break
+                # No sleep — go check the queue again immediately for
+                # any other pending rejections (including ones that
+                # arrived during this iteration).
             elif once:
                 print(
-                    f"\n=== one-shot mode: queue stable (hash={current_hash[:8]}); exiting ===",
+                    "\n=== one-shot mode: queue drained; exiting ===",
                     flush=True,
                 )
                 break
             else:
                 print(
-                    f"\n--- queue stable (hash={current_hash[:8]}); "
-                    f"sleeping {POLL_INTERVAL_SECONDS}s ---",
+                    f"\n--- queue drained; sleeping {POLL_INTERVAL_SECONDS}s ---",
                     flush=True,
                 )
                 # Sleep in small chunks so a stop signal is responsive.

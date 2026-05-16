@@ -330,9 +330,9 @@ def _launch_or_queue_refine(cfg: ReviewConfig, chapter: int) -> None:
             if _process_alive(pid):
                 print(
                     f"  refine daemon already active for c{chapter} "
-                    f"(pid {pid}); this rejection will be picked up on the "
-                    "daemon's next loop iteration (state.json is re-hashed "
-                    "before each marathon refine call)"
+                    f"(pid {pid}); this rejection is queued in state.json "
+                    "and the daemon will dispatch its own iteration for "
+                    "this issue (one-rejection-per-iteration dispatch)"
                 )
                 return
         except (ValueError, OSError):

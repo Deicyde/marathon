@@ -32,10 +32,25 @@ Schema (versioned for forward compatibility)::
         "<issue_num>": {
           "status": "rejected" | "verified",
           "verdict_ts": "2026-05-15T20:52:04-04:00",
-          "notes": "...markdown body..."   // present iff status=="rejected"
+          "notes": "...markdown body...",         // present iff status=="rejected"
+          "last_iteration_ts": "...iso 8601..."   // optional; set by the
+                                                  // refine daemon after
+                                                  // dispatching an
+                                                  // iteration for this
+                                                  // issue. A rejection
+                                                  // "needs iteration"
+                                                  // iff `last_iteration_ts`
+                                                  // is absent OR strictly
+                                                  // less than `verdict_ts`.
         }
       }
     }
+
+The ``last_iteration_ts`` field lets the daemon track *per-issue*
+queue progress, rather than treating the whole pending-rejections
+set as a single batch. The prior single-hash design lost any
+rejection that arrived during a refine iteration — see
+``pending_rejections_needing_iteration`` for the corrected query.
 
 Concurrent writes are not protected; the CLI's per-issue command
 granularity makes overlap rare and the worst-case is a lost write
@@ -60,9 +75,25 @@ STATE_RELPATH = Path(".marathon/review/state.json")
 
 @dataclass
 class IssueState:
-    status: str                    # "rejected" or "verified"
-    verdict_ts: str                # ISO 8601
-    notes: Optional[str] = None    # markdown; only when status=="rejected"
+    status: str                              # "rejected" or "verified"
+    verdict_ts: str                          # ISO 8601
+    notes: Optional[str] = None              # markdown; only when status=="rejected"
+    last_iteration_ts: Optional[str] = None  # ISO 8601; set by the daemon
+                                             # after dispatching an iteration
+                                             # for this issue. None ⇒ never
+                                             # iterated since current
+                                             # verdict_ts.
+
+    def needs_iteration(self) -> bool:
+        """A rejection needs iteration iff status=='rejected' and either
+        it has never been iterated, or the last iteration is older than
+        the current verdict (i.e., the rejection was re-recorded after
+        the last iteration)."""
+        if self.status != "rejected":
+            return False
+        if self.last_iteration_ts is None:
+            return True
+        return self.last_iteration_ts < self.verdict_ts
 
 
 @dataclass
@@ -80,6 +111,11 @@ class ReviewState:
                     "status": st.status,
                     "verdict_ts": st.verdict_ts,
                     **({"notes": st.notes} if st.notes is not None else {}),
+                    **(
+                        {"last_iteration_ts": st.last_iteration_ts}
+                        if st.last_iteration_ts is not None
+                        else {}
+                    ),
                 }
                 for num, st in sorted(self.issues.items())
             },
@@ -110,6 +146,7 @@ def load_state(cfg: ReviewConfig) -> ReviewState:
                 status=val["status"],
                 verdict_ts=val["verdict_ts"],
                 notes=val.get("notes"),
+                last_iteration_ts=val.get("last_iteration_ts"),
             )
         except (KeyError, ValueError) as e:
             print(f"  warning: {path} issue {key!r} malformed ({e}); skipping")
@@ -133,20 +170,59 @@ def _now_iso() -> str:
 
 def record_rejection(cfg: ReviewConfig, issue_num: int, notes: str) -> IssueState:
     """Record a rejection: status=rejected, notes set, timestamp now.
-    Overwrites any prior state for this issue."""
+    Overwrites any prior state for this issue. Resets ``last_iteration_ts``
+    to None so the daemon will re-dispatch — re-rejecting an issue that
+    was already iterated against re-queues it correctly."""
     state = load_state(cfg)
-    entry = IssueState(status="rejected", verdict_ts=_now_iso(), notes=notes.strip())
+    entry = IssueState(
+        status="rejected",
+        verdict_ts=_now_iso(),
+        notes=notes.strip(),
+        last_iteration_ts=None,
+    )
     state.issues[issue_num] = entry
     save_state(cfg, state)
     return entry
 
 
 def record_verification(cfg: ReviewConfig, issue_num: int) -> IssueState:
-    """Record a verification: status=verified, notes cleared. This is the
-    canonical way to clear a prior rejection's queue entry."""
+    """Record a verification: status=verified, notes cleared,
+    ``last_iteration_ts`` cleared. This is the canonical way to clear a
+    prior rejection's queue entry."""
     state = load_state(cfg)
-    entry = IssueState(status="verified", verdict_ts=_now_iso(), notes=None)
+    entry = IssueState(
+        status="verified",
+        verdict_ts=_now_iso(),
+        notes=None,
+        last_iteration_ts=None,
+    )
     state.issues[issue_num] = entry
+    save_state(cfg, state)
+    return entry
+
+
+def record_iteration(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
+    """Mark that the daemon dispatched a refine iteration for
+    ``issue_num``. Sets ``last_iteration_ts = now()`` on the existing
+    state entry. No-ops (with a warning) if no entry exists for the
+    issue — the daemon should only dispatch against issues already in
+    ``state.json``.
+
+    Called by the refine daemon AFTER a successful (or failed) refine
+    subprocess returns, so the issue is excluded from the next
+    queue-pick regardless of refine outcome. A failed iteration leaves
+    the issue marked as "iterated" to avoid an infinite retry loop —
+    the human re-rejects (which clears ``last_iteration_ts``) to
+    re-queue."""
+    state = load_state(cfg)
+    entry = state.issues.get(issue_num)
+    if entry is None:
+        print(
+            f"  warning: record_iteration(#{issue_num}) called but no "
+            "state.json entry exists; skipping"
+        )
+        return None
+    entry.last_iteration_ts = _now_iso()
     save_state(cfg, state)
     return entry
 
@@ -160,6 +236,10 @@ def pending_rejections(
     If ``chapter`` is supplied, only issues registered in that chapter's
     registry are returned. Unknown issues (not in any chapter registry)
     are returned only when ``chapter`` is ``None`` (project-wide query).
+
+    Note: this returns ALL rejected issues, including ones the daemon
+    has already iterated against once. For the daemon's queue-dispatch
+    logic, use :func:`pending_rejections_needing_iteration` instead.
     """
     state = load_state(cfg)
     if chapter is None:
@@ -173,8 +253,32 @@ def pending_rejections(
     return out
 
 
-def render_pending_rejections_md(
+def pending_rejections_needing_iteration(
     cfg: ReviewConfig, chapter: Optional[int] = None
+) -> list[tuple[int, IssueState]]:
+    """Subset of :func:`pending_rejections` that the daemon should still
+    dispatch an iteration for: rejections that have never been iterated,
+    or whose last iteration predates their current ``verdict_ts`` (e.g.
+    the human re-rejected after a previous iteration).
+
+    Sorted by ``verdict_ts`` ascending (oldest first), so the daemon
+    can pop the head when picking the next focus issue — older
+    rejections get attention first, which matches user intuition that
+    a long-pending rejection is more urgent than a fresh one.
+    """
+    out = [
+        (num, st)
+        for num, st in pending_rejections(cfg, chapter)
+        if st.needs_iteration()
+    ]
+    out.sort(key=lambda x: x[1].verdict_ts)
+    return out
+
+
+def render_pending_rejections_md(
+    cfg: ReviewConfig,
+    chapter: Optional[int] = None,
+    focus_issue: Optional[int] = None,
 ) -> Optional[str]:
     """Render the pending rejections for ``chapter`` (or all chapters
     when None) as a Markdown block suitable for the Hermes/Claude
@@ -182,8 +286,16 @@ def render_pending_rejections_md(
 
     Format mirrors what users wrote into referee.md before — top-level
     bullets, no auto-wrapper — so Hermes can read it identically.
+
+    When ``focus_issue`` is supplied, only that one issue's rejection
+    notes are rendered (or ``None`` if it isn't currently rejected).
+    The daemon uses this for one-rejection-per-iteration dispatch:
+    Hermes sees exactly the rejection the daemon picked, eliminating
+    the prior pick-one-and-ignore-the-rest failure mode.
     """
     pending = pending_rejections(cfg, chapter)
+    if focus_issue is not None:
+        pending = [(n, s) for n, s in pending if n == focus_issue]
     if not pending:
         return None
     parts: list[str] = []

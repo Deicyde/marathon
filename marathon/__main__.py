@@ -264,6 +264,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_refine.add_argument(
+        "--review-rejection",
+        type=int,
+        default=None,
+        metavar="ISSUE_NUM",
+        help=(
+            "Restrict the pending-rejections section of Hermes's prompt "
+            "to a single rejected sub-issue (by GitHub issue number). "
+            "Used by the auto-refine daemon to dispatch one rejection "
+            "per iteration; eliminates the prior failure mode where "
+            "Aristotle saw multiple queued rejections and silently "
+            "picked one. Has no effect if the named issue isn't in "
+            "the current rejection queue."
+        ),
+    )
+    p_refine.add_argument(
         "--dry-run",
         action="store_true",
         help=(

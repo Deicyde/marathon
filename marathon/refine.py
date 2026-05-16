@@ -68,12 +68,19 @@ RATINGS_FILENAME = "marathon-ratings.jsonl"
 
 
 def _load_pending_rejections_md(
-    repo_dir: Path, target_folder: Path
+    repo_dir: Path,
+    target_folder: Path,
+    focus_issue: Optional[int] = None,
 ) -> Optional[str]:
     """Load the pending-rejection queue for the chapter ``target_folder``
     belongs to, rendered as Markdown for Hermes's prompt context. Returns
     ``None`` if there's no review config, no pending rejections, or the
     target folder doesn't map to any registered chapter.
+
+    When ``focus_issue`` is supplied, the rendered block is restricted
+    to that single rejected issue — used by the refine daemon for
+    one-rejection-per-iteration dispatch (see
+    ``--review-rejection N`` on ``marathon refine``).
 
     Gracefully no-ops when the consumer repo isn't using the review
     workflow (`.marathon/review/config.toml` absent), so callers that
@@ -102,7 +109,7 @@ def _load_pending_rejections_md(
             break
     # If we can't identify the chapter, fall back to project-wide pending
     # rejections rather than dropping them entirely.
-    return render_pending_rejections_md(cfg, chapter)
+    return render_pending_rejections_md(cfg, chapter, focus_issue=focus_issue)
 
 
 def _read_latest_rating_note(workdir: Path) -> Optional[str]:
@@ -677,6 +684,7 @@ async def _run_iteration(
     cross_chapter: bool = True,
     watcher_factory=None,
     continue_on_review: bool = True,
+    review_rejection: Optional[int] = None,
 ) -> bool:
     """Run a single refinement iteration. Each attempt (other than a pure
     ``reattach`` reentry) gets its own Claude review against the current
@@ -759,8 +767,12 @@ async def _run_iteration(
             # `.marathon/review/state.json` (decoupled from referee.md as
             # of the L refactor). Filter to the chapter our target folder
             # belongs to, so cross-chapter rejections don't bleed in.
+            # ``review_rejection`` (when set, typically by the refine
+            # daemon) further restricts to a single rejected issue — the
+            # one-rejection-per-iteration dispatch that fixes the
+            # daemon-queue-not-honored failure mode.
             pending_rejections_md = _load_pending_rejections_md(
-                repo_dir, target_folder
+                repo_dir, target_folder, focus_issue=review_rejection,
             )
             # Re-read the latest rater note on every attempt (including
             # retries) so a fresh Claude review sees the latest available
@@ -1071,6 +1083,7 @@ async def refine_command(args) -> None:
             cross_chapter=not args.no_cross_chapter,
             watcher_factory=watcher_factory,
             continue_on_review=continue_on_review,
+            review_rejection=getattr(args, "review_rejection", None),
         )
 
         if not ok:
