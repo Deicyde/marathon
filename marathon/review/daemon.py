@@ -229,20 +229,35 @@ def run_daemon(chapter: int, once: bool = False) -> int:
                     flush=True,
                 )
                 exit_code = run_one_refine(cfg, chapter, focus_issue=target_issue)
-                # Mark iterated regardless of exit code. A failed
-                # iteration leaves the issue marked iterated; the human
-                # re-rejects (which clears last_iteration_ts) to re-queue.
-                # This avoids an infinite retry loop on a persistent
-                # submit failure or build failure.
-                record_iteration(cfg, target_issue)
-                if exit_code != 0:
+                # Decide whether to record this as an attempted iteration:
+                # * Clean exit (0): always record.
+                # * Non-zero exit: record, to avoid infinite retry loops
+                #   on persistent failures (the human re-rejects to
+                #   re-queue).
+                # * BUT: if the daemon itself received a stop signal
+                #   while the refine was running, the iteration was
+                #   killed prematurely — likely because the user wanted
+                #   to swap code or pause work, not because the refine
+                #   actually failed. Don't record in that case; the
+                #   next daemon launch will pick the same issue up.
+                if _STOP_REQUESTED and exit_code != 0:
                     print(
-                        f"--- iteration for #{target_issue} exited "
-                        f"non-zero ({exit_code}); marked iterated to "
-                        "avoid retry loop. Re-reject the issue to "
-                        "re-queue.",
+                        f"--- iteration for #{target_issue} interrupted "
+                        f"by daemon stop signal (exit {exit_code}); NOT "
+                        "marked iterated. Next daemon launch will "
+                        "re-dispatch for this issue.",
                         flush=True,
                     )
+                else:
+                    record_iteration(cfg, target_issue)
+                    if exit_code != 0:
+                        print(
+                            f"--- iteration for #{target_issue} exited "
+                            f"non-zero ({exit_code}); marked iterated to "
+                            "avoid retry loop. Re-reject the issue to "
+                            "re-queue.",
+                            flush=True,
+                        )
                 if once and iteration_count >= MAX_LOOPS_ONCE:
                     print(
                         f"\n=== one-shot mode: safety cap of {MAX_LOOPS_ONCE} "
