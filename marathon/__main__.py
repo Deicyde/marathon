@@ -410,6 +410,23 @@ def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--audit-verified",
+        action="store_true",
+        help=(
+            "After each successful auto-commit, audit the just-landed "
+            "diff against the set of verified declarations from the "
+            "project's `marathon review` sub-issues. Any verified "
+            "declaration modified by this iteration is flagged loudly "
+            "and logged to `<workdir>/marathon-audit-violations.jsonl`. "
+            "Soft warning only — does not auto-revert or re-launch. "
+            "Requires the consumer repo to use the `marathon review` "
+            "workflow (`.marathon/review/config.toml` + GitHub "
+            "sub-issues); gracefully no-ops otherwise. Default: off "
+            "for manual `marathon refine`; the auto-refine daemon "
+            "enables this by default."
+        ),
+    )
+    parser.add_argument(
         "--build-timeout",
         type=int,
         default=600,

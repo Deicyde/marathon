@@ -66,6 +66,7 @@ DEFAULT_REFINE_ARGS: list[str] = [
     "--auto-build", "--build-timeout", "1800",
     "--auto-commit", "--auto-push", "--auto-rate",
     "--auto-referee-every", "1",
+    "--audit-verified",
 ]
 
 # Set by SIGTERM/SIGINT to break the daemon's poll loop. Module-level so

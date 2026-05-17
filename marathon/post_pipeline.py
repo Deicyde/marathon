@@ -44,6 +44,18 @@ class PipelineConfig:
     # auto_rate is on, the rater also receives these notes as
     # project-specific priorities to weight scoring against.
     referee_path: Optional[Path] = None
+    # When True (and auto_commit also True), after the auto-commit lands,
+    # run a post-iteration audit that diffs HEAD~1..HEAD against the set
+    # of verified declarations extracted from currently-verified
+    # sub-issue bodies. Any overlap is flagged. Soft warning only — does
+    # not auto-revert or auto-reject. Logs to
+    # ``<workdir>/marathon-audit-violations.jsonl``. Requires the consumer
+    # repo to use the `marathon review` workflow (review config + GitHub
+    # sub-issues); no-ops gracefully otherwise.
+    audit_verified: bool = False
+    # Workdir path for the iteration; used to emit the audit JSONL log.
+    # Set by refine; skeleton doesn't currently audit.
+    audit_workdir: Optional[Path] = None
 
     def has_any(self) -> bool:
         return self.auto_build or self.auto_commit or self.auto_push or self.auto_rate
@@ -538,6 +550,21 @@ def run_post_pipeline(
             else:
                 print(f"  push: failed — {push_msg}")
 
+        # Post-commit audit: did this iteration touch any verified
+        # declarations the human has already locked? Soft warning;
+        # logs to <workdir>/marathon-audit-violations.jsonl. Graceful
+        # no-op when the consumer repo isn't using `marathon review`.
+        if config.audit_verified and c.sha:
+            try:
+                _run_verified_decls_audit(
+                    repo_dir=repo_dir,
+                    chapter_label=chapter_label,
+                    commit_sha=c.sha,
+                    workdir=config.audit_workdir,
+                )
+            except Exception as e:  # noqa: BLE001 — soft-warning audit
+                print(f"  audit: skipped — {type(e).__name__}: {e}")
+
     if config.auto_rate:
         commit_sha = out["commit"].sha if out["commit"] else None
         r = call_claude_rater(
@@ -574,6 +601,83 @@ def run_post_pipeline(
                 print(f"  ratings log: could not append — {e}")
 
     return out
+
+
+def _run_verified_decls_audit(
+    repo_dir: Path,
+    chapter_label: str,
+    commit_sha: str,
+    workdir: Optional[Path],
+) -> None:
+    """Helper invoked from ``run_post_pipeline`` when
+    ``config.audit_verified`` is True and a commit landed.
+
+    Parses the chapter number from ``chapter_label`` (e.g. ``Chapter14``
+    → 14), loads the review config, runs
+    ``audit_iteration(HEAD~1..commit_sha)``, prints results, and
+    appends to the workdir's audit-violations JSONL.
+
+    Soft no-op if the review config isn't present or the chapter
+    label doesn't match the expected ``Chapter<N>`` shape.
+    """
+    import re as _re
+    m = _re.match(r"Chapter(\d+)$", chapter_label)
+    if not m:
+        return  # not a chapter-style label; nothing to audit against
+    chapter_num = int(m.group(1))
+
+    try:
+        from marathon.review.config import load_config
+        from marathon.review.verified_decls import (
+            audit_iteration,
+            write_audit_log,
+        )
+    except ImportError:
+        return
+
+    config_path = repo_dir / ".marathon" / "review" / "config.toml"
+    if not config_path.is_file():
+        return
+
+    try:
+        cfg = load_config(repo_dir=repo_dir)
+    except SystemExit:
+        return
+    if chapter_num not in cfg.chapters:
+        return
+
+    result = audit_iteration(
+        cfg, chapter_num, repo_dir, ref_old=f"{commit_sha}~1", ref_new=commit_sha,
+    )
+
+    print(
+        f"  audit: scanned {result.verified_decl_count} verified decls across "
+        f"{result.verified_issue_count} verified issues; iteration modified "
+        f"{result.modified_decl_count} decls."
+    )
+    if result.has_violations():
+        print(
+            f"  ⚠ audit: {len(result.violations)} verified declaration(s) "
+            f"modified by this iteration:"
+        )
+        for v in result.violations:
+            title = f" — {v.issue_title}" if v.issue_title else ""
+            print(f"    #{v.issue_num}{title}: {v.decl_name}")
+        print(
+            "  ⚠ recommended: inspect the diff; if the changes are unwanted, "
+            "`git revert` this commit or `git checkout HEAD~1 -- <file>` for "
+            "the offending files, then re-launch refine."
+        )
+    if workdir is not None:
+        try:
+            log_path = write_audit_log(
+                workdir, result,
+                ref_old=f"{commit_sha}~1",
+                ref_new=commit_sha,
+            )
+            print(f"  audit: log written to {log_path}")
+        except OSError as e:
+            print(f"  audit: could not write log — {e}")
 
 
 # Helpers

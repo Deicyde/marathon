@@ -1075,6 +1075,8 @@ async def refine_command(args) -> None:
         ratings_path=workdir / "marathon-ratings.jsonl",
         claude_in_loop=True,  # refine drafts each prompt via Claude
         referee_path=referee_path,
+        audit_verified=getattr(args, "audit_verified", False),
+        audit_workdir=workdir,
     )
     if pipeline_config.has_any():
         flags = [
