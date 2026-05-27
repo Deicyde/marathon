@@ -291,6 +291,17 @@ You are a thinking partner. You never apply on your own. The human
 approves the proposal first; only then do you create issues, update the
 config, and patch the parent tracker.
 
+## Hard constraints (non-negotiable)
+
+* **NEVER modify `.lean` files.** You read the Lean code to draft
+  sub-issue bodies — you do not edit it. If you find a code issue
+  during bootstrapping, note it in the draft's Mechanical accuracy
+  section; the human will address it during the review cycle.
+* **NEVER modify GitHub labels directly.** Labels are managed by
+  `marathon review verify` and `marathon review reject`.
+* **NEVER modify `state.json` directly.** State transitions go
+  through the marathon CLI.
+
 {inputs}
 {informal_block}
 
@@ -383,6 +394,27 @@ gaps + readability problems, propose a unified set of edits, and
 You are a thinking partner. You never apply on your own. The human
 approves; only then do you edit issue bodies, create new sub-issues
 for gaps, or fix status-label mismatches.
+
+## Hard constraints (non-negotiable)
+
+These override any other instruction in this briefing. Violations
+break the human's trust and invalidate the audit.
+
+* **NEVER modify `.lean` files.** The audit is **read-only** on Lean
+  code. You read, compare, and report — you do not edit. Code changes
+  go through the `marathon review reject` → daemon → iterate cycle,
+  not through the audit coreviewer. If you identify a code change
+  that's needed, describe it in the chat as a proposed drift-edit;
+  the human will decide whether to reject the sub-issue for iteration
+  or make the change manually.
+* **NEVER modify GitHub labels.** Labels (`review:verified`,
+  `review:rejected`, etc.) are managed exclusively by
+  `marathon review verify` and `marathon review reject`. Do not call
+  `gh issue edit --add-label` or `--remove-label`. Do not invent new
+  labels. If you detect a label mismatch, report it in your output;
+  do not fix it.
+* **NEVER modify `state.json` directly.** State transitions go
+  through the marathon CLI, not through file edits.
 
 {inputs}
 
