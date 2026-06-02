@@ -56,6 +56,21 @@ class PipelineConfig:
     # Workdir path for the iteration; used to emit the audit JSONL log.
     # Set by refine; skeleton doesn't currently audit.
     audit_workdir: Optional[Path] = None
+    # When True (default), refresh ``formalization.yaml`` (mathlib-
+    # initiative v0.2 schema) at the repo root with auto-derived
+    # fields (sorry_count, models, etc.) before each auto-commit.
+    # No-op for repos that haven't created the file (the auto-updater
+    # itself is opt-in; the file is created only by
+    # ``marathon formalization init`` or manually).
+    update_formalization: bool = True
+    # Model identifiers stamped into ``automation.models``. Set by
+    # refine to ``["claude-opus-4-7", "Aristotle"]`` (Claude + the
+    # Aristotle worker); set by skeleton to ``["Aristotle"]``.
+    formalization_models: Optional[list[str]] = None
+    # Framework name stamped into ``automation.framework``. Defaults
+    # to ``"Marathon"`` at call sites; override if the consumer pipes
+    # marathon through a different orchestrator.
+    formalization_framework: Optional[str] = "Marathon"
 
     def has_any(self) -> bool:
         return self.auto_build or self.auto_commit or self.auto_push or self.auto_rate
@@ -263,6 +278,14 @@ def run_git_commit(
     promptlog = repo_dir / PROMPTLOG_FILENAME
     if promptlog.is_file():
         paths_to_stage.append(PROMPTLOG_FILENAME)
+    # Stage formalization.yaml when present so its auto-update (run by
+    # run_post_pipeline before this commit lands) is bundled into the
+    # same commit as the iteration's .lean edits. No-op when the project
+    # hasn't opted in.
+    from marathon.formalization import FORMALIZATION_FILENAME
+    formalization = repo_dir / FORMALIZATION_FILENAME
+    if formalization.is_file():
+        paths_to_stage.append(FORMALIZATION_FILENAME)
 
     add_proc = subprocess.run(
         ["git", "add", "--", *paths_to_stage],
@@ -521,6 +544,23 @@ def run_post_pipeline(
             print(f"  build: {status} ({duration})")
 
     if config.auto_commit:
+        # Refresh formalization.yaml's auto-fields (sorry_count,
+        # models, framework) before the commit so the yaml change is
+        # bundled into the same commit as the iteration's .lean edits.
+        # No-op when the project hasn't opted in (file missing).
+        if config.update_formalization:
+            try:
+                from marathon.formalization import update_formalization
+                written = update_formalization(
+                    repo_dir,
+                    models=config.formalization_models,
+                    framework=config.formalization_framework,
+                )
+                if written is not None:
+                    print(f"  formalization: refreshed {written.name}")
+            except Exception as e:  # noqa: BLE001 — soft-warning
+                print(f"  formalization: skipped — {type(e).__name__}: {e}")
+
         msg_parts = [f"marathon: {chapter_label}"]
         if iteration is not None:
             msg_parts.append(f"iteration {iteration}")

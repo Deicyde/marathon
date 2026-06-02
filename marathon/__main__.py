@@ -365,7 +365,87 @@ def _build_parser() -> argparse.ArgumentParser:
     # Project-specific settings come from <repo>/.marathon/review/config.toml.
     _add_review_subparser(subparsers)
 
+    # Formalization tree: `marathon formalization init/update`
+    _add_formalization_subparser(subparsers)
+
     return parser
+
+
+def _add_formalization_subparser(subparsers) -> None:
+    """Adds `marathon formalization init/update` for managing the
+    mathlib-initiative v0.2 ``formalization.yaml`` at the repo root."""
+    p_form = subparsers.add_parser(
+        "formalization",
+        help="Manage formalization.yaml (mathlib-initiative v0.2 schema).",
+        description=(
+            "Initialize or refresh the project's `formalization.yaml`. "
+            "Auto-fields (version, sorry_count, sorry_in_definitions, "
+            "automation.models, automation.framework) are managed by "
+            "marathon; every other field is human-curated and preserved "
+            "verbatim across refreshes."
+        ),
+    )
+    sub = p_form.add_subparsers(dest="form_command", required=True)
+
+    p_init = sub.add_parser(
+        "init",
+        help="Create formalization.yaml at the repo root from the v0.2 template.",
+    )
+    p_init.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Repo root. Default: current directory.",
+    )
+    p_init.add_argument(
+        "--force", action="store_true",
+        help="Overwrite an existing formalization.yaml. Default: refuse.",
+    )
+    p_init.set_defaults(func=_run_formalization_init)
+
+    p_up = sub.add_parser(
+        "update",
+        help="Refresh formalization.yaml's auto-fields (no-op if file missing).",
+    )
+    p_up.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Repo root. Default: current directory.",
+    )
+    p_up.add_argument(
+        "--models", nargs="+", default=None,
+        help="Model identifiers to stamp into automation.models.",
+    )
+    p_up.add_argument(
+        "--framework", default="Marathon",
+        help="Framework name for automation.framework. Default: 'Marathon'.",
+    )
+    p_up.set_defaults(func=_run_formalization_update)
+
+
+def _run_formalization_init(args) -> None:
+    from marathon.formalization import (
+        FORMALIZATION_FILENAME, update_formalization,
+    )
+    repo_dir: Path = args.repo_dir.resolve()
+    target = repo_dir / FORMALIZATION_FILENAME
+    if target.is_file() and not args.force:
+        print(f"refusing to overwrite existing {target} (use --force to allow)")
+        raise SystemExit(2)
+    written = update_formalization(
+        repo_dir, framework="Marathon", create_if_missing=True
+    )
+    print(f"wrote {written}")
+
+
+def _run_formalization_update(args) -> None:
+    from marathon.formalization import update_formalization
+    repo_dir: Path = args.repo_dir.resolve()
+    written = update_formalization(
+        repo_dir, models=args.models, framework=args.framework
+    )
+    if written is None:
+        print(f"no formalization.yaml at {repo_dir}; "
+              "run `marathon formalization init` first")
+        raise SystemExit(1)
+    print(f"refreshed {written}")
 
 
 def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
@@ -424,6 +504,22 @@ def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
             "sub-issues); gracefully no-ops otherwise. Default: off "
             "for manual `marathon refine`; the auto-refine daemon "
             "enables this by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-update-formalization",
+        dest="update_formalization",
+        action="store_false",
+        default=True,
+        help=(
+            "Skip the per-iteration refresh of `formalization.yaml` "
+            "(mathlib-initiative v0.2 schema) at the repo root. "
+            "Default: on, but only writes when the file already "
+            "exists at the repo root — opt in per project via "
+            "`marathon formalization init`. The auto-refresh updates "
+            "sorry_count, sorry_in_definitions, version, and the "
+            "automation.models/framework fields; everything else is "
+            "preserved verbatim."
         ),
     )
     parser.add_argument(
