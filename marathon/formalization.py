@@ -123,15 +123,33 @@ def read_formalization(path: Path) -> dict[str, Any]:
 def write_formalization(path: Path, data: dict[str, Any]) -> None:
     """Write the dict to disk with deterministic key order (matches the
     template), trailing newline, no tags. The deterministic ordering
-    minimises diff noise across runs."""
+    minimises diff noise across runs.
+
+    Multi-line strings are emitted as literal block scalars (``|-``)
+    rather than the default expanded-plain style, which preserves
+    paragraph structure for the human-curated ``notes`` / ``scope`` /
+    ``divergences`` fields.
+    """
     yaml = _try_import_yaml()
     ordered = _reorder_to_template(data)
-    text = yaml.safe_dump(
+
+    def _str_representer(dumper, value: str):
+        # Multi-line → literal block; single-line → default plain.
+        if "\n" in value:
+            return dumper.represent_scalar(
+                "tag:yaml.org,2002:str", value, style="|"
+            )
+        return dumper.represent_scalar("tag:yaml.org,2002:str", value)
+
+    dumper = yaml.SafeDumper
+    dumper.add_representer(str, _str_representer)
+    text = yaml.dump(
         ordered,
-        sort_keys=False,  # we apply our own ordering
+        Dumper=dumper,
+        sort_keys=False,
         default_flow_style=False,
         allow_unicode=True,
-        width=10000,  # avoid wrapping long lines
+        width=10000,
     )
     path.write_text(text)
 
