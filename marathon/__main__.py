@@ -571,6 +571,9 @@ def main() -> None:
         except KeyboardInterrupt:
             print("\ninterrupted", file=sys.stderr)
             sys.exit(130)
+    elif args.command == "formalization":
+        # Dispatch via the subparser's set_defaults(func=…) handler.
+        args.func(args)
 
 
 if __name__ == "__main__":

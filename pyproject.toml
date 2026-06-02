@@ -8,6 +8,10 @@ dependencies = [
     # AgentTask + Event; marathon.aristotle_runtime wraps that back into
     # Marathon's lifecycle shape.
     "aristotlelib>=2.0.0",
+    # Used by marathon.formalization to maintain formalization.yaml
+    # (mathlib-initiative v0.2 schema). Pinned to PyYAML 6+ for the
+    # safe_load / safe_dump API used in the module.
+    "PyYAML>=6.0",
 ]
 
 [project.scripts]
