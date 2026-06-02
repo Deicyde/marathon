@@ -548,16 +548,26 @@ def run_post_pipeline(
         # models, framework) before the commit so the yaml change is
         # bundled into the same commit as the iteration's .lean edits.
         # No-op when the project hasn't opted in (file missing).
+        # When the build succeeded this iteration, also refresh the
+        # verified-axiom set on every `status.main_results` entry via
+        # `#print axioms` (one `lake env lean` invocation, batched
+        # across all main results).
         if config.update_formalization:
             try:
                 from marathon.formalization import update_formalization
+                build_ok = (
+                    out["build"] is not None
+                    and out["build"].ok is True
+                )
                 written = update_formalization(
                     repo_dir,
                     models=config.formalization_models,
                     framework=config.formalization_framework,
+                    check_axioms_on_build=build_ok,
                 )
                 if written is not None:
-                    print(f"  formalization: refreshed {written.name}")
+                    suffix = " (with axioms)" if build_ok else ""
+                    print(f"  formalization: refreshed {written.name}{suffix}")
             except Exception as e:  # noqa: BLE001 — soft-warning
                 print(f"  formalization: skipped — {type(e).__name__}: {e}")
 

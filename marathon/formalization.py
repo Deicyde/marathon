@@ -250,6 +250,157 @@ def compute_auto_fields(
     return out
 
 
+# --- axiom checking ------------------------------------------------------
+#
+# ``status.main_results[].axioms`` is the per-declaration axiom set
+# Mathlib's ``#print axioms`` reports. Auto-checking requires the
+# project to be built (`.olean` files present); the checker batches
+# every main-result decl into one Lean invocation so multi-result
+# projects only pay one process spawn per iteration.
+
+
+def _module_from_file_path(file_path: str) -> str | None:
+    """Convert a relative source path (``GeometricAnalysis/LeeSM/Chapter16/
+    StokesTheorem.lean``) to a Lean module path
+    (``GeometricAnalysis.LeeSM.Chapter16.StokesTheorem``).
+
+    Returns ``None`` for inputs that don't look like a Lean source path
+    (no ``.lean`` suffix, absolute paths, empty)."""
+    if not file_path or not file_path.endswith(".lean"):
+        return None
+    if file_path.startswith("/"):
+        # Strip a leading absolute prefix the user accidentally pasted —
+        # we can't recover the module path from an absolute path without
+        # knowing the project root, so refuse.
+        return None
+    stem = file_path[: -len(".lean")]
+    return stem.replace("/", ".")
+
+
+# `#print axioms` output shapes:
+#   <decl> depends on axioms: [a, b, c]
+#   <decl> does not depend on any axioms
+# The "depends on axioms:" form is multi-line — axioms can wrap. The
+# "does not depend" form is one line.
+_AXIOMS_LIST_RE = re.compile(
+    r"'(?P<decl>[^']+)' depends on axioms:\s*\[(?P<axioms>.*?)\]",
+    re.DOTALL,
+)
+_AXIOMS_NONE_RE = re.compile(
+    r"'(?P<decl>[^']+)' does not depend on any axioms"
+)
+
+
+def check_axioms(
+    repo_dir: Path,
+    decl_to_module: list[tuple[str, str]],
+    *,
+    timeout: int = 120,
+) -> dict[str, list[str] | None]:
+    """Run ``#print axioms`` on a batch of declarations in one Lean
+    invocation. Returns ``{decl_name: axioms | None}``; ``None`` means
+    the declaration's axioms couldn't be determined (build missing,
+    decl not in scope, Lean error). Decls that genuinely depend on no
+    axioms return an empty list.
+
+    Args:
+        repo_dir: Project root (where ``lake env lean`` runs).
+        decl_to_module: List of ``(decl_name, module_path)`` pairs.
+            ``module_path`` is the dotted Lean module the decl lives
+            in (use ``_module_from_file_path`` to convert source paths).
+        timeout: Seconds to wait for ``lake env lean`` before
+            aborting (returns ``None`` for every decl on timeout).
+    """
+    if not decl_to_module:
+        return {}
+    # Dedup module imports, preserve order so the test file is stable.
+    modules_seen: set[str] = set()
+    modules_ordered: list[str] = []
+    for _, mod in decl_to_module:
+        if mod not in modules_seen:
+            modules_seen.add(mod)
+            modules_ordered.append(mod)
+    # Build the temp Lean file: imports + print-axioms commands.
+    lines = [f"import {m}" for m in modules_ordered]
+    lines.append("")
+    for decl, _ in decl_to_module:
+        lines.append(f"#print axioms {decl}")
+    tmp_path = repo_dir / ".marathon-axioms-check.lean"
+    out: dict[str, list[str] | None] = {decl: None for decl, _ in decl_to_module}
+    try:
+        tmp_path.write_text("\n".join(lines) + "\n")
+        try:
+            proc = subprocess.run(
+                ["lake", "env", "lean", str(tmp_path.name)],
+                cwd=str(repo_dir),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "axiom check timed out after %ds for %d decls",
+                timeout, len(decl_to_module),
+            )
+            return out
+        # Lean writes "<decl> depends on axioms: [..]" or "does not
+        # depend" lines to stdout. Errors go to stderr; if stderr is
+        # noisy but the decl printed, we still take the printed value.
+        text = proc.stdout
+        for m in _AXIOMS_LIST_RE.finditer(text):
+            decl = m.group("decl")
+            ax_blob = m.group("axioms")
+            # Axioms are comma-separated bare identifiers (or dotted).
+            axs = [a.strip() for a in ax_blob.split(",") if a.strip()]
+            out[decl] = axs
+        for m in _AXIOMS_NONE_RE.finditer(text):
+            out[m.group("decl")] = []
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return out
+
+
+def update_main_results_axioms(
+    data: dict[str, Any], repo_dir: Path
+) -> int:
+    """Walk ``data['status']['main_results']`` and replace each entry's
+    ``axioms`` list with the verified set from ``#print axioms``.
+    Entries whose axioms can't be determined (build missing, decl
+    not in scope) are left unchanged.
+
+    Returns the number of entries whose ``axioms`` field was updated.
+    """
+    main_results = (data.get("status") or {}).get("main_results") or []
+    decl_to_module: list[tuple[str, str]] = []
+    for entry in main_results:
+        decl = entry.get("declaration") if isinstance(entry, dict) else None
+        file_path = entry.get("file") if isinstance(entry, dict) else None
+        if not decl or not file_path:
+            continue
+        module = _module_from_file_path(file_path)
+        if module is None:
+            continue
+        decl_to_module.append((decl, module))
+    if not decl_to_module:
+        return 0
+    axioms_by_decl = check_axioms(repo_dir, decl_to_module)
+    updated = 0
+    for entry in main_results:
+        if not isinstance(entry, dict):
+            continue
+        decl = entry.get("declaration")
+        result = axioms_by_decl.get(decl)
+        if result is None:
+            continue
+        entry["axioms"] = result
+        updated += 1
+    return updated
+
+
 # --- orchestrator --------------------------------------------------------
 
 
@@ -259,6 +410,7 @@ def update_formalization(
     framework: str | None = None,
     yaml_path: Path | None = None,
     create_if_missing: bool = False,
+    check_axioms_on_build: bool = False,
 ) -> Path | None:
     """Read, update the auto-fields, write back. Returns the path
     written, or ``None`` if the file was absent and
@@ -280,6 +432,15 @@ def update_formalization(
             file in repos that haven't asked for it. Use
             ``marathon formalization init`` to initialize a fresh
             file in a new project.
+        check_axioms_on_build: If True, run ``#print axioms`` on
+            every declaration in ``status.main_results`` and replace
+            their ``axioms`` lists with the verified set. Costs one
+            ``lake env lean`` invocation per call (batched across
+            all main results). Only meaningful when the build is
+            current — the caller is responsible for gating this on a
+            successful ``lake build``. Default False — opt-in via
+            ``--check-axioms`` on the CLI or ``build.ok`` in
+            ``post_pipeline``.
     """
     yaml_path = yaml_path or (repo_dir / FORMALIZATION_FILENAME)
     if not yaml_path.is_file() and not create_if_missing:
@@ -287,6 +448,18 @@ def update_formalization(
     current = read_formalization(yaml_path)
     auto = compute_auto_fields(repo_dir, models=models, framework=framework)
     merged = _overlay_auto_fields(current, auto)
+    if check_axioms_on_build:
+        try:
+            updated = update_main_results_axioms(merged, repo_dir)
+            if updated:
+                logger.info(
+                    "formalization: refreshed axioms for %d main_result(s)",
+                    updated,
+                )
+        except Exception:  # noqa: BLE001 — soft-warning
+            logger.exception(
+                "formalization: axiom check failed; existing axioms preserved"
+            )
     write_formalization(yaml_path, merged)
     return yaml_path
 
