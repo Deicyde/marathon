@@ -67,6 +67,109 @@ REFINE_LOG_FILENAME = "marathon-refine-log.md"
 RATINGS_FILENAME = "marathon-ratings.jsonl"
 
 
+def _load_additional_writable_paths(
+    repo_dir: Path, expected_path: PurePosixPath
+) -> list[PurePosixPath]:
+    """Compute the cross-chapter / vendor writable whitelist for the
+    extractor. Returns a list of repo-relative POSIX paths the
+    extractor may write into (in addition to the primary
+    ``expected_path``).
+
+    Sources:
+
+    * Every registered chapter path under
+      ``.marathon/review/config.toml``'s ``[[chapters]]`` block,
+      EXCEPT the primary chapter ``expected_path`` (which the
+      extractor already handles separately with wipe-and-replace).
+    * Every entry of the top-level ``extra_writable_paths`` config
+      array (typically vendor directories such as ``Mathlib_4_30/``).
+
+    Gracefully returns ``[]`` when the consumer repo isn't using the
+    review workflow (no ``config.toml``) — preserves the historical
+    chapter-scoped extractor behavior in that case.
+    """
+    try:
+        from marathon.review.config import load_config
+    except ImportError:
+        return []
+    config_path = repo_dir / ".marathon" / "review" / "config.toml"
+    if not config_path.is_file():
+        return []
+    try:
+        cfg = load_config(repo_dir=repo_dir)
+    except SystemExit:
+        return []
+
+    expected_parts = tuple(expected_path.parts)
+    out: list[PurePosixPath] = []
+    seen: set[tuple[str, ...]] = {expected_parts}
+    for chap in cfg.chapters:
+        chap_path = cfg.target_path(chap)
+        try:
+            rel = chap_path.relative_to(cfg.repo_dir)
+        except ValueError:
+            continue
+        ppp = PurePosixPath(*rel.parts)
+        parts = tuple(ppp.parts)
+        if parts in seen:
+            continue
+        seen.add(parts)
+        out.append(ppp)
+    for p in cfg.extra_writable_paths:
+        ppp = PurePosixPath(*p.parts)
+        parts = tuple(ppp.parts)
+        if parts in seen:
+            continue
+        seen.add(parts)
+        out.append(ppp)
+    return out
+
+
+def _load_pending_rejections_md(
+    repo_dir: Path,
+    target_folder: Path,
+    focus_issue: Optional[int] = None,
+) -> Optional[str]:
+    """Load the pending-rejection queue for the chapter ``target_folder``
+    belongs to, rendered as Markdown for Hermes's prompt context. Returns
+    ``None`` if there's no review config, no pending rejections, or the
+    target folder doesn't map to any registered chapter.
+
+    When ``focus_issue`` is supplied, the rendered block is restricted
+    to that single rejected issue — used by the refine daemon for
+    one-rejection-per-iteration dispatch (see
+    ``--review-rejection N`` on ``marathon refine``).
+
+    Gracefully no-ops when the consumer repo isn't using the review
+    workflow (`.marathon/review/config.toml` absent), so callers that
+    don't care about the queue don't break.
+    """
+    try:
+        from marathon.review.config import load_config
+        from marathon.review.state import render_pending_rejections_md
+    except ImportError:
+        return None
+    config_path = repo_dir / ".marathon" / "review" / "config.toml"
+    if not config_path.is_file():
+        return None
+    try:
+        cfg = load_config(repo_dir=repo_dir)
+    except SystemExit:
+        # load_config sys.exits on missing required fields; treat as
+        # "no review config available" rather than crashing refine.
+        return None
+    # Map target_folder back to a chapter via the template.
+    chapter: Optional[int] = None
+    target_resolved = target_folder.resolve()
+    for cand_chapter in cfg.chapters.keys():
+        if cfg.target_path(cand_chapter).resolve() == target_resolved:
+            chapter = cand_chapter
+            break
+    # If we can't identify the chapter, fall back to project-wide pending
+    # rejections rather than dropping them entirely.
+    return render_pending_rejections_md(cfg, chapter, focus_issue=focus_issue)
+
+
 def _read_latest_rating_note(workdir: Path) -> Optional[str]:
     """Return the most-recent rating's `notes` paragraph from the workdir's
     ratings log, or None if the file is missing/empty/malformed.
@@ -570,8 +673,17 @@ async def _run_refine_attempt(
                 return None
 
             log_dest = workdir_log if workdir_log is not None else Path(dl_tmp) / "_unused.md"
-            found, log_updated, unexpected = _extract_solution(
-                Path(result_path), expected_path, repo_dir, log_dest
+            # Compute the cross-chapter / vendor writable whitelist
+            # from .marathon/review/config.toml (every registered
+            # chapter folder other than the primary one, plus any
+            # `extra_writable_paths` entries). Gracefully no-ops when
+            # the project isn't using the review workflow.
+            additional_writable = _load_additional_writable_paths(
+                repo_dir, expected_path,
+            )
+            found, log_updated, unexpected, cross_writes = _extract_solution(
+                Path(result_path), expected_path, repo_dir, log_dest,
+                additional_writable_paths=additional_writable,
             )
             if found:
                 state.output_path = str(repo_dir / Path(*expected_path.parts))
@@ -583,6 +695,25 @@ async def _run_refine_attempt(
                         f"{len(unexpected)} unexpected top-level entries "
                         f"(mostly echoed input): {unexpected}"
                     )
+                if cross_writes:
+                    # Cross-chapter writes are a *positive* event when
+                    # the reject-notes asked for cross-chapter work
+                    # (the bug-report scenario the widening was added
+                    # for). Surface them loudly so the iteration log
+                    # actually shows what landed beyond the primary
+                    # chapter.
+                    notes.append(
+                        f"{len(cross_writes)} cross-chapter write(s) "
+                        f"into additional writable paths: {cross_writes}"
+                    )
+                    print(
+                        f"  cross-chapter writes accepted: "
+                        f"{len(cross_writes)} file(s) outside the primary "
+                        f"chapter scope:",
+                        flush=True,
+                    )
+                    for w in cross_writes:
+                        print(f"    {w}", flush=True)
                 if notes:
                     state.note = "; ".join(notes)
             else:
@@ -639,6 +770,7 @@ async def _run_iteration(
     cross_chapter: bool = True,
     watcher_factory=None,
     continue_on_review: bool = True,
+    review_rejection: Optional[int] = None,
 ) -> bool:
     """Run a single refinement iteration. Each attempt (other than a pure
     ``reattach`` reentry) gets its own Claude review against the current
@@ -717,6 +849,17 @@ async def _run_iteration(
                 if referee_path and referee_path.is_file()
                 else None
             )
+            # Per-iteration rejection queue: load pending rejections from
+            # `.marathon/review/state.json` (decoupled from referee.md as
+            # of the L refactor). Filter to the chapter our target folder
+            # belongs to, so cross-chapter rejections don't bleed in.
+            # ``review_rejection`` (when set, typically by the refine
+            # daemon) further restricts to a single rejected issue — the
+            # one-rejection-per-iteration dispatch that fixes the
+            # daemon-queue-not-honored failure mode.
+            pending_rejections_md = _load_pending_rejections_md(
+                repo_dir, target_folder, focus_issue=review_rejection,
+            )
             # Re-read the latest rater note on every attempt (including
             # retries) so a fresh Claude review sees the latest available
             # diagnosis even if a retry follows a partial pipeline run.
@@ -738,6 +881,7 @@ async def _run_iteration(
                 max_retries=max_retries,
                 previous_status=last_status,
                 referee_md=referee_md,
+                pending_rejections_md=pending_rejections_md,
                 previous_rating_note=previous_rating_note,
                 cross_chapter_md=cross_chapter_md,
                 continuation_mode=(attempt_mode == "continue"),
@@ -931,6 +1075,11 @@ async def refine_command(args) -> None:
         ratings_path=workdir / "marathon-ratings.jsonl",
         claude_in_loop=True,  # refine drafts each prompt via Claude
         referee_path=referee_path,
+        audit_verified=getattr(args, "audit_verified", False),
+        audit_workdir=workdir,
+        update_formalization=getattr(args, "update_formalization", True),
+        formalization_models=["claude-opus-4-7", "Aristotle"],
+        formalization_framework="Marathon",
     )
     if pipeline_config.has_any():
         flags = [
@@ -1025,6 +1174,7 @@ async def refine_command(args) -> None:
             cross_chapter=not args.no_cross_chapter,
             watcher_factory=watcher_factory,
             continue_on_review=continue_on_review,
+            review_rejection=getattr(args, "review_rejection", None),
         )
 
         if not ok:

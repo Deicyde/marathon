@@ -22,7 +22,7 @@ from typing import Optional
 
 from marathon.review.config import ReviewConfig, load_config
 from marathon.review.github import gh, issue_labels, issue_title
-from marathon.review.referee_queue import append_rejection_bullet
+from marathon.review.state import record_rejection, record_verification
 from marathon.review.tracker import update_tracker_emoji
 
 
@@ -84,6 +84,132 @@ def cmd_show(args) -> None:
     _show_issue(cfg, args.issue_num)
 
 
+# --- open (interactive Claude Code session in VS Code) -----------------------
+
+
+def cmd_open(args) -> None:
+    """``marathon review open <issue_num>`` — spawn an interactive Claude
+    Code chat in the user's VS Code via the URI handler, pre-populated
+    with the issue's context + chapter queue + `@`-mention list."""
+    from marathon.review.open_session import open_session_for_issue
+
+    cfg = load_config()
+    num = args.issue_num
+    try:
+        result = open_session_for_issue(
+            cfg, num,
+            include_file_mentions=not args.no_attach,
+            dry_run=args.dry_run,
+        )
+    except RuntimeError as e:
+        sys.exit(str(e))
+
+    if args.dry_run:
+        print(f"# dry-run for `marathon review open {num}`")
+        print(f"# prompt_chars = {result.prompt_chars} / 5000")
+        print(f"# files listed = {result.files_listed!r}")
+        if result.truncated:
+            print(
+                "# note: prompt was trimmed to fit the 5000-char "
+                "VS Code URI ceiling"
+            )
+        print()
+        print(result.uri)
+        return
+
+    print(f"opened interactive Claude Code session for #{num}")
+    print(f"  prompt_chars = {result.prompt_chars} / 5000")
+    if result.truncated:
+        print(
+            "  note: the issue body and/or pending-queue section was "
+            "trimmed (with a `…[trimmed]…` marker) to fit the 5000-char "
+            "VS Code URI ceiling. Use `gh issue view {num}` once the chat "
+            "opens to inspect the full body if needed."
+        )
+    if result.files_listed:
+        print("  files to @-mention once the chat opens:")
+        for m in result.files_listed:
+            print(f"    {m}")
+
+
+# --- bootstrap-chapter / audit-chapter (chapter-scale sessions) ---------------
+
+
+def cmd_bootstrap_chapter(args) -> None:
+    """``marathon review bootstrap-chapter --chapter N [--informal-statements F]``
+
+    One-time setup pass: opens a chapter-bootstrap coreviewer session in
+    VS Code that drafts a `Chapter{N}.md` drafts file by pairing every
+    Lean declaration in the chapter folder with sections of the
+    user-supplied informal-statements file (or LLM-rendered statements
+    if none is provided). The agent proposes the full sub-issue list
+    and waits for human go-ahead before creating any GitHub issues."""
+    from marathon.review.chapter_sessions import open_chapter_session
+    cfg = load_config()
+    informal: Optional[Path] = None
+    if args.informal_statements:
+        informal = Path(args.informal_statements)
+        if not informal.is_file():
+            sys.exit(f"informal-statements file not found: {informal}")
+    try:
+        result = open_chapter_session(
+            cfg, args.chapter, "bootstrap",
+            informal_statements_path=informal,
+            dry_run=args.dry_run,
+        )
+    except RuntimeError as e:
+        sys.exit(str(e))
+
+    if args.dry_run:
+        print(f"# dry-run for `marathon review bootstrap-chapter --chapter {args.chapter}`")
+        print(f"# briefing written to: {result.briefing_path}")
+        print(f"# pointer prompt_chars = {result.prompt_chars} / 5000")
+        print()
+        print(result.uri)
+        return
+
+    print(f"opened chapter-bootstrap session for chapter {args.chapter}")
+    print(f"  briefing: {result.briefing_path}")
+    print(f"  pointer prompt_chars: {result.prompt_chars} / 5000")
+    if informal is None:
+        print(
+            "  note: no --informal-statements file was provided; the "
+            "coreviewer will LLM-render Informal Statements with the "
+            "`⚠️ verification pending` marker. Pass --informal-statements "
+            "<file> next time to skip that."
+        )
+
+
+def cmd_audit_chapter(args) -> None:
+    """``marathon review audit-chapter --chapter N``
+
+    Maintenance pass: opens a chapter-audit coreviewer session that
+    cross-references every existing sub-issue body against current code,
+    identifies drift / coverage gaps / readability passes, proposes a
+    unified edit set, and waits for human go-ahead."""
+    from marathon.review.chapter_sessions import open_chapter_session
+    cfg = load_config()
+    try:
+        result = open_chapter_session(
+            cfg, args.chapter, "audit",
+            dry_run=args.dry_run,
+        )
+    except RuntimeError as e:
+        sys.exit(str(e))
+
+    if args.dry_run:
+        print(f"# dry-run for `marathon review audit-chapter --chapter {args.chapter}`")
+        print(f"# briefing written to: {result.briefing_path}")
+        print(f"# pointer prompt_chars = {result.prompt_chars} / 5000")
+        print()
+        print(result.uri)
+        return
+
+    print(f"opened chapter-audit session for chapter {args.chapter}")
+    print(f"  briefing: {result.briefing_path}")
+    print(f"  pointer prompt_chars: {result.prompt_chars} / 5000")
+
+
 # --- verify ------------------------------------------------------------------
 
 
@@ -114,6 +240,10 @@ def cmd_verify(args) -> None:
         "--remove-label", cfg.labels.rejected,
         check=False,
     )
+    # Clear any prior rejection queue entry for this issue. Idempotent
+    # if there was no prior rejection.
+    record_verification(cfg, num)
+
     if args.close:
         gh("issue", "close", str(num), "--repo", cfg.github_repo)
         print(f"✅ #{num} verified + closed (fully implemented), tracker → 🟡.")
@@ -147,21 +277,19 @@ def cmd_reject(args) -> None:
 
     print(f"Marking #{num} as REJECTED...")
     comment = args.comment or (
-        "❌ REJECTED — see body for findings; fix bullet queued in "
-        "`.marathon/referee.md` user-managed header."
+        "❌ REJECTED — see body for findings; fix queued in "
+        "`.marathon/review/state.json` (`marathon review reject` queue)."
     )
     gh("issue", "comment", str(num), "--repo", cfg.github_repo, "--body", comment)
     gh(
         "issue", "edit", str(num),
         "--repo", cfg.github_repo,
         "--add-label", cfg.labels.rejected,
+        "--remove-label", cfg.labels.verified,
+        check=False,
     )
-    if append_rejection_bullet(cfg.referee_path, num, notes_text):
-        print(f"  appended rejection bullet to {cfg.referee_path}")
-    else:
-        print(
-            f"  warning: {cfg.referee_path} not found; skipping referee.md append"
-        )
+    record_rejection(cfg, num, notes_text)
+    print(f"  recorded rejection at {cfg.state_path}")
     print(f"❌ #{num} rejected and queued for refinement.")
 
     if not args.no_refine:
@@ -202,9 +330,9 @@ def _launch_or_queue_refine(cfg: ReviewConfig, chapter: int) -> None:
             if _process_alive(pid):
                 print(
                     f"  refine daemon already active for c{chapter} "
-                    f"(pid {pid}); this rejection will be picked up on the "
-                    "daemon's next loop iteration (referee.md is re-hashed "
-                    "before each marathon refine call)"
+                    f"(pid {pid}); this rejection is queued in state.json "
+                    "and the daemon will dispatch its own iteration for "
+                    "this issue (one-rejection-per-iteration dispatch)"
                 )
                 return
         except (ValueError, OSError):

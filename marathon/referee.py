@@ -51,6 +51,92 @@ class RefereeResult:
     push_message: Optional[str] = None
     skipped_reason: Optional[str] = None  # if we declined to run
     error: Optional[str] = None  # if Claude failed / output unparseable
+    bloat_warnings: Optional[list[str]] = None  # see _check_tail_bloat
+
+
+# Structural caps mirrored from referee_agent.md (rule 10). Violations
+# are soft warnings, not errors: the agent is allowed to drift, but we
+# print loudly so the human sees the bloat creeping in across passes.
+_TAIL_LINE_CAP = 100             # rule 9 hard cap
+_TAIL_LINE_TARGET = 80           # rule 9 target
+_CLOSURES_BULLET_CAP = 5         # "Recent iteration closures" — rolling window
+_TOP_LEVERAGE_BULLET_CAP = 6
+_CALIBRATION_BULLET_CAP = 6
+_NEXT_ITER_BULLET_CAP = 6
+
+
+def _count_top_level_bullets(section_text: str) -> int:
+    """Count lines that look like a top-level markdown bullet
+    (``- ``/``* ``/numbered) at column 0. Sub-bullets (indented) are
+    excluded — they're part of the parent bullet."""
+    import re
+    bullet_re = re.compile(r"^(?:[-*]|\d+\.)\s+")
+    return sum(1 for line in section_text.splitlines() if bullet_re.match(line))
+
+
+def _check_tail_bloat(machine_tail: str) -> list[str]:
+    """Soft-check the new machine tail against referee_agent.md's rule
+    10 / rule 9 structural caps. Returns a list of warning strings (one
+    per violation). Empty list means clean.
+
+    Section detection is deliberately tolerant: the agent may rename a
+    subsection slightly, so we match by leading keyword rather than
+    exact heading. Sections we don't recognize don't generate warnings.
+    """
+    import re
+
+    warnings: list[str] = []
+
+    total_lines = len(machine_tail.splitlines())
+    if total_lines > _TAIL_LINE_CAP:
+        warnings.append(
+            f"machine tail is {total_lines} lines (>{_TAIL_LINE_CAP} hard cap; "
+            f"target {_TAIL_LINE_TARGET}). Rule 9 violation — likely under-pruning."
+        )
+    elif total_lines > _TAIL_LINE_TARGET:
+        warnings.append(
+            f"machine tail is {total_lines} lines (>{_TAIL_LINE_TARGET} target, "
+            f"≤{_TAIL_LINE_CAP} hard cap). Drifting; flag for next pass."
+        )
+
+    # Split into ### subsections so we can bullet-count each.
+    # A subsection runs from one ``### `` heading to the next.
+    section_heading_re = re.compile(r"^###\s+(.+?)\s*$", re.MULTILINE)
+    matches = list(section_heading_re.finditer(machine_tail))
+    sections: list[tuple[str, str]] = []
+    for i, m in enumerate(matches):
+        heading = m.group(1).lower()
+        body_start = m.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(machine_tail)
+        sections.append((heading, machine_tail[body_start:body_end]))
+
+    # Forbidden section: output discipline belongs in the user header.
+    for heading, _ in sections:
+        if "output discipline" in heading:
+            warnings.append(
+                "machine tail contains an 'Output discipline' subsection — "
+                "rule 10 violation. Belongs in the user-managed header."
+            )
+
+    # Per-section bullet caps.
+    section_caps = (
+        ("top-leverage", _TOP_LEVERAGE_BULLET_CAP, "Top-leverage open items"),
+        ("iteration closure", _CLOSURES_BULLET_CAP, "Recent iteration closures"),
+        ("calibration", _CALIBRATION_BULLET_CAP, "Calibration sharpening"),
+        ("next-iter", _NEXT_ITER_BULLET_CAP, "Next-iter target priority"),
+    )
+    for keyword, cap, pretty in section_caps:
+        for heading, body in sections:
+            if keyword in heading:
+                count = _count_top_level_bullets(body)
+                if count > cap:
+                    warnings.append(
+                        f"section '{pretty}' has {count} bullets (>{cap} cap). "
+                        "Rule 10 violation — prune older entries."
+                    )
+                break  # only check first matching section
+
+    return warnings
 
 
 def _split_referee(text: str) -> tuple[str, Optional[str]]:
@@ -366,7 +452,25 @@ def update_referee(
     if existing_machine_tail is not None and not write_to_proposed_only:
         old_lines = existing_machine_tail.splitlines()
         new_lines = new_machine_tail.splitlines()
-        diff_summary = f"machine tail: {len(old_lines)} → {len(new_lines)} lines"
+        delta = len(new_lines) - len(old_lines)
+        delta_str = f" ({delta:+d})" if delta else ""
+        diff_summary = (
+            f"machine tail: {len(old_lines)} → {len(new_lines)} lines{delta_str}"
+        )
+
+    # 9a. Bloat audit against referee_agent.md rules 9/10. Soft: we
+    # warn loudly but still write — the human inspects and re-runs if
+    # needed. Prints prominently so the auto-referee log surfaces drift.
+    bloat_warnings = _check_tail_bloat(new_machine_tail)
+    if bloat_warnings:
+        print("  referee: BLOAT WARNINGS — output drifted past structural caps:")
+        for w in bloat_warnings:
+            print(f"    ! {w}")
+        print(
+            "    (soft warnings; the file was still written. Re-run "
+            "`marathon referee --review` to inspect a fresh draft before "
+            "next iteration.)"
+        )
 
     # 10. Write.
     try:
@@ -394,6 +498,7 @@ def update_referee(
         push_message=push_message,
         diff_summary=diff_summary,
         machine_tail_len=len(new_machine_tail.splitlines()),
+        bloat_warnings=bloat_warnings or None,
     )
 
 
@@ -510,6 +615,9 @@ def referee_command(args) -> None:
         print(f"  delta: {result.diff_summary}")
     if result.machine_tail_len is not None:
         print(f"  new machine tail: {result.machine_tail_len} lines")
+    if result.bloat_warnings:
+        print(f"  bloat warnings: {len(result.bloat_warnings)} "
+              "(see above; consider re-running with --review to inspect)")
     if result.commit_sha:
         print(f"  commit: {result.commit_sha}")
     if result.pushed is True:

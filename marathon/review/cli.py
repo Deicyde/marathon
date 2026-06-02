@@ -49,6 +49,96 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
     p_show.add_argument("issue_num", type=int)
     p_show.set_defaults(func=r.cmd_show)
 
+    p_open = cv_sub.add_parser(
+        "open",
+        help=(
+            "Open an interactive Claude Code chat in the user's VS Code "
+            "(via the `vscode://anthropic.claude-code/open?prompt=...` URI "
+            "handler), pre-populated with the issue body, chapter "
+            "pending-rejections queue, and `@`-mention list for the "
+            "target Lean folder + review context files. Useful for "
+            "discussing a verdict before running `verify`/`reject`."
+        ),
+    )
+    p_open.add_argument("issue_num", type=int)
+    p_open.add_argument(
+        "--no-attach",
+        action="store_true",
+        help=(
+            "Skip the `@`-mention file list in the prompt. Use when you "
+            "want a leaner prompt or when the chapter folder isn't yet "
+            "what you want Claude to look at."
+        ),
+    )
+    p_open.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Print the assembled `vscode://…` URI (and prompt char count) "
+            "without invoking the platform's URL opener. Handy for "
+            "verifying the prompt before launching, or for piping into "
+            "an alternate opener."
+        ),
+    )
+    p_open.set_defaults(func=r.cmd_open)
+
+    p_bootstrap = cv_sub.add_parser(
+        "bootstrap-chapter",
+        help=(
+            "One-time setup pass: open a chapter-bootstrap coreviewer "
+            "session in VS Code that drafts a `Chapter{N}.md` drafts "
+            "file from the chapter's Lean code + a user-supplied "
+            "informal-statements file, proposes the full sub-issue "
+            "list, and waits for human go-ahead before creating any "
+            "GitHub issues."
+        ),
+    )
+    p_bootstrap.add_argument("--chapter", type=int, required=True)
+    p_bootstrap.add_argument(
+        "--informal-statements",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Path to a markdown file holding the human's informal "
+            "statements, one section per named textbook result. If "
+            "omitted, the coreviewer will LLM-render statements with "
+            "a `⚠️ verification pending` marker on each."
+        ),
+    )
+    p_bootstrap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Write the briefing file to .marathon/review/sessions/ and "
+            "print the resulting URI without invoking the platform's "
+            "URL opener. Useful for inspecting the briefing before "
+            "launching."
+        ),
+    )
+    p_bootstrap.set_defaults(func=r.cmd_bootstrap_chapter)
+
+    p_audit = cv_sub.add_parser(
+        "audit-chapter",
+        help=(
+            "Maintenance pass: open a chapter-audit coreviewer session "
+            "in VS Code that cross-references every existing sub-issue "
+            "body against current code, identifies drift / coverage "
+            "gaps / readability passes, proposes a unified edit set, "
+            "and waits for human go-ahead."
+        ),
+    )
+    p_audit.add_argument("--chapter", type=int, required=True)
+    p_audit.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Write the briefing file to .marathon/review/sessions/ and "
+            "print the resulting URI without invoking the platform's "
+            "URL opener."
+        ),
+    )
+    p_audit.set_defaults(func=r.cmd_audit_chapter)
+
     p_v = cv_sub.add_parser(
         "verify",
         help=(
