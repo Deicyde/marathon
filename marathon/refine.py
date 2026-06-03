@@ -1066,6 +1066,15 @@ async def refine_command(args) -> None:
     if args.max_prompt_words is not None:
         print(f"max prompt words: {args.max_prompt_words}")
 
+    # Determine sub-issue this iteration addresses (used by --auto-pr to
+    # name the dedicated marathon branch deterministically per-issue and
+    # link the PR back to the tracking issue).
+    review_issue_num: Optional[int] = (
+        int(args.review_rejection)
+        if getattr(args, "review_rejection", None) is not None
+        else None
+    )
+
     pipeline_config = PipelineConfig(
         auto_build=args.auto_build,
         auto_commit=args.auto_commit,
@@ -1080,7 +1089,29 @@ async def refine_command(args) -> None:
         update_formalization=getattr(args, "update_formalization", True),
         formalization_models=["claude-opus-4-7", "Aristotle"],
         formalization_framework="Marathon",
+        auto_pr=getattr(args, "auto_pr", False),
+        auto_pr_repo=getattr(args, "auto_pr_repo", None),
+        auto_pr_review_issue=review_issue_num,
+        auto_pr_base=getattr(args, "auto_pr_base", "main"),
     )
+
+    # When --auto-pr is set, prepare the dedicated marathon branch
+    # BEFORE the iteration runs so the auto-commit lands on the right
+    # branch. Refuses on a dirty working tree; fail-fast so the human
+    # doesn't lose uncommitted work.
+    if pipeline_config.auto_pr:
+        from marathon.post_pipeline import prepare_auto_pr_branch
+        ok, branch_name, branch_msg = prepare_auto_pr_branch(
+            repo_dir=Path(args.repo_dir).resolve(),
+            chapter_label=chapter_label,
+            issue_num=review_issue_num,
+            base=pipeline_config.auto_pr_base,
+        )
+        if not ok:
+            print(f"  auto-pr: {branch_msg}", flush=True)
+            print("  refusing to run iteration on the wrong branch.")
+            return
+        print(f"  auto-pr: {branch_msg}")
     if pipeline_config.has_any():
         flags = [
             name for name, on in [
