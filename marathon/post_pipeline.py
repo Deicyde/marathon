@@ -71,6 +71,27 @@ class PipelineConfig:
     # to ``"Marathon"`` at call sites; override if the consumer pipes
     # marathon through a different orchestrator.
     formalization_framework: Optional[str] = "Marathon"
+    # When True, the iteration runs on a dedicated marathon-owned
+    # branch (``marathon/refine-c<N>-i<issue>``) instead of whatever
+    # branch is currently checked out, and a PR is opened against
+    # ``main`` after the auto-commit. Force-pushes the branch on
+    # subsequent iterations so the PR always reflects the latest
+    # iteration's diff. Solves the failure mode where the daemon
+    # accidentally commits iteration changes onto an unrelated
+    # branch (e.g., a docs-WIP branch) because that branch was
+    # checked out at run time.
+    auto_pr: bool = False
+    # Owner/name of the GitHub repo. Inferred from ``gh repo view``
+    # if None. Required when ``auto_pr`` is True.
+    auto_pr_repo: Optional[str] = None
+    # Sub-issue number this iteration is addressing. Set by refine
+    # from ``--review-rejection N``. Used to (1) name the branch
+    # deterministically per-issue and (2) link the PR back to the
+    # tracking sub-issue. When None, the PR mechanism falls back to
+    # a timestamped branch + a generic title.
+    auto_pr_review_issue: Optional[int] = None
+    # PR base branch. ``main`` is the default; override per project.
+    auto_pr_base: str = "main"
 
     def has_any(self) -> bool:
         return self.auto_build or self.auto_commit or self.auto_push or self.auto_rate
@@ -345,6 +366,283 @@ def run_git_push(repo_dir: Path) -> tuple[bool, str]:
     return True, short
 
 
+# ---------------------------------------------------------------------------
+# Branch + PR management for --auto-pr
+# ---------------------------------------------------------------------------
+#
+# When --auto-pr is enabled, each iteration:
+# 1. Checks out a dedicated branch ``marathon/refine-c<N>-i<issue>``,
+#    creating it off origin/<base> if it doesn't exist (or hard-resetting
+#    to origin/<base> if it does, since each iteration replaces — the
+#    persistent-branch-per-issue model means the branch always reflects
+#    only the latest iteration's diff against the base).
+# 2. Runs the iteration's normal pipeline (auto-build, auto-commit).
+# 3. After the auto-commit lands, force-pushes the branch and opens or
+#    updates the PR.
+#
+# The branch lifetime is tied to the issue's verdict: when
+# `marathon review verify N` runs, it merges + deletes the branch. On
+# re-rejection, the next iteration recreates the branch.
+
+
+def _branch_name_for_issue(chapter_label: str, issue_num: Optional[int]) -> str:
+    """Return the dedicated marathon branch name for an iteration.
+
+    Persistent per-issue when ``issue_num`` is set:
+    ``marathon/refine-c<N>-i<issue>``. Falls back to a chapter-scoped
+    name when ``issue_num`` is None (e.g., manual ``marathon refine``
+    not driven by a sub-issue rejection)."""
+    # ``chapter_label`` is e.g. "Chapter14" — extract the integer.
+    chap_digits = "".join(ch for ch in chapter_label if ch.isdigit())
+    chap = chap_digits or "?"
+    if issue_num is not None:
+        return f"marathon/refine-c{chap}-i{issue_num}"
+    return f"marathon/refine-c{chap}"
+
+
+def _gh(*args: str, cwd: Optional[Path] = None, check: bool = False) -> subprocess.CompletedProcess[str]:
+    """Run ``gh ...`` with stdout/stderr captured. Centralised so the
+    repo-inference + error formatting are consistent."""
+    proc = subprocess.run(
+        ["gh", *args],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check and proc.returncode != 0:
+        raise RuntimeError(
+            f"gh {' '.join(args[:3])}... failed (exit {proc.returncode}): "
+            f"{(proc.stderr or proc.stdout).strip()[:500]}"
+        )
+    return proc
+
+
+def _infer_repo(repo_dir: Path) -> Optional[str]:
+    """Run ``gh repo view --json nameWithOwner`` to infer ``owner/name``
+    from the working directory. Returns None on failure."""
+    proc = _gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner", cwd=repo_dir)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def prepare_auto_pr_branch(
+    repo_dir: Path,
+    chapter_label: str,
+    issue_num: Optional[int],
+    base: str = "main",
+) -> tuple[bool, str, str]:
+    """Check out the marathon branch for this iteration, resetting to
+    ``origin/<base>`` so each iteration's diff is clean.
+
+    Returns ``(ok, branch_name, message)``. On failure (e.g., the
+    working tree has uncommitted changes that would be lost), ``ok`` is
+    False and ``message`` carries the error.
+
+    Must be called BEFORE the iteration runs so the auto-commit lands
+    on this branch. Existing branches are hard-reset to
+    ``origin/<base>`` (the per-issue-persistent-branch model means we
+    only keep the latest iteration on the branch).
+    """
+    branch = _branch_name_for_issue(chapter_label, issue_num)
+
+    # Fetch latest base to ensure the reset target is current.
+    fetch = subprocess.run(
+        ["git", "fetch", "origin", base],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if fetch.returncode != 0:
+        return False, branch, f"git fetch origin {base} failed: {fetch.stderr.strip()[:200]}"
+
+    # If the working tree is dirty, refuse — we'd risk losing uncommitted
+    # work by switching branches.
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(repo_dir), capture_output=True, text=True, check=False,
+    )
+    if status.returncode == 0 and status.stdout.strip():
+        return False, branch, (
+            "working tree has uncommitted changes; refusing to switch "
+            "branches for --auto-pr (the iteration would have run on the "
+            "current branch and risked losing work). Commit or stash, then "
+            "re-run."
+        )
+
+    # Create-or-reset to origin/<base>.
+    checkout = subprocess.run(
+        ["git", "checkout", "-B", branch, f"origin/{base}"],
+        cwd=str(repo_dir), capture_output=True, text=True, check=False,
+    )
+    if checkout.returncode != 0:
+        return False, branch, f"git checkout -B {branch} failed: {checkout.stderr.strip()[:200]}"
+
+    return True, branch, f"on {branch} (reset to origin/{base})"
+
+
+def _build_pr_body(
+    chapter_label: str,
+    issue_num: Optional[int],
+    iteration: Optional[int],
+    build_result: "BuildResult",
+    rating: Optional["RatingResult"] = None,
+    project_id: Optional[str] = None,
+    marathon_md: Optional[str] = None,
+    repo: Optional[str] = None,
+) -> str:
+    """Assemble the PR body — build status, rater scores, issue link,
+    marathon.md preview. Kept compact (≤ 8 KB) so the PR list page
+    doesn't drown."""
+    parts: list[str] = []
+
+    # Header line: links the PR back to the tracking sub-issue.
+    if issue_num is not None and repo:
+        issue_url = f"https://github.com/{repo}/issues/{issue_num}"
+        parts.append(
+            f"Marathon refine iteration for [#{issue_num}]({issue_url}) "
+            f"({chapter_label})."
+        )
+    else:
+        parts.append(f"Marathon refine iteration ({chapter_label}).")
+
+    # Build status.
+    if build_result.skipped_reason:
+        parts.append(f"**Build**: skipped — `{build_result.skipped_reason}`")
+    elif build_result.timed_out:
+        parts.append("**Build**: TIMED OUT")
+    elif build_result.ok is True:
+        dur = build_result.duration_seconds
+        dur_str = f"{dur:.0f}s" if dur is not None else "?"
+        parts.append(f"**Build**: ✅ OK ({dur_str})")
+    elif build_result.ok is False:
+        parts.append("**Build**: ❌ FAIL")
+    else:
+        parts.append("**Build**: (no result)")
+
+    # Rater scores (single-line tabular summary).
+    if rating is not None and rating.parse_error is None:
+        scores = " ".join([
+            f"q={rating.quality}",
+            f"m={rating.math_correctness}",
+            f"g={rating.generality}",
+            f"api={rating.api_coverage}",
+            f"con={rating.concision}",
+            f"l4={rating.modern_lean4}",
+            f"struct={rating.structural_focus}",
+        ])
+        parts.append(f"**Rater**: `{scores}`")
+        if rating.notes:
+            # Keep notes compact — first ~1500 chars so the PR body
+            # doesn't balloon when the rater is verbose.
+            note = rating.notes.strip()
+            if len(note) > 1500:
+                note = note[:1500] + "… *(truncated)*"
+            parts.append(f"**Rater notes**:\n\n> {note.replace(chr(10), chr(10) + '> ')}")
+
+    # marathon.md design log (truncated).
+    if marathon_md:
+        md = marathon_md.strip()
+        if len(md) > 3000:
+            md = md[:3000] + "\n\n*… (truncated; see workdir's marathon.md for the full design log)*"
+        parts.append(f"**Design log**:\n\n{md}")
+
+    # Project link.
+    if project_id:
+        parts.append(
+            f"Aristotle project: "
+            f"https://aristotle.harmonic.fun/dashboard/requests/{project_id}"
+        )
+
+    parts.append(
+        "---\n\n"
+        "🤖 Opened automatically by `marathon refine --auto-pr`. "
+        "Branch is force-pushed each iteration; the diff above always "
+        "reflects the latest iteration's content against `main`."
+    )
+    return "\n\n".join(parts)
+
+
+def _existing_pr_number(
+    repo: str, head: str, repo_dir: Path
+) -> Optional[int]:
+    """Return the number of an open PR with the given head branch, or
+    None if no such PR exists."""
+    # ``gh pr list --head <branch>`` returns matching PRs; --json + jq
+    # gives us the number without parsing the human-readable output.
+    proc = _gh(
+        "pr", "list",
+        "--repo", repo,
+        "--head", head,
+        "--state", "open",
+        "--json", "number",
+        "--jq", ".[0].number // empty",
+        cwd=repo_dir,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        return int(proc.stdout.strip())
+    except ValueError:
+        return None
+
+
+def open_or_update_pr(
+    repo_dir: Path,
+    branch: str,
+    base: str,
+    repo: str,
+    title: str,
+    body: str,
+) -> tuple[bool, str]:
+    """Push ``branch`` (force) and open-or-update its PR. Returns
+    ``(ok, url_or_error)``."""
+    # Force-push (with lease) so each iteration's commits land on the
+    # branch cleanly. The per-issue persistent-branch model means the
+    # branch's history only ever reflects the latest iteration, so a
+    # force-push is safe — no shared collaborators are tracking this
+    # branch besides the daemon itself.
+    push = subprocess.run(
+        ["git", "push", "--force-with-lease", "-u", "origin", branch],
+        cwd=str(repo_dir), capture_output=True, text=True, check=False,
+    )
+    if push.returncode != 0:
+        return False, f"git push failed: {(push.stderr or push.stdout).strip()[:300]}"
+
+    existing = _existing_pr_number(repo, branch, repo_dir)
+    if existing is not None:
+        # Update the existing PR's title + body so the next reviewer
+        # sees the freshest iteration's status.
+        ed = _gh(
+            "pr", "edit", str(existing),
+            "--repo", repo,
+            "--title", title,
+            "--body", body,
+            cwd=repo_dir,
+        )
+        if ed.returncode != 0:
+            return False, f"gh pr edit #{existing} failed: {(ed.stderr or ed.stdout).strip()[:300]}"
+        return True, f"https://github.com/{repo}/pull/{existing}"
+
+    # No existing PR — open a fresh one.
+    cr = _gh(
+        "pr", "create",
+        "--repo", repo,
+        "--base", base,
+        "--head", branch,
+        "--title", title,
+        "--body", body,
+        cwd=repo_dir,
+    )
+    if cr.returncode != 0:
+        return False, f"gh pr create failed: {(cr.stderr or cr.stdout).strip()[:300]}"
+    # gh prints the new PR URL as the last line of stdout.
+    url = cr.stdout.strip().splitlines()[-1] if cr.stdout else ""
+    return True, url
+
+
 def _compute_iteration_diff(
     repo_dir: Path,
     target_path: Path,
@@ -542,6 +840,22 @@ def run_post_pipeline(
             duration = format_duration(b.duration_seconds)
             status = "OK" if b.ok else "FAIL"
             print(f"  build: {status} ({duration})")
+        # Accumulate iteration build time into the formalization
+        # wall-time sidecar (when --update-formalization is on AND
+        # the build actually ran). The yaml's
+        # automation.cost.wall_time field is re-derived from the
+        # sidecar on each refresh. Build-failed iterations still
+        # count — the compute was spent.
+        if (
+            config.update_formalization
+            and b.duration_seconds is not None
+            and b.duration_seconds > 0
+        ):
+            try:
+                from marathon.formalization import add_wall_seconds
+                add_wall_seconds(repo_dir, b.duration_seconds)
+            except Exception:  # noqa: BLE001 — soft-warning
+                pass
 
     if config.auto_commit:
         # Refresh formalization.yaml's auto-fields (sorry_count,
@@ -600,6 +914,7 @@ def run_post_pipeline(
             else:
                 print(f"  push: failed — {push_msg}")
 
+
         # Post-commit audit: did this iteration touch any verified
         # declarations the human has already locked? Soft warning;
         # logs to <workdir>/marathon-audit-violations.jsonl. Graceful
@@ -649,6 +964,73 @@ def run_post_pipeline(
                 )
             except OSError as e:
                 print(f"  ratings log: could not append — {e}")
+
+    # --- auto-pr: push the marathon branch + open/update its PR --------
+    # Runs LAST so the rater scores (just computed above) land in the PR
+    # body. The marathon branch was prepared by refine.py before this
+    # iteration ran (via prepare_auto_pr_branch); we only handle the
+    # push + PR here. No-op when the iteration didn't commit (c.sha is
+    # None — usually because there was nothing to commit).
+    if (
+        config.auto_pr
+        and out["commit"] is not None
+        and out["commit"].sha is not None
+    ):
+        try:
+            repo = config.auto_pr_repo or _infer_repo(repo_dir)
+            if repo is None:
+                print("  pr: skipped — could not infer GitHub repo "
+                      "(set --auto-pr-repo or run `gh auth login`)")
+            else:
+                branch = _branch_name_for_issue(
+                    chapter_label, config.auto_pr_review_issue
+                )
+                issue_part = (
+                    f" iter for #{config.auto_pr_review_issue}"
+                    if config.auto_pr_review_issue is not None
+                    else ""
+                )
+                build_tag = ""
+                if out["build"] is not None and out["build"].ok is not None:
+                    build_tag = " [build:" + (
+                        "OK" if out["build"].ok
+                        else ("TIMEOUT" if out["build"].timed_out else "FAIL")
+                    ) + "]"
+                pr_title = f"marathon: {chapter_label}{issue_part}{build_tag}"
+                # Try to embed marathon.md (Aristotle's design log)
+                # when the workdir is known.
+                marathon_md_text: Optional[str] = None
+                if config.audit_workdir is not None:
+                    md_path = config.audit_workdir / "marathon.md"
+                    if md_path.is_file():
+                        try:
+                            marathon_md_text = md_path.read_text()
+                        except OSError:
+                            pass
+                pr_body = _build_pr_body(
+                    chapter_label=chapter_label,
+                    issue_num=config.auto_pr_review_issue,
+                    iteration=iteration,
+                    build_result=out["build"] or BuildResult(),
+                    rating=out["rating"],
+                    project_id=project_id,
+                    marathon_md=marathon_md_text,
+                    repo=repo,
+                )
+                pr_ok, pr_msg = open_or_update_pr(
+                    repo_dir=repo_dir,
+                    branch=branch,
+                    base=config.auto_pr_base,
+                    repo=repo,
+                    title=pr_title,
+                    body=pr_body,
+                )
+                if pr_ok:
+                    print(f"  pr: {pr_msg}")
+                else:
+                    print(f"  pr: failed — {pr_msg}")
+        except Exception as e:  # noqa: BLE001 — soft-warning
+            print(f"  pr: skipped — {type(e).__name__}: {e}")
 
     return out
 

@@ -79,9 +79,17 @@ _AUTO_PATHS: tuple[tuple[str, ...], ...] = (
     ("version",),
     ("automation", "models"),
     ("automation", "framework"),
+    ("automation", "cost", "wall_time"),
     ("status", "sorry_count"),
     ("status", "sorry_in_definitions"),
 )
+
+# Sidecar file holding the cumulative iteration seconds the
+# ``automation.cost.wall_time`` field is derived from. Kept separate
+# from the yaml so the yaml field can stay in human-readable format
+# (e.g. ``"3h 24m"``) while the underlying source-of-truth is the
+# unambiguous numeric total here.
+_WALL_TIME_SIDECAR = Path(".marathon") / "wall-time.json"
 
 
 # --- yaml IO ---------------------------------------------------------------
@@ -247,7 +255,79 @@ def compute_auto_fields(
         out["automation"]["models"] = list(models)
     if framework is not None:
         out["automation"]["framework"] = framework
+    # Pull cumulative wall_time from the sidecar (if present) and
+    # format as human-readable. Missing sidecar / zero seconds means
+    # the field doesn't get overlaid — the on-disk value is preserved.
+    cumulative_seconds = read_cumulative_wall_seconds(repo_dir)
+    if cumulative_seconds > 0:
+        out["automation"]["cost"] = {
+            "wall_time": format_wall_time(cumulative_seconds),
+        }
     return out
+
+
+# --- wall_time accumulation ------------------------------------------
+
+
+def read_cumulative_wall_seconds(repo_dir: Path) -> int:
+    """Read total seconds from the sidecar at
+    ``<repo_dir>/.marathon/wall-time.json``. Returns 0 if absent."""
+    import json
+    path = repo_dir / _WALL_TIME_SIDECAR
+    if not path.is_file():
+        return 0
+    try:
+        return int(json.loads(path.read_text()).get("total_seconds", 0))
+    except (OSError, ValueError):
+        return 0
+
+
+def add_wall_seconds(repo_dir: Path, seconds: float) -> int:
+    """Add ``seconds`` to the cumulative wall-time sidecar. Returns the
+    new cumulative total (in seconds). Creates the sidecar if absent.
+
+    Called by ``post_pipeline.run_post_pipeline`` after each
+    iteration's build to accumulate iteration durations. Iteration
+    durations include build + Aristotle compute (when both are
+    measured); only build duration is tracked here today since that's
+    what the post-pipeline has in hand. Aristotle duration could be
+    added later by also reading ``project.duration_seconds`` from
+    refine-state.json.
+    """
+    import json
+    if seconds <= 0:
+        return read_cumulative_wall_seconds(repo_dir)
+    path = repo_dir / _WALL_TIME_SIDECAR
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current = read_cumulative_wall_seconds(repo_dir)
+    new_total = current + int(seconds)
+    path.write_text(json.dumps({
+        "total_seconds": new_total,
+        "last_updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }, indent=2))
+    return new_total
+
+
+def format_wall_time(seconds: int) -> str:
+    """Format a duration in seconds as a human-readable string for the
+    formalization.yaml ``automation.cost.wall_time`` field.
+
+    Output shapes (largest applicable unit, two-component max):
+    * ``"42s"`` (< 1 min)
+    * ``"5m 23s"`` (< 1 hr)
+    * ``"3h 24m"`` (< 1 day)
+    * ``"5d 12h"`` (≥ 1 day)
+    """
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s"
+    hours, mins = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {mins}m"
+    days, hrs = divmod(hours, 24)
+    return f"{days}d {hrs}h"
 
 
 # --- axiom checking ------------------------------------------------------

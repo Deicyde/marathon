@@ -539,6 +539,41 @@ def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--auto-pr",
+        action="store_true",
+        help=(
+            "Run the iteration on a dedicated marathon-owned branch "
+            "(`marathon/refine-c<N>-i<issue>` when --review-rejection "
+            "is set, otherwise `marathon/refine-c<N>`) and open or "
+            "update a PR against --auto-pr-base (default: `main`) "
+            "after the auto-commit lands. The branch is reset to "
+            "origin/<base> at iteration start so the PR always "
+            "reflects the latest iteration's diff against the base, "
+            "and force-pushed at iteration end. Refuses to run when "
+            "the working tree is dirty (would clobber uncommitted "
+            "work). Solves the failure mode where the daemon "
+            "accidentally commits iteration changes onto an "
+            "unrelated branch. Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--auto-pr-repo",
+        default=None,
+        metavar="OWNER/NAME",
+        help=(
+            "GitHub repo for --auto-pr. Inferred from `gh repo view` "
+            "if omitted."
+        ),
+    )
+    parser.add_argument(
+        "--auto-pr-base",
+        default="main",
+        metavar="BRANCH",
+        help=(
+            "Base branch for --auto-pr. Default: `main`."
+        ),
+    )
+    parser.add_argument(
         "--build-timeout",
         type=int,
         default=600,
