@@ -284,9 +284,13 @@ def run_git_commit(
     message: str,
     project_id: Optional[str] = None,
     claude_in_loop: bool = False,
+    extra_paths: Optional[list[str]] = None,
 ) -> CommitResult:
     """Stage ``target_path`` (and ``PromptLog.md`` if it exists and is
-    dirty) and commit. The final commit message includes a project URL
+    dirty) and commit. ``extra_paths`` (repo-relative POSIX paths) are
+    additionally staged — used for cross-chapter refactor iterations
+    where Aristotle edits files in ``extra_writable_paths`` outside the
+    primary target. The final commit message includes a project URL
     line (when ``project_id`` is set) and a Co-authored-by trailer block
     crediting Aristotle (and Claude, when ``claude_in_loop`` is True).
     Skips silently if the index is busy or there's nothing to commit."""
@@ -299,6 +303,22 @@ def run_git_commit(
     promptlog = repo_dir / PROMPTLOG_FILENAME
     if promptlog.is_file():
         paths_to_stage.append(PROMPTLOG_FILENAME)
+    # Cross-chapter refactor support: stage every file outside the
+    # primary target that the extractor reported writing. Dedup since
+    # any path under ``rel`` is already covered by the primary stage
+    # and would otherwise produce a no-op git add (still safe, but
+    # cleaner without it).
+    if extra_paths:
+        seen: set[str] = {str(rel)}
+        for p in extra_paths:
+            if p in seen:
+                continue
+            # Skip files already under the primary target — they're
+            # staged via the directory entry above.
+            if p == str(rel) or p.startswith(str(rel) + "/"):
+                continue
+            seen.add(p)
+            paths_to_stage.append(p)
     # Stage formalization.yaml when present so its auto-update (run by
     # run_post_pipeline before this commit lands) is bundled into the
     # same commit as the iteration's .lean edits. No-op when the project
@@ -383,6 +403,29 @@ def run_git_push(repo_dir: Path) -> tuple[bool, str]:
 # The branch lifetime is tied to the issue's verdict: when
 # `marathon review verify N` runs, it merges + deletes the branch. On
 # re-rejection, the next iteration recreates the branch.
+
+
+_CHAPTER_PATH_RE = re.compile(r"Chapter(\d+)")
+
+
+def _extra_chapters_in_writes(
+    primary_chapter_label: str, extra_paths: list[str]
+) -> list[int]:
+    """Return chapter numbers touched by ``extra_paths`` that are NOT
+    the primary chapter, in ascending order. Used to compose
+    ``+ChN+ChM`` suffixes for cross-chapter PR titles."""
+    if not extra_paths:
+        return []
+    primary_match = _CHAPTER_PATH_RE.search(primary_chapter_label)
+    primary_n = int(primary_match.group(1)) if primary_match else None
+    found: set[int] = set()
+    for p in extra_paths:
+        m = _CHAPTER_PATH_RE.search(p)
+        if m:
+            n = int(m.group(1))
+            if n != primary_n:
+                found.add(n)
+    return sorted(found)
 
 
 def _branch_name_for_issue(chapter_label: str, issue_num: Optional[int]) -> str:
@@ -824,6 +867,7 @@ def run_post_pipeline(
     chapter_label: str,
     iteration: Optional[int],
     project_id: Optional[str],
+    extra_paths_to_stage: Optional[list[str]] = None,
 ) -> dict:
     """Run the build → commit → rate pipeline. Returns a dict with results."""
     out: dict = {"build": None, "commit": None, "rating": None}
@@ -900,6 +944,7 @@ def run_post_pipeline(
             message,
             project_id=project_id,
             claude_in_loop=config.claude_in_loop,
+            extra_paths=extra_paths_to_stage,
         )
         out["commit"] = c
         if c.sha:
@@ -996,7 +1041,14 @@ def run_post_pipeline(
                         "OK" if out["build"].ok
                         else ("TIMEOUT" if out["build"].timed_out else "FAIL")
                     ) + "]"
-                pr_title = f"marathon: {chapter_label}{issue_part}{build_tag}"
+                extra_chapters = _extra_chapters_in_writes(
+                    chapter_label, extra_paths_to_stage or []
+                )
+                extra_suffix = (
+                    " (" + " + ".join(f"+Ch{n}" for n in extra_chapters) + ")"
+                    if extra_chapters else ""
+                )
+                pr_title = f"marathon: {chapter_label}{issue_part}{extra_suffix}{build_tag}"
                 # Try to embed marathon.md (Aristotle's design log)
                 # when the workdir is known.
                 marathon_md_text: Optional[str] = None

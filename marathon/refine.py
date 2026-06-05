@@ -662,6 +662,11 @@ async def _run_refine_attempt(
         TaskStatus.COMPLETE_WITH_ERRORS,
         TaskStatus.OUT_OF_BUDGET,
     }:
+        # Cross-chapter writes are captured inside the with-block below
+        # but consumed by ``run_post_pipeline`` further down (outside
+        # the block), so hoist to outer scope to preserve.
+        cross_writes_for_pipeline: list[str] = []
+
         with tempfile.TemporaryDirectory(prefix="marathon-refine-dl-") as dl_tmp:
             download_path = Path(dl_tmp) / "solution.tar.gz"
             try:
@@ -695,6 +700,9 @@ async def _run_refine_attempt(
                         f"{len(unexpected)} unexpected top-level entries "
                         f"(mostly echoed input): {unexpected}"
                     )
+                # Capture cross-chapter writes for the post-pipeline
+                # commit/PR (consumed outside the with-block below).
+                cross_writes_for_pipeline = list(cross_writes)
                 if cross_writes:
                     # Cross-chapter writes are a *positive* event when
                     # the reject-notes asked for cross-chapter work
@@ -739,6 +747,7 @@ async def _run_refine_attempt(
             chapter_label=target_folder_name,
             iteration=iteration_idx,
             project_id=state.project_id,
+            extra_paths_to_stage=cross_writes_for_pipeline or None,
         )
 
     return task.status
