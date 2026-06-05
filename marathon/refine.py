@@ -1110,9 +1110,13 @@ async def refine_command(args) -> None:
     # doesn't lose uncommitted work.
     if pipeline_config.auto_pr:
         from marathon.post_pipeline import prepare_auto_pr_branch
+        # ``chapter_label`` isn't bound in this function — the analog
+        # is ``target_folder.name`` (e.g., "Chapter14"). The inner
+        # iteration loop uses ``target_folder_name`` for the same
+        # purpose (cf. run_post_pipeline calls in _run_iteration).
         ok, branch_name, branch_msg = prepare_auto_pr_branch(
             repo_dir=Path(args.repo_dir).resolve(),
-            chapter_label=chapter_label,
+            chapter_label=target_folder.name,
             issue_num=review_issue_num,
             base=pipeline_config.auto_pr_base,
         )
