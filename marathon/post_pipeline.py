@@ -502,18 +502,49 @@ def prepare_auto_pr_branch(
         return False, branch, f"git fetch origin {base} failed: {fetch.stderr.strip()[:200]}"
 
     # If the working tree is dirty, refuse — we'd risk losing uncommitted
-    # work by switching branches.
+    # work by switching branches. EXCEPT: if the only dirty files are
+    # marathon-managed (under ``.marathon/``), auto-commit them so the
+    # branch switch can proceed and the audit trail stays tracked. Any
+    # non-marathon dirt still refuses.
     status = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=str(repo_dir), capture_output=True, text=True, check=False,
     )
     if status.returncode == 0 and status.stdout.strip():
-        return False, branch, (
-            "working tree has uncommitted changes; refusing to switch "
-            "branches for --auto-pr (the iteration would have run on the "
-            "current branch and risked losing work). Commit or stash, then "
-            "re-run."
+        # NOTE: don't ``.strip()`` before ``.splitlines()`` — porcelain v1
+        # reserves col 0 for the unstaged-status code (often a space, e.g.
+        # `` M path`` for unstaged-modified). Stripping the whole output
+        # eats the first line's leading space and shifts column indices.
+        dirty_lines = status.stdout.rstrip("\n").splitlines()
+        # ``git status --porcelain`` prefixes each line with a 2-char
+        # status code + space; the path starts at column 3.
+        marathon_only = all(
+            line[3:].startswith(".marathon/") for line in dirty_lines
         )
+        if not marathon_only:
+            offending = [l for l in dirty_lines if not l[3:].startswith(".marathon/")]
+            return False, branch, (
+                "working tree has uncommitted non-marathon changes; "
+                "refusing to switch branches for --auto-pr (the iteration "
+                "would have run on the current branch and risked losing "
+                "work). Commit or stash, then re-run. "
+                f"Offending lines: {offending!r}"
+            )
+        # All dirt is marathon bookkeeping — auto-commit it inline so the
+        # branch switch is safe and the audit trail stays tracked.
+        subprocess.run(
+            ["git", "add", "--", ".marathon/"],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
+        )
+        commit = subprocess.run(
+            ["git", "commit", "-m", f"chore(marathon): auto-bump for {branch}"],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
+        )
+        if commit.returncode != 0:
+            return False, branch, (
+                f"auto-commit of .marathon/ failed: "
+                f"{(commit.stderr or commit.stdout).strip()[:200]}"
+            )
 
     # Create-or-reset to origin/<base>.
     checkout = subprocess.run(
@@ -1041,11 +1072,28 @@ def run_post_pipeline(
                         "OK" if out["build"].ok
                         else ("TIMEOUT" if out["build"].timed_out else "FAIL")
                     ) + "]"
+                # PR-title chapter suffix sources from `git diff
+                # --name-only HEAD~1 HEAD` (actually-changed files),
+                # not from `extra_paths_to_stage` (the writable scope,
+                # which includes echo-writes Aristotle made that don't
+                # differ from main). Otherwise multi-chapter writable
+                # scopes produce inflated titles like
+                # "(+Ch10 + +Ch12 + +Ch14 + +Ch15 + +Ch16)" when only
+                # one extra chapter actually changed.
+                diff_proc = subprocess.run(
+                    ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
+                    cwd=str(repo_dir), capture_output=True, text=True,
+                    check=False,
+                )
+                changed_paths = (
+                    diff_proc.stdout.splitlines()
+                    if diff_proc.returncode == 0 else (extra_paths_to_stage or [])
+                )
                 extra_chapters = _extra_chapters_in_writes(
-                    chapter_label, extra_paths_to_stage or []
+                    chapter_label, changed_paths
                 )
                 extra_suffix = (
-                    " (" + " + ".join(f"+Ch{n}" for n in extra_chapters) + ")"
+                    " (" + " ".join(f"+Ch{n}" for n in extra_chapters) + ")"
                     if extra_chapters else ""
                 )
                 pr_title = f"marathon: {chapter_label}{issue_part}{extra_suffix}{build_tag}"
