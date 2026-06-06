@@ -33,7 +33,9 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-CLAUDE_MODEL = "claude-opus-4-7"
+# Env-overridable so large repos can route the (whole-repo) review prompt
+# through a 1M-context model, e.g. MARATHON_CLAUDE_MODEL="claude-opus-4-8[1m]".
+CLAUDE_MODEL = os.environ.get("MARATHON_CLAUDE_MODEL", "claude-opus-4-7")
 
 
 def _ensure_claude_cli() -> str:
@@ -67,7 +69,20 @@ def _read_lean_files(folder: Path) -> str:
 
 def _read_repo_lean_context(repo_dir: Path, exclude_folder: Path) -> str:
     """Lean files in repo (gitignore-filtered), excluding everything under
-    ``exclude_folder``. ``.tex`` and other non-Lean files are excluded."""
+    ``exclude_folder``. ``.tex`` and other non-Lean files are excluded.
+
+    If ``MARATHON_REVIEW_CONTEXT_PATHS`` is set (a colon-separated list of
+    repo-relative path prefixes — files or directories), only Lean files
+    under those prefixes are included. This keeps the review prompt under
+    the model's context limit on large repos; the target folder is always
+    added separately by the caller. Unset = whole-repo context (historical
+    behavior)."""
+    allow_raw = os.environ.get("MARATHON_REVIEW_CONTEXT_PATHS", "").strip()
+    allow_prefixes: Optional[list[str]] = (
+        [p.strip().rstrip("/") for p in allow_raw.split(":") if p.strip()]
+        if allow_raw
+        else None
+    )
     result = subprocess.run(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
         cwd=str(repo_dir),
@@ -88,6 +103,10 @@ def _read_repo_lean_context(repo_dir: Path, exclude_folder: Path) -> str:
             continue  # under target folder; skip
         except ValueError:
             pass  # not under target; include
+        if allow_prefixes is not None and not any(
+            rel == p or rel.startswith(p + "/") for p in allow_prefixes
+        ):
+            continue  # not under an allowed context prefix; skip
         parts.append(f"=== FILE: {rel} ===\n{full.read_text()}")
     return "\n\n".join(parts)
 
@@ -316,9 +335,12 @@ def review_and_draft_prompt(
     # token, which broke Max auth. `--tools ""` still disables the agent
     # tool surface; we accept the slight risk of cwd-local .claude/ files
     # affecting the call.
+    # Pass the prompt via stdin (not argv): the combined review prompt bundles
+    # the whole repo and routinely exceeds the OS argv limit (E2BIG). `claude
+    # -p` with no inline query reads the prompt from stdin.
     cmd = [
         claude_path,
-        "-p", combined,
+        "-p",
         "--model", CLAUDE_MODEL,
         "--tools", "",
         "--output-format", "text",
@@ -343,6 +365,7 @@ def review_and_draft_prompt(
             text=True,
             check=False,
             env=env,
+            input=combined,
         )
     except OSError as e:
         sys.exit(
