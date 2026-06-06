@@ -67,6 +67,12 @@ DEFAULT_REFINE_ARGS: list[str] = [
     "--auto-commit", "--auto-push", "--auto-rate",
     "--auto-referee-every", "1",
     "--audit-verified",
+    # Daemon iterations always go through a marathon-owned branch +
+    # PR. Solves the stranded-commit failure mode where the daemon
+    # would auto-commit to whatever branch happened to be checked
+    # out — with --auto-pr the daemon uses
+    # `marathon/refine-c<N>-i<issue>` regardless of HEAD.
+    "--auto-pr",
 ]
 
 # Set by SIGTERM/SIGINT to break the daemon's poll loop. Module-level so

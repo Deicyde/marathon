@@ -244,6 +244,14 @@ def cmd_verify(args) -> None:
     # if there was no prior rejection.
     record_verification(cfg, num)
 
+    # If --auto-pr was used, the iteration's commits sit in a
+    # marathon-owned branch with an open PR. Verifying the issue
+    # should also merge that PR so the iteration lands on main —
+    # otherwise the labels say "verified" but the code is still in
+    # a pending PR. Best-effort: skip silently when no matching PR
+    # exists (e.g., older issues that pre-date --auto-pr).
+    _maybe_merge_marathon_pr(cfg, num)
+
     if args.close:
         gh("issue", "close", str(num), "--repo", cfg.github_repo)
         print(f"✅ #{num} verified + closed (fully implemented), tracker → 🟡.")
@@ -252,6 +260,68 @@ def cmd_verify(args) -> None:
         print(
             f"✅ #{num} verified (statements accepted; sorrys remain — "
             "issue kept OPEN), tracker → 🟡."
+        )
+
+
+def _maybe_merge_marathon_pr(cfg, issue_num: int) -> None:
+    """Find the open marathon PR for ``issue_num`` and merge it.
+
+    PR is identified by head branch ``marathon/refine-c<N>-i<issue_num>``
+    where N is derived from the chapter the issue lives in. Skips
+    silently when no matching open PR exists (e.g., the iteration
+    didn't go through --auto-pr, or the PR was already merged).
+    """
+    import subprocess
+    # Find the chapter from the cfg's registry. Iterate
+    # ``cfg.chapters`` and pick the one containing this issue.
+    chapter: int | None = None
+    try:
+        for ch in cfg.chapters:
+            reg = cfg.chapter_registry(ch.chapter)
+            if any(num == issue_num for num, _ in reg.entries):
+                chapter = ch.chapter
+                break
+    except Exception:  # noqa: BLE001 — soft-warning helper
+        return
+    if chapter is None:
+        return
+
+    branch = f"marathon/refine-c{chapter}-i{issue_num}"
+    # Look for an open PR with this head branch.
+    proc = subprocess.run(
+        ["gh", "pr", "list",
+         "--repo", cfg.github_repo,
+         "--head", branch,
+         "--state", "open",
+         "--json", "number",
+         "--jq", ".[0].number // empty"],
+        capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return
+    try:
+        pr_num = int(proc.stdout.strip())
+    except ValueError:
+        return
+    # Merge with --delete-branch so the marathon branch goes away on
+    # success — the iteration's content is on main, no need to keep
+    # the source branch around.
+    merge = subprocess.run(
+        ["gh", "pr", "merge", str(pr_num),
+         "--repo", cfg.github_repo,
+         "--merge",
+         "--delete-branch"],
+        capture_output=True, text=True, check=False,
+    )
+    if merge.returncode == 0:
+        print(f"  pr: merged #{pr_num} ({branch}) + deleted branch")
+    else:
+        # Common case: PR has merge conflicts because main moved.
+        # Surface the error but don't block the verification — the
+        # label flip already happened.
+        print(
+            f"  pr: could not merge #{pr_num} ({branch}); "
+            f"{(merge.stderr or merge.stdout).strip()[:200]}"
         )
     ok, msg = update_tracker_emoji(cfg, num, "🟡")
     if ok:

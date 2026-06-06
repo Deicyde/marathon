@@ -1,7 +1,7 @@
 {
   "name": "marathon",
-  "version": "0.1.0",
-  "description": "Drive the Aristotle (Harmonic) automated theorem-proving API through the marathon CLI from Claude Code: submit textbooks chapter-by-chapter (skeleton), iteratively refine an existing Lean folder, maintain a project referee rubric, run human-in-the-loop per-declaration review, and rate or live-steer Aristotle runs. Optionally pairs with the autoform plugin's Lean conventions/rubrics skills when both are installed.",
+  "version": "0.2.0",
+  "description": "Drive the Aristotle (Harmonic) automated theorem-proving API through the marathon CLI from Claude Code: submit textbooks chapter-by-chapter (skeleton), iteratively refine an existing Lean folder, fill a single declaration or every `sorry` in a single file in one shot, maintain a project referee rubric, run human-in-the-loop per-declaration review (with auto-merge on verify), and rate or live-steer Aristotle runs. Optionally pairs with the autoform plugin's Lean conventions/rubrics skills when both are installed.",
   "author": {
     "name": "Jack McCarthy",
     "url": "https://github.com/Deicyde"

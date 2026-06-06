@@ -10,6 +10,7 @@ from marathon.review.cli import review_command
 from marathon.refine import refine_command
 from marathon.referee import referee_command
 from marathon.skeleton import skeleton_command
+from marathon.fill import add_fill_subparsers
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -368,6 +369,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # Formalization tree: `marathon formalization init/update`
     _add_formalization_subparser(subparsers)
 
+    # Fill tree: `marathon fill` (single decl) and `marathon fill-file`
+    # (every sorry in a file). Both wrap `refine_command` with a focus
+    # directive so the slash commands can shell out without knowing the
+    # focus-directive incantation.
+    add_fill_subparsers(subparsers)
+
     return parser
 
 
@@ -417,6 +424,18 @@ def _add_formalization_subparser(subparsers) -> None:
         "--framework", default="Marathon",
         help="Framework name for automation.framework. Default: 'Marathon'.",
     )
+    p_up.add_argument(
+        "--check-axioms", action="store_true",
+        help=(
+            "Run `#print axioms` on every declaration in "
+            "`status.main_results` and replace their `axioms` lists "
+            "with the verified set. Requires a built project "
+            "(`.lake/build/lib/lean/...` populated); will silently "
+            "leave existing axioms unchanged on decls whose modules "
+            "haven't been built. One `lake env lean` invocation, "
+            "batched across all main results. Default: off."
+        ),
+    )
     p_up.set_defaults(func=_run_formalization_update)
 
 
@@ -439,13 +458,17 @@ def _run_formalization_update(args) -> None:
     from marathon.formalization import update_formalization
     repo_dir: Path = args.repo_dir.resolve()
     written = update_formalization(
-        repo_dir, models=args.models, framework=args.framework
+        repo_dir,
+        models=args.models,
+        framework=args.framework,
+        check_axioms_on_build=getattr(args, "check_axioms", False),
     )
     if written is None:
         print(f"no formalization.yaml at {repo_dir}; "
               "run `marathon formalization init` first")
         raise SystemExit(1)
-    print(f"refreshed {written}")
+    suffix = " (with axioms)" if getattr(args, "check_axioms", False) else ""
+    print(f"refreshed {written}{suffix}")
 
 
 def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
@@ -523,6 +546,56 @@ def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--focus-directive",
+        type=str,
+        default=None,
+        metavar="STRING",
+        help=(
+            "Inject a high-salience directive into Hermes's prompt — "
+            "the last thing Claude reads before drafting the Aristotle "
+            "instruction. Used by `marathon fill` / `marathon fill-file` "
+            "to scope an iteration to a single declaration or file. "
+            "Example: \"Fill ONLY the sorry body of "
+            "`CovectorField.coordinateCoframe`. Do not modify any "
+            "other declaration.\""
+        ),
+    )
+    parser.add_argument(
+        "--auto-pr",
+        action="store_true",
+        help=(
+            "Run the iteration on a dedicated marathon-owned branch "
+            "(`marathon/refine-c<N>-i<issue>` when --review-rejection "
+            "is set, otherwise `marathon/refine-c<N>`) and open or "
+            "update a PR against --auto-pr-base (default: `main`) "
+            "after the auto-commit lands. The branch is reset to "
+            "origin/<base> at iteration start so the PR always "
+            "reflects the latest iteration's diff against the base, "
+            "and force-pushed at iteration end. Refuses to run when "
+            "the working tree is dirty (would clobber uncommitted "
+            "work). Solves the failure mode where the daemon "
+            "accidentally commits iteration changes onto an "
+            "unrelated branch. Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--auto-pr-repo",
+        default=None,
+        metavar="OWNER/NAME",
+        help=(
+            "GitHub repo for --auto-pr. Inferred from `gh repo view` "
+            "if omitted."
+        ),
+    )
+    parser.add_argument(
+        "--auto-pr-base",
+        default="main",
+        metavar="BRANCH",
+        help=(
+            "Base branch for --auto-pr. Default: `main`."
+        ),
+    )
+    parser.add_argument(
         "--build-timeout",
         type=int,
         default=600,
@@ -568,6 +641,19 @@ def main() -> None:
     elif args.command == "review":
         try:
             review_command(args)
+        except KeyboardInterrupt:
+            print("\ninterrupted", file=sys.stderr)
+            sys.exit(130)
+    elif args.command == "formalization":
+        # Dispatch via the subparser's set_defaults(func=…) handler.
+        args.func(args)
+    elif args.command in ("fill", "fill-file"):
+        # `fill`/`fill-file` set_defaults(func=_run_fill[_file]); both are
+        # async wrappers that build a focus directive and delegate to
+        # `refine_command`. The `_verb` default lets the handler distinguish
+        # the two without re-parsing args.command.
+        try:
+            asyncio.run(args.func(args))
         except KeyboardInterrupt:
             print("\ninterrupted", file=sys.stderr)
             sys.exit(130)
