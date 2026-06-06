@@ -149,20 +149,41 @@ class RatingResult:
     parse_error: Optional[str] = None
 
 
-PROMPTLOG_FILENAME = "PromptLog.md"
+PROMPTLOG_FILENAME = ".marathon/PromptLog.md"
+# Legacy location of PromptLog.md, kept for backward compatibility on
+# repos that haven't yet moved the file under ``.marathon/``. We check
+# both locations on read and prefer the new one when both exist; on write
+# we always target the new location (and the auto-pr safety check only
+# whitelists ``.marathon/**``, so the new location avoids the
+# "marathon-managed file at repo root blocks branch switch" failure).
+_LEGACY_PROMPTLOG_FILENAME = "PromptLog.md"
+
+
+def _resolve_promptlog_path(repo_dir: Path) -> Optional[Path]:
+    """Return the active ``PromptLog.md`` path, preferring
+    ``.marathon/PromptLog.md`` over the legacy repo-root location. Returns
+    None if neither exists (the per-repo opt-in convention)."""
+    new_path = repo_dir / PROMPTLOG_FILENAME
+    if new_path.is_file():
+        return new_path
+    legacy_path = repo_dir / _LEGACY_PROMPTLOG_FILENAME
+    if legacy_path.is_file():
+        return legacy_path
+    return None
 
 
 def append_promptlog_url(repo_dir: Path, project_id: str) -> bool:
-    """If ``PromptLog.md`` exists at the root of ``repo_dir``, append a
-    blank line plus a ``<timestamp>  <project_id>`` entry. Skips silently
-    if the file doesn't exist or ``project_id`` is empty.
+    """If ``PromptLog.md`` exists (preferred under ``.marathon/``, legacy
+    at repo root), append a blank line plus a ``<timestamp>  <project_id>``
+    entry. Skips silently if the file doesn't exist or ``project_id`` is
+    empty.
 
     Returns True if the file was appended to, False if skipped.
     """
     if not project_id:
         return False
-    log_path = repo_dir / PROMPTLOG_FILENAME
-    if not log_path.is_file():
+    log_path = _resolve_promptlog_path(repo_dir)
+    if log_path is None:
         return False
     # Local import to avoid a top-level circular dep with marathon.state.
     from marathon.state import now_iso
@@ -300,9 +321,12 @@ def run_git_commit(
         return CommitResult(skipped_reason=f"{target_path} not under repo {repo_dir}")
 
     paths_to_stage = [str(rel)]
-    promptlog = repo_dir / PROMPTLOG_FILENAME
-    if promptlog.is_file():
-        paths_to_stage.append(PROMPTLOG_FILENAME)
+    promptlog = _resolve_promptlog_path(repo_dir)
+    if promptlog is not None:
+        try:
+            paths_to_stage.append(str(promptlog.relative_to(repo_dir)))
+        except ValueError:
+            pass
     # Cross-chapter refactor support: stage every file outside the
     # primary target that the extractor reported writing. Dedup since
     # any path under ``rel`` is already covered by the primary stage
