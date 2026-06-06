@@ -821,11 +821,22 @@ async def _run_iteration(
     continue_on_review: bool = True,
     review_rejection: Optional[int] = None,
     focus_directive: Optional[str] = None,
+    prefetched_pending_rejections_md: Optional[str] = None,
 ) -> bool:
     """Run a single refinement iteration. Each attempt (other than a pure
     ``reattach`` reentry) gets its own Claude review against the current
     target-folder state. Returns True on success, False if the iteration
     failed permanently.
+
+    ``prefetched_pending_rejections_md`` lets the caller hand in the
+    rendered pending-rejections context loaded BEFORE this iteration's
+    branch switch. Necessary when ``--auto-pr`` is on, since
+    ``prepare_auto_pr_branch`` does ``git checkout -B branch
+    origin/main`` and wipes the local ``state.json`` rejection record;
+    reading state.json inside the iteration would then return None and
+    the focused-rejection bypass would silently fall through to
+    Claude-in-loop. When this argument is None, the iteration loads
+    fresh (autonomous-run path, no branch switch).
 
     ``existing_mode`` is the mode handed in from :func:`_try_reattach_or_continue`:
 
@@ -899,17 +910,17 @@ async def _run_iteration(
                 if referee_path and referee_path.is_file()
                 else None
             )
-            # Per-iteration rejection queue: load pending rejections from
-            # `.marathon/review/state.json` (decoupled from referee.md as
-            # of the L refactor). Filter to the chapter our target folder
-            # belongs to, so cross-chapter rejections don't bleed in.
-            # ``review_rejection`` (when set, typically by the refine
-            # daemon) further restricts to a single rejected issue — the
-            # one-rejection-per-iteration dispatch that fixes the
-            # daemon-queue-not-honored failure mode.
-            pending_rejections_md = _load_pending_rejections_md(
-                repo_dir, target_folder, focus_issue=review_rejection,
-            )
+            # Per-iteration rejection queue. Prefer the prefetched value
+            # passed in from the caller (necessary under ``--auto-pr``,
+            # where the branch switch wipes ``state.json`` before this
+            # iteration reads it). Fall back to a fresh load for
+            # autonomous runs that don't switch branches.
+            if prefetched_pending_rejections_md is not None:
+                pending_rejections_md = prefetched_pending_rejections_md
+            else:
+                pending_rejections_md = _load_pending_rejections_md(
+                    repo_dir, target_folder, focus_issue=review_rejection,
+                )
             # When the daemon is dispatching a focused single-issue
             # rejection, suppress referee.md ENTIRELY so Claude-in-loop
             # can't second-guess the human's specific reject ask by
@@ -1175,6 +1186,23 @@ async def refine_command(args) -> None:
         auto_pr_base=getattr(args, "auto_pr_base", "main"),
     )
 
+    # Load the pending-rejections context BEFORE any branch switch.
+    # ``prepare_auto_pr_branch`` (below, when ``--auto-pr`` is on) does
+    # ``git checkout -B branch origin/main`` and wipes the local
+    # ``state.json`` rejection record. Reading state.json from inside
+    # the iteration would then return None and the focused-rejection
+    # bypass would silently fall through to Claude-in-loop. Capture the
+    # rejection notes here while state.json still reflects them, then
+    # thread the value into the iteration via
+    # ``prefetched_pending_rejections_md``.
+    prefetched_pending_rejections_md = (
+        _load_pending_rejections_md(
+            repo_dir, target_folder, focus_issue=review_issue_num,
+        )
+        if review_issue_num is not None
+        else None
+    )
+
     # When --auto-pr is set, prepare the dedicated marathon branch
     # BEFORE the iteration runs so the auto-commit lands on the right
     # branch. Refuses on a dirty working tree; fail-fast so the human
@@ -1291,6 +1319,7 @@ async def refine_command(args) -> None:
             continue_on_review=continue_on_review,
             review_rejection=getattr(args, "review_rejection", None),
             focus_directive=getattr(args, "focus_directive", None),
+            prefetched_pending_rejections_md=prefetched_pending_rejections_md,
         )
 
         if not ok:
