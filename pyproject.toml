@@ -14,12 +14,20 @@ dependencies = [
     "PyYAML>=6.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
 [project.scripts]
 # Exposes a ``marathon`` console script. After ``uv tool install
 # /path/to/marathon`` (or ``pipx install -e .``), ``marathon review ...``
 # is on PATH and the review shims at <repo>/.marathon/review/*.py
 # dispatch to it cleanly.
 marathon = "marathon.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [build-system]
 requires = ["hatchling"]
