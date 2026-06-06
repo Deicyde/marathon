@@ -125,6 +125,46 @@ def _load_additional_writable_paths(
     return out
 
 
+def _format_reject_as_aristotle_prompt(
+    pending_rejections_md: str,
+    focus_issue: int,
+    skeleton_mode: bool,
+) -> str:
+    """Format a single rejected sub-issue's notes as a direct Aristotle
+    prompt, bypassing Claude-in-loop.
+
+    The notes that the human typed into ``marathon review reject N --notes
+    NOTES_FILE`` are already file-and-declaration-level instructions for
+    Aristotle. For focused single-issue rejections, Claude-in-loop's
+    "review and draft" pass adds noise rather than value — it tends to
+    scan the target folder, notice unrelated structural opportunities,
+    and override the explicit reject ask with its own picks. Skipping
+    Claude entirely on these iterations keeps the contract intact.
+
+    The returned text is sent verbatim to Aristotle (modulo the standard
+    output-requirements trailer appended by the caller). A short
+    contextual lead is prepended so Aristotle knows the scope is exact.
+    """
+    lead = (
+        f"You are addressing a focused rejection of sub-issue #{focus_issue}.\n\n"
+        "The human reviewer typed the change request below. Execute it "
+        "exactly as written — same file(s), same declarations, same "
+        "structural change. Do NOT introduce other refactors, even if you "
+        "notice clean structural opportunities in adjacent files. Do NOT "
+        "touch files outside those named in the request. If the request "
+        "has unavoidable downstream consumer edits, include only those "
+        "minimal consumer fixes.\n\n"
+    )
+    if skeleton_mode:
+        lead += (
+            "Skeleton mode: every proof body stays ``by sorry``. Only "
+            "signatures, definitions, and structural shape change this "
+            "iteration.\n\n"
+        )
+    lead += "---\n\n# Reject notes\n\n"
+    return lead + pending_rejections_md.strip() + "\n"
+
+
 def _load_pending_rejections_md(
     repo_dir: Path,
     target_folder: Path,
@@ -888,26 +928,45 @@ async def _run_iteration(
                 _collect_sibling_chapter_context(workdir) if cross_chapter else None
             )
 
-            claude_response = review_and_draft_prompt(
-                target_folder=target_folder,
-                repo_dir=repo_dir,
-                marathon_md=marathon_md,
-                refine_log=refine_log_text,
-                iteration_idx=iteration_idx,
-                max_iterations=max_iterations,
-                skeleton_mode=skeleton_mode,
-                max_prompt_words=max_prompt_words,
-                attempt_idx=attempt_idx,
-                max_retries=max_retries,
-                previous_status=last_status,
-                referee_md=referee_md_for_prompt,
-                pending_rejections_md=pending_rejections_md,
-                previous_rating_note=previous_rating_note,
-                cross_chapter_md=cross_chapter_md,
-                continuation_mode=(attempt_mode == "continue"),
-                previous_output_summary=previous_output_summary,
-                focus_directive=focus_directive,
-            )
+            # Bypass Claude-in-loop for focused single-issue rejections:
+            # the human's reject notes ARE the Aristotle prompt. Past
+            # iterations under Claude-in-loop have repeatedly overridden
+            # the explicit reject ask with project-wide structural picks
+            # — even after muting referee.md and tightening the
+            # rejection-queue preamble. The target file's visible content
+            # alone is enough to nudge Claude toward "while we're at it"
+            # refactors. For focused rejections, the simplest fix is to
+            # skip the review-and-draft pass entirely and dispatch the
+            # human's notes verbatim. The reject notes that the human
+            # types into ``marathon review reject --notes`` are already
+            # file-and-declaration-level Aristotle instructions.
+            if review_rejection is not None and pending_rejections_md:
+                claude_response = _format_reject_as_aristotle_prompt(
+                    pending_rejections_md,
+                    review_rejection,
+                    skeleton_mode,
+                )
+            else:
+                claude_response = review_and_draft_prompt(
+                    target_folder=target_folder,
+                    repo_dir=repo_dir,
+                    marathon_md=marathon_md,
+                    refine_log=refine_log_text,
+                    iteration_idx=iteration_idx,
+                    max_iterations=max_iterations,
+                    skeleton_mode=skeleton_mode,
+                    max_prompt_words=max_prompt_words,
+                    attempt_idx=attempt_idx,
+                    max_retries=max_retries,
+                    previous_status=last_status,
+                    referee_md=referee_md_for_prompt,
+                    pending_rejections_md=pending_rejections_md,
+                    previous_rating_note=previous_rating_note,
+                    cross_chapter_md=cross_chapter_md,
+                    continuation_mode=(attempt_mode == "continue"),
+                    previous_output_summary=previous_output_summary,
+                    focus_directive=focus_directive,
+                )
 
             print("\n--- Claude's drafted prompt (sent verbatim to Aristotle) ---")
             print(claude_response)
