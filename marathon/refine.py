@@ -895,6 +895,7 @@ async def _run_iteration(
                 cross_chapter_md=cross_chapter_md,
                 continuation_mode=(attempt_mode == "continue"),
                 previous_output_summary=previous_output_summary,
+                focus_directive=getattr(args, "focus_directive", None),
             )
 
             print("\n--- Claude's drafted prompt (sent verbatim to Aristotle) ---")

@@ -10,6 +10,7 @@ from marathon.review.cli import review_command
 from marathon.refine import refine_command
 from marathon.referee import referee_command
 from marathon.skeleton import skeleton_command
+from marathon.fill import add_fill_subparsers
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -368,6 +369,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # Formalization tree: `marathon formalization init/update`
     _add_formalization_subparser(subparsers)
 
+    # Fill tree: `marathon fill` (single decl) and `marathon fill-file`
+    # (every sorry in a file). Both wrap `refine_command` with a focus
+    # directive so the slash commands can shell out without knowing the
+    # focus-directive incantation.
+    add_fill_subparsers(subparsers)
+
     return parser
 
 
@@ -539,6 +546,21 @@ def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--focus-directive",
+        type=str,
+        default=None,
+        metavar="STRING",
+        help=(
+            "Inject a high-salience directive into Hermes's prompt — "
+            "the last thing Claude reads before drafting the Aristotle "
+            "instruction. Used by `marathon fill` / `marathon fill-file` "
+            "to scope an iteration to a single declaration or file. "
+            "Example: \"Fill ONLY the sorry body of "
+            "`CovectorField.coordinateCoframe`. Do not modify any "
+            "other declaration.\""
+        ),
+    )
+    parser.add_argument(
         "--auto-pr",
         action="store_true",
         help=(
@@ -625,6 +647,16 @@ def main() -> None:
     elif args.command == "formalization":
         # Dispatch via the subparser's set_defaults(func=…) handler.
         args.func(args)
+    elif args.command in ("fill", "fill-file"):
+        # `fill`/`fill-file` set_defaults(func=_run_fill[_file]); both are
+        # async wrappers that build a focus directive and delegate to
+        # `refine_command`. The `_verb` default lets the handler distinguish
+        # the two without re-parsing args.command.
+        try:
+            asyncio.run(args.func(args))
+        except KeyboardInterrupt:
+            print("\ninterrupted", file=sys.stderr)
+            sys.exit(130)
 
 
 if __name__ == "__main__":

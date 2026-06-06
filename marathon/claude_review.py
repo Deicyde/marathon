@@ -110,6 +110,7 @@ def review_and_draft_prompt(
     cross_chapter_md: Optional[str] = None,
     continuation_mode: bool = False,
     previous_output_summary: Optional[str] = None,
+    focus_directive: Optional[str] = None,
 ) -> str:
     """Call Claude Code. Return the response text (sent verbatim to Aristotle).
 
@@ -270,6 +271,20 @@ def review_and_draft_prompt(
             "what you remember asking for) and write a freshly-targeted prompt "
             "to push Aristotle further from where it stopped. Be more specific "
             "about what wasn't done; Aristotle has another shot."
+        )
+    # Focus directive (highest salience: read by Claude immediately
+    # before being told to write the prompt). Used by `marathon fill`,
+    # `marathon fill-file`, and the slash-command plugin to scope the
+    # iteration to a single declaration or file. The directive becomes
+    # the FIRST sentence Hermes echoes into the Aristotle prompt.
+    if focus_directive:
+        sections.append(
+            "# Focus directive (highest priority — overrides any wider "
+            "rubric instruction)\n\n"
+            + focus_directive.strip()
+            + "\n\n*This directive is load-bearing.* Lead your drafted "
+            "Aristotle prompt with the same constraint stated plainly; "
+            "every later sentence is subordinate to it."
         )
     sections.append(
         f"This is iteration {iteration_idx} of up to {max_iterations}, "
