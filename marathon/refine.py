@@ -780,6 +780,7 @@ async def _run_iteration(
     watcher_factory=None,
     continue_on_review: bool = True,
     review_rejection: Optional[int] = None,
+    focus_directive: Optional[str] = None,
 ) -> bool:
     """Run a single refinement iteration. Each attempt (other than a pure
     ``reattach`` reentry) gets its own Claude review against the current
@@ -869,6 +870,16 @@ async def _run_iteration(
             pending_rejections_md = _load_pending_rejections_md(
                 repo_dir, target_folder, focus_issue=review_rejection,
             )
+            # When the daemon is dispatching a focused single-issue
+            # rejection, suppress referee.md ENTIRELY so Claude-in-loop
+            # can't second-guess the human's specific reject ask by
+            # scanning the failure-mode catalog in the user header.
+            # The rubric (system prompt) still carries style/idiom
+            # guidance; the project-specific priorities are not
+            # load-bearing for a one-rejection iteration.
+            referee_md_for_prompt = (
+                None if review_rejection is not None else referee_md
+            )
             # Re-read the latest rater note on every attempt (including
             # retries) so a fresh Claude review sees the latest available
             # diagnosis even if a retry follows a partial pipeline run.
@@ -889,13 +900,13 @@ async def _run_iteration(
                 attempt_idx=attempt_idx,
                 max_retries=max_retries,
                 previous_status=last_status,
-                referee_md=referee_md,
+                referee_md=referee_md_for_prompt,
                 pending_rejections_md=pending_rejections_md,
                 previous_rating_note=previous_rating_note,
                 cross_chapter_md=cross_chapter_md,
                 continuation_mode=(attempt_mode == "continue"),
                 previous_output_summary=previous_output_summary,
-                focus_directive=getattr(args, "focus_directive", None),
+                focus_directive=focus_directive,
             )
 
             print("\n--- Claude's drafted prompt (sent verbatim to Aristotle) ---")
@@ -1220,6 +1231,7 @@ async def refine_command(args) -> None:
             watcher_factory=watcher_factory,
             continue_on_review=continue_on_review,
             review_rejection=getattr(args, "review_rejection", None),
+            focus_directive=getattr(args, "focus_directive", None),
         )
 
         if not ok:

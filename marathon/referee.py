@@ -1,22 +1,26 @@
 """The ``marathon referee`` subcommand and ``update_referee`` helper.
 
 Runs a Claude agent that scans the LeeSM repo + all per-chapter workdirs +
-the existing referee.md, and rewrites the machine-managed tail of
-``referee.md`` to reflect the most pressing project-specific issues.
+the existing ``standing-items.md``, and rewrites its content to reflect
+the most pressing project-specific issues.
 
 Two entry points:
 
 - ``referee_command(args)`` — invoked via ``marathon referee``. One-shot
-  pass with optional ``--review`` to write to ``referee.md.proposed``
+  pass with optional ``--review`` to write to ``standing-items.md.proposed``
   instead of overwriting.
-- ``update_referee(...)`` — library function callable from ``refine``'s
-  inner loop via the ``--auto-referee-every N`` flag. Runs synchronously
-  in the iteration loop; treats failures as warnings, not aborts.
+- ``update_referee(...)`` — library function. (The auto-trigger from
+  ``marathon refine``'s inner loop has been removed; run manually when
+  you want a fresh standing-items snapshot.)
 
-The referee.md file is split into a **user-managed header** and a
-**machine-managed tail** by sentinel comments. On first run (no
-sentinel), the existing file becomes the user header and an empty
-machine tail is appended.
+``standing-items.md`` is a **purely machine-managed** file written by
+this module. ``referee.md`` is now purely user-managed and is no longer
+touched by Claude — only the human edits failure modes / calibration
+rules there.
+
+Backward compat: the sentinel/header split logic is preserved on read
+so that any legacy ``standing-items.md`` written by an older version
+(with sentinels and an empty user-header) can be parsed and replaced.
 """
 
 from __future__ import annotations
@@ -29,10 +33,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-REFEREE_FILENAME = ".marathon/referee.md"
+REFEREE_FILENAME = ".marathon/standing-items.md"
 REFEREE_PROPOSED_SUFFIX = ".proposed"
 REFEREE_MODEL = "claude-opus-4-7"
 
+# Legacy sentinels. ``standing-items.md`` is purely machine-managed so
+# new writes don't emit them, but reads still split on them in case an
+# older file is on disk (or someone hand-pastes the legacy structure).
 BEGIN_SENTINEL = "<!-- BEGIN: Marathon-managed referee tail (do not edit below this line; use `marathon referee` to refresh) -->"
 END_SENTINEL = "<!-- END: Marathon-managed referee tail -->"
 
@@ -140,27 +147,41 @@ def _check_tail_bloat(machine_tail: str) -> list[str]:
 
 
 def _split_referee(text: str) -> tuple[str, Optional[str]]:
-    """Split an existing referee.md into (user_header, machine_tail).
+    """Split an existing standing-items.md into (user_header, machine_tail).
 
-    Returns ``(text, None)`` if the file has no sentinel — the whole
-    file is treated as user-managed and the caller should attach a
-    fresh machine tail at the end.
+    Since ``standing-items.md`` is purely machine-managed:
+    - No sentinels → whole file is the prior machine tail, empty user
+      header. (This is the new default for files written by this
+      module's current ``_assemble_referee``.)
+    - Sentinels present → legacy format; split into user_header /
+      machine_tail at the sentinels as before.
     """
     if BEGIN_SENTINEL not in text or END_SENTINEL not in text:
-        return text.rstrip(), None
+        # No sentinel: pure machine-managed file — treat the whole
+        # content as the prior machine tail with no user header.
+        return "", text.strip()
     begin_idx = text.index(BEGIN_SENTINEL)
     end_idx = text.index(END_SENTINEL)
     if end_idx < begin_idx:
-        # Malformed — treat whole thing as user header.
-        return text.rstrip(), None
+        # Malformed — fall back to "whole thing is the prior tail".
+        return "", text.strip()
     user_header = text[:begin_idx].rstrip()
     machine_tail = text[begin_idx + len(BEGIN_SENTINEL):end_idx].strip()
     return user_header, machine_tail
 
 
 def _assemble_referee(user_header: str, new_machine_tail: str) -> str:
-    """Recombine user_header + sentinels + new_machine_tail into a single
-    referee.md body."""
+    """Recombine user_header + new_machine_tail into a single body.
+
+    ``standing-items.md`` is purely machine-managed, so when
+    ``user_header`` is empty (the new default), we skip the sentinel
+    markers entirely — the file is just the tail content plus a
+    trailing newline. Legacy callers that supply a non-empty
+    ``user_header`` still get the sentinel-bracketed form for
+    backward compatibility.
+    """
+    if not user_header.strip():
+        return new_machine_tail.strip() + "\n"
     parts = [user_header.rstrip()]
     parts.append("")  # blank line before sentinel
     parts.append(BEGIN_SENTINEL)

@@ -65,7 +65,12 @@ DEFAULT_REFINE_ARGS: list[str] = [
     "--skeleton", "--max-iterations", "1", "--max-retries", "3",
     "--auto-build", "--build-timeout", "1800",
     "--auto-commit", "--auto-push", "--auto-rate",
-    "--auto-referee-every", "1",
+    # ``--auto-referee-every`` deliberately omitted: Claude no longer
+    # auto-refreshes referee.md from daemon iterations. Standing items
+    # are tracked in standing-items.md instead (run ``marathon referee``
+    # manually if you want a refresh). Removing the auto-refresh prevents
+    # the machine-managed priority tail from competing with explicit
+    # human reject notes for Aristotle's marquee move.
     "--audit-verified",
     # Daemon iterations always go through a marathon-owned branch +
     # PR. Solves the stranded-commit failure mode where the daemon
