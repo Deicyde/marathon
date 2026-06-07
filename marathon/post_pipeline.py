@@ -923,8 +923,16 @@ def run_post_pipeline(
     iteration: Optional[int],
     project_id: Optional[str],
     extra_paths_to_stage: Optional[list[str]] = None,
+    iteration_duration_seconds: Optional[float] = None,
 ) -> dict:
-    """Run the build → commit → rate pipeline. Returns a dict with results."""
+    """Run the build → commit → rate pipeline. Returns a dict with results.
+
+    ``iteration_duration_seconds`` is the Aristotle wall-clock for this
+    iteration (typically the dominant compute cost — minutes to half-hours).
+    It is accumulated alongside the lake build duration into the
+    formalization wall-time sidecar so ``formalization.yaml`` reflects
+    actual compute spent, not just local build time.
+    """
     out: dict = {"build": None, "commit": None, "rating": None}
 
     if config.auto_build:
@@ -939,22 +947,23 @@ def run_post_pipeline(
             duration = format_duration(b.duration_seconds)
             status = "OK" if b.ok else "FAIL"
             print(f"  build: {status} ({duration})")
-        # Accumulate iteration build time into the formalization
-        # wall-time sidecar (when --update-formalization is on AND
-        # the build actually ran). The yaml's
-        # automation.cost.wall_time field is re-derived from the
-        # sidecar on each refresh. Build-failed iterations still
-        # count — the compute was spent.
-        if (
-            config.update_formalization
-            and b.duration_seconds is not None
-            and b.duration_seconds > 0
-        ):
-            try:
-                from marathon.formalization import add_wall_seconds
-                add_wall_seconds(repo_dir, b.duration_seconds)
-            except Exception:  # noqa: BLE001 — soft-warning
-                pass
+        # Accumulate iteration wall-clock into the formalization wall-time
+        # sidecar (when --update-formalization is on). The yaml's
+        # automation.cost.wall_time field is re-derived from the sidecar
+        # on each refresh. Build-failed iterations still count — the
+        # compute (Aristotle + lake) was spent.
+        if config.update_formalization:
+            seconds_to_add = 0.0
+            if iteration_duration_seconds is not None and iteration_duration_seconds > 0:
+                seconds_to_add += float(iteration_duration_seconds)
+            if b.duration_seconds is not None and b.duration_seconds > 0:
+                seconds_to_add += float(b.duration_seconds)
+            if seconds_to_add > 0:
+                try:
+                    from marathon.formalization import add_wall_seconds
+                    add_wall_seconds(repo_dir, seconds_to_add)
+                except Exception:  # noqa: BLE001 — soft-warning
+                    pass
 
     if config.auto_commit:
         # Refresh formalization.yaml's auto-fields (sorry_count,
