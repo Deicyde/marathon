@@ -251,6 +251,9 @@ async def _run_fill(args) -> None:
     args.tex = getattr(args, "tex", None)
     args.referee = getattr(args, "referee", None)
     args.max_prompt_words = getattr(args, "max_prompt_words", None)
+    args.no_cross_chapter = getattr(args, "no_cross_chapter", True)
+    args.dry_run = getattr(args, "dry_run", False)
+    args.auto_referee_every = getattr(args, "auto_referee_every", 0)
     await refine_command(args)
 
 
@@ -282,6 +285,9 @@ async def _run_fill_file(args) -> None:
     args.tex = getattr(args, "tex", None)
     args.referee = getattr(args, "referee", None)
     args.max_prompt_words = getattr(args, "max_prompt_words", None)
+    args.no_cross_chapter = getattr(args, "no_cross_chapter", True)
+    args.dry_run = getattr(args, "dry_run", False)
+    args.auto_referee_every = getattr(args, "auto_referee_every", 0)
     await refine_command(args)
 
 
