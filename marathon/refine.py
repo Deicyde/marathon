@@ -125,6 +125,46 @@ def _load_additional_writable_paths(
     return out
 
 
+def _format_reject_as_aristotle_prompt(
+    pending_rejections_md: str,
+    focus_issue: int,
+    skeleton_mode: bool,
+) -> str:
+    """Format a single rejected sub-issue's notes as a direct Aristotle
+    prompt, bypassing Claude-in-loop.
+
+    The notes that the human typed into ``marathon review reject N --notes
+    NOTES_FILE`` are already file-and-declaration-level instructions for
+    Aristotle. For focused single-issue rejections, Claude-in-loop's
+    "review and draft" pass adds noise rather than value — it tends to
+    scan the target folder, notice unrelated structural opportunities,
+    and override the explicit reject ask with its own picks. Skipping
+    Claude entirely on these iterations keeps the contract intact.
+
+    The returned text is sent verbatim to Aristotle (modulo the standard
+    output-requirements trailer appended by the caller). A short
+    contextual lead is prepended so Aristotle knows the scope is exact.
+    """
+    lead = (
+        f"You are addressing a focused rejection of sub-issue #{focus_issue}.\n\n"
+        "The human reviewer typed the change request below. Execute it "
+        "exactly as written — same file(s), same declarations, same "
+        "structural change. Do NOT introduce other refactors, even if you "
+        "notice clean structural opportunities in adjacent files. Do NOT "
+        "touch files outside those named in the request. If the request "
+        "has unavoidable downstream consumer edits, include only those "
+        "minimal consumer fixes.\n\n"
+    )
+    if skeleton_mode:
+        lead += (
+            "Skeleton mode: every proof body stays ``by sorry``. Only "
+            "signatures, definitions, and structural shape change this "
+            "iteration.\n\n"
+        )
+    lead += "---\n\n# Reject notes\n\n"
+    return lead + pending_rejections_md.strip() + "\n"
+
+
 def _load_pending_rejections_md(
     repo_dir: Path,
     target_folder: Path,
@@ -342,12 +382,17 @@ SKELETON_OUTPUT_REQUIREMENTS_TRAILER = """
 
 ## Output requirements (added by Marathon, skeleton mode)
 
-This is a **skeleton refinement** iteration: every theorem, lemma,
-proposition, and corollary body must remain `sorry`. **Do not attempt to
-prove anything**, even one-line tactic proofs you think will succeed. Your
-job is to improve signatures, definitions, names, and structure — not to
-fill in proofs. If existing code in the target folder contains non-`sorry`
-proof bodies, revert them to `sorry`.
+This is a **skeleton refinement** iteration: **new** theorem, lemma,
+proposition, and corollary bodies must be `sorry`. **Do not attempt to
+prove anything new**, even one-line tactic proofs you think will succeed.
+Your job is to improve signatures, definitions, names, and structure —
+not to write fresh proofs. **However: if existing code already contains
+honest non-`sorry` proof bodies, preserve them.** Do not regress an
+already-discharged proof to `sorry` just because you are restructuring
+its signature or surrounding context — wrap the existing body under
+whatever lead tactic the new signature needs (`funext`, `intro`, etc.)
+and keep its tail unchanged. Skeleton mode forbids *new* proof work, not
+*existing* proof preservation.
 
 Place every Lean file you produce at the relative path `{output_path}/` in
 your response. This path has multiple components; preserve each one as a
@@ -781,11 +826,22 @@ async def _run_iteration(
     continue_on_review: bool = True,
     review_rejection: Optional[int] = None,
     focus_directive: Optional[str] = None,
+    prefetched_pending_rejections_md: Optional[str] = None,
 ) -> bool:
     """Run a single refinement iteration. Each attempt (other than a pure
     ``reattach`` reentry) gets its own Claude review against the current
     target-folder state. Returns True on success, False if the iteration
     failed permanently.
+
+    ``prefetched_pending_rejections_md`` lets the caller hand in the
+    rendered pending-rejections context loaded BEFORE this iteration's
+    branch switch. Necessary when ``--auto-pr`` is on, since
+    ``prepare_auto_pr_branch`` does ``git checkout -B branch
+    origin/main`` and wipes the local ``state.json`` rejection record;
+    reading state.json inside the iteration would then return None and
+    the focused-rejection bypass would silently fall through to
+    Claude-in-loop. When this argument is None, the iteration loads
+    fresh (autonomous-run path, no branch switch).
 
     ``existing_mode`` is the mode handed in from :func:`_try_reattach_or_continue`:
 
@@ -859,17 +915,17 @@ async def _run_iteration(
                 if referee_path and referee_path.is_file()
                 else None
             )
-            # Per-iteration rejection queue: load pending rejections from
-            # `.marathon/review/state.json` (decoupled from referee.md as
-            # of the L refactor). Filter to the chapter our target folder
-            # belongs to, so cross-chapter rejections don't bleed in.
-            # ``review_rejection`` (when set, typically by the refine
-            # daemon) further restricts to a single rejected issue — the
-            # one-rejection-per-iteration dispatch that fixes the
-            # daemon-queue-not-honored failure mode.
-            pending_rejections_md = _load_pending_rejections_md(
-                repo_dir, target_folder, focus_issue=review_rejection,
-            )
+            # Per-iteration rejection queue. Prefer the prefetched value
+            # passed in from the caller (necessary under ``--auto-pr``,
+            # where the branch switch wipes ``state.json`` before this
+            # iteration reads it). Fall back to a fresh load for
+            # autonomous runs that don't switch branches.
+            if prefetched_pending_rejections_md is not None:
+                pending_rejections_md = prefetched_pending_rejections_md
+            else:
+                pending_rejections_md = _load_pending_rejections_md(
+                    repo_dir, target_folder, focus_issue=review_rejection,
+                )
             # When the daemon is dispatching a focused single-issue
             # rejection, suppress referee.md ENTIRELY so Claude-in-loop
             # can't second-guess the human's specific reject ask by
@@ -888,26 +944,45 @@ async def _run_iteration(
                 _collect_sibling_chapter_context(workdir) if cross_chapter else None
             )
 
-            claude_response = review_and_draft_prompt(
-                target_folder=target_folder,
-                repo_dir=repo_dir,
-                marathon_md=marathon_md,
-                refine_log=refine_log_text,
-                iteration_idx=iteration_idx,
-                max_iterations=max_iterations,
-                skeleton_mode=skeleton_mode,
-                max_prompt_words=max_prompt_words,
-                attempt_idx=attempt_idx,
-                max_retries=max_retries,
-                previous_status=last_status,
-                referee_md=referee_md_for_prompt,
-                pending_rejections_md=pending_rejections_md,
-                previous_rating_note=previous_rating_note,
-                cross_chapter_md=cross_chapter_md,
-                continuation_mode=(attempt_mode == "continue"),
-                previous_output_summary=previous_output_summary,
-                focus_directive=focus_directive,
-            )
+            # Bypass Claude-in-loop for focused single-issue rejections:
+            # the human's reject notes ARE the Aristotle prompt. Past
+            # iterations under Claude-in-loop have repeatedly overridden
+            # the explicit reject ask with project-wide structural picks
+            # — even after muting referee.md and tightening the
+            # rejection-queue preamble. The target file's visible content
+            # alone is enough to nudge Claude toward "while we're at it"
+            # refactors. For focused rejections, the simplest fix is to
+            # skip the review-and-draft pass entirely and dispatch the
+            # human's notes verbatim. The reject notes that the human
+            # types into ``marathon review reject --notes`` are already
+            # file-and-declaration-level Aristotle instructions.
+            if review_rejection is not None and pending_rejections_md:
+                claude_response = _format_reject_as_aristotle_prompt(
+                    pending_rejections_md,
+                    review_rejection,
+                    skeleton_mode,
+                )
+            else:
+                claude_response = review_and_draft_prompt(
+                    target_folder=target_folder,
+                    repo_dir=repo_dir,
+                    marathon_md=marathon_md,
+                    refine_log=refine_log_text,
+                    iteration_idx=iteration_idx,
+                    max_iterations=max_iterations,
+                    skeleton_mode=skeleton_mode,
+                    max_prompt_words=max_prompt_words,
+                    attempt_idx=attempt_idx,
+                    max_retries=max_retries,
+                    previous_status=last_status,
+                    referee_md=referee_md_for_prompt,
+                    pending_rejections_md=pending_rejections_md,
+                    previous_rating_note=previous_rating_note,
+                    cross_chapter_md=cross_chapter_md,
+                    continuation_mode=(attempt_mode == "continue"),
+                    previous_output_summary=previous_output_summary,
+                    focus_directive=focus_directive,
+                )
 
             print("\n--- Claude's drafted prompt (sent verbatim to Aristotle) ---")
             print(claude_response)
@@ -1116,6 +1191,23 @@ async def refine_command(args) -> None:
         auto_pr_base=getattr(args, "auto_pr_base", "main"),
     )
 
+    # Load the pending-rejections context BEFORE any branch switch.
+    # ``prepare_auto_pr_branch`` (below, when ``--auto-pr`` is on) does
+    # ``git checkout -B branch origin/main`` and wipes the local
+    # ``state.json`` rejection record. Reading state.json from inside
+    # the iteration would then return None and the focused-rejection
+    # bypass would silently fall through to Claude-in-loop. Capture the
+    # rejection notes here while state.json still reflects them, then
+    # thread the value into the iteration via
+    # ``prefetched_pending_rejections_md``.
+    prefetched_pending_rejections_md = (
+        _load_pending_rejections_md(
+            repo_dir, target_folder, focus_issue=review_issue_num,
+        )
+        if review_issue_num is not None
+        else None
+    )
+
     # When --auto-pr is set, prepare the dedicated marathon branch
     # BEFORE the iteration runs so the auto-commit lands on the right
     # branch. Refuses on a dirty working tree; fail-fast so the human
@@ -1232,6 +1324,7 @@ async def refine_command(args) -> None:
             continue_on_review=continue_on_review,
             review_rejection=getattr(args, "review_rejection", None),
             focus_directive=getattr(args, "focus_directive", None),
+            prefetched_pending_rejections_md=prefetched_pending_rejections_md,
         )
 
         if not ok:
