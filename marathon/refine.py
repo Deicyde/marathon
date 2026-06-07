@@ -382,12 +382,17 @@ SKELETON_OUTPUT_REQUIREMENTS_TRAILER = """
 
 ## Output requirements (added by Marathon, skeleton mode)
 
-This is a **skeleton refinement** iteration: every theorem, lemma,
-proposition, and corollary body must remain `sorry`. **Do not attempt to
-prove anything**, even one-line tactic proofs you think will succeed. Your
-job is to improve signatures, definitions, names, and structure — not to
-fill in proofs. If existing code in the target folder contains non-`sorry`
-proof bodies, revert them to `sorry`.
+This is a **skeleton refinement** iteration: **new** theorem, lemma,
+proposition, and corollary bodies must be `sorry`. **Do not attempt to
+prove anything new**, even one-line tactic proofs you think will succeed.
+Your job is to improve signatures, definitions, names, and structure —
+not to write fresh proofs. **However: if existing code already contains
+honest non-`sorry` proof bodies, preserve them.** Do not regress an
+already-discharged proof to `sorry` just because you are restructuring
+its signature or surrounding context — wrap the existing body under
+whatever lead tactic the new signature needs (`funext`, `intro`, etc.)
+and keep its tail unchanged. Skeleton mode forbids *new* proof work, not
+*existing* proof preservation.
 
 Place every Lean file you produce at the relative path `{output_path}/` in
 your response. This path has multiple components; preserve each one as a

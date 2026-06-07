@@ -118,9 +118,13 @@ style — even a small correctness fix is more valuable than a large
 style pass. As iterations accumulate and correctness issues thin out,
 leading with category 2 or 3 becomes the right call.
 
-**Do not critique missing proofs.** Every body is supposed to be
-`sorry`. If existing code in the target folder contains a non-`sorry`
-proof body, instruct Aristotle to revert it to `sorry`.
+**Do not critique missing proofs.** New theorem/lemma/proposition/
+corollary bodies are supposed to be `sorry`. **If existing code in the
+target folder contains a non-`sorry` proof body, preserve it** — do not
+instruct Aristotle to regress it. When restructuring a signature whose
+existing proof becomes locally rewriteable (e.g., dropping `∀ p` →
+wrapping with `funext p`), explicitly tell Aristotle to keep the
+existing tail of the proof.
 
 ## Anti-patterns to push back on by name
 
