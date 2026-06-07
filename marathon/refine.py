@@ -793,6 +793,7 @@ async def _run_refine_attempt(
             iteration=iteration_idx,
             project_id=state.project_id,
             extra_paths_to_stage=cross_writes_for_pipeline or None,
+            iteration_duration_seconds=state.duration_seconds,
         )
 
     return task.status
