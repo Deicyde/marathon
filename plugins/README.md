@@ -24,6 +24,8 @@ are re-homed here as agents.
 | `/marathon:fill-file` | `marathon fill-file` — fill every `sorry` in a single file in one iteration |
 | `/marathon:referee` | `marathon referee` — refresh project reviewer notes (`referee.md`) |
 | `/marathon:review` | `marathon review …` — human-in-the-loop per-declaration verify/reject |
+| `/marathon:review:bootstrap-chapter` | `marathon review bootstrap-chapter` — first-time chapter setup: open one GitHub sub-issue per named result |
+| `/marathon:review:audit-chapter` | `marathon review audit-chapter` — refresh an already-bootstrapped chapter's sub-issues against current Lean |
 | `/marathon:review:verify` | `marathon review verify` — verify a sub-issue and auto-merge its PR |
 | `/marathon:rate` | seven-dimension quality rating of a chapter's output |
 | `/marathon:steer` | Hermes live-steering of an in-flight Aristotle run |
