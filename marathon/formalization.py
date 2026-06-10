@@ -404,6 +404,170 @@ def format_wall_time(seconds: int) -> str:
     return f"{days}d {hrs}h"
 
 
+# --- wall_time backfill from Aristotle -------------------------------------
+#
+# The per-iteration accumulator only counts compute from the moment the
+# project-id-keyed sidecar was introduced. To reconstruct the historical
+# total, walk ``PromptLog.md`` for every Aristotle project UUID ever
+# submitted and ask the Aristotle API for each project's actual task
+# wall-clock. This rebuilds the ``projects`` map authoritatively, so the
+# resulting total is the real cumulative compute — not a lower bound.
+
+# Aristotle project UUIDs as they appear in PromptLog.md, e.g.
+# ``2026-06-09T21:02:13-04:00  307cb266-efec-4f84-8bb6-8fae535031e3``.
+_UUID_RE = re.compile(
+    r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"
+)
+_PROMPTLOG_PATHS = (Path(".marathon") / "PromptLog.md", Path("PromptLog.md"))
+
+
+def parse_promptlog_project_ids(repo_dir: Path) -> list[str]:
+    """Return the de-duplicated Aristotle project UUIDs recorded in the
+    repo's ``PromptLog.md`` (preferring ``.marathon/PromptLog.md`` over the
+    legacy repo-root location), in first-seen order. Empty if no log."""
+    for rel in _PROMPTLOG_PATHS:
+        path = repo_dir / rel
+        if path.is_file():
+            seen: dict[str, None] = {}
+            for m in _UUID_RE.finditer(path.read_text()):
+                seen.setdefault(m.group(1), None)
+            return list(seen.keys())
+    return []
+
+
+async def _fetch_project_seconds(
+    project_id: str, max_retries: int = 4
+) -> Optional[int]:
+    """Sum the wall-clock spans of a project's tasks via the Aristotle
+    API. Each task's span is ``last_updated_at - created_at`` — the same
+    "submitted → settled" window the live refine loop records. Summing
+    across a project's tasks covers retries and ``project.ask``
+    continuations within one iteration.
+
+    Retries on transient errors (HTTP 5xx, network blips) with
+    exponential backoff so a flaky API call doesn't silently drop a
+    project from the backfill total. Gives up immediately on a permanent
+    403/404 (the project belongs to a different API key or no longer
+    exists). Returns the integer seconds, or ``None`` if the project
+    couldn't be fetched after retries — the caller reports the gap.
+    """
+    import asyncio
+    import aristotlelib
+    from aristotlelib import AristotleAPIError
+
+    for attempt in range(max_retries + 1):
+        try:
+            proj = await aristotlelib.Project.from_id(project_id)
+            total = 0.0
+            pagination_key: Optional[str] = None
+            while True:
+                tasks, pagination_key = await proj.get_tasks(
+                    pagination_key=pagination_key, limit=50, newest_first=False
+                )
+                for t in tasks:
+                    span = (t.last_updated_at - t.created_at).total_seconds()
+                    if span > 0:
+                        total += span
+                if not pagination_key:
+                    break
+            return int(total)
+        except AristotleAPIError as e:
+            status = getattr(e, "status_code", None)
+            # Permanent: don't burn retries on access/existence failures.
+            if status in (403, 404, 401):
+                return None
+            # Transient (5xx / unknown): back off and retry.
+            if attempt < max_retries:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+            return None
+        except Exception:  # noqa: BLE001 — network blip etc.; retry
+            if attempt < max_retries:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+            return None
+    return None
+
+
+async def backfill_wall_time(
+    repo_dir: Path,
+    concurrency: int = 8,
+    progress: Optional[Any] = None,
+) -> dict:
+    """Reconstruct the wall-time sidecar from Aristotle's record of every
+    project in ``PromptLog.md``. Fetches each project's authoritative
+    per-task wall-clock and overlays it onto the existing sidecar's
+    ``projects`` map, then writes the result. Returns a summary dict.
+
+    **Merge semantics** (not a wipe): existing sidecar entries are the
+    starting point. Each successfully-fetched project overwrites its entry
+    with the authoritative value (idempotent re-runs). Projects that can't
+    be fetched — typically a 403 because they were submitted under a
+    different API key/account, or expired past Harmonic's retention window
+    — keep whatever entry they already had and are reported in
+    ``summary["forbidden"]``. ``build_only_seconds`` is preserved. This
+    makes the recovered total a *lower bound* when some projects are
+    inaccessible: re-run with a key that owns the older projects to recover
+    more.
+
+    ``progress`` is an optional callable ``(done, total)`` for CLI
+    feedback. Requires ``aristotlelib.set_api_key`` to have been called.
+    """
+    import asyncio
+    import json as _json
+
+    project_ids = parse_promptlog_project_ids(repo_dir)
+    summary: dict = {
+        "projects_in_log": len(project_ids),
+        "fetched": 0,
+        "forbidden": [],
+        "total_seconds": 0,
+    }
+    if not project_ids:
+        return summary
+
+    sem = asyncio.Semaphore(max(1, concurrency))
+    done = 0
+    lock = asyncio.Lock()
+
+    async def _one(pid: str) -> tuple[str, Optional[int]]:
+        nonlocal done
+        async with sem:
+            secs = await _fetch_project_seconds(pid)
+        async with lock:
+            done += 1
+            if progress is not None:
+                progress(done, len(project_ids))
+        return pid, secs
+
+    results = await asyncio.gather(*[_one(p) for p in project_ids])
+
+    path = repo_dir / _WALL_TIME_SIDECAR
+    data = _load_sidecar(path)
+    projects: dict[str, dict] = dict(data.get("projects") or {})
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for pid, secs in results:
+        if secs is None:
+            # Couldn't fetch (403 / deleted / transient). Keep any
+            # pre-existing entry; report the gap.
+            summary["forbidden"].append(pid)
+            continue
+        projects[pid] = {"seconds": secs, "added_at": now_iso}
+        summary["fetched"] += 1
+
+    payload = {
+        "version": 2,
+        "projects": projects,
+        "build_only_seconds": int(data.get("build_only_seconds", 0) or 0),
+        "last_updated": now_iso,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps(payload, indent=2, sort_keys=True))
+
+    summary["total_seconds"] = _sum_sidecar(payload)
+    return summary
+
+
 # --- axiom checking ------------------------------------------------------
 #
 # ``status.main_results[].axioms`` is the per-declaration axiom set

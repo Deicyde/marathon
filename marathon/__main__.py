@@ -438,6 +438,39 @@ def _add_formalization_subparser(subparsers) -> None:
     )
     p_up.set_defaults(func=_run_formalization_update)
 
+    p_bf = sub.add_parser(
+        "backfill-wall-time",
+        help=(
+            "Reconstruct .marathon/wall-time.json from Aristotle's record "
+            "of every project in PromptLog.md."
+        ),
+        description=(
+            "Walk PromptLog.md for every Aristotle project UUID ever "
+            "submitted, ask the Aristotle API for each project's actual "
+            "task wall-clock, and rebuild the project-id-keyed wall-time "
+            "sidecar from those authoritative spans. Use this once after "
+            "upgrading to the v2 sidecar to recover the historical total "
+            "(the live accumulator only counts compute from the upgrade "
+            "forward). Requires ARISTOTLE_API_KEY. Overwrites the sidecar."
+        ),
+    )
+    p_bf.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Repo root (must contain PromptLog.md). Default: current directory.",
+    )
+    p_bf.add_argument(
+        "--concurrency", type=int, default=8, metavar="N",
+        help="Max concurrent Aristotle API fetches. Default: 8.",
+    )
+    p_bf.add_argument(
+        "--update-yaml", action="store_true",
+        help=(
+            "After rebuilding the sidecar, refresh formalization.yaml's "
+            "automation.cost.wall_time from the new total."
+        ),
+    )
+    p_bf.set_defaults(func=_run_formalization_backfill_wall_time)
+
 
 def _run_formalization_init(args) -> None:
     from marathon.formalization import (
@@ -469,6 +502,47 @@ def _run_formalization_update(args) -> None:
         raise SystemExit(1)
     suffix = " (with axioms)" if getattr(args, "check_axioms", False) else ""
     print(f"refreshed {written}{suffix}")
+
+
+def _run_formalization_backfill_wall_time(args) -> None:
+    import aristotlelib
+    from marathon.skeleton import _ensure_api_key
+    from marathon.formalization import (
+        backfill_wall_time, format_wall_time, update_formalization,
+    )
+
+    repo_dir: Path = args.repo_dir.resolve()
+    _ensure_api_key()  # exits if ARISTOTLE_API_KEY is unset; calls set_api_key
+
+    def _progress(done: int, total: int) -> None:
+        print(f"\r  fetching project durations… {done}/{total}",
+              end="", file=sys.stderr, flush=True)
+
+    summary = asyncio.run(
+        backfill_wall_time(repo_dir, concurrency=args.concurrency,
+                           progress=_progress)
+    )
+    print("", file=sys.stderr)  # newline after the progress line
+
+    if summary["projects_in_log"] == 0:
+        print(f"no PromptLog.md project UUIDs found under {repo_dir}; nothing to backfill")
+        raise SystemExit(1)
+
+    total = summary["total_seconds"]
+    print(f"backfilled {summary['fetched']}/{summary['projects_in_log']} projects "
+          f"→ {format_wall_time(total)} ({total}s)")
+    if summary["forbidden"]:
+        n = len(summary["forbidden"])
+        print(f"  could not fetch {n} project(s) (403/expired — likely submitted "
+              f"under a different API key); total is a lower bound. Re-run with a "
+              f"key that owns them to recover more.")
+
+    if args.update_yaml:
+        written = update_formalization(repo_dir, framework="Marathon")
+        if written is None:
+            print(f"  (no formalization.yaml at {repo_dir}; sidecar updated, yaml unchanged)")
+        else:
+            print(f"  refreshed {written} (wall_time = {format_wall_time(total)})")
 
 
 def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
