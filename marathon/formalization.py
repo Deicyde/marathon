@@ -21,7 +21,7 @@ import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -269,43 +269,117 @@ def compute_auto_fields(
 # --- wall_time accumulation ------------------------------------------
 
 
+def _load_sidecar(path: Path) -> dict:
+    """Load the wall-time sidecar in either v1 (``total_seconds``) or v2
+    (``projects`` + ``build_only_seconds``) shape. v1 sidecars are
+    migrated in-memory to v2 with ``total_seconds`` rolled into
+    ``build_only_seconds`` — those seconds are real compute, just not
+    attributable to a specific Aristotle project. Missing or unreadable
+    sidecar returns an empty v2 shape."""
+    import json
+    empty: dict = {"version": 2, "projects": {}, "build_only_seconds": 0}
+    if not path.is_file():
+        return empty
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    # v1 → v2 migration: a v1 sidecar has ``total_seconds`` at the
+    # top level. Roll that into ``build_only_seconds``; per-project
+    # attribution starts fresh from here.
+    if "total_seconds" in data and "projects" not in data:
+        legacy = int(data.get("total_seconds", 0) or 0)
+        return {"version": 2, "projects": {}, "build_only_seconds": legacy}
+    projects = data.get("projects") or {}
+    if not isinstance(projects, dict):
+        projects = {}
+    build_only = int(data.get("build_only_seconds", 0) or 0)
+    return {"version": 2, "projects": projects, "build_only_seconds": build_only}
+
+
+def _sum_sidecar(data: dict) -> int:
+    """Total seconds = sum of every project's seconds + build_only_seconds.
+    Robust to malformed entries (skipped)."""
+    total = int(data.get("build_only_seconds", 0) or 0)
+    for entry in (data.get("projects") or {}).values():
+        if isinstance(entry, dict):
+            try:
+                total += int(entry.get("seconds", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
 def read_cumulative_wall_seconds(repo_dir: Path) -> int:
     """Read total seconds from the sidecar at
-    ``<repo_dir>/.marathon/wall-time.json``. Returns 0 if absent."""
-    import json
-    path = repo_dir / _WALL_TIME_SIDECAR
-    if not path.is_file():
-        return 0
-    try:
-        return int(json.loads(path.read_text()).get("total_seconds", 0))
-    except (OSError, ValueError):
-        return 0
+    ``<repo_dir>/.marathon/wall-time.json``. Returns 0 if absent.
+
+    Handles both v1 (``total_seconds``) and v2 (``projects`` +
+    ``build_only_seconds``) sidecars transparently. v1's lump sum is
+    treated as unattributed build seconds — the cumulative total is
+    preserved across schema migration."""
+    return _sum_sidecar(_load_sidecar(repo_dir / _WALL_TIME_SIDECAR))
 
 
-def add_wall_seconds(repo_dir: Path, seconds: float) -> int:
-    """Add ``seconds`` to the cumulative wall-time sidecar. Returns the
-    new cumulative total (in seconds). Creates the sidecar if absent.
+def add_wall_seconds(
+    repo_dir: Path,
+    seconds: float,
+    project_id: Optional[str] = None,
+) -> int:
+    """Record ``seconds`` against ``project_id`` in the v2 wall-time
+    sidecar, then return the new cumulative total (sum across all
+    projects + build_only_seconds). Creates the sidecar if absent.
+    Migrates a v1 sidecar to v2 on first write (preserving the old
+    ``total_seconds`` as ``build_only_seconds``).
 
-    Called by ``post_pipeline.run_post_pipeline`` after each
-    iteration's build to accumulate iteration durations. Iteration
-    durations include build + Aristotle compute (when both are
-    measured); only build duration is tracked here today since that's
-    what the post-pipeline has in hand. Aristotle duration could be
-    added later by also reading ``project.duration_seconds`` from
-    refine-state.json.
+    When ``project_id`` is given, ``projects[project_id]`` is
+    overwritten with the new seconds — idempotent across re-runs of the
+    same Aristotle project (continuations, retries) and resilient to
+    merge races between parallel iteration branches: two branches that
+    record distinct project_ids merge cleanly (different JSON keys);
+    two branches that record the same project_id end up with the same
+    value, so there's nothing to clobber. This is the fix for the
+    classic counter-merge race that caused main's ``wall_time`` to go
+    *down* on certain PR landings.
+
+    When ``project_id`` is absent, the seconds are added to
+    ``build_only_seconds`` (the historical lump-sum bucket).
+
+    Called by ``post_pipeline.run_post_pipeline`` after each iteration
+    with the iteration's wall-clock (Aristotle compute + lake build).
     """
     import json
     if seconds <= 0:
         return read_cumulative_wall_seconds(repo_dir)
     path = repo_dir / _WALL_TIME_SIDECAR
     path.parent.mkdir(parents=True, exist_ok=True)
-    current = read_cumulative_wall_seconds(repo_dir)
-    new_total = current + int(seconds)
-    path.write_text(json.dumps({
-        "total_seconds": new_total,
+    data = _load_sidecar(path)
+    if project_id:
+        # Idempotent overwrite — re-recording the same Aristotle project
+        # never double-counts and same-value merges never conflict.
+        data["projects"][project_id] = {
+            "seconds": int(seconds),
+            "added_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+    else:
+        # No project_id (rare — non-Aristotle path) → fall back to the
+        # historical lump-sum bucket.
+        data["build_only_seconds"] = (
+            int(data.get("build_only_seconds", 0) or 0) + int(seconds)
+        )
+    # Serialize with sorted keys so distinct project additions produce
+    # disjoint, line-by-line diffs that git's 3-way merge can handle
+    # without manual conflict resolution.
+    payload = {
+        "version": 2,
+        "projects": data["projects"],
+        "build_only_seconds": data["build_only_seconds"],
         "last_updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }, indent=2))
-    return new_total
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    return _sum_sidecar(data)
 
 
 def format_wall_time(seconds: int) -> str:
