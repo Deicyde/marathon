@@ -161,6 +161,52 @@ def _build_submission_dir(
     return staged
 
 
+def _atomic_replace_dir(new_dir: Path, target_dir: Path) -> None:
+    """Atomically swap ``new_dir`` into place at ``target_dir``.
+
+    Both paths must be on the same filesystem (callers stage ``new_dir``
+    next to ``target_dir``, never in ``/tmp``, so the swap is a cheap
+    rename rather than a cross-device copy). POSIX ``rename`` can't
+    replace a non-empty directory, so the swap is two renames: the old
+    folder is moved aside into a unique holding directory, the new one
+    renamed into place, then the old copy is deleted. If the second
+    rename fails the old folder is restored — there is no window where
+    the destination is missing *and* unrecoverable.
+    """
+    if not target_dir.exists():
+        os.replace(new_dir, target_dir)
+        return
+    # mkdtemp gives us a collision-free holding spot beside the target
+    # (crash leftovers from a previous run can't shadow the rename).
+    holding = Path(tempfile.mkdtemp(prefix=".marathon-old-", dir=target_dir.parent))
+    old_moved = holding / target_dir.name
+    try:
+        os.replace(target_dir, old_moved)
+    except OSError:
+        shutil.rmtree(holding, ignore_errors=True)  # holding is still empty
+        raise
+    try:
+        os.replace(new_dir, target_dir)
+    except OSError:
+        # Restore the previous contents before propagating: better to
+        # keep the stale chapter than to lose it.
+        try:
+            os.replace(old_moved, target_dir)
+        except OSError:
+            # Double fault: swap-in AND restore both failed. The holding
+            # dir now holds the ONLY surviving copy of the previous
+            # contents — deleting it here would destroy them, so leave
+            # it in place and tell the operator where it is.
+            print(
+                f"  WARN: could not restore {target_dir} after a failed "
+                f"swap; previous contents preserved at {old_moved}"
+            )
+            raise
+        shutil.rmtree(holding, ignore_errors=True)
+        raise
+    shutil.rmtree(holding, ignore_errors=True)
+
+
 def _extract_solution(
     tar_path: Path,
     expected_path: PurePosixPath,
@@ -177,10 +223,17 @@ def _extract_solution(
     ``marathon.md`` lookup also moves to the same level.
 
     **Primary chapter** (``expected_path``) gets wipe-and-replace
-    semantics: stale contents of ``repo_dir/expected_path`` are wiped
-    before extracting any tar member under that path. This propagates
-    Aristotle's deletes for the chapter that was the focal subject of
-    the refine call.
+    semantics: the chapter's new contents fully replace
+    ``repo_dir/expected_path``. This propagates Aristotle's deletes for
+    the chapter that was the focal subject of the refine call. The
+    replacement is *validate-then-swap*: members are extracted into a
+    temp dir next to the destination, and only if at least one file
+    actually landed under ``expected_path`` is the temp dir atomically
+    swapped into place (via :func:`_atomic_replace_dir`). A malformed
+    or folder-less result tar therefore leaves the previous chapter
+    output untouched — previously the destination was ``rmtree``'d
+    *before* the tar was inspected, so a bad tar destroyed the prior
+    attempt's output with nothing to replace it.
 
     **Additional writable paths** (``additional_writable_paths``) get
     *overlay-extract* semantics: tar members under these paths are
@@ -217,118 +270,147 @@ def _extract_solution(
     log_updated = False
     unexpected_top: set[str] = set()
     cross_chapter_writes: set[str] = set()
+    primary_files_extracted = 0
 
-    with tarfile.open(tar_path, "r:*") as tf:
-        members = tf.getmembers()
+    # Stage the primary chapter's new contents in a temp dir NEXT TO the
+    # destination — same filesystem, so the final swap is an atomic
+    # rename, never a copy through /tmp. The previous chapter output is
+    # not touched until the staged copy has been validated.
+    target_dir = repo_dir / Path(*expected_parts)
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir: Optional[Path] = Path(
+        tempfile.mkdtemp(prefix=".marathon-extract-", dir=target_dir.parent)
+    )
 
-        # Determine whether to strip a wrapper directory. Try the tar root
-        # first; if the expected path doesn't match anywhere, see if exactly
-        # one top-level directory contains everything and try stripping that.
-        candidate_prefixes: list[tuple[str, ...]] = [()]
-        top_levels = sorted({
-            tuple(Path(m.name).parts[:1])[0]
-            for m in members
-            if m.name and Path(m.name).parts
-        })
-        if (
-            len(top_levels) == 1
-            and (not expected_parts or top_levels[0] != expected_parts[0])
-        ):
-            candidate_prefixes.append((top_levels[0],))
+    try:
+        with tarfile.open(tar_path, "r:*") as tf:
+            members = tf.getmembers()
 
-        chosen_prefix: tuple[str, ...] = ()
-        for prefix in candidate_prefixes:
-            full = prefix + expected_parts
-            n = len(full)
+            # Determine whether to strip a wrapper directory. Try the tar root
+            # first; if the expected path doesn't match anywhere, see if exactly
+            # one top-level directory contains everything and try stripping that.
+            candidate_prefixes: list[tuple[str, ...]] = [()]
+            top_levels = sorted({
+                tuple(Path(m.name).parts[:1])[0]
+                for m in members
+                if m.name and Path(m.name).parts
+            })
+            if (
+                len(top_levels) == 1
+                and (not expected_parts or top_levels[0] != expected_parts[0])
+            ):
+                candidate_prefixes.append((top_levels[0],))
+
+            chosen_prefix: tuple[str, ...] = ()
+            for prefix in candidate_prefixes:
+                full = prefix + expected_parts
+                n = len(full)
+                for m in members:
+                    parts = tuple(Path(m.name).parts)
+                    if len(parts) >= n and parts[:n] == full:
+                        chosen_prefix = prefix
+                        break
+                else:
+                    continue
+                break
+            else:
+                chosen_prefix = ()  # no match anywhere; will leave found=False
+
+            prefix_skip = len(chosen_prefix)
+            full_expected = chosen_prefix + expected_parts
+            full_extras = [chosen_prefix + ep for ep in extra_paths_parts]
+
             for m in members:
                 parts = tuple(Path(m.name).parts)
-                if len(parts) >= n and parts[:n] == full:
-                    chosen_prefix = prefix
-                    break
-            else:
-                continue
-            break
-        else:
-            chosen_prefix = ()  # no match anywhere; will leave found=False
+                if not parts:
+                    continue
+                if any(p == ".." for p in parts) or Path(m.name).is_absolute():
+                    continue
 
-        prefix_skip = len(chosen_prefix)
-        full_expected = chosen_prefix + expected_parts
-        full_extras = [chosen_prefix + ep for ep in extra_paths_parts]
-
-        # Primary chapter: wipe-and-replace semantics.
-        target_dir = repo_dir / Path(*expected_parts)
-        if target_dir.exists():
-            shutil.rmtree(target_dir)
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
-
-        for m in members:
-            parts = tuple(Path(m.name).parts)
-            if not parts:
-                continue
-            if any(p == ".." for p in parts) or Path(m.name).is_absolute():
-                continue
-
-            # Member under expected output path (after stripping wrapper)?
-            if (
-                len(parts) >= len(full_expected)
-                and parts[: len(full_expected)] == full_expected
-            ):
-                found = True
-                if m.isfile():
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    inner_parts = parts[prefix_skip:]
-                    out_path = repo_dir / Path(*inner_parts)
-                    out_path.parent.mkdir(parents=True, exist_ok=True)
-                    out_path.write_bytes(f.read())
-                continue
-
-            # Member under any of the additional writable paths?
-            # Overlay-extract (no wipe) so we preserve any files in the
-            # path that Aristotle didn't echo. Cross-chapter deletes
-            # are not propagated this way; that's an acceptable
-            # tradeoff for safety — the common workflow is add /
-            # modify in the cross-chapter scope, not delete.
-            matched_extra: Optional[tuple[str, ...]] = None
-            for full_extra in full_extras:
+                # Member under expected output path (after stripping wrapper)?
+                # Goes to the staging dir, not the live repo — swapped in
+                # below only after validation.
                 if (
-                    len(parts) >= len(full_extra)
-                    and parts[: len(full_extra)] == full_extra
+                    len(parts) >= len(full_expected)
+                    and parts[: len(full_expected)] == full_expected
                 ):
-                    matched_extra = full_extra
-                    break
-            if matched_extra is not None:
-                if m.isfile():
+                    found = True
+                    if m.isfile():
+                        f = tf.extractfile(m)
+                        if f is None:
+                            continue
+                        rel_parts = parts[len(full_expected):]
+                        if not rel_parts:
+                            # The expected *folder* path is a plain file in
+                            # this tar — malformed; don't let it become the
+                            # chapter "directory".
+                            continue
+                        out_path = staging_dir / Path(*rel_parts)
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+                        out_path.write_bytes(f.read())
+                        primary_files_extracted += 1
+                    continue
+
+                # Member under any of the additional writable paths?
+                # Overlay-extract (no wipe) so we preserve any files in the
+                # path that Aristotle didn't echo. Cross-chapter deletes
+                # are not propagated this way; that's an acceptable
+                # tradeoff for safety — the common workflow is add /
+                # modify in the cross-chapter scope, not delete.
+                matched_extra: Optional[tuple[str, ...]] = None
+                for full_extra in full_extras:
+                    if (
+                        len(parts) >= len(full_extra)
+                        and parts[: len(full_extra)] == full_extra
+                    ):
+                        matched_extra = full_extra
+                        break
+                if matched_extra is not None:
+                    if m.isfile():
+                        f = tf.extractfile(m)
+                        if f is None:
+                            continue
+                        inner_parts = parts[prefix_skip:]
+                        out_path = repo_dir / Path(*inner_parts)
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+                        out_path.write_bytes(f.read())
+                        cross_chapter_writes.add("/".join(inner_parts))
+                    continue
+
+                # marathon.md at the wrapper-stripped root (or true root).
+                if (
+                    len(parts) == prefix_skip + 1
+                    and parts[:prefix_skip] == chosen_prefix
+                    and parts[-1] == LOG_FILENAME
+                    and m.isfile()
+                ):
+                    log_updated = True
                     f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    inner_parts = parts[prefix_skip:]
-                    out_path = repo_dir / Path(*inner_parts)
-                    out_path.parent.mkdir(parents=True, exist_ok=True)
-                    out_path.write_bytes(f.read())
-                    cross_chapter_writes.add("/".join(inner_parts))
-                continue
+                    if f is not None:
+                        log_dest.write_bytes(f.read())
+                    continue
 
-            # marathon.md at the wrapper-stripped root (or true root).
-            if (
-                len(parts) == prefix_skip + 1
-                and parts[:prefix_skip] == chosen_prefix
-                and parts[-1] == LOG_FILENAME
-                and m.isfile()
-            ):
-                log_updated = True
-                f = tf.extractfile(m)
-                if f is not None:
-                    log_dest.write_bytes(f.read())
-                continue
+                # Otherwise: track top-level entry (after wrapper-strip) as "unexpected".
+                if prefix_skip > 0 and parts[:prefix_skip] == chosen_prefix:
+                    if len(parts) > prefix_skip:
+                        unexpected_top.add(parts[prefix_skip])
+                else:
+                    unexpected_top.add(parts[0])
 
-            # Otherwise: track top-level entry (after wrapper-strip) as "unexpected".
-            if prefix_skip > 0 and parts[:prefix_skip] == chosen_prefix:
-                if len(parts) > prefix_skip:
-                    unexpected_top.add(parts[prefix_skip])
-            else:
-                unexpected_top.add(parts[0])
+        # Validation: the chapter folder must actually contain files. A tar
+        # that names the folder but ships nothing under it (or only the bare
+        # directory entry) is treated the same as a missing folder, so the
+        # caller's OUTPUT_FOLDER_MISSING path fires and the previous chapter
+        # output survives untouched.
+        if found and primary_files_extracted == 0:
+            found = False
+
+        if found:
+            _atomic_replace_dir(staging_dir, target_dir)
+            staging_dir = None  # consumed by the swap; nothing to clean up
+    finally:
+        if staging_dir is not None:
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
     return (
         found,

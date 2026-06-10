@@ -834,11 +834,16 @@ def call_claude_rater(
     env = os.environ.copy()
     env.pop("ANTHROPIC_API_KEY", None)
 
+    # Pass the prompt via stdin (not argv): the rater prompt embeds every
+    # .lean file under the target plus an optional ~80k-char diff, which can
+    # exceed the OS argv/env limit (E2BIG). `claude -p` with no inline query
+    # reads the prompt from stdin — same pattern as claude_review.py's
+    # invoke_claude.
     try:
         proc = subprocess.run(
             [
                 claude_path,
-                "-p", prompt,
+                "-p",
                 "--model", "claude-opus-4-7",
                 "--tools", "",
                 "--output-format", "text",
@@ -847,6 +852,7 @@ def call_claude_rater(
             text=True,
             env=env,
             check=False,
+            input=prompt,
         )
     except OSError as e:
         return RatingResult(parse_error=f"could not exec claude (errno {e.errno}: {e.strerror})")

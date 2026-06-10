@@ -214,7 +214,15 @@ async def _poll_task_loop(
 
     Sets ``stop`` on exit so a concurrent watcher knows to drain. Honors
     ``stop`` being set externally (caller cancellation) by returning early.
+
+    Prints a one-line status update whenever the task's status or progress
+    changes, so multi-hour waits aren't silent. Progress comes from
+    ``AgentTask.percent_complete`` (``int | None`` in aristotlelib 2.0.0 —
+    ``None`` until the server starts reporting; ``Project`` itself carries
+    no progress field). We print only on change, not every poll, so quiet
+    stretches don't flood the log at one line per ``polling_interval``.
     """
+    last_seen: tuple[TaskStatus, Optional[int]] = (task.status, task.percent_complete)
     try:
         while task.status in IN_FLIGHT_STATUSES:
             try:
@@ -231,6 +239,15 @@ async def _poll_task_loop(
                 # leave task.status alone and try again on the next iteration.
                 # Repeated failures will eventually exhaust caller timeouts.
                 continue
+            current = (task.status, task.percent_complete)
+            if current != last_seen:
+                pct = (
+                    f" ({task.percent_complete}% complete)"
+                    if task.percent_complete is not None
+                    else ""
+                )
+                print(f"    status: {task.status.value}{pct}")
+                last_seen = current
     finally:
         stop.set()
 

@@ -441,10 +441,17 @@ class HermesWatcher:
         Runs from the Marathon repo root so any cwd-local ``.claude/``
         settings still apply. ``ANTHROPIC_API_KEY`` is scrubbed so the
         CLI uses Max OAuth from the keychain (same as ``claude_review``).
+
+        The prompt goes via stdin (not argv): it bundles the rubric,
+        referee notes, the memory tail, and up to ``RECENT_EVENTS_CONTEXT``
+        recent events — large enough on busy attempts to exceed the OS
+        argv/env limit (E2BIG). ``claude -p`` with no inline query reads
+        the prompt from stdin — same pattern as ``claude_review``'s
+        ``invoke_claude``.
         """
         cmd = [
             self._claude_path,
-            "-p", prompt,
+            "-p",
             "--model", CLAUDE_MODEL,
             "--tools", "",
             "--output-format", "text",
@@ -453,6 +460,7 @@ class HermesWatcher:
         env.pop("ANTHROPIC_API_KEY", None)
         proc = subprocess.run(
             cmd, capture_output=True, text=True, check=False, env=env,
+            input=prompt,
         )
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "").strip() or "(no output)"
