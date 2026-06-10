@@ -8,7 +8,9 @@ top-level handler.
 from __future__ import annotations
 
 import argparse
+import sys
 
+from marathon.review import config as config_mod
 from marathon.review import review as r
 
 
@@ -138,6 +140,114 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     p_audit.set_defaults(func=r.cmd_audit_chapter)
+
+    # --- chapters registry (machine-managed config.toml block) ----------
+    # WHY a CLI verb: the bootstrap/audit coreviewer agents used to
+    # hand-edit the `[[chapters]]` block in config.toml — a documented
+    # desync source (plan §1; recon review-subsystem §2 "third state
+    # surface"). Registration is now a programmatic rewrite that
+    # preserves the hand-edited part of the file byte-for-byte.
+    p_reg = cv_sub.add_parser(
+        "register-chapter",
+        help=(
+            "Register a chapter's ordered entry list in config.toml's "
+            "machine-managed `[[chapters]]` registry (never hand-edit "
+            "that block). Prints the resulting registry block."
+        ),
+    )
+    p_reg.add_argument("--chapter", type=int, required=True)
+    p_reg.add_argument(
+        "--target",
+        required=True,
+        metavar="PATH",
+        help=(
+            "Repo-relative chapter folder (e.g. SomeProject/Chapter14). "
+            "Cross-checked against the config's target_path_template — "
+            "a guard against registering issues under the wrong chapter "
+            "number."
+        ),
+    )
+    p_reg.add_argument(
+        "--entry",
+        action="append",
+        required=True,
+        metavar="ISSUE:SUBSTRING",
+        help=(
+            'One registry entry, repeatable, in textbook order: "<github '
+            'issue number>:<tracker substring>", e.g. --entry "14:Lemma '
+            '14.7". Split on the first colon only, so the substring may '
+            "itself contain colons. The substring must match exactly one "
+            "line in the parent issue's chapter section."
+        ),
+    )
+    p_reg.add_argument(
+        "--replace",
+        action="store_true",
+        help=(
+            "Overwrite the chapter's existing entry list instead of "
+            "refusing when the chapter is already registered. Pass the "
+            "FULL list — the block is regenerated wholesale."
+        ),
+    )
+    p_reg.set_defaults(func=_cmd_register_chapter)
+
+    p_showreg = cv_sub.add_parser(
+        "show-registry",
+        help=(
+            "Print the current `[[chapters]]` registry block exactly as "
+            "register-chapter would write it."
+        ),
+    )
+    p_showreg.set_defaults(func=_cmd_show_registry)
+
+    # --- GitHub ↔ local state reconciliation ----------------------------
+    # WHY a CLI verb: labels and state.json drift by design — there was
+    # no reconciliation job, only a briefing asking the human to fix
+    # mismatches by hand (plan §1 "seven state surfaces"; recon
+    # report-review-subsystem §6 item 4). `sync` is that job. Policy
+    # lives in marathon.review.sync; dry-run is the default so the verb
+    # is always safe to run.
+    p_sync = cv_sub.add_parser(
+        "sync",
+        help=(
+            "Reconcile GitHub verdict labels with local review state, "
+            "both directions. Dry-run by default: prints the drift table "
+            "and exits 0. --apply performs inbound GitHub→local verdict "
+            "updates (labels are authoritative for human verdicts; "
+            "local operational fields are never overwritten); outbound "
+            "label pushes additionally require --push-labels."
+        ),
+    )
+    p_sync.add_argument(
+        "--chapter",
+        type=int,
+        default=None,
+        help=(
+            "Limit reconciliation to one registered chapter "
+            "(default: every registered chapter, plus any state.json "
+            "entries outside the registries)."
+        ),
+    )
+    p_sync.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Perform the proposed inbound updates (recorded via the "
+            "normal record_verification/record_rejection path, so the "
+            "ledger dual-write and verdicts.jsonl fire, source-tagged "
+            "'sync')."
+        ),
+    )
+    p_sync.add_argument(
+        "--push-labels",
+        action="store_true",
+        help=(
+            "With --apply: also push local-only verdicts out to GitHub "
+            "as label edits. Off by default so sync never writes to "
+            "GitHub unless explicitly asked."
+        ),
+    )
+    p_sync.set_defaults(func=_cmd_sync)
 
     p_v = cv_sub.add_parser(
         "verify",
@@ -280,6 +390,61 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     p_sub_refresh.set_defaults(func=r.cmd_subissues_refresh)
+
+
+def _cmd_register_chapter(args) -> None:
+    """``marathon review register-chapter --chapter N --target PATH
+    --entry "ISSUE:SUBSTRING" [--entry ...] [--replace]``
+
+    Thin shell over :func:`marathon.review.config.register_chapter`:
+    parse the repeatable ``--entry`` args, perform the rewrite, print
+    the resulting registry block so the operator (or the coreviewer
+    agent's transcript) shows exactly what was written.
+    """
+    repo_dir = config_mod.find_repo_dir()
+    try:
+        entries = [config_mod.parse_entry_arg(raw) for raw in args.entry]
+    except ValueError as e:
+        sys.exit(str(e))
+    try:
+        block = config_mod.register_chapter(
+            repo_dir,
+            args.chapter,
+            args.target,
+            entries,
+            replace=args.replace,
+        )
+    except config_mod.RegistryEditError as e:
+        sys.exit(str(e))
+    config_path = repo_dir / config_mod.CONFIG_RELPATH
+    verb = "replaced" if args.replace else "registered"
+    print(
+        f"{verb} chapter {args.chapter} ({len(entries)} entries) "
+        f"in {config_path}"
+    )
+    print()
+    print(block, end="")
+
+
+def _cmd_show_registry(args) -> None:
+    """``marathon review show-registry`` — print the registry block in
+    the same stable format register-chapter writes, so eyeballed output
+    and on-disk content can never disagree in shape."""
+    cfg = config_mod.load_config()
+    if not cfg.chapters:
+        print(f"no chapters registered in {cfg.config_path}")
+        return
+    print(config_mod.render_chapters_block(cfg.chapters), end="")
+
+
+def _cmd_sync(args) -> None:
+    """Dispatch ``marathon review sync ...`` into the sync module.
+
+    Lazy import (matching :func:`_run_daemon_subcommand`'s style) so
+    ``marathon review --help`` and the other verbs never pay for the
+    sync/ledger machinery."""
+    from marathon.review.sync import cmd_sync
+    cmd_sync(args)
 
 
 def _run_daemon_subcommand(args) -> None:

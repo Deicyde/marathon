@@ -7,8 +7,10 @@ Two operations, both at *chapter* scope rather than per-sub-issue:
   pairs declarations with a user-supplied informal-statements file,
   drafts ``.marathon/review/drafts/Chapter{N}.md`` in the project's
   standard sub-issue-body format, and proposes the full set of
-  sub-issues. On human go-ahead, it creates the issues, updates the
-  config registry, and patches the parent tracker.
+  sub-issues. On human go-ahead, it creates the issues, registers the
+  chapter via ``marathon review register-chapter`` (the config.toml
+  ``[[chapters]]`` block is machine-managed — agents no longer
+  hand-edit it), and patches the parent tracker.
 
 * ``audit_chapter`` — maintenance pass for a chapter that already has
   a queue. The coreviewer cross-references existing sub-issue bodies
@@ -105,7 +107,9 @@ def _common_inputs_section(cfg: ReviewConfig, chapter: int) -> str:
         f"* **Review config registry** at "
         f"`@.marathon/review/config.toml` — the `[[chapters]]` block for "
         f"chapter {chapter} maps each sub-issue's GitHub number to the "
-        f"tracker substring it patches in the parent issue body.\n"
+        f"tracker substring it patches in the parent issue body. The "
+        f"block is machine-managed (written by `marathon review "
+        f"register-chapter`): read it, never hand-edit it.\n"
         f"* **State file** at `@.marathon/review/state.json` — per-issue "
         f"rejection state; entries for currently-rejected sub-issues "
         f"carry notes the coreviewer should be aware of.\n"
@@ -132,7 +136,12 @@ def _common_decision_rubric_section() -> str:
     )
 
 
-def _common_apply_section(chapter: int) -> str:
+def _common_apply_section(cfg: ReviewConfig, chapter: int) -> str:
+    target = cfg.target_path(chapter)
+    try:
+        rel_target = target.relative_to(cfg.repo_dir)
+    except ValueError:
+        rel_target = target
     return (
         "## Apply only on explicit human go-ahead\n\n"
         "When (and only when) the human says \"go\" / \"approve\" / "
@@ -148,11 +157,20 @@ def _common_apply_section(chapter: int) -> str:
         "GitHub issue per draft section, labels with `review` + "
         f"`chapter-{chapter}`, attaches each as a sub-issue of the "
         "parent tracker.\n"
-        f"3. Update `.marathon/review/config.toml`'s `[[chapters]]` "
-        f"block for chapter {chapter}: insert each new entry in "
-        "textbook order with `[<issue_num>, \"<tracker_substring>\"]`. "
-        "The tracker substring must match exactly one line in the "
-        "parent issue's chapter section.\n"
+        f"3. Register the chapter's FULL entry list via the CLI (do "
+        f"NOT hand-edit `.marathon/review/config.toml` — the "
+        f"`[[chapters]]` block is machine-managed):\n"
+        f"   `marathon review register-chapter --chapter {chapter} "
+        f"--target {rel_target} \\\n"
+        f"        --entry \"<issue_num>:<tracker_substring>\" --entry "
+        f"... [--replace]`\n"
+        "   One `--entry` per sub-issue, in textbook order, covering "
+        "every entry for the chapter (existing + new) — the command "
+        "rewrites the chapter's whole list, so omitting an existing "
+        "entry drops it. Add `--replace` iff the chapter is already "
+        "registered. The tracker substring must match exactly one line "
+        "in the parent issue's chapter section. Confirm the printed "
+        "block (or `marathon review show-registry`) before moving on.\n"
         f"4. Update parent tracker `#<parent>` body's `### Chapter "
         f"{chapter}:` section: insert numbered lines in textbook order; "
         "renumber subsequent lines; default status emoji is 🟠. Use "
@@ -226,7 +244,7 @@ def build_bootstrap_briefing(
     inputs = _common_inputs_section(cfg, chapter)
     rubric = _common_decision_rubric_section()
     output = _common_output_format_section("bootstrap")
-    apply = _common_apply_section(chapter)
+    apply = _common_apply_section(cfg, chapter)
     target = cfg.target_path(chapter)
     try:
         rel_target = target.relative_to(cfg.repo_dir)
@@ -288,8 +306,9 @@ standard format, propose the full set of sub-issues, and **stop and
 wait** for the human's go-ahead before creating any GitHub issues.
 
 You are a thinking partner. You never apply on your own. The human
-approves the proposal first; only then do you create issues, update the
-config, and patch the parent tracker.
+approves the proposal first; only then do you create issues, register
+the chapter via `marathon review register-chapter`, and patch the
+parent tracker.
 
 ## Hard constraints (non-negotiable)
 
@@ -301,6 +320,10 @@ config, and patch the parent tracker.
   `marathon review verify` and `marathon review reject`.
 * **NEVER modify `state.json` directly.** State transitions go
   through the marathon CLI.
+* **NEVER hand-edit `.marathon/review/config.toml`.** The
+  `[[chapters]]` registry is machine-managed; register entries only
+  via `marathon review register-chapter` (exact command in the
+  apply-sequence below). Hand-edits are a documented desync source.
 
 {inputs}
 {informal_block}
@@ -374,7 +397,7 @@ def build_audit_briefing(cfg: ReviewConfig, chapter: int) -> str:
     inputs = _common_inputs_section(cfg, chapter)
     rubric = _common_decision_rubric_section()
     output = _common_output_format_section("audit")
-    apply = _common_apply_section(chapter)
+    apply = _common_apply_section(cfg, chapter)
     target = cfg.target_path(chapter)
     try:
         rel_target = target.relative_to(cfg.repo_dir)
@@ -415,6 +438,11 @@ break the human's trust and invalidate the audit.
   do not fix it.
 * **NEVER modify `state.json` directly.** State transitions go
   through the marathon CLI, not through file edits.
+* **NEVER hand-edit `.marathon/review/config.toml`.** The
+  `[[chapters]]` registry is machine-managed; if the audit creates
+  new sub-issues for coverage gaps, register them only via
+  `marathon review register-chapter --replace` (exact command in the
+  apply-sequence below). Hand-edits are a documented desync source.
 
 {inputs}
 
