@@ -369,6 +369,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # Formalization tree: `marathon formalization init/update`
     _add_formalization_subparser(subparsers)
 
+    # Ledger tree: `marathon ledger init/import/status` — the Phase-1
+    # SQLite runtime ledger (dual-write target; reads stay legacy).
+    _add_ledger_subparser(subparsers)
+
     # Fill tree: `marathon fill` (single decl) and `marathon fill-file`
     # (every sorry in a file). Both wrap `refine_command` with a focus
     # directive so the slash commands can shell out without knowing the
@@ -470,6 +474,120 @@ def _add_formalization_subparser(subparsers) -> None:
         ),
     )
     p_bf.set_defaults(func=_run_formalization_backfill_wall_time)
+
+
+def _add_ledger_subparser(subparsers) -> None:
+    """Adds `marathon ledger init/import/status` for the Phase-1 runtime
+    ledger at ``<repo>/.marathon/marathon.db`` (see ``marathon.ledger``).
+
+    Phase-1 contract: the ledger is a dual-write mirror of the legacy
+    JSON state surfaces — reads stay on the legacy files until a later
+    cutover, so these commands manage the mirror (create it, backfill it
+    from the seven legacy surfaces, inspect it) without any behavior
+    change elsewhere."""
+    p_ledger = subparsers.add_parser(
+        "ledger",
+        help="Manage the runtime ledger (.marathon/marathon.db, SQLite).",
+        description=(
+            "Initialize, backfill, or inspect the Phase-1 SQLite ledger. "
+            "The ledger mirrors the legacy state surfaces "
+            "(review/state.json, config.toml chapter registry, "
+            "wall-time.json, PromptLog.md, per-workdir marathon-state / "
+            "marathon-refine-state checkpoints); marathon's review verdict "
+            "commands dual-write into it automatically once it exists. "
+            "The db is consumer-repo runtime state and must be gitignored "
+            "(.marathon/marathon.db*); tracked git provenance for verdicts "
+            "lives in .marathon/review/verdicts.jsonl instead."
+        ),
+    )
+    sub = p_ledger.add_subparsers(dest="ledger_command", required=True)
+
+    p_init = sub.add_parser(
+        "init",
+        help="Create the ledger db + schema (idempotent).",
+    )
+    p_init.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root. Default: current directory.",
+    )
+    p_init.set_defaults(func=_run_ledger_init)
+
+    p_imp = sub.add_parser(
+        "import",
+        help="One-shot idempotent import of the legacy state surfaces.",
+        description=(
+            "Ingest whatever legacy surfaces exist under --repo-dir "
+            "(review config.toml chapters, review/state.json, "
+            "wall-time.json, PromptLog.md) plus, with --workdirs-parent, "
+            "the per-workdir marathon-state.json / "
+            "marathon-refine-state.json checkpoints. Idempotent: "
+            "re-running updates rows in place instead of duplicating."
+        ),
+    )
+    p_imp.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root. Default: current directory.",
+    )
+    p_imp.add_argument(
+        "--workdirs-parent", type=Path, default=None, metavar="DIR",
+        help=(
+            "Parent directory containing per-chapter marathon workdirs "
+            "(subdirs with marathon-state.json / "
+            "marathon-refine-state.json) — same convention as "
+            "`marathon referee --workdirs-parent`. Omit to import only "
+            "the in-repo surfaces."
+        ),
+    )
+    p_imp.set_defaults(func=_run_ledger_import)
+
+    p_stat = sub.add_parser(
+        "status",
+        help="Print the ledger's schema version and per-table row counts.",
+    )
+    p_stat.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root. Default: current directory.",
+    )
+    p_stat.set_defaults(func=_run_ledger_status)
+
+
+def _run_ledger_init(args) -> None:
+    from marathon.ledger import SCHEMA_VERSION, Ledger
+
+    repo_dir: Path = args.repo_dir.resolve()
+    path = Ledger.for_repo(repo_dir).init()
+    print(f"ledger ready at {path} (schema v{SCHEMA_VERSION})")
+    print(
+        "reminder: add `.marathon/marathon.db*` to the consumer repo's "
+        ".gitignore — the db (and its WAL -wal/-shm siblings) is runtime "
+        "state, never committed. Tracked verdict provenance lives in "
+        ".marathon/review/verdicts.jsonl."
+    )
+
+
+def _run_ledger_import(args) -> None:
+    from marathon.ledger import Ledger, import_all, print_import_summary
+
+    repo_dir: Path = args.repo_dir.resolve()
+    workdirs_parent: Path | None = (
+        args.workdirs_parent.resolve() if args.workdirs_parent else None
+    )
+    counts = import_all(repo_dir, workdirs_parent=workdirs_parent)
+    print_import_summary(Ledger.for_repo(repo_dir).db_path, counts)
+
+
+def _run_ledger_status(args) -> None:
+    from marathon.ledger import Ledger
+
+    repo_dir: Path = args.repo_dir.resolve()
+    ledger = Ledger.for_repo(repo_dir)
+    if not ledger.db_path.is_file():
+        print(f"no ledger at {ledger.db_path}; run `marathon ledger init`")
+        raise SystemExit(1)
+    info = ledger.status()
+    print(f"{ledger.db_path} (schema v{info['schema_version']})")
+    for table, count in info["tables"].items():
+        print(f"  {table}: {count} row(s)")
 
 
 def _run_formalization_init(args) -> None:
@@ -719,6 +837,9 @@ def main() -> None:
             print("\ninterrupted", file=sys.stderr)
             sys.exit(130)
     elif args.command == "formalization":
+        # Dispatch via the subparser's set_defaults(func=…) handler.
+        args.func(args)
+    elif args.command == "ledger":
         # Dispatch via the subparser's set_defaults(func=…) handler.
         args.func(args)
     elif args.command in ("fill", "fill-file"):

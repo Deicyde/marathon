@@ -75,6 +75,16 @@ rejection that arrived during a refine iteration — see
 Concurrent writes are not protected; the CLI's per-issue command
 granularity makes overlap rare and the worst-case is a lost write
 that the next ``reject``/``verify`` reapplies.
+
+**Phase-1 dual-write (docs/marathon-v2-plan.md §3 Phase 1).** Every
+``record_*`` write additionally mirrors into the SQLite ledger at
+``<repo>/.marathon/marathon.db`` (``marathon.ledger``), and the two
+human-verdict writes (:func:`record_rejection` /
+:func:`record_verification`) also append one line to the TRACKED
+append-only ``verdicts.jsonl`` beside this file. Reads stay on
+state.json — the ledger is write-only here until a later-phase cutover,
+so any ledger failure degrades to legacy-only behavior with ONE printed
+warning per process and never breaks a verdict.
 """
 
 from __future__ import annotations
@@ -91,6 +101,12 @@ from marathon.review.config import ReviewConfig
 
 SCHEMA_VERSION = 1
 STATE_RELPATH = Path(".marathon/review/state.json")
+# Tracked, append-only, merge-friendly verdict log (one JSON object per
+# line, stable key order, never rewritten — the wall-time-v2-sidecar
+# pattern). Exists for git provenance of human verdicts: the
+# GeometricAnalysis operator hand-made PR #74 just to record a verify
+# in git, which this file makes a one-line auto-appended diff instead.
+VERDICTS_RELPATH = Path(".marathon/review/verdicts.jsonl")
 
 
 @dataclass
@@ -210,6 +226,108 @@ def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+# --- Phase-1 dual-write shim (docs/marathon-v2-plan.md §3 Phase 1) ----------
+#
+# state.json stays the read-side truth; the ledger and verdicts.jsonl
+# are write-only mirrors until a later-phase cutover. The binding
+# constraint: a missing/uninitializable ledger must NEVER break a
+# verdict — degrade to legacy-only with one printed warning.
+
+# Process-wide once-flag for the ledger-failure warning. Once the
+# ledger has failed it will keep failing for the same reason (missing
+# parent dir, locked db, newer schema), and the daemon calls record_*
+# in a loop — warn on the first failure, stay silent after.
+_ledger_warn_emitted = False
+
+
+def _warn_ledger_once(exc: Exception) -> None:
+    global _ledger_warn_emitted
+    if _ledger_warn_emitted:
+        return
+    _ledger_warn_emitted = True
+    print(
+        f"  warning: ledger write failed ({exc}); continuing with legacy "
+        "state.json only (further ledger warnings suppressed)"
+    )
+
+
+def _ledger_upsert(
+    cfg: ReviewConfig,
+    issue_num: int,
+    entry: IssueState,
+    verdict_event: Optional[str] = None,
+) -> None:
+    """Best-effort mirror of one state.json write into the ledger.
+
+    Mirrors the just-saved ``entry`` as the issue's latest-verdict row;
+    when ``verdict_event`` is given ("rejected"/"verified" — i.e. a
+    human verdict, not daemon bookkeeping), also appends one row to the
+    append-only ``verdict_events`` history. The ledger import is lazy
+    and the whole body is fail-soft: Phase 1 forbids the ledger from
+    being load-bearing, so ANY failure (no db, locked db, future
+    schema) warns once and returns — the legacy write already
+    succeeded."""
+    try:
+        from marathon.ledger import Ledger  # lazy: keep read paths ledger-free
+
+        ledger = Ledger.for_review_config(cfg)
+        ledger.upsert_issue(
+            issue_num,
+            chapter=cfg.chapter_of_issue(issue_num),
+            status=entry.status,
+            verdict_ts=entry.verdict_ts,
+            notes=entry.notes,
+            attempts=entry.attempts,
+            last_iteration_ts=entry.last_iteration_ts,
+        )
+        if verdict_event is not None:
+            ledger.append_verdict_event(
+                issue_num,
+                verdict_event,
+                notes=entry.notes,
+                ts=entry.verdict_ts,
+                source="cli",
+            )
+    except Exception as e:  # noqa: BLE001 — never break verdict recording
+        _warn_ledger_once(e)
+
+
+def _append_verdict_jsonl(
+    cfg: ReviewConfig,
+    issue_num: int,
+    verdict: str,
+    notes: Optional[str],
+    ts: str,
+) -> None:
+    """Append one human verdict to the TRACKED ``verdicts.jsonl``.
+
+    Append-only by contract: one self-contained JSON object per line,
+    never rewritten, so parallel branches that each append distinct
+    verdicts merge line-by-line without conflicts (the same pattern
+    that fixed the wall-time counter-merge race). Unlike state.json —
+    which only keeps the latest verdict per issue — this file is the
+    durable git history of every verdict ever issued. Failures are
+    non-fatal (warn and continue): the verdict already landed in
+    state.json."""
+    try:
+        path = cfg.repo_dir / VERDICTS_RELPATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "issue": issue_num,
+            "verdict": verdict,
+            "notes": notes,
+            "ts": ts,
+            "source": "cli",
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(
+            f"  warning: could not append to {VERDICTS_RELPATH} ({e}); "
+            "verdict recorded in state.json only"
+        )
+
+
 def record_rejection(cfg: ReviewConfig, issue_num: int, notes: str) -> IssueState:
     """Record a rejection: status=rejected, notes set, timestamp now.
     Overwrites any prior state for this issue. Resets ``last_iteration_ts``
@@ -221,7 +339,11 @@ def record_rejection(cfg: ReviewConfig, issue_num: int, notes: str) -> IssueStat
     clean slate (the stall notification on the GitHub issue tells the
     human exactly this). Implemented here — rather than in the daemon —
     so every rejection entry point (``marathon review reject``, future
-    callers) gets the reset for free."""
+    callers) gets the reset for free.
+
+    Phase-1 dual-write: also mirrored into the ledger (issues row + one
+    verdict_events row) and appended to the tracked ``verdicts.jsonl``;
+    both are best-effort and never block the legacy write."""
     state = load_state(cfg)
     entry = IssueState(
         status="rejected",
@@ -232,13 +354,19 @@ def record_rejection(cfg: ReviewConfig, issue_num: int, notes: str) -> IssueStat
     )
     state.issues[issue_num] = entry
     save_state(cfg, state)
+    _append_verdict_jsonl(cfg, issue_num, "rejected", entry.notes, entry.verdict_ts)
+    _ledger_upsert(cfg, issue_num, entry, verdict_event="rejected")
     return entry
 
 
 def record_verification(cfg: ReviewConfig, issue_num: int) -> IssueState:
     """Record a verification: status=verified, notes cleared,
     ``last_iteration_ts`` cleared. This is the canonical way to clear a
-    prior rejection's queue entry."""
+    prior rejection's queue entry.
+
+    Phase-1 dual-write: also mirrored into the ledger (issues row + one
+    verdict_events row) and appended to the tracked ``verdicts.jsonl``;
+    both are best-effort and never block the legacy write."""
     state = load_state(cfg)
     entry = IssueState(
         status="verified",
@@ -249,6 +377,8 @@ def record_verification(cfg: ReviewConfig, issue_num: int) -> IssueState:
     )
     state.issues[issue_num] = entry
     save_state(cfg, state)
+    _append_verdict_jsonl(cfg, issue_num, "verified", None, entry.verdict_ts)
+    _ledger_upsert(cfg, issue_num, entry, verdict_event="verified")
     return entry
 
 
@@ -276,6 +406,9 @@ def record_iteration(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
         return None
     entry.last_iteration_ts = _now_iso()
     save_state(cfg, state)
+    # Daemon bookkeeping, not a human verdict — mirror the row but
+    # append no verdict_events entry.
+    _ledger_upsert(cfg, issue_num, entry)
     return entry
 
 
@@ -302,6 +435,8 @@ def record_failed_attempt(cfg: ReviewConfig, issue_num: int) -> Optional[IssueSt
         return None
     entry.attempts += 1
     save_state(cfg, state)
+    # Daemon bookkeeping — mirror the row, no verdict event.
+    _ledger_upsert(cfg, issue_num, entry)
     return entry
 
 
@@ -325,6 +460,9 @@ def record_stall(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
         return None
     entry.status = "stalled"
     save_state(cfg, state)
+    # Daemon bookkeeping (the underlying human verdict is unchanged) —
+    # mirror the row, no verdict event.
+    _ledger_upsert(cfg, issue_num, entry)
     return entry
 
 
