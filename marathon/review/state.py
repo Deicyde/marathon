@@ -30,10 +30,11 @@ Schema (versioned for forward compatibility)::
       "schema_version": 1,
       "issues": {
         "<issue_num>": {
-          "status": "rejected" | "verified",
+          "status": "rejected" | "verified" | "stalled",
           "verdict_ts": "2026-05-15T20:52:04-04:00",
-          "notes": "...markdown body...",         // present iff status=="rejected"
-          "last_iteration_ts": "...iso 8601..."   // optional; set by the
+          "notes": "...markdown body...",         // present iff status is
+                                                  // "rejected" or "stalled"
+          "last_iteration_ts": "...iso 8601...",  // optional; set by the
                                                   // refine daemon after
                                                   // dispatching an
                                                   // iteration for this
@@ -42,9 +43,28 @@ Schema (versioned for forward compatibility)::
                                                   // iff `last_iteration_ts`
                                                   // is absent OR strictly
                                                   // less than `verdict_ts`.
+          "attempts": 2                           // optional (absent ⇒ 0);
+                                                  // consecutive FAILED refine
+                                                  // dispatches since the
+                                                  // current verdict_ts.
+                                                  // Incremented by the daemon
+                                                  // on non-zero refine exit;
+                                                  // reset to 0 by
+                                                  // record_rejection /
+                                                  // record_verification.
         }
       }
     }
+
+The ``"stalled"`` status is set by the daemon (via :func:`record_stall`)
+after a rejection accumulates ``--max-attempts`` consecutive failed
+refine dispatches. A stalled entry keeps its notes / verdict_ts /
+attempt count for post-mortems, but no longer satisfies
+``needs_iteration`` — the daemon stops retrying it. Re-rejecting the
+issue (:func:`record_rejection`) resets the counter and returns the
+entry to the normal pending flow. Older state files predating the
+``attempts`` field load fine (the field defaults to 0); the schema
+change is purely additive, so ``schema_version`` stays at 1.
 
 The ``last_iteration_ts`` field lets the daemon track *per-issue*
 queue progress, rather than treating the whole pending-rejections
@@ -75,20 +95,34 @@ STATE_RELPATH = Path(".marathon/review/state.json")
 
 @dataclass
 class IssueState:
-    status: str                              # "rejected" or "verified"
+    status: str                              # "rejected", "verified" or "stalled"
     verdict_ts: str                          # ISO 8601
-    notes: Optional[str] = None              # markdown; only when status=="rejected"
+    notes: Optional[str] = None              # markdown; only when status is
+                                             # "rejected" (or "stalled", which
+                                             # preserves the rejection notes)
     last_iteration_ts: Optional[str] = None  # ISO 8601; set by the daemon
                                              # after dispatching an iteration
                                              # for this issue. None ⇒ never
                                              # iterated since current
                                              # verdict_ts.
+    attempts: int = 0                        # consecutive FAILED refine
+                                             # dispatches since the current
+                                             # verdict_ts. Incremented by the
+                                             # daemon (record_failed_attempt);
+                                             # reset to 0 on any new verdict.
+                                             # Default 0 keeps older state
+                                             # files (which lack the field)
+                                             # loading unchanged.
 
     def needs_iteration(self) -> bool:
         """A rejection needs iteration iff status=='rejected' and either
         it has never been iterated, or the last iteration is older than
         the current verdict (i.e., the rejection was re-recorded after
-        the last iteration)."""
+        the last iteration).
+
+        "stalled" entries deliberately fail this test: the daemon
+        exhausted its retry budget on them, and only a fresh human
+        verdict (re-reject) re-queues them."""
         if self.status != "rejected":
             return False
         if self.last_iteration_ts is None:
@@ -116,6 +150,11 @@ class ReviewState:
                         if st.last_iteration_ts is not None
                         else {}
                     ),
+                    # Omitted when 0, matching the other optional fields'
+                    # absent-means-default convention — keeps state files
+                    # written before the retry feature byte-identical on
+                    # round-trip.
+                    **({"attempts": st.attempts} if st.attempts else {}),
                 }
                 for num, st in sorted(self.issues.items())
             },
@@ -147,6 +186,9 @@ def load_state(cfg: ReviewConfig) -> ReviewState:
                 verdict_ts=val["verdict_ts"],
                 notes=val.get("notes"),
                 last_iteration_ts=val.get("last_iteration_ts"),
+                # Absent in state files written before the daemon grew
+                # retry tracking — default to 0, never an error.
+                attempts=int(val.get("attempts", 0)),
             )
         except (KeyError, ValueError) as e:
             print(f"  warning: {path} issue {key!r} malformed ({e}); skipping")
@@ -172,13 +214,21 @@ def record_rejection(cfg: ReviewConfig, issue_num: int, notes: str) -> IssueStat
     """Record a rejection: status=rejected, notes set, timestamp now.
     Overwrites any prior state for this issue. Resets ``last_iteration_ts``
     to None so the daemon will re-dispatch — re-rejecting an issue that
-    was already iterated against re-queues it correctly."""
+    was already iterated against re-queues it correctly.
+
+    Also resets ``attempts`` to 0, which is what un-stalls a "stalled"
+    entry: a fresh human verdict means the daemon should retry from a
+    clean slate (the stall notification on the GitHub issue tells the
+    human exactly this). Implemented here — rather than in the daemon —
+    so every rejection entry point (``marathon review reject``, future
+    callers) gets the reset for free."""
     state = load_state(cfg)
     entry = IssueState(
         status="rejected",
         verdict_ts=_now_iso(),
         notes=notes.strip(),
         last_iteration_ts=None,
+        attempts=0,
     )
     state.issues[issue_num] = entry
     save_state(cfg, state)
@@ -195,6 +245,7 @@ def record_verification(cfg: ReviewConfig, issue_num: int) -> IssueState:
         verdict_ts=_now_iso(),
         notes=None,
         last_iteration_ts=None,
+        attempts=0,
     )
     state.issues[issue_num] = entry
     save_state(cfg, state)
@@ -208,12 +259,13 @@ def record_iteration(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
     issue — the daemon should only dispatch against issues already in
     ``state.json``.
 
-    Called by the refine daemon AFTER a successful (or failed) refine
-    subprocess returns, so the issue is excluded from the next
-    queue-pick regardless of refine outcome. A failed iteration leaves
-    the issue marked as "iterated" to avoid an infinite retry loop —
-    the human re-rejects (which clears ``last_iteration_ts``) to
-    re-queue."""
+    Called by the refine daemon AFTER a refine subprocess exits
+    *cleanly* (exit 0), so the issue is excluded from the next
+    queue-pick and the human verdict (verify / re-reject) becomes the
+    gate. Failed dispatches go through :func:`record_failed_attempt`
+    instead — they must NOT consume the rejection (the old
+    mark-iterated-regardless behavior silently dropped rejections on
+    refine crashes and made the human the retry logic)."""
     state = load_state(cfg)
     entry = state.issues.get(issue_num)
     if entry is None:
@@ -223,6 +275,55 @@ def record_iteration(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
         )
         return None
     entry.last_iteration_ts = _now_iso()
+    save_state(cfg, state)
+    return entry
+
+
+def record_failed_attempt(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
+    """Increment the failed-dispatch counter for ``issue_num`` after a
+    refine subprocess exited non-zero (and was NOT interrupted by a
+    daemon stop signal — interrupted runs record nothing at all).
+
+    Deliberately does NOT touch ``last_iteration_ts``: the issue keeps
+    satisfying ``needs_iteration`` and stays at the head of the
+    daemon's dispatch queue, so the daemon retries it (after a
+    backoff) instead of silently consuming the rejection. Returns the
+    updated entry so the daemon can compare ``attempts`` against its
+    retry budget; no-ops (with a warning, returning None) if no entry
+    exists — e.g. a concurrent ``verify``/state edit removed it
+    mid-iteration."""
+    state = load_state(cfg)
+    entry = state.issues.get(issue_num)
+    if entry is None:
+        print(
+            f"  warning: record_failed_attempt(#{issue_num}) called but no "
+            "state.json entry exists; skipping"
+        )
+        return None
+    entry.attempts += 1
+    save_state(cfg, state)
+    return entry
+
+
+def record_stall(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
+    """Flip ``issue_num`` to status="stalled" after the daemon exhausted
+    its retry budget (``--max-attempts`` consecutive failed dispatches).
+
+    A stalled entry keeps its notes, ``verdict_ts`` and ``attempts``
+    for post-mortems, but ``needs_iteration`` is False for it, so the
+    daemon stops picking it up. The daemon posts ONE notification
+    comment on the GitHub issue when it stalls an entry; re-rejecting
+    (:func:`record_rejection`) resets the counter and re-queues. No-ops
+    (with a warning) if no entry exists."""
+    state = load_state(cfg)
+    entry = state.issues.get(issue_num)
+    if entry is None:
+        print(
+            f"  warning: record_stall(#{issue_num}) called but no "
+            "state.json entry exists; skipping"
+        )
+        return None
+    entry.status = "stalled"
     save_state(cfg, state)
     return entry
 
@@ -238,8 +339,11 @@ def pending_rejections(
     are returned only when ``chapter`` is ``None`` (project-wide query).
 
     Note: this returns ALL rejected issues, including ones the daemon
-    has already iterated against once. For the daemon's queue-dispatch
-    logic, use :func:`pending_rejections_needing_iteration` instead.
+    has already iterated against once. "stalled" entries are NOT
+    included — once the daemon gives up on a rejection, its notes also
+    stop feeding the refine prompt context until the human re-rejects.
+    For the daemon's queue-dispatch logic, use
+    :func:`pending_rejections_needing_iteration` instead.
     """
     state = load_state(cfg)
     if chapter is None:

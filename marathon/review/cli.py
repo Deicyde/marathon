@@ -228,6 +228,16 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Process queue once then exit (legacy semantics).",
     )
+    p_daemon.add_argument(
+        "--max-attempts",
+        type=int,
+        default=None,
+        help=(
+            "Consecutive failed dispatches per rejection before it is "
+            "marked stalled and a notification comment is posted "
+            "(default: the daemon's DEFAULT_MAX_ATTEMPTS)."
+        ),
+    )
     p_daemon.set_defaults(func=_run_daemon_subcommand)
 
     # --- subissues bulk operations -------------------------------------
@@ -274,8 +284,15 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
 
 def _run_daemon_subcommand(args) -> None:
     """Dispatch ``marathon review daemon ...`` into the daemon module."""
-    from marathon.review.daemon import run_daemon
-    sys_exit = run_daemon(chapter=args.chapter, once=args.once)
+    from marathon.review.daemon import DEFAULT_MAX_ATTEMPTS, run_daemon
+    max_attempts = (
+        args.max_attempts
+        if getattr(args, "max_attempts", None) is not None
+        else DEFAULT_MAX_ATTEMPTS
+    )
+    sys_exit = run_daemon(
+        chapter=args.chapter, once=args.once, max_attempts=max_attempts
+    )
     if sys_exit:
         import sys
         sys.exit(sys_exit)

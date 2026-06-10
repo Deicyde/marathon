@@ -12,10 +12,27 @@ Loop semantics — *one rejection per iteration, dispatched explicitly*::
         pick the oldest one (by verdict_ts)
         run one `marathon refine --skeleton --max-iterations 1 \\
             --review-rejection <issue_num>` iteration
-        record_iteration(<issue_num>)   # mark as iterated regardless of
-                                        # success — the human re-rejects
-                                        # to re-queue on failure
+        if it exited 0:
+            record_iteration(<issue_num>)   # human verdict (verify /
+                                            # re-reject) is the gate
+        elif the daemon got a stop signal mid-run:
+            record nothing                  # interrupted ≠ failed; next
+                                            # daemon launch re-dispatches
+        else:
+            increment the issue's attempt counter; retry the SAME
+            issue after an exponential backoff (2^attempts * 60s,
+            capped). After --max-attempts consecutive failures, mark
+            the entry "stalled" (drops out of the dispatch queue) and
+            post ONE `gh issue comment` notification; re-rejecting
+            resets the counter and re-queues.
     sleep, then re-poll.
+
+Failed dispatches used to be marked "iterated" anyway — consuming the
+rejection and requiring the human to notice the silence and re-reject
+(GeometricAnalysis issue #49 accumulated 11 manual re-queue comments
+this way). The retry/stall path above replaces that contract: the
+rejection is only ever consumed by a clean refine exit or a fresh
+human verdict, never by a crash.
 
 The earlier single-hash design treated the whole pending-rejection
 set as one batch and marked every rejection "processed" after one
@@ -46,12 +63,28 @@ from marathon.review.config import ReviewConfig, load_config
 from marathon.review.state import (
     hash_pending,
     pending_rejections_needing_iteration,
+    record_failed_attempt,
     record_iteration,
+    record_stall,
 )
 
 # Polling interval (seconds) when the runner is in daemon mode and the
 # queue is currently drained.
 POLL_INTERVAL_SECONDS = 60
+
+# Retry budget for failed refine dispatches. After this many consecutive
+# non-zero refine exits for the same rejection, the daemon marks the
+# queue entry "stalled", posts one notification comment on the GitHub
+# issue, and moves on. Overridable via ``--max-attempts``.
+DEFAULT_MAX_ATTEMPTS = 3
+
+# Exponential backoff before re-dispatching a failed rejection:
+# 2^attempts * BASE, capped at CAP. With the defaults that's 2 min
+# after the first failure and 4 min after the second — enough for
+# transient causes (API hiccup, dirty checkout from a concurrent
+# command) to clear, without holding the queue hostage for hours.
+BACKOFF_BASE_SECONDS = 60
+BACKOFF_CAP_SECONDS = 3600
 
 # Safety cap on consecutive iterations when running in ``--once`` mode.
 # Daemon mode has no cap (loops forever, picking up new bullets as they
@@ -198,16 +231,146 @@ def run_one_refine(
     return result.returncode
 
 
-def run_daemon(chapter: int, once: bool = False) -> int:
+def _interruptible_sleep(seconds: int) -> None:
+    """Sleep in 1s chunks so a SIGTERM/SIGINT is responsive mid-sleep.
+
+    Used for both the drained-queue poll interval and the failed-
+    dispatch backoff."""
+    for _ in range(seconds):
+        if _STOP_REQUESTED:
+            return
+        time.sleep(1)
+
+
+def _backoff_seconds(attempts: int) -> int:
+    """Exponential backoff after ``attempts`` consecutive failures:
+    ``2^attempts * BACKOFF_BASE_SECONDS``, capped at
+    ``BACKOFF_CAP_SECONDS``."""
+    return min(2 ** attempts * BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS)
+
+
+def _notify_stall(cfg: ReviewConfig, issue_num: int, attempts: int) -> None:
+    """Post a one-time comment on the GitHub issue telling the human the
+    rejection stalled and how to re-queue it.
+
+    Posted exactly once per stall: ``record_stall`` drops the entry from
+    the dispatch queue, so the daemon never reaches this path again for
+    the same verdict. Best-effort by design — a notification failure
+    (gh missing, network down, auth expired) is printed and swallowed,
+    never allowed to crash the daemon; the "stalled" state in
+    state.json is the durable record either way."""
+    body = (
+        f"**Auto-refine stalled.** The review daemon failed to dispatch a "
+        f"refine iteration for this rejection {attempts} times in a row and "
+        f"has stopped retrying it.\n\n"
+        f"Check the daemon log for the underlying error. Re-rejecting this "
+        f"issue (`marathon review reject {issue_num} ...`) resets the "
+        f"attempt counter and re-queues it."
+    )
+    cmd = [
+        "gh", "issue", "comment", str(issue_num),
+        "--repo", cfg.github_repo,
+        "--body", body,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(
+                f"  warning: stall notification for #{issue_num} failed "
+                f"(gh exit {result.returncode}): {result.stderr.strip()}",
+                flush=True,
+            )
+    except Exception as e:  # noqa: BLE001 — best-effort; see docstring.
+        print(
+            f"  warning: stall notification for #{issue_num} failed ({e})",
+            flush=True,
+        )
+
+
+def _handle_refine_exit(
+    cfg: ReviewConfig,
+    issue_num: int,
+    exit_code: int,
+    *,
+    max_attempts: int,
+    interrupted: bool,
+) -> int:
+    """Apply the post-refine state transition for ``issue_num``; return
+    the backoff (seconds) to sleep before the next dispatch (0 ⇒ none).
+
+    Extracted from ``run_daemon`` so the retry/stall decision table is
+    unit-testable without a real subprocess or poll loop:
+
+    * ``interrupted`` — the daemon received a stop signal while the
+      refine was running and the refine died non-zero. The kill was
+      almost certainly the user pausing work, not a refine failure:
+      record NOTHING (no iteration, no attempt), so the next daemon
+      launch re-dispatches the same issue.
+    * clean exit (0) — ``record_iteration``, exactly the historical
+      contract: the human verdict (verify / re-reject) is the gate on
+      whether the fix actually landed.
+    * non-zero exit — do NOT consume the rejection. Increment the
+      attempt counter; the issue still ``needs_iteration`` so the loop
+      re-picks it after the returned backoff. Once ``max_attempts``
+      consecutive failures accumulate, mark the entry "stalled"
+      (drops it from the queue), post one notification comment, and
+      return 0 so any other queued rejections get attention
+      immediately.
+    """
+    if interrupted:
+        print(
+            f"--- iteration for #{issue_num} interrupted by daemon stop "
+            f"signal (exit {exit_code}); NOT recorded. Next daemon launch "
+            "will re-dispatch for this issue.",
+            flush=True,
+        )
+        return 0
+
+    if exit_code == 0:
+        record_iteration(cfg, issue_num)
+        return 0
+
+    entry = record_failed_attempt(cfg, issue_num)
+    if entry is None:
+        # The entry vanished mid-iteration (e.g. a concurrent `verify`
+        # cleared it). Nothing left to retry against.
+        return 0
+
+    if entry.attempts >= max_attempts:
+        record_stall(cfg, issue_num)
+        print(
+            f"--- iteration for #{issue_num} exited non-zero ({exit_code}); "
+            f"attempt {entry.attempts}/{max_attempts} — STALLED. Posting "
+            "notification; re-reject the issue to re-queue.",
+            flush=True,
+        )
+        _notify_stall(cfg, issue_num, entry.attempts)
+        return 0
+
+    backoff = _backoff_seconds(entry.attempts)
+    print(
+        f"--- iteration for #{issue_num} exited non-zero ({exit_code}); "
+        f"attempt {entry.attempts}/{max_attempts} — will retry after "
+        f"{backoff}s backoff.",
+        flush=True,
+    )
+    return backoff
+
+
+def run_daemon(
+    chapter: int, once: bool = False, max_attempts: int = DEFAULT_MAX_ATTEMPTS
+) -> int:
     """Run the daemon loop for ``chapter``. Returns final exit code.
 
     Per-issue dispatch loop (see module docstring for the rationale):
     on each tick, pick the oldest pending rejection that still needs
     an iteration (``last_iteration_ts is None`` or older than
-    ``verdict_ts``), dispatch a single ``marathon refine`` with
-    ``--review-rejection N``, and mark the issue iterated regardless of
-    refine outcome. The human re-rejects to re-queue if an iteration
-    didn't actually fix things.
+    ``verdict_ts``) and dispatch a single ``marathon refine`` with
+    ``--review-rejection N``. The outcome handling lives in
+    :func:`_handle_refine_exit`: clean exits are marked iterated (the
+    human re-rejects if the fix didn't land); failed exits are retried
+    with exponential backoff up to ``max_attempts`` times, then
+    stalled + notified.
     """
     cfg = load_config()
 
@@ -241,35 +404,19 @@ def run_daemon(chapter: int, once: bool = False) -> int:
                     flush=True,
                 )
                 exit_code = run_one_refine(cfg, chapter, focus_issue=target_issue)
-                # Decide whether to record this as an attempted iteration:
-                # * Clean exit (0): always record.
-                # * Non-zero exit: record, to avoid infinite retry loops
-                #   on persistent failures (the human re-rejects to
-                #   re-queue).
-                # * BUT: if the daemon itself received a stop signal
-                #   while the refine was running, the iteration was
-                #   killed prematurely — likely because the user wanted
-                #   to swap code or pause work, not because the refine
-                #   actually failed. Don't record in that case; the
-                #   next daemon launch will pick the same issue up.
-                if _STOP_REQUESTED and exit_code != 0:
-                    print(
-                        f"--- iteration for #{target_issue} interrupted "
-                        f"by daemon stop signal (exit {exit_code}); NOT "
-                        "marked iterated. Next daemon launch will "
-                        "re-dispatch for this issue.",
-                        flush=True,
-                    )
-                else:
-                    record_iteration(cfg, target_issue)
-                    if exit_code != 0:
-                        print(
-                            f"--- iteration for #{target_issue} exited "
-                            f"non-zero ({exit_code}); marked iterated to "
-                            "avoid retry loop. Re-reject the issue to "
-                            "re-queue.",
-                            flush=True,
-                        )
+                # A stop signal received while the refine was running
+                # means the non-zero exit (if any) reflects the kill,
+                # not a real refine failure — likely the user pausing
+                # work. _handle_refine_exit records nothing in that
+                # case so the next daemon launch re-dispatches.
+                interrupted = _STOP_REQUESTED and exit_code != 0
+                backoff = _handle_refine_exit(
+                    cfg,
+                    target_issue,
+                    exit_code,
+                    max_attempts=max_attempts,
+                    interrupted=interrupted,
+                )
                 if once and iteration_count >= MAX_LOOPS_ONCE:
                     print(
                         f"\n=== one-shot mode: safety cap of {MAX_LOOPS_ONCE} "
@@ -277,9 +424,20 @@ def run_daemon(chapter: int, once: bool = False) -> int:
                         flush=True,
                     )
                     break
-                # No sleep — go check the queue again immediately for
-                # any other pending rejections (including ones that
-                # arrived during this iteration).
+                if backoff:
+                    # Failed dispatch, retry budget not yet exhausted:
+                    # the issue still needs_iteration, so the next tick
+                    # re-picks it. Back off first so transient causes
+                    # can clear (sleep is stop-signal responsive).
+                    print(
+                        f"\n--- backing off {backoff}s before "
+                        f"re-dispatching #{target_issue} ---",
+                        flush=True,
+                    )
+                    _interruptible_sleep(backoff)
+                # Otherwise no sleep — go check the queue again
+                # immediately for any other pending rejections
+                # (including ones that arrived during this iteration).
             elif once:
                 print(
                     "\n=== one-shot mode: queue drained; exiting ===",
@@ -291,11 +449,7 @@ def run_daemon(chapter: int, once: bool = False) -> int:
                     f"\n--- queue drained; sleeping {POLL_INTERVAL_SECONDS}s ---",
                     flush=True,
                 )
-                # Sleep in small chunks so a stop signal is responsive.
-                for _ in range(POLL_INTERVAL_SECONDS):
-                    if _STOP_REQUESTED:
-                        break
-                    time.sleep(1)
+                _interruptible_sleep(POLL_INTERVAL_SECONDS)
     finally:
         release_lock(cfg, chapter)
         print(
@@ -324,8 +478,21 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"polling every {POLL_INTERVAL_SECONDS}s."
         ),
     )
+    p.add_argument(
+        "--max-attempts",
+        type=int,
+        default=DEFAULT_MAX_ATTEMPTS,
+        help=(
+            "Consecutive failed refine dispatches tolerated per rejection "
+            "before its queue entry is marked stalled and a notification "
+            f"comment is posted on the issue (default {DEFAULT_MAX_ATTEMPTS}). "
+            "Re-rejecting a stalled issue resets the counter and re-queues it."
+        ),
+    )
     args = p.parse_args(argv)
-    return run_daemon(chapter=args.chapter, once=args.once)
+    return run_daemon(
+        chapter=args.chapter, once=args.once, max_attempts=args.max_attempts
+    )
 
 
 if __name__ == "__main__":
