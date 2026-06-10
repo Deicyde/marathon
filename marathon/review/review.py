@@ -21,7 +21,12 @@ from pathlib import Path
 from typing import Optional
 
 from marathon.review.config import ReviewConfig, load_config
-from marathon.review.github import gh, issue_labels, issue_title
+from marathon.review.github import (
+    fetch_issues_bulk,
+    gh,
+    issue_labels,
+    issue_title,
+)
 from marathon.review.state import record_rejection, record_verification
 from marathon.review.tracker import update_tracker_emoji
 
@@ -29,11 +34,8 @@ from marathon.review.tracker import update_tracker_emoji
 # --- Status reporting --------------------------------------------------------
 
 
-def get_issue_status(cfg: ReviewConfig, num: int) -> Optional[str]:
-    """Returns 'verified', 'rejected', 'inflight', or None (unreviewed)."""
-    labels = issue_labels(num, cfg.github_repo)
-    if labels is None:
-        return None
+def _status_from_labels(cfg: ReviewConfig, labels: set[str]) -> Optional[str]:
+    """Map a label set → 'verified' / 'inflight' / 'rejected' / None."""
     if cfg.labels.verified in labels:
         return "verified"
     if cfg.labels.inflight in labels:
@@ -43,12 +45,42 @@ def get_issue_status(cfg: ReviewConfig, num: int) -> Optional[str]:
     return None
 
 
+def get_issue_status(cfg: ReviewConfig, num: int) -> Optional[str]:
+    """Returns 'verified', 'rejected', 'inflight', or None (unreviewed)."""
+    labels = issue_labels(num, cfg.github_repo)
+    if labels is None:
+        return None
+    return _status_from_labels(cfg, labels)
+
+
 # --- list / next / show ------------------------------------------------------
+
+
+def _bulk_registry_meta(
+    cfg: ReviewConfig, registry
+) -> Optional[dict[int, dict]]:
+    """Fetch metadata for every issue in ``registry`` in one GraphQL call.
+
+    Returns the ``fetch_issues_bulk`` dict, or None when the bulk call
+    failed — in which case a warning is printed (degraded performance
+    must be visible, not silent) and the caller should fall back to the
+    per-issue ``gh issue view`` helpers.
+    """
+    nums = [num for num, _ in registry.entries]
+    meta = fetch_issues_bulk(nums, cfg.github_repo)
+    if meta is None:
+        print(
+            "  warn: bulk GraphQL issue fetch failed; "
+            "falling back to one `gh issue view` per issue (slower)",
+            file=sys.stderr,
+        )
+    return meta
 
 
 def cmd_list(args) -> None:
     cfg = load_config()
     registry = cfg.chapter_registry(args.chapter)
+    meta = _bulk_registry_meta(cfg, registry)
     print(
         f"Sub-issues of #{cfg.parent_issue} in review order "
         f"(chapter {args.chapter}):\n"
@@ -56,8 +88,14 @@ def cmd_list(args) -> None:
     print(f"  {'idx':>3}  {'issue':>6}  {'status':<10}  title")
     print(f"  {'---':>3}  {'-----':>6}  {'------':<10}  -----")
     for idx, (num, _) in enumerate(registry.entries, 1):
-        status = get_issue_status(cfg, num) or "unreviewed"
-        title = issue_title(num, cfg.github_repo)
+        if meta is not None and num in meta:
+            status = _status_from_labels(cfg, meta[num]["labels"]) or "unreviewed"
+            title = meta[num]["title"]
+        else:
+            # Bulk call failed, or this one issue was absent from the
+            # bulk response — per-issue fallback.
+            status = get_issue_status(cfg, num) or "unreviewed"
+            title = issue_title(num, cfg.github_repo)
         marker = "→ " if status == "unreviewed" else "  "
         print(f"  {marker}{idx:>2}  #{num:>4}  {status:<10}  {title}")
     print()
@@ -66,8 +104,13 @@ def cmd_list(args) -> None:
 def cmd_next(args) -> None:
     cfg = load_config()
     registry = cfg.chapter_registry(args.chapter)
+    meta = _bulk_registry_meta(cfg, registry)
     for num, _ in registry.entries:
-        if get_issue_status(cfg, num) is None:
+        if meta is not None and num in meta:
+            status = _status_from_labels(cfg, meta[num]["labels"])
+        else:
+            status = get_issue_status(cfg, num)
+        if status is None:
             print(f"Next unreviewed sub-issue: #{num}\n")
             _show_issue(cfg, num)
             return
@@ -248,9 +291,29 @@ def cmd_verify(args) -> None:
     # marathon-owned branch with an open PR. Verifying the issue
     # should also merge that PR so the iteration lands on main —
     # otherwise the labels say "verified" but the code is still in
-    # a pending PR. Best-effort: skip silently when no matching PR
-    # exists (e.g., older issues that pre-date --auto-pr).
-    _maybe_merge_marathon_pr(cfg, num)
+    # a pending PR. Best-effort: skips when no matching PR exists
+    # (e.g., older issues that pre-date --auto-pr), and a merge
+    # failure must never abort the verification (the label flip
+    # already happened) — but it must be SEEN, so failures print a
+    # WARN rather than being swallowed.
+    try:
+        _maybe_merge_marathon_pr(cfg, num)
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        print(f"  pr: WARN — auto-merge step failed for #{num}: {e}")
+
+    # Tracker flip lives here, NOT inside _maybe_merge_marathon_pr: the
+    # parent-issue emoji must go 🟠→🟡 whether or not there is a PR to
+    # merge (issues that pre-date --auto-pr have no PR at all).
+    # update_tracker_emoji uses gh(check=True), which raises
+    # RuntimeError on gh failure — downgrade to a visible WARN.
+    try:
+        ok, msg = update_tracker_emoji(cfg, num, "🟡")
+    except (RuntimeError, OSError) as e:
+        ok, msg = False, f"update failed: {e}"
+    if ok:
+        print(f"  tracker: {msg}")
+    else:
+        print(f"  tracker: WARN — {msg}")
 
     if args.close:
         gh("issue", "close", str(num), "--repo", cfg.github_repo)
@@ -263,55 +326,65 @@ def cmd_verify(args) -> None:
         )
 
 
-def _maybe_merge_marathon_pr(cfg, issue_num: int) -> None:
+def _maybe_merge_marathon_pr(cfg: ReviewConfig, issue_num: int) -> None:
     """Find the open marathon PR for ``issue_num`` and merge it.
 
     PR is identified by head branch ``marathon/refine-c<N>-i<issue_num>``
     where N is derived from the chapter the issue lives in. Skips
-    silently when no matching open PR exists (e.g., the iteration
-    didn't go through --auto-pr, or the PR was already merged).
+    silently ONLY when no matching open PR exists (the legitimate
+    no-op: the iteration didn't go through --auto-pr, or the PR was
+    already merged). Every failure mode — unregistered issue, gh
+    error, unmergeable PR — prints a WARN so it can't go unnoticed;
+    historically a bare ``except Exception: return`` here meant no
+    verify ever merged a PR and nobody knew.
+
+    The tracker-emoji update deliberately does NOT live here — it
+    belongs to ``cmd_verify`` so it runs even when there is no PR.
     """
-    import subprocess
-    # Find the chapter from the cfg's registry. Iterate
-    # ``cfg.chapters`` and pick the one containing this issue.
-    chapter: int | None = None
-    try:
-        for ch in cfg.chapters:
-            reg = cfg.chapter_registry(ch.chapter)
-            if any(num == issue_num for num, _ in reg.entries):
-                chapter = ch.chapter
-                break
-    except Exception:  # noqa: BLE001 — soft-warning helper
-        return
+    chapter = cfg.chapter_of_issue(issue_num)
     if chapter is None:
+        print(
+            f"  pr: WARN — #{issue_num} not in any registered chapter; "
+            "cannot derive the marathon branch name to look for a PR"
+        )
         return
 
     branch = f"marathon/refine-c{chapter}-i{issue_num}"
     # Look for an open PR with this head branch.
-    proc = subprocess.run(
-        ["gh", "pr", "list",
-         "--repo", cfg.github_repo,
-         "--head", branch,
-         "--state", "open",
-         "--json", "number",
-         "--jq", ".[0].number // empty"],
-        capture_output=True, text=True, check=False,
+    proc = gh(
+        "pr", "list",
+        "--repo", cfg.github_repo,
+        "--head", branch,
+        "--state", "open",
+        "--json", "number",
+        "--jq", ".[0].number // empty",
+        check=False,
     )
-    if proc.returncode != 0 or not proc.stdout.strip():
+    if proc.returncode != 0:
+        print(
+            f"  pr: WARN — `gh pr list` failed for head {branch}: "
+            f"{(proc.stderr or proc.stdout).strip()[:200]}"
+        )
         return
+    if not proc.stdout.strip():
+        return  # no open PR — the normal silent skip
     try:
         pr_num = int(proc.stdout.strip())
     except ValueError:
+        print(
+            f"  pr: WARN — unexpected `gh pr list` output for {branch}: "
+            f"{proc.stdout.strip()[:200]!r}"
+        )
         return
     # Merge with --delete-branch so the marathon branch goes away on
     # success — the iteration's content is on main, no need to keep
     # the source branch around.
-    merge = subprocess.run(
-        ["gh", "pr", "merge", str(pr_num),
-         "--repo", cfg.github_repo,
-         "--merge",
-         "--delete-branch"],
-        capture_output=True, text=True, check=False,
+    merge = gh(
+        "pr", "merge", str(pr_num),
+        "--repo", cfg.github_repo,
+        "--merge",
+        "--delete-branch",
+        check=False,
     )
     if merge.returncode == 0:
         print(f"  pr: merged #{pr_num} ({branch}) + deleted branch")
@@ -320,14 +393,9 @@ def _maybe_merge_marathon_pr(cfg, issue_num: int) -> None:
         # Surface the error but don't block the verification — the
         # label flip already happened.
         print(
-            f"  pr: could not merge #{pr_num} ({branch}); "
+            f"  pr: WARN — could not merge #{pr_num} ({branch}); "
             f"{(merge.stderr or merge.stdout).strip()[:200]}"
         )
-    ok, msg = update_tracker_emoji(cfg, num, "🟡")
-    if ok:
-        print(f"  tracker: {msg}")
-    else:
-        print(f"  tracker: WARN — {msg}")
 
 
 # --- reject ------------------------------------------------------------------

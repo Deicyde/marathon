@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Optional
 
 from marathon.review.config import ReviewConfig
-from marathon.review.github import gh, issue_labels
+from marathon.review.github import fetch_issues_bulk, gh, issue_labels
 
 
 # Lean declaration-keyword set we care about. ``opaque`` and ``axiom``
@@ -161,15 +161,38 @@ def verified_declarations(
     ``{issue_num: {decl_name, ...}}``.
 
     Sub-issues that lack the ``review:verified`` label are skipped.
-    Body-fetch failures are logged (stderr) and skipped.
+    Body-fetch failures are logged (stdout, with the iteration log) and
+    skipped.
+
+    Labels + bodies for the whole registry are fetched in ONE GraphQL
+    call (``fetch_issues_bulk``); previously this was 1–2 ``gh issue
+    view`` subprocesses per issue, serially, on every post-iteration
+    audit. If the bulk call fails we warn and fall back to the
+    per-issue path so the audit still runs.
     """
     registry = cfg.chapter_registry(chapter)
+    meta = fetch_issues_bulk(
+        [num for num, _ in registry.entries], cfg.github_repo
+    )
+    if meta is None:
+        print(
+            "  audit: warning: bulk GraphQL issue fetch failed; "
+            "falling back to per-issue gh calls (slower)"
+        )
     out: dict[int, set[str]] = {}
     for num, _pattern in registry.entries:
-        labels = issue_labels(num, cfg.github_repo) or []
+        if meta is not None and num in meta:
+            labels: set[str] = meta[num]["labels"]
+            body: Optional[str] = meta[num]["body"]
+        else:
+            # Bulk call failed, or this one issue was absent from the
+            # bulk response — per-issue fallback.
+            labels = issue_labels(num, cfg.github_repo) or set()
+            body = None  # fetched below only if the label gate passes
         if cfg.labels.verified not in labels:
             continue
-        body = _fetch_body(num, cfg.github_repo)
+        if body is None:
+            body = _fetch_body(num, cfg.github_repo)
         if body is None:
             print(f"  audit: warning: could not fetch body for #{num}; skipping")
             continue
