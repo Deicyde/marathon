@@ -21,7 +21,7 @@ import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -269,43 +269,117 @@ def compute_auto_fields(
 # --- wall_time accumulation ------------------------------------------
 
 
+def _load_sidecar(path: Path) -> dict:
+    """Load the wall-time sidecar in either v1 (``total_seconds``) or v2
+    (``projects`` + ``build_only_seconds``) shape. v1 sidecars are
+    migrated in-memory to v2 with ``total_seconds`` rolled into
+    ``build_only_seconds`` — those seconds are real compute, just not
+    attributable to a specific Aristotle project. Missing or unreadable
+    sidecar returns an empty v2 shape."""
+    import json
+    empty: dict = {"version": 2, "projects": {}, "build_only_seconds": 0}
+    if not path.is_file():
+        return empty
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    # v1 → v2 migration: a v1 sidecar has ``total_seconds`` at the
+    # top level. Roll that into ``build_only_seconds``; per-project
+    # attribution starts fresh from here.
+    if "total_seconds" in data and "projects" not in data:
+        legacy = int(data.get("total_seconds", 0) or 0)
+        return {"version": 2, "projects": {}, "build_only_seconds": legacy}
+    projects = data.get("projects") or {}
+    if not isinstance(projects, dict):
+        projects = {}
+    build_only = int(data.get("build_only_seconds", 0) or 0)
+    return {"version": 2, "projects": projects, "build_only_seconds": build_only}
+
+
+def _sum_sidecar(data: dict) -> int:
+    """Total seconds = sum of every project's seconds + build_only_seconds.
+    Robust to malformed entries (skipped)."""
+    total = int(data.get("build_only_seconds", 0) or 0)
+    for entry in (data.get("projects") or {}).values():
+        if isinstance(entry, dict):
+            try:
+                total += int(entry.get("seconds", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
 def read_cumulative_wall_seconds(repo_dir: Path) -> int:
     """Read total seconds from the sidecar at
-    ``<repo_dir>/.marathon/wall-time.json``. Returns 0 if absent."""
-    import json
-    path = repo_dir / _WALL_TIME_SIDECAR
-    if not path.is_file():
-        return 0
-    try:
-        return int(json.loads(path.read_text()).get("total_seconds", 0))
-    except (OSError, ValueError):
-        return 0
+    ``<repo_dir>/.marathon/wall-time.json``. Returns 0 if absent.
+
+    Handles both v1 (``total_seconds``) and v2 (``projects`` +
+    ``build_only_seconds``) sidecars transparently. v1's lump sum is
+    treated as unattributed build seconds — the cumulative total is
+    preserved across schema migration."""
+    return _sum_sidecar(_load_sidecar(repo_dir / _WALL_TIME_SIDECAR))
 
 
-def add_wall_seconds(repo_dir: Path, seconds: float) -> int:
-    """Add ``seconds`` to the cumulative wall-time sidecar. Returns the
-    new cumulative total (in seconds). Creates the sidecar if absent.
+def add_wall_seconds(
+    repo_dir: Path,
+    seconds: float,
+    project_id: Optional[str] = None,
+) -> int:
+    """Record ``seconds`` against ``project_id`` in the v2 wall-time
+    sidecar, then return the new cumulative total (sum across all
+    projects + build_only_seconds). Creates the sidecar if absent.
+    Migrates a v1 sidecar to v2 on first write (preserving the old
+    ``total_seconds`` as ``build_only_seconds``).
 
-    Called by ``post_pipeline.run_post_pipeline`` after each
-    iteration's build to accumulate iteration durations. Iteration
-    durations include build + Aristotle compute (when both are
-    measured); only build duration is tracked here today since that's
-    what the post-pipeline has in hand. Aristotle duration could be
-    added later by also reading ``project.duration_seconds`` from
-    refine-state.json.
+    When ``project_id`` is given, ``projects[project_id]`` is
+    overwritten with the new seconds — idempotent across re-runs of the
+    same Aristotle project (continuations, retries) and resilient to
+    merge races between parallel iteration branches: two branches that
+    record distinct project_ids merge cleanly (different JSON keys);
+    two branches that record the same project_id end up with the same
+    value, so there's nothing to clobber. This is the fix for the
+    classic counter-merge race that caused main's ``wall_time`` to go
+    *down* on certain PR landings.
+
+    When ``project_id`` is absent, the seconds are added to
+    ``build_only_seconds`` (the historical lump-sum bucket).
+
+    Called by ``post_pipeline.run_post_pipeline`` after each iteration
+    with the iteration's wall-clock (Aristotle compute + lake build).
     """
     import json
     if seconds <= 0:
         return read_cumulative_wall_seconds(repo_dir)
     path = repo_dir / _WALL_TIME_SIDECAR
     path.parent.mkdir(parents=True, exist_ok=True)
-    current = read_cumulative_wall_seconds(repo_dir)
-    new_total = current + int(seconds)
-    path.write_text(json.dumps({
-        "total_seconds": new_total,
+    data = _load_sidecar(path)
+    if project_id:
+        # Idempotent overwrite — re-recording the same Aristotle project
+        # never double-counts and same-value merges never conflict.
+        data["projects"][project_id] = {
+            "seconds": int(seconds),
+            "added_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+    else:
+        # No project_id (rare — non-Aristotle path) → fall back to the
+        # historical lump-sum bucket.
+        data["build_only_seconds"] = (
+            int(data.get("build_only_seconds", 0) or 0) + int(seconds)
+        )
+    # Serialize with sorted keys so distinct project additions produce
+    # disjoint, line-by-line diffs that git's 3-way merge can handle
+    # without manual conflict resolution.
+    payload = {
+        "version": 2,
+        "projects": data["projects"],
+        "build_only_seconds": data["build_only_seconds"],
         "last_updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }, indent=2))
-    return new_total
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    return _sum_sidecar(data)
 
 
 def format_wall_time(seconds: int) -> str:
@@ -328,6 +402,170 @@ def format_wall_time(seconds: int) -> str:
         return f"{hours}h {mins}m"
     days, hrs = divmod(hours, 24)
     return f"{days}d {hrs}h"
+
+
+# --- wall_time backfill from Aristotle -------------------------------------
+#
+# The per-iteration accumulator only counts compute from the moment the
+# project-id-keyed sidecar was introduced. To reconstruct the historical
+# total, walk ``PromptLog.md`` for every Aristotle project UUID ever
+# submitted and ask the Aristotle API for each project's actual task
+# wall-clock. This rebuilds the ``projects`` map authoritatively, so the
+# resulting total is the real cumulative compute — not a lower bound.
+
+# Aristotle project UUIDs as they appear in PromptLog.md, e.g.
+# ``2026-06-09T21:02:13-04:00  307cb266-efec-4f84-8bb6-8fae535031e3``.
+_UUID_RE = re.compile(
+    r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"
+)
+_PROMPTLOG_PATHS = (Path(".marathon") / "PromptLog.md", Path("PromptLog.md"))
+
+
+def parse_promptlog_project_ids(repo_dir: Path) -> list[str]:
+    """Return the de-duplicated Aristotle project UUIDs recorded in the
+    repo's ``PromptLog.md`` (preferring ``.marathon/PromptLog.md`` over the
+    legacy repo-root location), in first-seen order. Empty if no log."""
+    for rel in _PROMPTLOG_PATHS:
+        path = repo_dir / rel
+        if path.is_file():
+            seen: dict[str, None] = {}
+            for m in _UUID_RE.finditer(path.read_text()):
+                seen.setdefault(m.group(1), None)
+            return list(seen.keys())
+    return []
+
+
+async def _fetch_project_seconds(
+    project_id: str, max_retries: int = 4
+) -> Optional[int]:
+    """Sum the wall-clock spans of a project's tasks via the Aristotle
+    API. Each task's span is ``last_updated_at - created_at`` — the same
+    "submitted → settled" window the live refine loop records. Summing
+    across a project's tasks covers retries and ``project.ask``
+    continuations within one iteration.
+
+    Retries on transient errors (HTTP 5xx, network blips) with
+    exponential backoff so a flaky API call doesn't silently drop a
+    project from the backfill total. Gives up immediately on a permanent
+    403/404 (the project belongs to a different API key or no longer
+    exists). Returns the integer seconds, or ``None`` if the project
+    couldn't be fetched after retries — the caller reports the gap.
+    """
+    import asyncio
+    import aristotlelib
+    from aristotlelib import AristotleAPIError
+
+    for attempt in range(max_retries + 1):
+        try:
+            proj = await aristotlelib.Project.from_id(project_id)
+            total = 0.0
+            pagination_key: Optional[str] = None
+            while True:
+                tasks, pagination_key = await proj.get_tasks(
+                    pagination_key=pagination_key, limit=50, newest_first=False
+                )
+                for t in tasks:
+                    span = (t.last_updated_at - t.created_at).total_seconds()
+                    if span > 0:
+                        total += span
+                if not pagination_key:
+                    break
+            return int(total)
+        except AristotleAPIError as e:
+            status = getattr(e, "status_code", None)
+            # Permanent: don't burn retries on access/existence failures.
+            if status in (403, 404, 401):
+                return None
+            # Transient (5xx / unknown): back off and retry.
+            if attempt < max_retries:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+            return None
+        except Exception:  # noqa: BLE001 — network blip etc.; retry
+            if attempt < max_retries:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+            return None
+    return None
+
+
+async def backfill_wall_time(
+    repo_dir: Path,
+    concurrency: int = 8,
+    progress: Optional[Any] = None,
+) -> dict:
+    """Reconstruct the wall-time sidecar from Aristotle's record of every
+    project in ``PromptLog.md``. Fetches each project's authoritative
+    per-task wall-clock and overlays it onto the existing sidecar's
+    ``projects`` map, then writes the result. Returns a summary dict.
+
+    **Merge semantics** (not a wipe): existing sidecar entries are the
+    starting point. Each successfully-fetched project overwrites its entry
+    with the authoritative value (idempotent re-runs). Projects that can't
+    be fetched — typically a 403 because they were submitted under a
+    different API key/account, or expired past Harmonic's retention window
+    — keep whatever entry they already had and are reported in
+    ``summary["forbidden"]``. ``build_only_seconds`` is preserved. This
+    makes the recovered total a *lower bound* when some projects are
+    inaccessible: re-run with a key that owns the older projects to recover
+    more.
+
+    ``progress`` is an optional callable ``(done, total)`` for CLI
+    feedback. Requires ``aristotlelib.set_api_key`` to have been called.
+    """
+    import asyncio
+    import json as _json
+
+    project_ids = parse_promptlog_project_ids(repo_dir)
+    summary: dict = {
+        "projects_in_log": len(project_ids),
+        "fetched": 0,
+        "forbidden": [],
+        "total_seconds": 0,
+    }
+    if not project_ids:
+        return summary
+
+    sem = asyncio.Semaphore(max(1, concurrency))
+    done = 0
+    lock = asyncio.Lock()
+
+    async def _one(pid: str) -> tuple[str, Optional[int]]:
+        nonlocal done
+        async with sem:
+            secs = await _fetch_project_seconds(pid)
+        async with lock:
+            done += 1
+            if progress is not None:
+                progress(done, len(project_ids))
+        return pid, secs
+
+    results = await asyncio.gather(*[_one(p) for p in project_ids])
+
+    path = repo_dir / _WALL_TIME_SIDECAR
+    data = _load_sidecar(path)
+    projects: dict[str, dict] = dict(data.get("projects") or {})
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for pid, secs in results:
+        if secs is None:
+            # Couldn't fetch (403 / deleted / transient). Keep any
+            # pre-existing entry; report the gap.
+            summary["forbidden"].append(pid)
+            continue
+        projects[pid] = {"seconds": secs, "added_at": now_iso}
+        summary["fetched"] += 1
+
+    payload = {
+        "version": 2,
+        "projects": projects,
+        "build_only_seconds": int(data.get("build_only_seconds", 0) or 0),
+        "last_updated": now_iso,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps(payload, indent=2, sort_keys=True))
+
+    summary["total_seconds"] = _sum_sidecar(payload)
+    return summary
 
 
 # --- axiom checking ------------------------------------------------------

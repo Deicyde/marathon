@@ -961,7 +961,12 @@ def run_post_pipeline(
             if seconds_to_add > 0:
                 try:
                     from marathon.formalization import add_wall_seconds
-                    add_wall_seconds(repo_dir, seconds_to_add)
+                    # Pass the Aristotle project_id so the sidecar entry
+                    # is keyed by project — idempotent on re-runs, and
+                    # immune to the merge race that caused main's
+                    # wall_time to go *down* when two iteration branches
+                    # racing off the same base both PR'd a counter update.
+                    add_wall_seconds(repo_dir, seconds_to_add, project_id=project_id)
                 except Exception:  # noqa: BLE001 — soft-warning
                     pass
 
