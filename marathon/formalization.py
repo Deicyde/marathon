@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -162,6 +163,117 @@ def write_formalization(path: Path, data: dict[str, Any]) -> None:
     path.write_text(text)
 
 
+# --- Lean source scanning ---------------------------------------------------
+#
+# Shared, line-based declaration discovery, used by ``count_sorries``
+# below and by ``marathon.gate``'s axiom / sorry-accounting checks. It
+# lives here (not in gate.py) because ``count_sorries`` predates the gate
+# and both must agree on what counts as a declaration. Line-based on
+# purpose: a real tokenizer would need Lean's grammar; this is a
+# bookkeeping heuristic, not ground truth. Known limitations (documented,
+# accepted): block comments and string literals are not excluded, and
+# ``where``/``let rec`` sub-decls attribute to their parent.
+
+# Declaration-keyword line. Group 1 is the decl kind; the optional
+# ``name`` group is the source spelling that follows the keyword (absent
+# for anonymous decls, e.g. ``instance : Foo where``).
+_DECL_RE = re.compile(
+    r"^\s*(?:@\[[^\]]*\]\s*)*(?:noncomputable\s+)?"
+    r"(?:private\s+)?(?:protected\s+)?"
+    r"(def|theorem|lemma|abbrev|instance|structure|class|inductive|opaque|axiom)\b"
+    r"(?:\s+(?P<name>[A-Za-z_«][^\s:({\[]*))?"
+)
+_SORRY_RE = re.compile(r"\bsorry\b")
+# Decl kinds that count as "definitions" rather than proof-form
+# (``theorem``/``lemma``). A sorry in a definition body changes what
+# downstream statements *mean*; a sorry in a proof body only defers work.
+DEFINITION_KINDS = frozenset(
+    {"def", "abbrev", "instance", "structure", "class", "inductive"}
+)
+_NAMESPACE_RE = re.compile(r"^\s*namespace\s+(\S+)")
+# ``section`` / ``mutual`` open an ``end``-closed block that contributes
+# no name components; tracked only so their ``end`` doesn't pop a
+# namespace frame.
+_BLOCK_OPEN_RE = re.compile(r"^\s*(?:noncomputable\s+)?(?:section|mutual)\b")
+_END_RE = re.compile(r"^\s*end\b")
+
+
+@dataclass
+class LeanDeclSite:
+    """One declaration-keyword line found by ``scan_lean_source``.
+
+    ``qualified`` is the best-effort fully-qualified name (namespace
+    stack prepended; ``_root_.`` honored) — the form ``#print axioms``
+    needs. ``None`` when the decl is anonymous. ``sorry_count`` is the
+    number of ``sorry`` tokens attributed to this decl's body (every
+    sorry between this keyword line and the next one)."""
+
+    kind: str
+    name: Optional[str]
+    qualified: Optional[str]
+    line: int  # 1-based
+    sorry_count: int = 0
+
+
+def scan_lean_source(text: str) -> tuple[list[LeanDeclSite], int]:
+    """Walk Lean source line by line; return ``(decl_sites,
+    orphan_sorry_count)``.
+
+    Each ``sorry`` token is attributed to the most recent
+    declaration-keyword line; sorries seen before any declaration are
+    counted as orphans (they count toward file totals but belong to no
+    decl). Namespace nesting is tracked so ``qualified`` names are
+    usable with ``#print axioms``; line comments (``--``) are skipped;
+    block comments and strings are NOT excluded (see module note above).
+    """
+    decls: list[LeanDeclSite] = []
+    orphans = 0
+    # Stack frames: namespace frames carry their dotted components;
+    # section/mutual frames are empty so an ``end`` pops symmetrically.
+    stack: list[list[str]] = []
+    current: Optional[LeanDeclSite] = None
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        # Skip line comments; we don't try to detect block comments,
+        # which would require a tokenizer.
+        stripped = line.lstrip()
+        if stripped.startswith("--"):
+            continue
+        ns = _NAMESPACE_RE.match(line)
+        if ns:
+            stack.append(ns.group(1).split("."))
+        elif _BLOCK_OPEN_RE.match(line):
+            stack.append([])
+        elif _END_RE.match(line):
+            # ``end Foo.Bar`` closes the matching frame; popping one
+            # frame blindly is equivalent because ``namespace A.B`` is
+            # pushed as a single frame.
+            if stack:
+                stack.pop()
+        m = _DECL_RE.match(line)
+        if m:
+            name = m.group("name")
+            qualified: Optional[str] = None
+            if name:
+                if name.startswith("_root_."):
+                    qualified = name[len("_root_."):]
+                else:
+                    prefix = ".".join(c for frame in stack for c in frame)
+                    qualified = f"{prefix}.{name}" if prefix else name
+            current = LeanDeclSite(
+                kind=m.group(1), name=name, qualified=qualified, line=lineno
+            )
+            decls.append(current)
+        # Count sorry occurrences on this line (ignoring strings is
+        # out of scope — false positives are rare and benign).
+        n = len(_SORRY_RE.findall(line))
+        if n:
+            if current is not None:
+                current.sorry_count += n
+            else:
+                orphans += n
+    return decls, orphans
+
+
 # --- auto-field computation -----------------------------------------------
 
 
@@ -192,14 +304,6 @@ def count_sorries(repo_dir: Path) -> tuple[int, int]:
         return 0, 0
     total = 0
     in_defs = 0
-    decl_re = re.compile(
-        r"^\s*(?:@\[[^\]]*\]\s*)*(?:noncomputable\s+)?"
-        r"(?:private\s+)?(?:protected\s+)?"
-        r"(def|theorem|lemma|abbrev|instance|structure|class|inductive|opaque|axiom)\b"
-    )
-    sorry_re = re.compile(r"\bsorry\b")
-    # Token kinds that count as "definitions" rather than proof-form.
-    def_kinds = {"def", "abbrev", "instance", "structure", "class", "inductive"}
     for raw in proc.stdout.split(b"\0"):
         if not raw:
             continue
@@ -210,28 +314,14 @@ def count_sorries(repo_dir: Path) -> tuple[int, int]:
         if not full.is_file():
             continue
         try:
-            lines = full.read_text().splitlines()
+            text = full.read_text()
         except OSError:
             continue
-        # Walk the file; the current declaration's kind is the kind of
-        # the most recent declaration-keyword line we've seen.
-        current_kind: str | None = None
-        for line in lines:
-            # Skip line comments; we don't try to detect block comments,
-            # which would require a tokenizer.
-            stripped = line.lstrip()
-            if stripped.startswith("--"):
-                continue
-            m = decl_re.match(line)
-            if m:
-                current_kind = m.group(1)
-            # Count sorry occurrences on this line (ignoring strings is
-            # out of scope — false positives are rare and benign).
-            n = len(sorry_re.findall(line))
-            if n:
-                total += n
-                if current_kind in def_kinds:
-                    in_defs += n
+        decls, orphans = scan_lean_source(text)
+        total += orphans + sum(d.sorry_count for d in decls)
+        in_defs += sum(
+            d.sorry_count for d in decls if d.kind in DEFINITION_KINDS
+        )
     return total, in_defs
 
 
@@ -577,10 +667,13 @@ async def backfill_wall_time(
 # projects only pay one process spawn per iteration.
 
 
-def _module_from_file_path(file_path: str) -> str | None:
+def module_from_file_path(file_path: str) -> str | None:
     """Convert a relative source path (``GeometricAnalysis/LeeSM/Chapter16/
     StokesTheorem.lean``) to a Lean module path
     (``GeometricAnalysis.LeeSM.Chapter16.StokesTheorem``).
+
+    Public (no underscore) because ``marathon.gate`` reuses it for its
+    decl→module mapping when batching ``#print axioms``.
 
     Returns ``None`` for inputs that don't look like a Lean source path
     (no ``.lean`` suffix, absolute paths, empty)."""
@@ -625,7 +718,7 @@ def check_axioms(
         repo_dir: Project root (where ``lake env lean`` runs).
         decl_to_module: List of ``(decl_name, module_path)`` pairs.
             ``module_path`` is the dotted Lean module the decl lives
-            in (use ``_module_from_file_path`` to convert source paths).
+            in (use ``module_from_file_path`` to convert source paths).
         timeout: Seconds to wait for ``lake env lean`` before
             aborting (returns ``None`` for every decl on timeout).
     """
@@ -660,6 +753,15 @@ def check_axioms(
             logger.warning(
                 "axiom check timed out after %ds for %d decls",
                 timeout, len(decl_to_module),
+            )
+            return out
+        except FileNotFoundError:
+            # `lake` missing from PATH (no Lean toolchain on this
+            # machine). Degrade to the same all-None shape as a timeout
+            # so callers report "undetermined" instead of crashing.
+            logger.warning(
+                "axiom check skipped: `lake` not found on PATH "
+                "(%d decls undetermined)", len(decl_to_module),
             )
             return out
         # Lean writes "<decl> depends on axioms: [..]" or "does not
@@ -699,7 +801,7 @@ def update_main_results_axioms(
         file_path = entry.get("file") if isinstance(entry, dict) else None
         if not decl or not file_path:
             continue
-        module = _module_from_file_path(file_path)
+        module = module_from_file_path(file_path)
         if module is None:
             continue
         decl_to_module.append((decl, module))
