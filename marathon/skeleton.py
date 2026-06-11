@@ -40,6 +40,8 @@ from marathon.aristotle_runtime import (
 )
 from marathon.order import OrderEntry, parse_order_file
 from marathon.post_pipeline import (
+    GATE_STATE_FILENAME,
+    JURY_LOG_FILENAME,
     PipelineConfig,
     append_promptlog_url,
     run_post_pipeline,
@@ -812,6 +814,18 @@ async def skeleton_command(args) -> None:
         auto_rate=args.auto_rate,
         build_timeout=args.build_timeout,
         ratings_path=folder / "marathon-ratings.jsonl",
+        # Machine gate (phase-2). skeleton is ALWAYS skeleton mode —
+        # sorry bodies are this command's product, so theorem-body
+        # sorry deltas must not read as regressions. The snapshot and
+        # jury jsonl live in the input folder, beside the other
+        # per-input-folder state (marathon-state.json, the ratings
+        # jsonl).
+        gate=getattr(args, "gate", "warn"),
+        gate_override=getattr(args, "gate_override", None),
+        gate_state_path=folder / GATE_STATE_FILENAME,
+        skeleton_mode=True,
+        jury=getattr(args, "jury", False),
+        jury_log_path=folder / JURY_LOG_FILENAME,
     )
     if pipeline_config.has_any():
         flags = [

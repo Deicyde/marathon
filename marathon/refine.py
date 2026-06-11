@@ -42,6 +42,8 @@ from marathon.aristotle_runtime import (
 )
 from marathon.claude_review import review_and_draft_prompt
 from marathon.post_pipeline import (
+    GATE_STATE_FILENAME,
+    JURY_LOG_FILENAME,
     PipelineConfig,
     append_promptlog_url,
     run_post_pipeline,
@@ -1190,6 +1192,18 @@ async def refine_command(args) -> None:
         auto_pr_repo=getattr(args, "auto_pr_repo", None),
         auto_pr_review_issue=review_issue_num,
         auto_pr_base=getattr(args, "auto_pr_base", "main"),
+        # Machine gate (phase-2). Mode follows --skeleton (skeleton
+        # iterations are expected to produce sorry bodies); the state
+        # snapshot and jury jsonl live in the workdir beside the
+        # ratings jsonl. --review-rejection runs are human-demanded —
+        # the pipeline demotes enforce → warn for them.
+        gate=getattr(args, "gate", "warn"),
+        gate_override=getattr(args, "gate_override", None),
+        gate_state_path=workdir / GATE_STATE_FILENAME,
+        skeleton_mode=bool(args.skeleton),
+        review_rejection_run=review_issue_num is not None,
+        jury=getattr(args, "jury", False),
+        jury_log_path=workdir / JURY_LOG_FILENAME,
     )
 
     # Load the pending-rejections context BEFORE any branch switch.
@@ -1239,6 +1253,9 @@ async def refine_command(args) -> None:
                 ("auto-rate", pipeline_config.auto_rate),
             ] if on
         ]
+        flags.append(f"gate={pipeline_config.gate}")
+        if pipeline_config.jury:
+            flags.append("jury")
         print(f"post-extraction:  {', '.join(flags)}")
 
     # Construct the Hermes live-steering watcher factory if requested. The

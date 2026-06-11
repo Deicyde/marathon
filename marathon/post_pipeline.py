@@ -25,7 +25,11 @@ import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:  # gate/jury are imported lazily at the call sites
+    from marathon.gate import GateReport
+    from marathon.jury import JuryVerdict
 
 
 @dataclass
@@ -92,6 +96,40 @@ class PipelineConfig:
     auto_pr_review_issue: Optional[int] = None
     # PR base branch. ``main`` is the default; override per project.
     auto_pr_base: str = "main"
+    # --- machine gate (phase-2) -----------------------------------------
+    # Posture ∈ {"off", "warn", "enforce"}. ``warn`` (the default) runs
+    # the deterministic gate (marathon.gate: build + axiom whitelist +
+    # sorry accounting + forbidden keywords) and reports to console +
+    # PR body without ever blocking. ``enforce`` additionally blocks the
+    # PR open/update step on a fail-level verdict — NEVER the commit or
+    # push (the work is always preserved). ``off`` skips the gate
+    # entirely. Enforcement lives here in the wiring, not in the engine.
+    gate: str = "warn"
+    # Operator override for ``enforce``: when set and the gate verdict
+    # is fail, the PR opens anyway and this reason is recorded in the
+    # PR body's Gate section and the console — an audited override.
+    gate_override: Optional[str] = None
+    # Path of the gate's persisted snapshot (sorry counts baseline),
+    # ``<workdir>/marathon-gate-state.json`` beside the ratings jsonl.
+    # Set by refine; ``None`` ⇒ no baseline, no persistence (the gate
+    # still runs, with the sorry delta explicitly unevaluated).
+    gate_state_path: Optional[Path] = None
+    # Gate mode selector: True ⇒ skeleton mode (sorry bodies expected;
+    # only definition-body sorry deltas warn), False ⇒ proof mode (new
+    # sorries are regressions). Set by refine from ``--skeleton``.
+    skeleton_mode: bool = False
+    # True when this iteration was dispatched by ``--review-rejection N``
+    # — a human-demanded run. Enforcement never blocks those (the PR-#99
+    # lesson: cross-chapter refactors necessarily transit red; the
+    # human's explicit ask wins), so ``enforce`` demotes to ``warn``
+    # with a printed note.
+    review_rejection_run: bool = False
+    # Advisory jury (marathon.jury): Claude-scored proof_integrity +
+    # code_quality, no faithfulness. Runs only when True; the verdict
+    # line joins the console output + PR body and one JSON line is
+    # appended to ``jury_log_path`` (rater-jsonl pattern).
+    jury: bool = False
+    jury_log_path: Optional[Path] = None
 
     def has_any(self) -> bool:
         return self.auto_build or self.auto_commit or self.auto_push or self.auto_rate
@@ -148,6 +186,13 @@ class RatingResult:
     notes: Optional[str] = None
     parse_error: Optional[str] = None
 
+
+# Workdir-side gate artifacts, siblings of marathon-ratings.jsonl. The
+# state file carries the previous run's sorry counts so the gate's
+# delta semantics survive across iterations; the jury jsonl is the
+# advisory jury's append-only trail (rater-jsonl pattern).
+GATE_STATE_FILENAME = "marathon-gate-state.json"
+JURY_LOG_FILENAME = "marathon-jury.jsonl"
 
 PROMPTLOG_FILENAME = ".marathon/PromptLog.md"
 # Legacy location of PromptLog.md, kept for backward compatibility on
@@ -581,6 +626,122 @@ def prepare_auto_pr_branch(
     return True, branch, f"on {branch} (reset to origin/{base})"
 
 
+# ---------------------------------------------------------------------------
+# Machine gate (phase-2) wiring helpers
+# ---------------------------------------------------------------------------
+#
+# The engine (marathon.gate) is pure and posture-free by design; the
+# wiring below owns baselines, persistence, rendering destinations, and
+# enforcement. Faithfulness is deliberately absent everywhere — the
+# information firewall keeps the source text away from every Claude
+# call, so faithfulness review stays human (marathon-v2 plan §2 r.3).
+
+
+def _load_gate_baseline(
+    state_path: Path, target_rel: str, mode: str
+) -> Optional[dict]:
+    """Return the previous gate run's ``{"total": …, "definitions": …}``
+    sorry counts from the workdir snapshot, or ``None`` when the file is
+    missing/corrupt or was written for a different target (a recycled
+    workdir must not feed another chapter's counts into the delta) or
+    under a different gate ``mode`` — skeleton iterations are expected
+    to ADD theorem-body sorries, so a cross-mode delta would read an
+    expected product as a regression (or vice versa). The mode mismatch
+    is printed (unlike the silent missing/corrupt cases) because a mode
+    flip is an operator decision worth surfacing."""
+    try:
+        data = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("target") != target_rel:
+        return None
+    baseline_mode = data.get("mode")
+    if baseline_mode != mode:
+        print(
+            f"  gate: ignoring sorry baseline written under mode "
+            f"{baseline_mode!r} (this run is {mode!r}; cross-mode deltas "
+            "mislead) — treating as no baseline"
+        )
+        return None
+    counts = data.get("sorry_counts")
+    if not isinstance(counts, dict):
+        return None
+    return counts
+
+
+def _save_gate_state(
+    state_path: Path,
+    *,
+    target_rel: str,
+    mode: str,
+    verdict: str,
+    iteration: Optional[int],
+    total: int,
+    definitions: int,
+) -> None:
+    """Persist this iteration's gate snapshot — next run's baseline.
+    Whole-file rewrite, not append: the baseline is always exactly the
+    last run's counts (history lives in git / the ratings jsonl)."""
+    payload = {
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "target": target_rel,
+        "mode": mode,
+        "verdict": verdict,
+        "iteration": iteration,
+        "sorry_counts": {"total": total, "definitions": definitions},
+    }
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _append_jury_entry(
+    jury_log_path: Path,
+    chapter: str,
+    iteration: Optional[int],
+    project_id: str,
+    commit_result: Optional["CommitResult"],
+    verdict: "JuryVerdict",
+) -> None:
+    """Append one jury verdict as a JSON line (same shape conventions as
+    ``append_rating``: timestamp + iteration coordinates + payload)."""
+    entry = {
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "chapter": chapter,
+        "iteration": iteration,
+        "project_id": project_id,
+        "commit_sha": commit_result.sha if commit_result else None,
+        "jury": asdict(verdict),
+    }
+    jury_log_path.parent.mkdir(parents=True, exist_ok=True)
+    with jury_log_path.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def _build_gate_section(
+    gate_report: Optional["GateReport"],
+    jury_verdict: Optional["JuryVerdict"],
+    override_reason: Optional[str],
+) -> Optional[str]:
+    """Assemble the PR body's ``## Gate`` section: the deterministic
+    gate's markdown report, the advisory jury line, and — when the
+    operator overrode a fail verdict under enforce — the audited
+    override reason. Returns ``None`` when there is nothing to show so
+    PR bodies stay unchanged for runs with the gate off and no jury."""
+    parts: list[str] = []
+    if gate_report is not None:
+        parts.append(gate_report.render_markdown())
+    if jury_verdict is not None:
+        parts.append(f"**Jury**: `{jury_verdict.render_line()}`")
+    if override_reason is not None:
+        parts.append(
+            "**Gate override**: PR opened despite a FAIL gate verdict "
+            f"under `--gate enforce` — operator reason: {override_reason}"
+        )
+    if not parts:
+        return None
+    return "## Gate\n\n" + "\n\n".join(parts)
+
+
 def _build_pr_body(
     chapter_label: str,
     issue_num: Optional[int],
@@ -590,6 +751,7 @@ def _build_pr_body(
     project_id: Optional[str] = None,
     marathon_md: Optional[str] = None,
     repo: Optional[str] = None,
+    gate_section: Optional[str] = None,
 ) -> str:
     """Assemble the PR body — build status, rater scores, issue link,
     marathon.md preview. Kept compact (≤ 8 KB) so the PR list page
@@ -639,6 +801,11 @@ def _build_pr_body(
             if len(note) > 1500:
                 note = note[:1500] + "… *(truncated)*"
             parts.append(f"**Rater notes**:\n\n> {note.replace(chr(10), chr(10) + '> ')}")
+
+    # Machine gate + advisory jury (phase-2). Pre-assembled by
+    # _build_gate_section so this function stays a dumb renderer.
+    if gate_section:
+        parts.append(gate_section)
 
     # marathon.md design log (truncated).
     if marathon_md:
@@ -939,7 +1106,14 @@ def run_post_pipeline(
     formalization wall-time sidecar so ``formalization.yaml`` reflects
     actual compute spent, not just local build time.
     """
-    out: dict = {"build": None, "commit": None, "rating": None}
+    out: dict = {
+        "build": None,
+        "commit": None,
+        "rating": None,
+        "gate": None,
+        "gate_posture": None,
+        "jury": None,
+    }
 
     if config.auto_build:
         b = run_lake_build(repo_dir, config.build_timeout)
@@ -975,6 +1149,82 @@ def run_post_pipeline(
                     add_wall_seconds(repo_dir, seconds_to_add, project_id=project_id)
                 except Exception:  # noqa: BLE001 — soft-warning
                     pass
+
+    # --- machine gate (phase-2) ----------------------------------------
+    # Runs right after the build step because it CONSUMES the build
+    # outcome (the gate never re-runs lake) and before the commit so
+    # the console verdict sits next to the build line. Posture:
+    # off ⇒ skip entirely; warn (default) ⇒ report only; enforce ⇒ a
+    # fail verdict blocks the PR open/update step further down — never
+    # the commit/push, so the work is always preserved.
+    gate_posture = (config.gate or "warn").lower()
+    if gate_posture not in ("off", "warn", "enforce"):
+        print(f"  gate: unknown posture {config.gate!r}; treating as warn")
+        gate_posture = "warn"
+    if gate_posture == "enforce" and config.review_rejection_run:
+        # The PR-#99 lesson: cross-chapter refactors necessarily transit
+        # red, and a --review-rejection iteration is the human's
+        # explicit ask. Enforcement never blocks human-demanded runs.
+        print(
+            "  gate: posture demoted enforce → warn for this run "
+            "(--review-rejection iterations are human-demanded; "
+            "enforcement never blocks them)"
+        )
+        gate_posture = "warn"
+    out["gate_posture"] = gate_posture
+    if gate_posture != "off":
+        try:
+            from marathon import gate as gate_engine
+
+            b = out["build"]
+            try:
+                target_rel = target_path.relative_to(repo_dir).as_posix()
+            except ValueError:
+                target_rel = str(target_path)
+            gate_mode = (
+                gate_engine.MODE_SKELETON
+                if config.skeleton_mode
+                else gate_engine.MODE_PROOF
+            )
+            prev_counts = (
+                _load_gate_baseline(config.gate_state_path, target_rel, gate_mode)
+                if config.gate_state_path is not None
+                else None
+            )
+            report = gate_engine.run_gate(
+                repo_dir,
+                target_path,
+                mode=gate_mode,
+                build_ok=b.ok if b is not None else None,
+                build_log_tail=b.log_tail if b is not None else None,
+                prev_sorry_counts=prev_counts,
+            )
+            out["gate"] = report
+            for line in report.render_console().splitlines():
+                print(f"  {line}")
+            # Persist this iteration's counts as the next run's
+            # baseline. Skipped for a missing target folder — writing a
+            # 0/0 snapshot there would fabricate a "regression" the
+            # moment the folder reappears.
+            if config.gate_state_path is not None and target_path.is_dir():
+                counts = gate_engine.measure_sorries(target_path)
+                try:
+                    _save_gate_state(
+                        config.gate_state_path,
+                        target_rel=target_rel,
+                        mode=report.mode,
+                        verdict=report.verdict,
+                        iteration=iteration,
+                        total=counts.total,
+                        definitions=counts.definitions,
+                    )
+                except OSError as e:
+                    print(f"  gate: could not persist state — {e}")
+        except Exception as e:  # noqa: BLE001 — gate must not break the pipeline
+            # Fail OPEN, loudly: a crashed gate yields no report, so
+            # enforcement below cannot block. Blocking on gate bugs
+            # would make the gate the outage, not the safety net.
+            print(f"  gate: skipped — {type(e).__name__}: {e}")
 
     if config.auto_commit:
         # Refresh formalization.yaml's auto-fields (sorry_count,
@@ -1085,6 +1335,39 @@ def run_post_pipeline(
             except OSError as e:
                 print(f"  ratings log: could not append — {e}")
 
+    # --- advisory jury (phase-2): only when --jury is on ----------------
+    # Runs after the commit so the iteration diff can be attached (same
+    # source as the rater's diff). The jury never gates by itself —
+    # run_jury returns None on any failure and prints its own skip note.
+    if config.jury:
+        try:
+            from marathon.jury import run_jury
+
+            commit_sha = out["commit"].sha if out["commit"] else None
+            jury_diff = (
+                _compute_iteration_diff(repo_dir, target_path, commit_sha)
+                if commit_sha
+                else None
+            )
+            verdict = run_jury(repo_dir, target_path, diff_text=jury_diff)
+            out["jury"] = verdict
+            if verdict is not None:
+                print(f"  {verdict.render_line()}")
+                if config.jury_log_path is not None:
+                    try:
+                        _append_jury_entry(
+                            config.jury_log_path,
+                            chapter=chapter_label,
+                            iteration=iteration,
+                            project_id=project_id or "",
+                            commit_result=out["commit"],
+                            verdict=verdict,
+                        )
+                    except OSError as e:
+                        print(f"  jury log: could not append — {e}")
+        except Exception as e:  # noqa: BLE001 — advisory, never breaks the pipeline
+            print(f"  jury: skipped — {type(e).__name__}: {e}")
+
     # --- auto-pr: push the marathon branch + open/update its PR --------
     # Runs LAST so the rater scores (just computed above) land in the PR
     # body. The marathon branch was prepared by refine.py before this
@@ -1141,38 +1424,80 @@ def run_post_pipeline(
                     if extra_chapters else ""
                 )
                 pr_title = f"marathon: {chapter_label}{issue_part}{extra_suffix}{build_tag}"
-                # Try to embed marathon.md (Aristotle's design log)
-                # when the workdir is known.
-                marathon_md_text: Optional[str] = None
-                if config.audit_workdir is not None:
-                    md_path = config.audit_workdir / "marathon.md"
-                    if md_path.is_file():
-                        try:
-                            marathon_md_text = md_path.read_text()
-                        except OSError:
-                            pass
-                pr_body = _build_pr_body(
-                    chapter_label=chapter_label,
-                    issue_num=config.auto_pr_review_issue,
-                    iteration=iteration,
-                    build_result=out["build"] or BuildResult(),
-                    rating=out["rating"],
-                    project_id=project_id,
-                    marathon_md=marathon_md_text,
-                    repo=repo,
-                )
-                pr_ok, pr_msg = open_or_update_pr(
-                    repo_dir=repo_dir,
-                    branch=branch,
-                    base=config.auto_pr_base,
-                    repo=repo,
-                    title=pr_title,
-                    body=pr_body,
-                )
-                if pr_ok:
-                    print(f"  pr: {pr_msg}")
+                # --- gate enforcement (phase-2) -----------------------
+                # The ONLY step enforcement may block is this PR
+                # open/update. The commit (and any push) already landed
+                # above — the work is preserved either way.
+                gate_report = out["gate"]
+                override_reason: Optional[str] = None
+                gate_blocked = False
+                if (
+                    out["gate_posture"] == "enforce"
+                    and gate_report is not None
+                    and gate_report.verdict == "fail"
+                ):
+                    if config.gate_override:
+                        override_reason = config.gate_override
+                        print(
+                            f'  gate: override accepted — "{override_reason}" '
+                            "(FAIL verdict under enforce; opening the PR; "
+                            "reason recorded in the PR body's Gate section)"
+                        )
+                    else:
+                        gate_blocked = True
+                if gate_blocked:
+                    failing = "; ".join(
+                        f"{c.name}: {c.summary}"
+                        for c in gate_report.checks
+                        if c.status == "fail"
+                    ) or "(see gate report above)"
+                    print(
+                        "  pr: BLOCKED by gate — verdict FAIL under "
+                        f"--gate enforce; skipped the PR open/update for "
+                        f"branch {branch} → {config.auto_pr_base}."
+                    )
+                    print(f"      failing checks: {failing}")
+                    print(
+                        f"      commit {out['commit'].sha} was NOT blocked "
+                        "— the work is preserved locally; re-run with "
+                        '--gate-override "REASON" to open the PR anyway.'
+                    )
                 else:
-                    print(f"  pr: failed — {pr_msg}")
+                    # Try to embed marathon.md (Aristotle's design log)
+                    # when the workdir is known.
+                    marathon_md_text: Optional[str] = None
+                    if config.audit_workdir is not None:
+                        md_path = config.audit_workdir / "marathon.md"
+                        if md_path.is_file():
+                            try:
+                                marathon_md_text = md_path.read_text()
+                            except OSError:
+                                pass
+                    pr_body = _build_pr_body(
+                        chapter_label=chapter_label,
+                        issue_num=config.auto_pr_review_issue,
+                        iteration=iteration,
+                        build_result=out["build"] or BuildResult(),
+                        rating=out["rating"],
+                        project_id=project_id,
+                        marathon_md=marathon_md_text,
+                        repo=repo,
+                        gate_section=_build_gate_section(
+                            gate_report, out["jury"], override_reason
+                        ),
+                    )
+                    pr_ok, pr_msg = open_or_update_pr(
+                        repo_dir=repo_dir,
+                        branch=branch,
+                        base=config.auto_pr_base,
+                        repo=repo,
+                        title=pr_title,
+                        body=pr_body,
+                    )
+                    if pr_ok:
+                        print(f"  pr: {pr_msg}")
+                    else:
+                        print(f"  pr: failed — {pr_msg}")
         except Exception as e:  # noqa: BLE001 — soft-warning
             print(f"  pr: skipped — {type(e).__name__}: {e}")
 

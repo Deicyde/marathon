@@ -788,6 +788,51 @@ def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--gate",
+        choices=("off", "warn", "enforce"),
+        default="warn",
+        help=(
+            "Machine-gate posture for the post-extraction pipeline. The "
+            "gate (build outcome + axiom whitelist + sorry accounting + "
+            "forbidden-keyword scan; mode-aware — skeleton iterations "
+            "expect sorry bodies) renders into the console and the "
+            "--auto-pr body's Gate section. warn (default): report only, "
+            "never block. enforce: a fail-level verdict blocks ONLY the "
+            "PR open/update step — commit/push still happen, the work is "
+            "preserved — unless --gate-override is given; "
+            "--review-rejection iterations are always demoted to warn "
+            "(human-demanded runs are never blocked). off: skip the gate "
+            "entirely. No faithfulness judging anywhere — that review "
+            "stays human."
+        ),
+    )
+    parser.add_argument(
+        "--gate-override",
+        type=str,
+        default=None,
+        metavar="REASON",
+        help=(
+            "With --gate enforce: open/update the PR despite a fail-level "
+            "gate verdict. REASON is recorded in the PR body's Gate "
+            "section and printed to the console — an audited override, "
+            "not a mute."
+        ),
+    )
+    parser.add_argument(
+        "--jury",
+        action="store_true",
+        help=(
+            "After each successful extraction, spawn an advisory Claude "
+            "jury scoring proof_integrity + code_quality (1–5; pass needs "
+            "both ≥ 3; explicitly NO faithfulness — the firewall keeps "
+            "the source text away from Claude). The verdict line joins "
+            "the console output + PR body and one JSON line is appended "
+            "to <workdir>/marathon-jury.jsonl. Advisory only — never "
+            "blocks, even under --gate enforce. Uses your Max "
+            "subscription. Default: off."
+        ),
+    )
+    parser.add_argument(
         "--build-timeout",
         type=int,
         default=600,

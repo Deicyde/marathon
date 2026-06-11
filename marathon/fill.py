@@ -192,6 +192,13 @@ def _add_passthrough_refine_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--auto-pr-base", default="main", metavar="BRANCH")
     p.add_argument("--audit-verified", action="store_true", default=True)
     p.add_argument("--no-audit-verified", dest="audit_verified", action="store_false")
+    # Machine gate (phase-2). Fill's defaults-on philosophy does NOT
+    # escalate the posture: the gate stays at warn here too (enforcement
+    # is an explicit operator choice everywhere), and the jury stays
+    # opt-in because it bills a Max-session Claude call per landing.
+    p.add_argument("--gate", choices=("off", "warn", "enforce"), default="warn")
+    p.add_argument("--gate-override", type=str, default=None, metavar="REASON")
+    p.add_argument("--jury", action="store_true", default=False)
 
 
 # ---------------------------------------------------------------------------
