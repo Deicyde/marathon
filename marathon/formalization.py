@@ -89,8 +89,13 @@ _AUTO_PATHS: tuple[tuple[str, ...], ...] = (
 # ``automation.cost.wall_time`` field is derived from. Kept separate
 # from the yaml so the yaml field can stay in human-readable format
 # (e.g. ``"3h 24m"``) while the underlying source-of-truth is the
-# unambiguous numeric total here.
-_WALL_TIME_SIDECAR = Path(".marathon") / "wall-time.json"
+# unambiguous numeric total here. Public (no underscore) because
+# ``post_pipeline.run_git_commit`` stages it with every iteration
+# commit — its project-id-keyed entries merge cleanly across parallel
+# workers, unlike the yaml's derived counters.
+WALL_TIME_SIDECAR_RELPATH = Path(".marathon") / "wall-time.json"
+# Backward-compat alias for pre-rename internal callers.
+_WALL_TIME_SIDECAR = WALL_TIME_SIDECAR_RELPATH
 
 
 # --- yaml IO ---------------------------------------------------------------
@@ -882,6 +887,146 @@ def update_formalization(
             )
     write_formalization(yaml_path, merged)
     return yaml_path
+
+
+# Mechanical message for conductor-side metadata commits — greppable,
+# and obviously machine-authored (no iteration coordinates: the yaml is
+# derived from repo state, not from any one job).
+REGENERATE_COMMIT_MESSAGE = "chore(marathon): regenerate formalization.yaml"
+
+# Marathon's own runtime bookkeeping lives under .marathon/ —
+# review/state.json, wall-time.json, PromptLog.md, conductor/ — and
+# record_iteration & friends rewrite it on every success. Consumer
+# repos may git-TRACK some of these files (GeometricAnalysis tracks
+# review/state.json), so right after a successful job the checkout is
+# EXPECTED to be dirty here. The clean-tree guards around metadata
+# regeneration exist to protect operator work in flight, not
+# marathon's own bookkeeping: dirt confined to this directory must not
+# block regeneration — and must never be committed by it either (the
+# mechanical commit stages formalization.yaml alone).
+MARATHON_BOOKKEEPING_DIR = ".marathon/"
+
+
+def is_ignorable_bookkeeping_dirt(line: str) -> bool:
+    """True iff a ``git status --porcelain`` (v1) line is dirt the
+    metadata machinery may ignore: an UNSTAGED change (index column
+    ' ' or '?') to a path under ``MARATHON_BOOKKEEPING_DIR``. A STAGED
+    bookkeeping change still counts as real dirt — ``git commit``
+    sweeps in the whole index, so ignoring it would smuggle the
+    carved-out file into the mechanical metadata commit."""
+    # Porcelain v1: index status, worktree status, space, then the path.
+    return (
+        len(line) > 3
+        and line[0] in " ?"
+        and line[3:].startswith(MARATHON_BOOKKEEPING_DIR)
+    )
+
+
+def regenerate_metadata(
+    repo_dir: Path,
+    *,
+    commit: bool = False,
+    push: bool = False,
+) -> bool:
+    """Regenerate ``formalization.yaml``'s auto-fields, optionally
+    committing the result. Returns True iff the yaml meaningfully
+    changed.
+
+    WHY this exists: under the Phase-3 Conductor, metadata files move
+    to Conductor-side regeneration — workers run with
+    ``--no-metadata-commit`` because N parallel jobs all rewriting the
+    yaml is the generalized form of the wall_time merge race. The
+    Conductor calls this in the primary repo checkout after each
+    successful job: one writer instead of N racing ones. It is the
+    exact update path behind ``marathon formalization update``
+    (``update_formalization`` with the Marathon framework stamp; no
+    behavior fork).
+
+    A timestamp-only difference (the ``_auto: last updated`` stamp,
+    which changes on every write) does NOT count as a change: the
+    original file is restored and False is returned, so a no-op
+    regeneration never dirties the checkout or produces churn commits.
+
+    ``commit=True`` stages + commits the yaml with a mechanical
+    message — but only when the repo is otherwise clean (``git status
+    --porcelain`` shows nothing besides the yaml and unstaged
+    ``.marathon/`` bookkeeping — see ``MARATHON_BOOKKEEPING_DIR``).
+    Committing alongside unrelated dirt would smuggle operator
+    work-in-progress into a machine commit; in that case the file is
+    still updated (the change rides along with the next commit) and a
+    note is printed. ``push=True`` runs ``git push`` after a
+    successful commit.
+    """
+    yaml_path = repo_dir / FORMALIZATION_FILENAME
+    if not yaml_path.is_file():
+        return False
+    before = yaml_path.read_text()
+    written = update_formalization(repo_dir, framework="Marathon")
+    if written is None:
+        return False
+    after = written.read_text()
+    if _strip_auto_stamp(before) == _strip_auto_stamp(after):
+        # Timestamp-only churn: restore so the checkout stays clean.
+        written.write_text(before)
+        return False
+    if commit:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
+        )
+        # Porcelain v1: 2-char status code + space; path from column 3.
+        # Unstaged .marathon/ bookkeeping is expected dirt (see
+        # MARATHON_BOOKKEEPING_DIR) and never blocks the commit; it is
+        # never staged here either — only the yaml is added below, so
+        # the carved-out files cannot ride along.
+        dirty_others = [
+            line for line in (status.stdout or "").rstrip("\n").splitlines()
+            if line.strip()
+            and line[3:] != FORMALIZATION_FILENAME
+            and not is_ignorable_bookkeeping_dirt(line)
+        ]
+        if status.returncode != 0 or dirty_others:
+            print(
+                "  formalization: yaml regenerated but NOT committed — "
+                "the checkout has other uncommitted changes; the yaml "
+                "will ride along with the next commit"
+            )
+            return True
+        add = subprocess.run(
+            ["git", "add", "--", FORMALIZATION_FILENAME],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
+        )
+        commit_proc = subprocess.run(
+            ["git", "commit", "-m", REGENERATE_COMMIT_MESSAGE],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
+        )
+        if add.returncode != 0 or commit_proc.returncode != 0:
+            print(
+                "  formalization: yaml regenerated but commit failed — "
+                f"{((commit_proc.stderr or commit_proc.stdout) or '').strip()[:200]}"
+            )
+            return True
+        if push:
+            push_proc = subprocess.run(
+                ["git", "push"],
+                cwd=str(repo_dir), capture_output=True, text=True, check=False,
+            )
+            if push_proc.returncode != 0:
+                print(
+                    "  formalization: metadata commit landed but push "
+                    f"failed — {((push_proc.stderr or push_proc.stdout) or '').strip()[:200]}"
+                )
+    return True
+
+
+def _strip_auto_stamp(text: str) -> str:
+    """Drop the ``_auto: last updated …`` stamp lines so two yaml
+    renders can be compared for *meaningful* difference (the stamp
+    changes on every write by design)."""
+    return "\n".join(
+        line for line in text.splitlines()
+        if _LAST_UPDATED_PREFIX not in line
+    )
 
 
 # --- private helpers -----------------------------------------------------

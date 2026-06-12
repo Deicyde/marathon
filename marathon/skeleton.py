@@ -814,6 +814,7 @@ async def skeleton_command(args) -> None:
         auto_rate=args.auto_rate,
         build_timeout=args.build_timeout,
         ratings_path=folder / "marathon-ratings.jsonl",
+        commit_metadata=getattr(args, "commit_metadata", True),
         # Machine gate (phase-2). skeleton is ALWAYS skeleton mode —
         # sorry bodies are this command's product, so theorem-body
         # sorry deltas must not read as regressions. The snapshot and

@@ -17,7 +17,6 @@ one step are recorded but don't fail subsequent steps.
 """
 
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -26,6 +25,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+
+from marathon.claude_proc import run_claude
 
 if TYPE_CHECKING:  # gate/jury are imported lazily at the call sites
     from marathon.gate import GateReport
@@ -67,6 +68,16 @@ class PipelineConfig:
     # itself is opt-in; the file is created only by
     # ``marathon formalization init`` or manually).
     update_formalization: bool = True
+    # When False (--no-metadata-commit), ``formalization.yaml`` is
+    # EXCLUDED from the per-iteration git staging and its per-iteration
+    # refresh is skipped: N parallel conductor workers all rewriting
+    # the yaml is the generalized form of the wall_time merge race, so
+    # the Conductor regenerates it centrally in the primary checkout
+    # after each successful job (``formalization.regenerate_metadata``)
+    # — one writer instead of N racing ones. The project-id-keyed
+    # wall-time sidecar and the PromptLog stay committed either way:
+    # they are merge-friendly by design (write-once keys / append-only).
+    commit_metadata: bool = True
     # Model identifiers stamped into ``automation.models``. Set by
     # refine to ``["claude-opus-4-7", "Aristotle"]`` (Claude + the
     # Aristotle worker); set by skeleton to ``["Aristotle"]``.
@@ -351,13 +362,18 @@ def run_git_commit(
     project_id: Optional[str] = None,
     claude_in_loop: bool = False,
     extra_paths: Optional[list[str]] = None,
+    commit_metadata: bool = True,
 ) -> CommitResult:
     """Stage ``target_path`` (and ``PromptLog.md`` if it exists and is
     dirty) and commit. ``extra_paths`` (repo-relative POSIX paths) are
     additionally staged — used for cross-chapter refactor iterations
     where Aristotle edits files in ``extra_writable_paths`` outside the
-    primary target. The final commit message includes a project URL
-    line (when ``project_id`` is set) and a Co-authored-by trailer block
+    primary target. ``commit_metadata=False`` excludes
+    ``formalization.yaml`` from the staging (conductor workers; the
+    yaml is regenerated centrally — see ``PipelineConfig``); the
+    merge-friendly PromptLog + wall-time sidecar are staged regardless.
+    The final commit message includes a project URL line (when
+    ``project_id`` is set) and a Co-authored-by trailer block
     crediting Aristotle (and Claude, when ``claude_in_loop`` is True).
     Skips silently if the index is busy or there's nothing to commit."""
     try:
@@ -372,6 +388,13 @@ def run_git_commit(
             paths_to_stage.append(str(promptlog.relative_to(repo_dir)))
         except ValueError:
             pass
+    # The project-id-keyed wall-time sidecar is staged with every
+    # iteration commit: write-once keys merge cleanly across parallel
+    # workers (unlike the yaml's derived counter fields), so committing
+    # it from N workers is safe by construction.
+    from marathon.formalization import WALL_TIME_SIDECAR_RELPATH
+    if (repo_dir / WALL_TIME_SIDECAR_RELPATH).is_file():
+        paths_to_stage.append(WALL_TIME_SIDECAR_RELPATH.as_posix())
     # Cross-chapter refactor support: stage every file outside the
     # primary target that the extractor reported writing. Dedup since
     # any path under ``rel`` is already covered by the primary stage
@@ -391,11 +414,15 @@ def run_git_commit(
     # Stage formalization.yaml when present so its auto-update (run by
     # run_post_pipeline before this commit lands) is bundled into the
     # same commit as the iteration's .lean edits. No-op when the project
-    # hasn't opted in.
-    from marathon.formalization import FORMALIZATION_FILENAME
-    formalization = repo_dir / FORMALIZATION_FILENAME
-    if formalization.is_file():
-        paths_to_stage.append(FORMALIZATION_FILENAME)
+    # hasn't opted in. Skipped under --no-metadata-commit: the yaml's
+    # derived fields (sorry counts, wall_time rollup) do NOT merge
+    # cleanly across parallel workers, so conductor jobs leave it to
+    # the conductor's central regeneration.
+    if commit_metadata:
+        from marathon.formalization import FORMALIZATION_FILENAME
+        formalization = repo_dir / FORMALIZATION_FILENAME
+        if formalization.is_file():
+            paths_to_stage.append(FORMALIZATION_FILENAME)
 
     add_proc = subprocess.run(
         ["git", "add", "--", *paths_to_stage],
@@ -998,29 +1025,12 @@ def call_claude_rater(
     parts.append(f"## Code under review (current state)\n\n{code}")
     prompt = "\n\n---\n\n".join(parts)
 
-    env = os.environ.copy()
-    env.pop("ANTHROPIC_API_KEY", None)
-
-    # Pass the prompt via stdin (not argv): the rater prompt embeds every
-    # .lean file under the target plus an optional ~80k-char diff, which can
-    # exceed the OS argv/env limit (E2BIG). `claude -p` with no inline query
-    # reads the prompt from stdin — same pattern as claude_review.py's
-    # invoke_claude.
+    # Subprocess conventions (stdin prompt against E2BIG, API-key scrub
+    # for Max OAuth, cross-process slot limiter) live in
+    # marathon.claude_proc.run_claude. The model is pinned explicitly —
+    # historical rater behavior: no MARATHON_CLAUDE_MODEL override.
     try:
-        proc = subprocess.run(
-            [
-                claude_path,
-                "-p",
-                "--model", "claude-opus-4-7",
-                "--tools", "",
-                "--output-format", "text",
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-            input=prompt,
-        )
+        proc = run_claude(prompt, model="claude-opus-4-7")
     except OSError as e:
         return RatingResult(parse_error=f"could not exec claude (errno {e.errno}: {e.strerror})")
 
@@ -1234,8 +1244,17 @@ def run_post_pipeline(
         # When the build succeeded this iteration, also refresh the
         # verified-axiom set on every `status.main_results` entry via
         # `#print axioms` (one `lake env lean` invocation, batched
-        # across all main results).
-        if config.update_formalization:
+        # across all main results). Skipped entirely under
+        # --no-metadata-commit: refreshing a yaml we won't commit
+        # would leave the worker's checkout dirty at the repo root
+        # (blocking the next iteration's branch switch) for a file the
+        # conductor regenerates centrally anyway.
+        if config.update_formalization and not config.commit_metadata:
+            print(
+                "  formalization: deferred — --no-metadata-commit "
+                "(regenerated centrally by the conductor after the job lands)"
+            )
+        elif config.update_formalization:
             try:
                 from marathon.formalization import update_formalization
                 build_ok = (
@@ -1270,6 +1289,7 @@ def run_post_pipeline(
             project_id=project_id,
             claude_in_loop=config.claude_in_loop,
             extra_paths=extra_paths_to_stage,
+            commit_metadata=config.commit_metadata,
         )
         out["commit"] = c
         if c.sha:

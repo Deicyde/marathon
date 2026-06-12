@@ -80,7 +80,8 @@ def _install_boundaries(
         )
 
     def fake_commit(repo_dir, target_path, message, project_id=None,
-                    claude_in_loop=False, extra_paths=None):
+                    claude_in_loop=False, extra_paths=None,
+                    commit_metadata=True):
         calls.setdefault("commit", []).append(message)
         return CommitResult(sha="abc1234")
 

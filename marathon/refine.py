@@ -1186,6 +1186,7 @@ async def refine_command(args) -> None:
         audit_verified=getattr(args, "audit_verified", False),
         audit_workdir=workdir,
         update_formalization=getattr(args, "update_formalization", True),
+        commit_metadata=getattr(args, "commit_metadata", True),
         formalization_models=["claude-opus-4-7", "Aristotle"],
         formalization_framework="Marathon",
         auto_pr=getattr(args, "auto_pr", False),

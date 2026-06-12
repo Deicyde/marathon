@@ -431,6 +431,20 @@ def cmd_reject(args) -> None:
     print(f"❌ #{num} rejected and queued for refinement.")
 
     if not args.no_refine:
+        conductor_pid = _live_conductor_pid(cfg)
+        if conductor_pid is not None:
+            # Phase-3 routing: the repo-level conductor polls
+            # pending_rejections_needing_iteration across ALL chapters,
+            # so this rejection is already in its queue — launching a
+            # per-chapter daemon too would double-dispatch the issue
+            # (the worktree branch guard would catch it, but as noisy
+            # deferrals, not a clean hand-off).
+            print(
+                f"  repo-level conductor is active (pid {conductor_pid}); "
+                "rejection queued in state.json — the conductor will "
+                "dispatch it (no per-chapter daemon launched)"
+            )
+            return
         chapter = cfg.chapter_of_issue(num)
         if chapter is None:
             print(f"  cannot auto-launch refine: #{num} not in any registered chapter")
@@ -447,6 +461,23 @@ def _process_alive(pid: int) -> bool:
         return True
     except (OSError, ProcessLookupError):
         return False
+
+
+def _live_conductor_pid(cfg: ReviewConfig) -> Optional[int]:
+    """PID of a live repo-level conductor, or None. The lock location is
+    the conductor's own (imported, not re-derived) and the liveness
+    semantics mirror its stale-lock handling — a dead PID reads as
+    'no conductor', so rejections fall back to the per-chapter daemon
+    exactly as before Phase 3."""
+    from marathon.conductor import conductor_lock_path
+    lock = conductor_lock_path(cfg)
+    if not lock.is_file():
+        return None
+    try:
+        pid = int(lock.read_text().strip())
+    except (ValueError, OSError):
+        return None
+    return pid if _process_alive(pid) else None
 
 
 def _runner_lock_path(cfg: ReviewConfig, chapter: int) -> Path:
