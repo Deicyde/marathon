@@ -373,6 +373,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # SQLite runtime ledger (dual-write target; reads stay legacy).
     _add_ledger_subparser(subparsers)
 
+    # Conductor tree: `marathon conductor run/status` — the Phase-3
+    # repo-level multi-flight dispatcher (see marathon.conductor).
+    _add_conductor_subparser(subparsers)
+
     # Fill tree: `marathon fill` (single decl) and `marathon fill-file`
     # (every sorry in a file). Both wrap `refine_command` with a focus
     # directive so the slash commands can shell out without knowing the
@@ -549,6 +553,129 @@ def _add_ledger_subparser(subparsers) -> None:
         help="Consumer repo root. Default: current directory.",
     )
     p_stat.set_defaults(func=_run_ledger_status)
+
+
+def _add_conductor_subparser(subparsers) -> None:
+    """Adds `marathon conductor run/status` — the Phase-3 repo-level
+    multi-flight dispatcher (see ``marathon.conductor``): one daemon
+    polling pending rejections across ALL registered chapters and
+    running up to N concurrent `marathon refine` jobs, each in its own
+    git worktree of the consumer repo. Deterministic Python only — no
+    LLM in scheduling/retry decisions; Aristotle jobs are never
+    canceled automatically."""
+    p_cond = subparsers.add_parser(
+        "conductor",
+        help=(
+            "Repo-level multi-flight refine dispatcher (Phase 3): N "
+            "concurrent rejection-fix jobs in isolated git worktrees."
+        ),
+        description=(
+            "Run or inspect the conductor. `run` polls the review "
+            "rejection queue across every registered chapter (oldest "
+            "verdict first) and dispatches up to --concurrency "
+            "`marathon refine` subprocesses simultaneously, each in its "
+            "own git worktree so jobs never contaminate each other's "
+            "Aristotle bundles. Failure handling reuses the review "
+            "daemon's retry/stall state machine (backoff requeue, then "
+            "stall + GitHub notification). `status` prints the "
+            ".marathon/conductor/jobs.json snapshot without touching a "
+            "running conductor."
+        ),
+    )
+    sub = p_cond.add_subparsers(dest="conductor_command", required=True)
+
+    p_run = sub.add_parser(
+        "run",
+        help="Start the conductor loop (or one drain pass with --once).",
+    )
+    p_run.add_argument(
+        "--repo-dir", type=Path, default=None, metavar="PATH",
+        help=(
+            "Consumer repo root (must contain .marathon/review/"
+            "config.toml). Default: walk up from the current directory."
+        ),
+    )
+    p_run.add_argument(
+        "--concurrency", type=int, default=None, metavar="N",
+        help=(
+            "Max simultaneous refine jobs. Default: 1 (parity with the "
+            "single-flight daemon), or the MARATHON_ARISTOTLE_MAX_"
+            "CONCURRENT env var when set. Harmonic's concurrent-session "
+            "limits are undocumented — probe with "
+            "scripts/aristotle_concurrency_probe.py before raising this."
+        ),
+    )
+    p_run.add_argument(
+        "--once", action="store_true",
+        help="Drain the queue (all jobs finished, nothing pending) then exit.",
+    )
+    p_run.add_argument(
+        "--prune", action="store_true",
+        help=(
+            "Before dispatching, remove leftover job worktrees from "
+            "prior runs (failed jobs keep theirs for debugging)."
+        ),
+    )
+    p_run.add_argument(
+        "--max-attempts", type=int, default=None, metavar="N",
+        help=(
+            "Consecutive failed dispatches tolerated per rejection "
+            "before it is stalled + notified (default: the review "
+            "daemon's budget, currently 3)."
+        ),
+    )
+    p_run.add_argument(
+        "--worktree-parent", type=Path, default=None, metavar="DIR",
+        help=(
+            "Parent directory for job worktrees + workdirs. MUST be "
+            "outside the repo (in-repo worktrees leak into Aristotle "
+            "bundles). Default: ~/Desktop/marathon-runs/conductor/"
+            "<repo-name>/."
+        ),
+    )
+    p_run.set_defaults(func=_run_conductor_run)
+
+    p_stat = sub.add_parser(
+        "status",
+        help="Print the conductor's jobs.json snapshot as a table.",
+    )
+    p_stat.add_argument(
+        "--repo-dir", type=Path, default=None, metavar="PATH",
+        help=(
+            "Consumer repo root. Default: walk up from the current "
+            "directory."
+        ),
+    )
+    p_stat.set_defaults(func=_run_conductor_status)
+
+
+def _run_conductor_run(args) -> None:
+    from marathon.conductor import run_conductor
+    from marathon.review.daemon import DEFAULT_MAX_ATTEMPTS
+
+    rc = run_conductor(
+        repo_dir=args.repo_dir.resolve() if args.repo_dir else None,
+        concurrency=args.concurrency,
+        once=args.once,
+        prune=args.prune,
+        max_attempts=(
+            args.max_attempts if args.max_attempts is not None
+            else DEFAULT_MAX_ATTEMPTS
+        ),
+        worktree_parent=args.worktree_parent,
+    )
+    if rc:
+        raise SystemExit(rc)
+
+
+def _run_conductor_status(args) -> None:
+    from marathon.conductor import print_status
+    from marathon.review.config import find_repo_dir
+
+    repo_dir: Path = args.repo_dir.resolve() if args.repo_dir else find_repo_dir()
+    rc = print_status(repo_dir)
+    if rc:
+        raise SystemExit(rc)
 
 
 def _run_ledger_init(args) -> None:
@@ -738,6 +865,24 @@ def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--no-metadata-commit",
+        dest="commit_metadata",
+        action="store_false",
+        default=True,
+        help=(
+            "Exclude `formalization.yaml` from the per-iteration "
+            "auto-commit staging and skip its per-iteration refresh. "
+            "Used by the repo-level conductor's parallel workers: N "
+            "jobs all rewriting the yaml is the generalized form of "
+            "the wall_time merge race, so the conductor regenerates it "
+            "centrally in the primary checkout after each job lands. "
+            "The project-id-keyed wall-time sidecar and PromptLog.md "
+            "are still committed — they are merge-friendly by design. "
+            "Default: metadata committed (parity with single-flight "
+            "runs)."
+        ),
+    )
+    parser.add_argument(
         "--focus-directive",
         type=str,
         default=None,
@@ -886,6 +1031,11 @@ def main() -> None:
         args.func(args)
     elif args.command == "ledger":
         # Dispatch via the subparser's set_defaults(func=…) handler.
+        args.func(args)
+    elif args.command == "conductor":
+        # Dispatch via the subparser's set_defaults(func=…) handler.
+        # No KeyboardInterrupt wrapper: `conductor run` installs its own
+        # SIGINT/SIGTERM handlers (stop dispatching, wait for jobs).
         args.func(args)
     elif args.command in ("fill", "fill-file"):
         # `fill`/`fill-file` set_defaults(func=_run_fill[_file]); both are
