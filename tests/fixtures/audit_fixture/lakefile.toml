@@ -1,0 +1,9 @@
+# Minimal lake package for marathon's audit-script tests.
+# No Mathlib (keeps the test suite fast); toolchain pinned to the one
+# GeometricAnalysis pins (v4.28.0) so dev machines already have it.
+name = "auditfixture"
+version = "0.1.0"
+defaultTargets = ["AuditFixture"]
+
+[[lean_lib]]
+name = "AuditFixture"
