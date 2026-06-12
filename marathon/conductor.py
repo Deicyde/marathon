@@ -97,6 +97,11 @@ SNAPSHOT_SCHEMA_VERSION = 1
 JOBS_SNAPSHOT_RELPATH = Path(".marathon/conductor/jobs.json")
 CONDUCTOR_LOCK_FILENAME = "conductor.lock"
 
+# Phase-4 landing integration: the only accepted value for --land.
+# Opt-in (default None = off): today's per-issue --auto-pr flow is
+# unchanged until the marathon/next stack has soaked.
+LAND_NEXT = "next"
+
 # Concurrency: default 1 = parity with the single-flight daemon
 # (BINDING — see module docstring). The env var is a *fallback default*
 # for operators who have probed their real session limit; an explicit
@@ -587,12 +592,69 @@ def _regenerate_metadata_after_success(cfg: ReviewConfig) -> None:
         print("  metadata: formalization.yaml regenerated + committed", flush=True)
 
 
+def _enqueue_landing_after_success(cfg: ReviewConfig, job: ConductorJob) -> None:
+    """Phase-4 opt-in hook (``--land next``): hand a just-succeeded job
+    to the landing queue (``marathon landing run`` cherry-picks it onto
+    ``marathon/next`` behind the build+gate).
+
+    The per-issue branch is resolved to its commit SHA NOW: the next
+    --auto-pr iteration hard-resets that branch to origin/<base>, so a
+    branch name sitting in the queue could dangle — or silently point at
+    a different iteration — by the time the landing runner pops it.
+    Best-effort: a failed enqueue warns and never kills the loop (the
+    per-issue PR still carries the work)."""
+    from marathon.landing import enqueue_landing
+
+    try:
+        rev = _git(cfg.repo_dir, "rev-parse", "--verify", f"{job.branch}^{{commit}}")
+        source_ref = (rev.stdout or "").strip()
+        if rev.returncode != 0 or not source_ref:
+            # NEVER enqueue the branch name as a fallback: by the time
+            # the landing runner pops the request, origin/<branch> may
+            # have been hard-reset to a DIFFERENT iteration — the queue
+            # would silently land commits this job never produced.
+            print(
+                f"  warning: landing enqueue for #{job.issue_num} skipped — "
+                f"could not resolve {job.branch!r} to a commit "
+                f"({(rev.stderr or '').strip() or 'no output'}); the "
+                "per-issue PR flow still has the work",
+                flush=True,
+            )
+            return
+        # Gate mode mirrors the dispatched flag set (single source: the
+        # daemon's DEFAULT_REFINE_ARGS) — skeleton iterations must not
+        # be gated on proof-mode sorry semantics.
+        mode = "skeleton" if "--skeleton" in daemon.DEFAULT_REFINE_ARGS else "proof"
+        path = enqueue_landing(
+            cfg.repo_dir,
+            issue_num=job.issue_num,
+            chapter=job.chapter,
+            source_ref=source_ref,
+            workdir=job.workdir,
+            mode=mode,
+        )
+        print(
+            f"  landing: enqueued #{job.issue_num} ({source_ref[:12]}) "
+            f"→ {path.name}",
+            flush=True,
+        )
+    except Exception as e:  # noqa: BLE001 — bookkeeping must not kill the loop
+        print(
+            f"  warning: landing enqueue for #{job.issue_num} failed "
+            f"({type(e).__name__}: {e}); the per-issue PR flow still has "
+            "the work",
+            flush=True,
+        )
+
+
 def _reap_finished(
     cfg: ReviewConfig,
     jobs: list[ConductorJob],
     not_before: dict[int, float],
     kept_worktrees: dict[int, str],
     max_attempts: int,
+    *,
+    land: Optional[str] = None,
 ) -> int:
     """Poll running jobs; apply the Phase-0 state machine to each exit.
 
@@ -636,6 +698,11 @@ def _reap_finished(
         elif rc == 0:
             job.status = "succeeded"
             _remove_worktree(cfg.repo_dir, Path(job.worktree))
+            # Phase-4 opt-in: enqueue onto the landing queue ONLY under
+            # --land next (default off — the per-issue PR flow is
+            # unchanged until the marathon/next stack soaks).
+            if land == LAND_NEXT:
+                _enqueue_landing_after_success(cfg, job)
             # Completion hook: the job ran with --no-metadata-commit, so
             # formalization.yaml is regenerated here, centrally.
             _regenerate_metadata_after_success(cfg)
@@ -826,6 +893,7 @@ def run_conductor(
     prune: bool = False,
     max_attempts: int = daemon.DEFAULT_MAX_ATTEMPTS,
     worktree_parent: Optional[Path] = None,
+    land: Optional[str] = None,
 ) -> int:
     """Run the conductor loop. Returns the final exit code.
 
@@ -882,7 +950,9 @@ def run_conductor(
 
         while True:
             ticks += 1
-            _reap_finished(cfg, jobs, not_before, kept_worktrees, max_attempts)
+            _reap_finished(
+                cfg, jobs, not_before, kept_worktrees, max_attempts, land=land
+            )
             running = [j for j in jobs if j.status == "running"]
 
             picks: list[tuple[int, int]] = []
