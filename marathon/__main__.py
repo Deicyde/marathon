@@ -381,6 +381,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # serial landing queue onto marathon/next (see marathon.landing).
     _add_landing_subparser(subparsers)
 
+    # Audit tree: `marathon audit run/diff/show` — the Phase-5
+    # elaborator-grade audit engine (see marathon.audit.engine).
+    _add_audit_subparser(subparsers)
+
     # Fill tree: `marathon fill` (single decl) and `marathon fill-file`
     # (every sorry in a file). Both wrap `refine_command` with a focus
     # directive so the slash commands can shell out without knowing the
@@ -791,6 +795,198 @@ def _add_landing_subparser(subparsers) -> None:
     p_prom.set_defaults(func=_run_landing_promote)
 
 
+def _add_audit_subparser(subparsers) -> None:
+    """Adds `marathon audit run/diff/show` — the Phase-5 elaborator-grade
+    audit engine (see ``marathon.audit.engine``): runs the generated Lean
+    audit script inside the target repo's own workspace via
+    ``lake env lean``, records per-declaration evidence (elaborated-type/
+    value fingerprints over project-local vocabulary, transitive axioms,
+    sorry accounting, deception tags), and persists snapshots at
+    ``<repo>/.marathon/audit/latest.json`` (self-gitignored derived
+    cache; the prior run rotates to ``previous.json``)."""
+    p_audit = subparsers.add_parser(
+        "audit",
+        help="Elaborator-grade declaration audit (.marathon/audit/latest.json).",
+        description=(
+            "Run, diff, or inspect declaration audits. `run` derives the "
+            "target folder's modules, elaborates them with the repo's own "
+            "pinned toolchain (`lake env lean`), and snapshots per-decl "
+            "evidence: pinned-pp type/value fingerprints (project-local "
+            "constants only — Mathlib/Std/... are trusted vocabulary), "
+            "transitive axioms, sorry accounting, deception tags. "
+            "Declarations that fail to elaborate are recorded with status "
+            "`unknown` — absence of evidence is reported, never hidden. "
+            "Snapshots are derived cache (recomputable, gitignored), "
+            "never committed."
+        ),
+    )
+    sub = p_audit.add_subparsers(dest="audit_command", required=True)
+
+    p_run = sub.add_parser(
+        "run",
+        help="Audit a folder's declarations and save latest.json.",
+    )
+    p_run.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root (lake workspace). Default: current directory.",
+    )
+    p_run.add_argument(
+        "--target", required=True, metavar="FOLDER",
+        help=(
+            "Folder of .lean files to audit, relative to --repo-dir "
+            "(e.g. GeometricAnalysis/LeeSM). A single .lean file works too."
+        ),
+    )
+    p_run.add_argument(
+        "--timeout", type=int, default=900, metavar="SECONDS",
+        help="Timeout for the `lake env lean` run. Default: 900.",
+    )
+    p_run.set_defaults(func=_run_audit_run)
+
+    p_diff = sub.add_parser(
+        "diff",
+        help="Per-decl changes: latest.json vs previous.json.",
+    )
+    p_diff.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root. Default: current directory.",
+    )
+    p_diff.set_defaults(func=_run_audit_diff)
+
+    p_show = sub.add_parser(
+        "show",
+        help="Print one declaration's audit record from latest.json.",
+    )
+    p_show.add_argument(
+        "decl", metavar="DECL",
+        help=(
+            "Fully qualified declaration name (a unique dotted suffix "
+            "also works, e.g. `double_eq`)."
+        ),
+    )
+    p_show.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root. Default: current directory.",
+    )
+    p_show.set_defaults(func=_run_audit_show)
+
+
+def _run_audit_run(args) -> None:
+    from marathon.audit.engine import run_audit, save_snapshot
+    from marathon.gate import AXIOM_WHITELIST, SORRY_AXIOM
+
+    repo_dir: Path = args.repo_dir.resolve()
+    snapshot = run_audit(repo_dir, args.target, timeout=args.timeout)
+    path = save_snapshot(snapshot, repo_dir)
+    decls = snapshot.decls
+    sorried = sum(1 for d in decls if d.has_sorry is True)
+    unknown = sum(1 for d in decls if d.status == "unknown")
+    beyond = sorted({
+        ax for d in decls for ax in d.axioms
+        if ax not in AXIOM_WHITELIST and ax != SORRY_AXIOM
+    })
+    tagged = [(d.name, ";".join(d.tags)) for d in decls if d.tags]
+    print(
+        f"audited {len(decls)} declaration(s) across "
+        f"{len(snapshot.modules)} module(s)"
+        + (f" [toolchain {snapshot.toolchain}]" if snapshot.toolchain else "")
+    )
+    print(f"  sorry'd (transitive sorryAx): {sorried}")
+    print(f"  unknown (no evidence): {unknown}")
+    print(
+        f"  axioms beyond whitelist: {len(beyond)}"
+        + (f" ({', '.join(beyond)})" if beyond else "")
+    )
+    print(f"  deception-tagged: {len(tagged)}")
+    for name, tags in tagged:
+        print(f"    {name}: {tags}")
+    if snapshot.failures:
+        print(f"  failures ({len(snapshot.failures)}):")
+        for failure in snapshot.failures:
+            print(f"    - {failure}")
+    print(f"saved {path}")
+    if not decls and snapshot.failures:
+        # Nothing audited at all — honest absence, but a failing exit so
+        # scripts don't mistake an empty snapshot for a clean one.
+        raise SystemExit(1)
+
+
+def _run_audit_diff(args) -> None:
+    from marathon.audit.engine import (
+        DIFF_KEYS, LATEST_NAME, PREVIOUS_NAME, diff_snapshots, load_snapshot,
+    )
+
+    repo_dir: Path = args.repo_dir.resolve()
+    new = load_snapshot(repo_dir, LATEST_NAME)
+    if new is None:
+        print("no latest audit snapshot; run `marathon audit run` first")
+        raise SystemExit(1)
+    old = load_snapshot(repo_dir, PREVIOUS_NAME)
+    if old is None:
+        print(
+            "no previous audit snapshot to diff against "
+            "(only one run recorded so far)"
+        )
+        raise SystemExit(1)
+    diff = diff_snapshots(old, new)
+    print(f"audit diff: {old.created_at} -> {new.created_at}")
+    for warning in diff.get("warnings", []):
+        print(f"  WARNING: {warning}")
+    total = 0
+    for key in DIFF_KEYS:
+        names = diff.get(key, [])
+        total += len(names)
+        print(f"  {key}: {len(names)}")
+        for name in names:
+            print(f"    {name}")
+    if total == 0:
+        print("  no per-declaration changes")
+
+
+def _run_audit_show(args) -> None:
+    from marathon.audit.engine import load_snapshot
+
+    repo_dir: Path = args.repo_dir.resolve()
+    snapshot = load_snapshot(repo_dir)
+    if snapshot is None:
+        print("no latest audit snapshot; run `marathon audit run` first")
+        raise SystemExit(1)
+    by_name = snapshot.by_name()
+    decl = by_name.get(args.decl)
+    if decl is None:
+        # Convenience: a unique dotted-suffix match also resolves.
+        matches = [
+            d for name, d in by_name.items()
+            if name.endswith("." + args.decl)
+        ]
+        if len(matches) == 1:
+            decl = matches[0]
+        elif matches:
+            print(f"ambiguous suffix {args.decl!r}; candidates:")
+            for d in matches:
+                print(f"  {d.name}")
+            raise SystemExit(1)
+    if decl is None:
+        print(f"declaration {args.decl!r} not in latest snapshot "
+              f"({len(by_name)} decl(s) audited)")
+        raise SystemExit(1)
+    print(f"name: {decl.name}")
+    print(f"kind: {decl.kind}")
+    print(f"module: {decl.module}")
+    print(f"status: {decl.status}")
+    print(f"type: {decl.type_pp if decl.type_pp is not None else '-'}")
+    print(f"value: {decl.value_pp if decl.value_pp is not None else '-'}")
+    print(f"fingerprint_type: {decl.fingerprint_type or '-'}")
+    print(f"fingerprint_value: {decl.fingerprint_value or '-'}")
+    print(f"cone: {', '.join(decl.cone) or '-'}")
+    print(f"axioms: {', '.join(decl.axioms) or '-'}")
+    sorry = "-" if decl.has_sorry is None else str(decl.has_sorry).lower()
+    print(f"has_sorry: {sorry}")
+    print(f"tags: {';'.join(decl.tags) or '-'}")
+    if decl.reason is not None:
+        print(f"reason: {decl.reason}")
+
+
 def _run_landing_run(args) -> None:
     from marathon.landing import run_landing
 
@@ -1199,6 +1395,15 @@ def main() -> None:
         # Ctrl-C mid-landing is safe: every attempt starts by realigning
         # the worktree to origin/marathon/next, and the popped request's
         # work is re-derivable from the per-issue branch/PR.
+        try:
+            args.func(args)
+        except KeyboardInterrupt:
+            print("\ninterrupted", file=sys.stderr)
+            sys.exit(130)
+    elif args.command == "audit":
+        # Dispatch via the subparser's set_defaults(func=…) handler. All
+        # three subcommands are short-lived synchronous calls; `run`'s
+        # lake subprocess dies with us on Ctrl-C.
         try:
             args.func(args)
         except KeyboardInterrupt:
