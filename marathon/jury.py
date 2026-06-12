@@ -18,11 +18,12 @@ Binding design constraints (marathon-v2 plan §2 ruling 3):
   no prompt file, empty folder, subprocess error, unparseable output) and
   never raises out. Enforcement and overrides are wired by the caller.
 
-Subprocess conventions are copied from the rater
-(``post_pipeline.call_claude_rater``) and ``claude_review.py``: prompt via
-stdin (E2BIG), ``ANTHROPIC_API_KEY`` scrubbed so the CLI falls back to Max
-OAuth, ``MARATHON_CLAUDE_MODEL`` env override, lenient JSON extraction
-with a per-field regex fallback.
+Subprocess conventions (prompt via stdin against E2BIG,
+``ANTHROPIC_API_KEY`` scrubbed so the CLI falls back to Max OAuth, the
+cross-process slot limiter) are shared with the rater and
+``claude_review.py`` via ``marathon.claude_proc.run_claude``; the
+``MARATHON_CLAUDE_MODEL`` env override and the lenient JSON extraction
+with a per-field regex fallback stay here.
 """
 
 from __future__ import annotations
@@ -31,10 +32,16 @@ import json
 import os
 import re
 import shutil
-import subprocess
+# Kept although the claude call itself moved to marathon.claude_proc:
+# existing tests patch ``jury.subprocess.run`` (a setattr on the stdlib
+# module object, so the patch reaches claude_proc's ``subprocess.run``
+# too) and need this name to exist.
+import subprocess  # noqa: F401
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from marathon.claude_proc import run_claude
 
 # Default model, matching the rater. Resolution order (computed per call,
 # unlike claude_review's import-time read, so tests and long-lived
@@ -277,27 +284,13 @@ def run_jury(
 
     resolved_model = _resolve_model(model)
 
-    # Scrub ANTHROPIC_API_KEY so the CLI falls back to keychain Max OAuth
-    # (same as claude_review.py / the rater). Prompt goes via stdin, not
-    # argv: it embeds every .lean file plus an optional diff and can
-    # exceed the OS argv limit (E2BIG).
-    env = os.environ.copy()
-    env.pop("ANTHROPIC_API_KEY", None)
+    # Subprocess conventions (stdin prompt against E2BIG, the
+    # ANTHROPIC_API_KEY scrub for Max OAuth, the cross-process slot
+    # limiter) live in marathon.claude_proc.run_claude. The pre-resolved
+    # model is passed explicitly so the verdict's ``model`` field and the
+    # actual call can never disagree.
     try:
-        proc = subprocess.run(
-            [
-                claude_path,
-                "-p",
-                "--model", resolved_model,
-                "--tools", "",
-                "--output-format", "text",
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-            input=prompt,
-        )
+        proc = run_claude(prompt, model=resolved_model)
     except OSError as e:
         print(f"  jury: skipped — could not exec claude (errno {e.errno}: {e.strerror})")
         return None

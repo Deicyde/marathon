@@ -33,8 +33,12 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from marathon.claude_proc import run_claude
+
 # Env-overridable so large repos can route the (whole-repo) review prompt
 # through a 1M-context model, e.g. MARATHON_CLAUDE_MODEL="claude-opus-4-8[1m]".
+# Read at import time (historical behavior, preserved) and passed to
+# run_claude explicitly so the per-call env re-read there never disagrees.
 CLAUDE_MODEL = os.environ.get("MARATHON_CLAUDE_MODEL", "claude-opus-4-7")
 
 
@@ -147,7 +151,9 @@ def review_and_draft_prompt(
     description of what its prior task accomplished) is folded into the
     context when supplied.
     """
-    claude_path = _ensure_claude_cli()
+    # Pre-check with the friendly install/auth message; run_claude itself
+    # only raises a bare FileNotFoundError when the CLI is missing.
+    _ensure_claude_cli()
     system_prompt = _read_review_prompt(skeleton_mode)
 
     if max_prompt_words is not None:
@@ -335,38 +341,17 @@ def review_and_draft_prompt(
     # token, which broke Max auth. `--tools ""` still disables the agent
     # tool surface; we accept the slight risk of cwd-local .claude/ files
     # affecting the call.
-    # Pass the prompt via stdin (not argv): the combined review prompt bundles
-    # the whole repo and routinely exceeds the OS argv limit (E2BIG). `claude
-    # -p` with no inline query reads the prompt from stdin.
-    cmd = [
-        claude_path,
-        "-p",
-        "--model", CLAUDE_MODEL,
-        "--tools", "",
-        "--output-format", "text",
-    ]
-
+    # Subprocess conventions (prompt via stdin against E2BIG, API-key
+    # scrub for Max OAuth, cross-process slot limiter) live in
+    # marathon.claude_proc.run_claude — shared with the rater/jury/
+    # referee/Hermes call sites.
     print(
         f"  invoking Claude Code via subprocess (prompt size: "
         f"{len(combined):,} chars)"
     )
 
-    # Scrub ANTHROPIC_API_KEY from the subprocess env so claude falls back
-    # to its keychain-stored Max OAuth instead of routing through the API
-    # billing path. Users who actually want the API can edit this module to
-    # remove the scrub or pass env=os.environ.
-    env = os.environ.copy()
-    env.pop("ANTHROPIC_API_KEY", None)
-
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            input=combined,
-        )
+        proc = run_claude(combined, model=CLAUDE_MODEL)
     except OSError as e:
         sys.exit(
             f"could not exec claude (errno {e.errno}: {e.strerror}). "

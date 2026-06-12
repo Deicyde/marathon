@@ -25,13 +25,14 @@ so that any legacy ``standing-items.md`` written by an older version
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from marathon.claude_proc import run_claude
 
 REFEREE_FILENAME = ".marathon/standing-items.md"
 REFEREE_PROPOSED_SUFFIX = ".proposed"
@@ -353,23 +354,13 @@ def _invoke_claude_referee(prompt: str) -> tuple[bool, str]:
     if not claude_path:
         return False, "claude (Claude Code CLI) not on PATH"
 
-    env = os.environ.copy()
-    env.pop("ANTHROPIC_API_KEY", None)  # use Max OAuth
-
+    # Subprocess conventions (Max-OAuth API-key scrub, cross-process slot
+    # limiter) live in marathon.claude_proc.run_claude. The prompt now
+    # travels via stdin instead of argv — this was the last argv call
+    # site, and the referee prompt bundles the whole repo's Lean files,
+    # which can exceed the OS argv limit (E2BIG).
     try:
-        proc = subprocess.run(
-            [
-                claude_path,
-                "-p", prompt,
-                "--model", REFEREE_MODEL,
-                "--tools", "",
-                "--output-format", "text",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-        )
+        proc = run_claude(prompt, model=REFEREE_MODEL)
     except OSError as e:
         return False, f"could not exec claude (errno {e.errno}: {e.strerror})"
 

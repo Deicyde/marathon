@@ -27,10 +27,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import shutil
-import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -51,6 +49,7 @@ from marathon.aristotle_runtime import (
     EventWatcher,
     fetch_new_events_since,
 )
+from marathon.claude_proc import run_claude
 
 # Same model as the iteration reviewer and auto-rater.
 CLAUDE_MODEL = "claude-opus-4-7"
@@ -438,30 +437,14 @@ class HermesWatcher:
     def _invoke_claude(self, prompt: str) -> str:
         """Synchronous subprocess call to ``claude -p`` (Claude Code).
 
-        Runs from the Marathon repo root so any cwd-local ``.claude/``
-        settings still apply. ``ANTHROPIC_API_KEY`` is scrubbed so the
-        CLI uses Max OAuth from the keychain (same as ``claude_review``).
-
-        The prompt goes via stdin (not argv): it bundles the rubric,
-        referee notes, the memory tail, and up to ``RECENT_EVENTS_CONTEXT``
-        recent events — large enough on busy attempts to exceed the OS
-        argv/env limit (E2BIG). ``claude -p`` with no inline query reads
-        the prompt from stdin — same pattern as ``claude_review``'s
-        ``invoke_claude``.
+        Subprocess conventions (prompt via stdin against E2BIG, the
+        ``ANTHROPIC_API_KEY`` scrub for Max OAuth, the cross-process slot
+        limiter) live in ``marathon.claude_proc.run_claude``. The model
+        is pinned to ``CLAUDE_MODEL`` (historical Hermes behavior: no
+        ``MARATHON_CLAUDE_MODEL`` override — steering must stay on the
+        same model the rubric was tuned against).
         """
-        cmd = [
-            self._claude_path,
-            "-p",
-            "--model", CLAUDE_MODEL,
-            "--tools", "",
-            "--output-format", "text",
-        ]
-        env = os.environ.copy()
-        env.pop("ANTHROPIC_API_KEY", None)
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, check=False, env=env,
-            input=prompt,
-        )
+        proc = run_claude(prompt, model=CLAUDE_MODEL)
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "").strip() or "(no output)"
             raise RuntimeError(f"claude exited {proc.returncode}: {err}")
