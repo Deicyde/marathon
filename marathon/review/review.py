@@ -77,27 +77,118 @@ def _bulk_registry_meta(
     return meta
 
 
+# --- tier integration (Phase 5b — additive; guarded by new flags) ------------
+#
+# The tier column (`list --tiers`) and the floor filter (`next
+# --min-tier`) are the ONLY tier-aware behavior in this module, and both
+# are fully guarded: without the flag the commands run byte-for-byte as
+# before (Ch.12's seven first-reviews must never stall behind tooling
+# that has not run yet — crit-feas §6).
+
+
+def _load_tier_index(cfg: ReviewConfig):
+    """``(tiers_by_decl, note)``: ``{decl_name: TierResult}`` from the
+    latest audit snapshot + ledger, or ``({}, note)`` when no snapshot
+    exists. The note is a single line the caller prints so a missing
+    snapshot degrades visibly (a '-' column with one explanation), never
+    silently and never as an error — the audit engine may simply not
+    have run for this repo yet."""
+    # Local imports: keep the review CLI importable on a checkout whose
+    # audit/ledger deps are lazy, and mirror the trust core's own local
+    # imports across the audit↔review boundary.
+    from marathon.audit.engine import load_snapshot
+    from marathon.audit.trust import compute_tiers
+    from marathon.ledger import Ledger
+
+    snapshot = load_snapshot(cfg.repo_dir)
+    if snapshot is None:
+        return {}, (
+            "  note: no audit snapshot (`marathon audit run` has not run "
+            "for this repo) — tier column is '-'"
+        )
+    ledger = Ledger.for_repo(cfg.repo_dir)
+    return {r.decl_name: r for r in compute_tiers(snapshot, ledger)}, None
+
+
+def _issue_tier(
+    cfg: ReviewConfig,
+    num: int,
+    body: Optional[str],
+    tiers_by_decl: dict,
+) -> tuple[Optional[str], list[str]]:
+    """The tier of issue ``num`` = the WORST computed tier over the Lean
+    declarations its body cites (a sub-issue is only as trustworthy as
+    its least-trusted decl), with the names whose tier produced it.
+
+    Reuses ``verified_decls.extract_declarations_from_issue_body`` (the
+    single parser of the card format — never forked). Returns
+    ``(tier or None, decl_names)``; None when the body is unavailable or
+    cites no decl present in the snapshot — the caller renders '-' and
+    does not gate on an unknown."""
+    from marathon.audit.trust import TIER_ORDER
+    from marathon.review.verified_decls import (
+        extract_declarations_from_issue_body,
+    )
+
+    if body is None or not tiers_by_decl:
+        return None, []
+    cited = extract_declarations_from_issue_body(body)
+    matched: list[tuple[str, str]] = []  # (decl_name, tier)
+    for raw in sorted(cited):
+        result = tiers_by_decl.get(raw)
+        if result is None:
+            # Issue bodies cite names as written (often unqualified);
+            # the snapshot is fully qualified. Unique dotted-suffix
+            # match, same deterministic rule as `audit show` / backfill.
+            suffix = [
+                r for name, r in tiers_by_decl.items()
+                if name.endswith("." + raw)
+            ]
+            if len(suffix) == 1:
+                result = suffix[0]
+        if result is not None:
+            matched.append((result.decl_name, result.tier))
+    if not matched:
+        return None, []
+    worst = min(matched, key=lambda m: TIER_ORDER.index(m[1]))
+    return worst[1], [name for name, _ in matched]
+
+
 def cmd_list(args) -> None:
     cfg = load_config()
     registry = cfg.chapter_registry(args.chapter)
     meta = _bulk_registry_meta(cfg, registry)
+    show_tiers = getattr(args, "tiers", False)
+    tiers_by_decl: dict = {}
+    if show_tiers:
+        tiers_by_decl, note = _load_tier_index(cfg)
+        if note is not None:
+            print(note)
     print(
         f"Sub-issues of #{cfg.parent_issue} in review order "
         f"(chapter {args.chapter}):\n"
     )
-    print(f"  {'idx':>3}  {'issue':>6}  {'status':<10}  title")
-    print(f"  {'---':>3}  {'-----':>6}  {'------':<10}  -----")
+    tier_hdr = f"  {'tier':<7}" if show_tiers else ""
+    tier_rule = f"  {'----':<7}" if show_tiers else ""
+    print(f"  {'idx':>3}  {'issue':>6}  {'status':<10}{tier_hdr}  title")
+    print(f"  {'---':>3}  {'-----':>6}  {'------':<10}{tier_rule}  -----")
     for idx, (num, _) in enumerate(registry.entries, 1):
         if meta is not None and num in meta:
             status = _status_from_labels(cfg, meta[num]["labels"]) or "unreviewed"
             title = meta[num]["title"]
+            body = meta[num].get("body")
         else:
             # Bulk call failed, or this one issue was absent from the
             # bulk response — per-issue fallback.
             status = get_issue_status(cfg, num) or "unreviewed"
             title = issue_title(num, cfg.github_repo)
+            body = None
+        tier_col = ""
+        if show_tiers:
+            tier, _ = _issue_tier(cfg, num, body, tiers_by_decl)
+            tier_col = f"  {(tier or '-'):<7}"
         marker = "→ " if status == "unreviewed" else "  "
-        print(f"  {marker}{idx:>2}  #{num:>4}  {status:<10}  {title}")
+        print(f"  {marker}{idx:>2}  #{num:>4}  {status:<10}{tier_col}  {title}")
     print()
 
 
@@ -105,16 +196,40 @@ def cmd_next(args) -> None:
     cfg = load_config()
     registry = cfg.chapter_registry(args.chapter)
     meta = _bulk_registry_meta(cfg, registry)
+    min_tier = getattr(args, "min_tier", None)
+    tiers_by_decl: dict = {}
+    if min_tier is not None:
+        from marathon.audit.trust import TIER_ORDER
+
+        tiers_by_decl, note = _load_tier_index(cfg)
+        if note is not None:
+            print(note)
+        floor_rank = TIER_ORDER.index(min_tier)
     for num, _ in registry.entries:
         if meta is not None and num in meta:
             status = _status_from_labels(cfg, meta[num]["labels"])
+            body = meta[num].get("body")
         else:
             status = get_issue_status(cfg, num)
-        if status is None:
-            print(f"Next unreviewed sub-issue: #{num}\n")
-            _show_issue(cfg, num)
-            return
-    print(f"All chapter {args.chapter} sub-issues are reviewed. 🎉")
+            body = None
+        if status is not None:
+            continue  # already reviewed — unchanged behavior
+        if min_tier is not None:
+            from marathon.audit.trust import TIER_ORDER
+
+            tier, names = _issue_tier(cfg, num, body, tiers_by_decl)
+            if tier is not None and TIER_ORDER.index(tier) < floor_rank:
+                joined = ", ".join(names)
+                print(
+                    f"  skipping #{num}: tier {tier} below floor "
+                    f"{min_tier} (decls: {joined})"
+                )
+                continue
+        print(f"Next unreviewed sub-issue: #{num}\n")
+        _show_issue(cfg, num)
+        return
+    suffix = f" at or above {min_tier}" if min_tier is not None else ""
+    print(f"All chapter {args.chapter} sub-issues are reviewed{suffix}. 🎉")
 
 
 def _show_issue(cfg: ReviewConfig, num: int) -> None:

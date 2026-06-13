@@ -38,6 +38,15 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
         help="List sub-issues for the chapter in textbook order with statuses.",
     )
     p_list.add_argument("--chapter", type=int, required=True)
+    p_list.add_argument(
+        "--tiers", action="store_true",
+        help=(
+            "Add a computed trust-tier column (worst tier over each "
+            "issue's cited decls, from the latest `marathon audit run` "
+            "snapshot + ledger). Without a snapshot the column is '-' "
+            "with one note and the list works unchanged."
+        ),
+    )
     p_list.set_defaults(func=r.cmd_list)
 
     p_next = cv_sub.add_parser(
@@ -45,6 +54,17 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
         help="Show the next unreviewed sub-issue (skipping verified/rejected).",
     )
     p_next.add_argument("--chapter", type=int, required=True)
+    p_next.add_argument(
+        "--min-tier", choices=("T0", "T1", "T2", "T3"), default=None,
+        dest="min_tier",
+        help=(
+            "Skip unreviewed sub-issues whose worst cited-decl tier is "
+            "below this floor (printing a per-skip reason). Maps issue→"
+            "decl via the same body extraction as the post-iteration "
+            "audit. Without the flag every unreviewed issue is offered "
+            "(unchanged behavior)."
+        ),
+    )
     p_next.set_defaults(func=r.cmd_next)
 
     p_show = cv_sub.add_parser("show", help="Display a specific sub-issue body.")

@@ -935,6 +935,83 @@ def _add_audit_subparser(subparsers) -> None:
     )
     p_backfill.set_defaults(func=_run_audit_backfill)
 
+    p_inval = sub.add_parser(
+        "invalidations",
+        help="Report (and optionally surface) T2/T3 verdicts the latest "
+             "snapshot no longer covers.",
+        description=(
+            "Diff the LATEST snapshot against the PREVIOUS one and the "
+            "ledger's live verdicts: which human T2/T3 verdicts no longer "
+            "cover the current code? A verdict is INVALIDATED when the "
+            "decl's own type fingerprint changed, when a pinned cone "
+            "member changed meaning or vanished (the member is NAMED), or "
+            "when the decl went absent/unknown. Cross-toolchain wholesale "
+            "staleness is reported SEPARATELY (resolve with `audit repin`, "
+            "never a per-decl alarm). Default is a DRY RUN that writes "
+            "nothing. With --apply: ONE batched parent-issue body rewrite "
+            "flips every affected emoji 🟡→🟠, plus one idempotent "
+            "marker-comment per affected issue behind a circuit breaker "
+            "(content-hash dedup + per-issue daily cap) — the write-storm "
+            "ruling forbids one body rewrite or one tracker flip per decl."
+        ),
+    )
+    p_inval.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root. Default: current directory.",
+    )
+    p_inval.add_argument(
+        "--apply", action="store_true",
+        help=(
+            "Flip the affected tracker emojis (one batched rewrite) and "
+            "post circuit-broken marker comments. Default: dry run "
+            "(print the table, write nothing)."
+        ),
+    )
+    p_inval.set_defaults(func=_run_audit_invalidations)
+
+    p_repin = sub.add_parser(
+        "repin",
+        help="Bulk trust override: re-pin stale/changed verdicts to the "
+             "CURRENT snapshot (requires --yes).",
+        description=(
+            "RE-PIN AMNESTY — the bulk trust override. For every decl "
+            "carrying a live T2/T3 verdict whose pins no longer match the "
+            "current snapshot (own type changed, cone changed, or stale "
+            "across a toolchain bump), print the re-pin table (decl, old "
+            "fingerprint prefix → new, change kind: type-text / cone / "
+            "toolchain-only). With --yes, append a NEW source='repin' "
+            "verdict event for each, pinned to the CURRENT snapshot "
+            "(append-only — the old events are preserved, never mutated). "
+            "\n\nThis asserts that YOU re-checked these declarations "
+            "against their cards, OR that you accept the changes "
+            "sight-unseen: re-pinning silences the invalidation by "
+            "moving the human attestation onto current main. The "
+            "trade-off is yours. Decls absent or unknown in the current "
+            "snapshot are REFUSED (you cannot re-pin what does not "
+            "elaborate). Without --yes this is a dry run."
+        ),
+    )
+    p_repin.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root (lake workspace). Default: current directory.",
+    )
+    p_repin.add_argument(
+        "--decl", action="append", default=None, metavar="NAME",
+        help=(
+            "Restrict the re-pin to these declarations (repeatable; a "
+            "unique dotted suffix also resolves). Default: every decl "
+            "with a stale/changed verdict."
+        ),
+    )
+    p_repin.add_argument(
+        "--yes", action="store_true",
+        help=(
+            "Write the source='repin' verdict events. This is the trust "
+            "override — see the command description. Default: dry run."
+        ),
+    )
+    p_repin.set_defaults(func=_run_audit_repin)
+
 
 def _run_audit_run(args) -> None:
     from marathon.audit.engine import run_audit, save_snapshot
@@ -1143,6 +1220,202 @@ def _run_audit_backfill(args) -> None:
         f"wrote {written} T2 verdict event(s) (source=backfill) to "
         f"{ledger.db_path}"
     )
+
+
+def _run_audit_invalidations(args) -> None:
+    from marathon.audit.engine import LATEST_NAME, PREVIOUS_NAME, load_snapshot
+    from marathon.audit.invalidate import (
+        compute_invalidations, notify_invalidations,
+    )
+    from marathon.ledger import Ledger
+    from marathon.review.config import load_config
+
+    repo_dir: Path = args.repo_dir.resolve()
+    new = load_snapshot(repo_dir, LATEST_NAME)
+    if new is None:
+        print("no latest audit snapshot; run `marathon audit run` first")
+        raise SystemExit(1)
+    old = load_snapshot(repo_dir, PREVIOUS_NAME)  # may be None (first run)
+    ledger = Ledger.for_repo(repo_dir)
+    report = compute_invalidations(old, new, ledger)
+    if not args.apply:
+        print(notify_invalidations(load_config(repo_dir), report, apply=False))
+        return
+    cfg = load_config(repo_dir)
+    print(notify_invalidations(cfg, report, apply=True))
+
+
+def _run_audit_repin(args) -> None:
+    from marathon.audit.engine import LATEST_NAME, PREVIOUS_NAME, load_snapshot
+    from marathon.audit.invalidate import compute_invalidations
+    from marathon.audit.trust import TrustError, _cone_pins, record_spec_verdict
+    from marathon.ledger import Ledger
+
+    repo_dir: Path = args.repo_dir.resolve()
+    snapshot = load_snapshot(repo_dir, LATEST_NAME)
+    if snapshot is None:
+        print("no latest audit snapshot; run `marathon audit run` first")
+        raise SystemExit(1)
+    previous = load_snapshot(repo_dir, PREVIOUS_NAME)
+    ledger = Ledger.for_repo(repo_dir)
+    report = compute_invalidations(previous, snapshot, ledger)
+    by_name = snapshot.by_name()
+    all_events = ledger.all_decl_verdict_events()
+
+    # Candidate (decl, change-kind, claimed-tier) re-pins. type-text /
+    # cone come from per-decl invalidations; toolchain-only from the
+    # separate stale list (a bump, not a meaning change). Decls absent/
+    # unknown in the CURRENT snapshot are refused below, never re-pinned.
+    candidates: list[tuple[str, str, str]] = []
+    for inv in report.invalidations:
+        kind = "cone" if inv.cause == "cone-changed" else (
+            "absent" if inv.cause == "absent" else "type-text"
+        )
+        candidates.append((inv.decl_name, kind, inv.tier_claimed))
+    for name in report.stale_toolchain:
+        claimed = _claimed_tier(all_events.get(name, []))
+        candidates.append((name, "toolchain-only", claimed))
+
+    # --decl filter: exact, else unique dotted-suffix (same rule as
+    # `audit show`). An unresolvable/ambiguous selector is a hard error
+    # rather than a silent no-op.
+    if args.decl is not None:
+        wanted: set[str] = set()
+        for raw in args.decl:
+            resolved = _resolve_repin_target(raw, [c[0] for c in candidates])
+            if resolved is None:
+                print(
+                    f"--decl {raw!r}: no stale/changed verdict matches "
+                    "(nothing to re-pin for it)"
+                )
+                raise SystemExit(1)
+            wanted.add(resolved)
+        candidates = [c for c in candidates if c[0] in wanted]
+
+    if not candidates:
+        print("no stale or changed verdicts to re-pin")
+        return
+
+    refused: list[tuple[str, str]] = []
+    pinnable: list[tuple[str, str, str]] = []
+    for name, kind, claimed in candidates:
+        decl = by_name.get(name)
+        if kind == "absent" or decl is None or decl.is_unknown \
+                or decl.fingerprint_type is None:
+            refused.append((name, "absent or unknown in the current snapshot"))
+            continue
+        # A re-pin pins the decl's CURRENT cone, so a cone member that
+        # vanished/never-elaborated makes the decl unpinnable too — the
+        # 'refuse decls absent/unknown' ruling extends to an absent cone.
+        # Pre-check here (mirroring record_spec_verdict's guard) so the
+        # command refuses cleanly per-decl instead of crashing mid-batch
+        # on TrustError after the table prints (which also left earlier
+        # decls in the batch partially re-pinned). Naming the missing
+        # member fixes the MINOR old-fp==new-fp 'cone' row: the operator
+        # sees WHY it cannot be re-pinned, not a fake clean diff.
+        _pins, unpinnable = _cone_pins(decl, by_name)
+        if unpinnable:
+            refused.append((
+                name,
+                "cone member(s) absent or unknown — cannot re-pin: "
+                + ", ".join(unpinnable),
+            ))
+        else:
+            pinnable.append((name, kind, claimed))
+
+    print(f"re-pin table (snapshot {snapshot.created_at}, toolchain "
+          f"{snapshot.toolchain}):")
+    if pinnable:
+        name_w = max(len(n) for n, _, _ in pinnable)
+        for name, kind, claimed in pinnable:
+            old_fp = _old_pinned_fingerprint(all_events.get(name, []))
+            new_fp = by_name[name].fingerprint_type or ""
+            print(
+                f"  {name:<{name_w}}  {claimed}  "
+                f"{(old_fp[:12] + '…') if old_fp else '-':<13} → "
+                f"{(new_fp[:12] + '…') if new_fp else '-':<13}  {kind}"
+            )
+    else:
+        print("  (nothing pinnable)")
+    if refused:
+        print(f"refused {len(refused)} decl(s):")
+        for name, why in refused:
+            print(f"  {name}: {why}")
+
+    if not pinnable:
+        return
+    if not args.yes:
+        print(
+            "dry run — nothing written. `audit repin --yes` is the bulk "
+            "trust override: it asserts you re-checked these decls (or "
+            "accept the changes sight-unseen) and appends new "
+            "source='repin' verdict events pinned to current main."
+        )
+        return
+    written = 0
+    late_refused: list[tuple[str, str]] = []
+    for name, _kind, claimed in pinnable:
+        # The cone pre-check above should already have refused any
+        # unpinnable decl, so record_spec_verdict cannot raise here in
+        # practice. Guard anyway: a TrustError mid-batch must refuse THIS
+        # decl, not abort the loop and leave the already-written earlier
+        # decls as a partially-applied amnesty (defense in depth for the
+        # append-only / 'refuse, never crash' rulings).
+        try:
+            record_spec_verdict(
+                ledger, name, snapshot,
+                tier=claimed,
+                issue_num=_pinned_issue(all_events.get(name, [])),
+                source="repin",
+                notes="re-pin amnesty: operator re-checked or accepts current "
+                      "main sight-unseen",
+            )
+        except TrustError as e:
+            late_refused.append((name, str(e)))
+            continue
+        written += 1
+    print(
+        f"wrote {written} source='repin' verdict event(s) to "
+        f"{ledger.db_path} (old events preserved — append-only)"
+    )
+    if late_refused:
+        print(f"refused {len(late_refused)} decl(s) at write time:")
+        for name, why in late_refused:
+            print(f"  {name}: {why}")
+
+
+def _claimed_tier(events) -> str:
+    """Highest live verdict tier across an event log (T3 before T2),
+    defaulting to T2 — used to re-pin at the same rung the human
+    attested."""
+    from marathon.audit.invalidate import _live_verdict
+
+    event = _live_verdict(events)
+    return event.tier_claimed if event is not None else "T2"
+
+
+def _old_pinned_fingerprint(events) -> str:
+    from marathon.audit.invalidate import _live_verdict
+
+    event = _live_verdict(events)
+    return (event.fingerprint_type or "") if event is not None else ""
+
+
+def _pinned_issue(events):
+    from marathon.audit.invalidate import _live_verdict
+
+    event = _live_verdict(events)
+    return event.issue_num if event is not None else None
+
+
+def _resolve_repin_target(raw: str, names: list[str]):
+    """Resolve a ``--decl`` selector against the candidate decl names:
+    exact match, else a UNIQUE dotted-suffix match. None when neither
+    (caller errors out — a re-pin must never guess which decl)."""
+    if raw in names:
+        return raw
+    suffix = [n for n in names if n.endswith("." + raw)]
+    return suffix[0] if len(suffix) == 1 else None
 
 
 def _run_landing_run(args) -> None:
