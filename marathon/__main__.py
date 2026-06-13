@@ -1012,6 +1012,65 @@ def _add_audit_subparser(subparsers) -> None:
     )
     p_repin.set_defaults(func=_run_audit_repin)
 
+    p_kernel = sub.add_parser(
+        "kernel",
+        help="The trust kernel of a declaration: the minimized human-read "
+             "surface (project-local defs in its statement cone).",
+        description=(
+            "Compute the TRUST KERNEL of DECL (plan §2 ruling 5, goal 2's "
+            "mechanism): the transitive set of PROJECT-LOCAL definitions in "
+            "DECL's elaborated-type statement cone — the exact set of "
+            "definitions a human must read to trust the statement. "
+            "Mathlib/core constants are trusted vocabulary and are NOT in "
+            "the kernel; proof bodies are NEVER in the kernel. Prints the "
+            "kernel members (dependencies-first), the size (decls + "
+            "pinned-pp LOC), any project-local lemmas whose statements are "
+            "referenced but not read, and any unresolved cone references "
+            "(absent from the snapshot — reported, never hidden). Pure over "
+            "the latest snapshot; no Lean, no network."
+        ),
+    )
+    p_kernel.add_argument(
+        "decl", metavar="DECL",
+        help=(
+            "Fully qualified declaration name (a unique dotted suffix also "
+            "works, e.g. `main_thm`)."
+        ),
+    )
+    p_kernel.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root. Default: current directory.",
+    )
+    p_kernel.set_defaults(func=_run_audit_kernel)
+
+    p_card = sub.add_parser(
+        "card",
+        help="The machine half of a declaration's spec card (markdown).",
+        description=(
+            "Render the MACHINE HALF of DECL's spec card (the "
+            "diff-of-meaning unit, plan §2 ruling 5): the statement, the "
+            "'Definitions you must read' = the trust kernel ONLY (never the "
+            "whole file), and the evidence table (computed tier, axioms "
+            "beyond whitelist, sorry status, deception tags). The Claude "
+            "half — fresh informal rendering, kernel-shrink suggestions, "
+            "advisory semantic-delta prose — is attached later by the "
+            "spec-auditor and is absent here. Pure over the latest snapshot "
+            "+ ledger; no Lean, no network."
+        ),
+    )
+    p_card.add_argument(
+        "decl", metavar="DECL",
+        help=(
+            "Fully qualified declaration name (a unique dotted suffix also "
+            "works)."
+        ),
+    )
+    p_card.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root. Default: current directory.",
+    )
+    p_card.set_defaults(func=_run_audit_card)
+
 
 def _run_audit_run(args) -> None:
     from marathon.audit.engine import run_audit, save_snapshot
@@ -1416,6 +1475,77 @@ def _resolve_repin_target(raw: str, names: list[str]):
         return raw
     suffix = [n for n in names if n.endswith("." + raw)]
     return suffix[0] if len(suffix) == 1 else None
+
+
+def _resolve_snapshot_decl(decl: str, snapshot):
+    """Resolve a CLI decl selector against a snapshot: exact match, else a
+    UNIQUE dotted-suffix match (same convenience as `audit show`). Returns
+    the resolved fully-qualified name, or None when ambiguous/absent — the
+    caller prints the candidates and exits, never guessing."""
+    by_name = snapshot.by_name()
+    if decl in by_name:
+        return decl
+    matches = sorted(n for n in by_name if n.endswith("." + decl))
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        print(f"ambiguous suffix {decl!r}; candidates:")
+        for name in matches:
+            print(f"  {name}")
+        raise SystemExit(1)
+    return None
+
+
+def _run_audit_kernel(args) -> None:
+    from marathon.audit.engine import load_snapshot
+    from marathon.audit.kernel import compute_kernel
+
+    repo_dir: Path = args.repo_dir.resolve()
+    snapshot = load_snapshot(repo_dir)
+    if snapshot is None:
+        print("no latest audit snapshot; run `marathon audit run` first")
+        raise SystemExit(1)
+    resolved = _resolve_snapshot_decl(args.decl, snapshot)
+    # An unresolved selector still produces an honest kernel (target
+    # reported unresolved) — but if it isn't even a known suffix, say so.
+    target = resolved if resolved is not None else args.decl
+    kernel = compute_kernel(target, snapshot)
+    print(f"trust kernel of {kernel.target}")
+    print(
+        f"  size: {kernel.size_decls} local def(s), "
+        f"{kernel.size_loc} pinned-pp line(s)"
+    )
+    print("  definitions you must read:")
+    if kernel.members:
+        for member in kernel.members:
+            print(f"    {member.name}  ({member.kind})")
+    else:
+        print("    none — phrased entirely in trusted vocabulary")
+    if kernel.local_lemmas:
+        print("  local lemmas referenced (statements not read):")
+        for name in kernel.local_lemmas:
+            print(f"    {name}")
+    if kernel.unresolved:
+        print("  unresolved cone references (no audit evidence):")
+        for name in kernel.unresolved:
+            print(f"    {name}")
+
+
+def _run_audit_card(args) -> None:
+    from marathon.audit.engine import load_snapshot
+    from marathon.audit.spec_card import SpecCard
+    from marathon.ledger import Ledger
+
+    repo_dir: Path = args.repo_dir.resolve()
+    snapshot = load_snapshot(repo_dir)
+    if snapshot is None:
+        print("no latest audit snapshot; run `marathon audit run` first")
+        raise SystemExit(1)
+    resolved = _resolve_snapshot_decl(args.decl, snapshot)
+    target = resolved if resolved is not None else args.decl
+    ledger = Ledger.for_repo(repo_dir)
+    card = SpecCard.from_snapshot(target, snapshot, ledger)
+    print(card.render_markdown())
 
 
 def _run_landing_run(args) -> None:
