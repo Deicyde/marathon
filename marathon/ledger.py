@@ -56,6 +56,21 @@ corrupting a future schema):
   Phase-3 Conductor inherits a populated history instead of re-mining
   scattered workdirs.
 
+Schema v2 (Phase 5b — trust tiers) is purely **additive**: one new
+table, ``decl_verdicts``, the append-only human-verdict event log keyed
+``(decl_name, fingerprint, ts)`` per crit-feas §3. Each row pins the
+declaration's audit-time type fingerprint, its full statement-cone
+fingerprints, and the toolchain; the trust *tier* is never stored —
+:mod:`marathon.audit.trust` recomputes it on read from (current audit
+snapshot + these events), per plan §2 ruling 4. Append-only is enforced
+in the schema itself (``BEFORE UPDATE``/``BEFORE DELETE`` triggers
+abort), and the Ledger API deliberately exposes no update/delete for
+it: re-pinning appends a NEW event (``source='repin'``), revocation
+appends a ``verdict='revoked'`` event — history is never rewritten.
+A v1 db upgrades in place on first open (the new DDL is ``IF NOT
+EXISTS`` and v1 rows are untouched); the future-version guard keeps
+its v1 semantics for v3+ dbs.
+
 Stdlib only (sqlite3 / json / tomllib), per the project ground rules.
 """
 
@@ -76,7 +91,7 @@ if TYPE_CHECKING:  # pragma: no cover — type-only; avoids review-package dep
     from marathon.review.config import ReviewConfig
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 LEDGER_RELPATH = Path(".marathon") / "marathon.db"
 
 # How long a writer waits on a locked db before giving up. Generous:
@@ -96,6 +111,7 @@ BUILD_ONLY_PROJECT_ID = "__build_only__"
 TABLES = (
     "issues",
     "verdict_events",
+    "decl_verdicts",
     "chapters",
     "wall_time",
     "prompt_log",
@@ -185,6 +201,46 @@ CREATE TABLE IF NOT EXISTS refine_runs (
     output_path           TEXT,
     note                  TEXT
 );
+
+-- v2: decl-level human verdict events (Phase 5b trust tiers). One row
+-- per spec/line-review verdict (or revocation), pinning the decl's
+-- audit-time type fingerprint + full statement-cone fingerprints +
+-- toolchain. fingerprint_type/toolchain are NULLable only for
+-- 'revoked' rows (a revocation pins nothing). Tier is NEVER stored as
+-- a current label: tier_claimed records what the human attested at
+-- event time; marathon.audit.trust recomputes the live tier on read.
+CREATE TABLE IF NOT EXISTS decl_verdicts (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    decl_name        TEXT NOT NULL,
+    tier_claimed     TEXT NOT NULL CHECK (tier_claimed IN ('T2', 'T3')),
+    verdict          TEXT NOT NULL CHECK (verdict IN ('verified', 'revoked')),
+    fingerprint_type TEXT,
+    cone_json        TEXT NOT NULL DEFAULT '[]',
+    toolchain        TEXT,
+    issue_num        INTEGER,
+    ts               TEXT NOT NULL,
+    source           TEXT NOT NULL
+                     CHECK (source IN ('cli', 'backfill', 'repin', 'sync')),
+    notes            TEXT
+);
+
+CREATE INDEX IF NOT EXISTS decl_verdicts_by_decl
+    ON decl_verdicts (decl_name, id);
+
+-- Append-only enforced in the schema, not just the API surface:
+-- nothing ever rewrites or deletes a verdict event. Supersede by
+-- appending (re-pin => source='repin'; undo => verdict='revoked').
+CREATE TRIGGER IF NOT EXISTS decl_verdicts_no_update
+BEFORE UPDATE ON decl_verdicts
+BEGIN
+    SELECT RAISE(ABORT, 'decl_verdicts is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS decl_verdicts_no_delete
+BEFORE DELETE ON decl_verdicts
+BEGIN
+    SELECT RAISE(ABORT, 'decl_verdicts is append-only');
+END;
 """
 
 
@@ -192,6 +248,30 @@ class LedgerError(RuntimeError):
     """Raised for ledger-level invariant violations (e.g. a db written
     by a newer marathon). Callers in the dual-write path catch broadly
     and degrade to legacy-only; the CLI lets it surface."""
+
+
+@dataclass(frozen=True)
+class DeclVerdictEvent:
+    """One row of the append-only ``decl_verdicts`` event log.
+
+    ``cone`` is the parsed ``cone_json`` column: ``[{"name": ...,
+    "fingerprint": ...}, ...]`` — the decl's project-local statement
+    cone as pinned at verdict time. ``id`` is the authoritative event
+    order (monotonic insert order; ``ts`` strings may tie or come from
+    clocks that drift), so "newest event wins" means highest ``id``.
+    """
+
+    id: int
+    decl_name: str
+    tier_claimed: str  # 'T2' | 'T3'
+    verdict: str  # 'verified' | 'revoked'
+    fingerprint_type: Optional[str]  # None only for 'revoked' events
+    cone: list[dict]  # [{"name": str, "fingerprint": str}]
+    toolchain: Optional[str]
+    issue_num: Optional[int]
+    ts: str
+    source: str  # 'cli' | 'backfill' | 'repin' | 'sync'
+    notes: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -252,9 +332,10 @@ class Ledger:
             conn.close()
 
     def init(self) -> Path:
-        """Create the db + schema v1. Idempotent: every DDL statement
-        is ``IF NOT EXISTS`` and the version row is insert-or-ignore,
-        so calling against an existing v1 db is a no-op. Raises
+        """Create the db + current schema. Idempotent: every DDL
+        statement is ``IF NOT EXISTS`` and the version row is
+        insert-or-ignore, so calling against an existing current-version
+        db is a no-op; a v1 db upgrades in place (additive). Raises
         :class:`LedgerError` against a newer-versioned db."""
         with self._tx():
             pass
@@ -336,6 +417,66 @@ class Ledger:
         with self._tx() as conn:
             _upsert_prompt_log(conn, project_id, url, first_seen)
 
+    # --- decl verdict events (v2, append-only — no update/delete) -------
+
+    def append_decl_verdict(
+        self,
+        decl_name: str,
+        *,
+        tier_claimed: str,
+        verdict: str,
+        fingerprint_type: Optional[str],
+        cone: list[dict],
+        toolchain: Optional[str],
+        ts: str,
+        issue_num: Optional[int] = None,
+        source: str = "cli",
+        notes: Optional[str] = None,
+    ) -> int:
+        """Append one decl-verdict event; returns its row id.
+
+        The ONLY write path for ``decl_verdicts`` — there is no update
+        or delete (schema triggers abort both). Supersede by appending:
+        a re-pin is a new event with ``source='repin'``, an undo is a
+        new event with ``verdict='revoked'``. Column CHECK constraints
+        reject bad tier/verdict/source values (surfaced as
+        ``sqlite3.IntegrityError``)."""
+        with self._tx() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO decl_verdicts
+                    (decl_name, tier_claimed, verdict, fingerprint_type,
+                     cone_json, toolchain, issue_num, ts, source, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (decl_name, tier_claimed, verdict, fingerprint_type,
+                 json.dumps(cone), toolchain, issue_num, ts, source, notes),
+            )
+            return int(cur.lastrowid)
+
+    def decl_verdict_events(self, decl_name: str) -> list[DeclVerdictEvent]:
+        """Every verdict event for one declaration, newest-first."""
+        with self._tx() as conn:
+            rows = conn.execute(
+                _DECL_VERDICT_SELECT + " WHERE decl_name = ? ORDER BY id DESC",
+                (decl_name,),
+            ).fetchall()
+        return [_decl_verdict_from_row(r) for r in rows]
+
+    def all_decl_verdict_events(self) -> dict[str, list[DeclVerdictEvent]]:
+        """``{decl_name: events newest-first}`` for the whole log — the
+        batched read behind :func:`marathon.audit.trust.compute_tiers`
+        (one query instead of one per declaration)."""
+        with self._tx() as conn:
+            rows = conn.execute(
+                _DECL_VERDICT_SELECT + " ORDER BY id DESC"
+            ).fetchall()
+        out: dict[str, list[DeclVerdictEvent]] = {}
+        for row in rows:
+            event = _decl_verdict_from_row(row)
+            out.setdefault(event.decl_name, []).append(event)
+        return out
+
     # --- introspection ---------------------------------------------------
 
     def status(self) -> dict:
@@ -360,6 +501,35 @@ class Ledger:
 # Split out of the Ledger methods so ``import_all`` can batch hundreds
 # of rows into ONE transaction instead of one commit per row.
 
+_DECL_VERDICT_SELECT = (
+    "SELECT id, decl_name, tier_claimed, verdict, fingerprint_type, "
+    "cone_json, toolchain, issue_num, ts, source, notes FROM decl_verdicts"
+)
+
+
+def _decl_verdict_from_row(row: tuple) -> DeclVerdictEvent:
+    (row_id, decl_name, tier_claimed, verdict, fingerprint_type,
+     cone_json, toolchain, issue_num, ts, source, notes) = row
+    try:
+        cone = json.loads(cone_json) or []
+    except ValueError:
+        # A corrupt pin can't validate anything, but the event itself
+        # is still history — never drop it.
+        cone = [{"name": "<unparseable cone_json>", "fingerprint": ""}]
+    return DeclVerdictEvent(
+        id=int(row_id),
+        decl_name=decl_name,
+        tier_claimed=tier_claimed,
+        verdict=verdict,
+        fingerprint_type=fingerprint_type,
+        cone=list(cone),
+        toolchain=toolchain,
+        issue_num=issue_num,
+        ts=ts,
+        source=source,
+        notes=notes,
+    )
+
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA_SQL)
@@ -372,10 +542,23 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         "SELECT value FROM meta WHERE key = 'schema_version'"
     ).fetchone()
     found = int(row[0])
+    if found < SCHEMA_VERSION:
+        # In-place additive migration (v1 -> v2: the decl_verdicts DDL
+        # above is IF NOT EXISTS and touches no v1 table or row, so the
+        # executescript already brought the db up to date — only the
+        # version stamp remains). Idempotent: a re-opened v2 db takes
+        # neither branch.
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+            (str(SCHEMA_VERSION),),
+        )
+        conn.commit()
+        found = SCHEMA_VERSION
     if found != SCHEMA_VERSION:
         # A newer marathon wrote this db. Refuse to touch it — the
         # dual-write shim catches this and degrades to legacy-only, so
-        # an old checkout warns instead of corrupting a future schema.
+        # an old checkout warns instead of corrupting a future schema
+        # (same v1 guard semantics, now firing for v3+).
         raise LedgerError(
             f"ledger schema_version {found} is newer than this marathon's "
             f"{SCHEMA_VERSION}; refusing to write"

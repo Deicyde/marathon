@@ -796,14 +796,17 @@ def _add_landing_subparser(subparsers) -> None:
 
 
 def _add_audit_subparser(subparsers) -> None:
-    """Adds `marathon audit run/diff/show` — the Phase-5 elaborator-grade
-    audit engine (see ``marathon.audit.engine``): runs the generated Lean
-    audit script inside the target repo's own workspace via
-    ``lake env lean``, records per-declaration evidence (elaborated-type/
-    value fingerprints over project-local vocabulary, transitive axioms,
-    sorry accounting, deception tags), and persists snapshots at
-    ``<repo>/.marathon/audit/latest.json`` (self-gitignored derived
-    cache; the prior run rotates to ``previous.json``)."""
+    """Adds `marathon audit run/diff/show/tiers/backfill` — the Phase-5
+    elaborator-grade audit engine (see ``marathon.audit.engine``): runs
+    the generated Lean audit script inside the target repo's own
+    workspace via ``lake env lean``, records per-declaration evidence
+    (elaborated-type/value fingerprints over project-local vocabulary,
+    transitive axioms, sorry accounting, deception tags), and persists
+    snapshots at ``<repo>/.marathon/audit/latest.json`` (self-gitignored
+    derived cache; the prior run rotates to ``previous.json``). `tiers`
+    and `backfill` are the Phase-5b trust layer (see
+    ``marathon.audit.trust``): tiers computed on read from snapshot +
+    ledger verdict events, never stored."""
     p_audit = subparsers.add_parser(
         "audit",
         help="Elaborator-grade declaration audit (.marathon/audit/latest.json).",
@@ -869,6 +872,68 @@ def _add_audit_subparser(subparsers) -> None:
         help="Consumer repo root. Default: current directory.",
     )
     p_show.set_defaults(func=_run_audit_show)
+
+    p_tiers = sub.add_parser(
+        "tiers",
+        help="Computed trust tier per declaration (snapshot + verdicts).",
+        description=(
+            "Compute the trust tier of every declaration in the latest "
+            "audit snapshot. Tiers are COMPUTED on read from the snapshot "
+            "plus the ledger's append-only decl-verdict events — never "
+            "stored (plan §2 ruling 4). UNKNOWN = absent/failed to "
+            "elaborate; T0 = elaborated; T1 = axiom-clean (sorryAx "
+            "accounted), no deception tags; T2 = + human spec-verdict "
+            "with matching type+cone pins; T3 = + line-review verdict. "
+            "Stale or broken pins surface as qualifiers "
+            "(stale-toolchain, fingerprint-changed, cone-changed:X)."
+        ),
+    )
+    p_tiers.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root. Default: current directory.",
+    )
+    p_tiers.add_argument(
+        "--target", default=None, metavar="FOLDER",
+        help=(
+            "Restrict the table to declarations from this folder's "
+            "modules (same semantics as `audit run --target`). "
+            "Default: every declaration in the snapshot."
+        ),
+    )
+    p_tiers.set_defaults(func=_run_audit_tiers)
+
+    p_backfill = sub.add_parser(
+        "backfill",
+        help="Pin existing VERIFIED review issues as T2 verdicts (one-time).",
+        description=(
+            "Map every VERIFIED review sub-issue's cited declarations "
+            "onto the LATEST audit snapshot and append T2 verdict events "
+            "pinned to CURRENT main (source='backfill'). The historical "
+            "verdict-time SHAs include red builds and are unbuildable, "
+            "so these pins assert 'current main matches what I verified "
+            "back then' — which is why writing REQUIRES --attest (one "
+            "human attestation pass). Without --attest this is a dry "
+            "run: the full would-be-pinned table prints and nothing is "
+            "written. Declarations missing from the snapshot are listed "
+            "as skipped with a reason, never guessed."
+        ),
+    )
+    p_backfill.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root. Default: current directory.",
+    )
+    p_backfill.add_argument(
+        "--chapter", type=int, default=None, metavar="N",
+        help="Backfill only this chapter's issues. Default: all chapters.",
+    )
+    p_backfill.add_argument(
+        "--attest", action="store_true",
+        help=(
+            "Attest that current main matches what you verified, and "
+            "write the T2 events. Default: dry run."
+        ),
+    )
+    p_backfill.set_defaults(func=_run_audit_backfill)
 
 
 def _run_audit_run(args) -> None:
@@ -985,6 +1050,99 @@ def _run_audit_show(args) -> None:
     print(f"tags: {';'.join(decl.tags) or '-'}")
     if decl.reason is not None:
         print(f"reason: {decl.reason}")
+
+
+def _run_audit_tiers(args) -> None:
+    from marathon.audit.engine import derive_modules, load_snapshot
+    from marathon.audit.trust import TIER_ORDER, compute_tiers
+    from marathon.ledger import Ledger
+
+    repo_dir: Path = args.repo_dir.resolve()
+    snapshot = load_snapshot(repo_dir)
+    if snapshot is None:
+        print("no latest audit snapshot; run `marathon audit run` first")
+        raise SystemExit(1)
+    ledger = Ledger.for_repo(repo_dir)
+    results = compute_tiers(snapshot, ledger)
+    if args.target is not None:
+        modules, failures = derive_modules(repo_dir, args.target)
+        for failure in failures:
+            print(f"  warning: {failure}")
+        if not modules:
+            print(f"no auditable .lean modules under {args.target}")
+            raise SystemExit(1)
+        wanted = set(modules)
+        by_name = snapshot.by_name()
+        results = [
+            r for r in results if by_name[r.decl_name].module in wanted
+        ]
+    if not results:
+        print("no declarations to report")
+        return
+    print(
+        f"trust tiers: {len(results)} declaration(s), computed on read "
+        f"(snapshot {snapshot.created_at}"
+        + (f", toolchain {snapshot.toolchain}" if snapshot.toolchain else "")
+        + ")"
+    )
+    name_w = max(len(r.decl_name) for r in results)
+    for r in sorted(results, key=lambda r: r.decl_name):
+        line = f"  {r.decl_name:<{name_w}}  {r.tier:<7}"
+        if r.qualifiers:
+            line += "  " + ",".join(r.qualifiers)
+        print(line)
+    counts = {tier: 0 for tier in TIER_ORDER}
+    for r in results:
+        counts[r.tier] += 1
+    print("summary: " + "  ".join(
+        f"{tier}={counts[tier]}" for tier in TIER_ORDER
+    ))
+
+
+def _run_audit_backfill(args) -> None:
+    from marathon.audit.engine import load_snapshot
+    from marathon.audit.trust import apply_backfill, plan_backfill
+    from marathon.ledger import Ledger
+    from marathon.review.config import load_config
+
+    repo_dir: Path = args.repo_dir.resolve()
+    snapshot = load_snapshot(repo_dir)
+    if snapshot is None:
+        print("no latest audit snapshot; run `marathon audit run` first")
+        raise SystemExit(1)
+    cfg = load_config(repo_dir)
+    ledger = Ledger.for_repo(repo_dir)
+    chapters = [args.chapter] if args.chapter is not None else None
+    plan = plan_backfill(cfg, snapshot, ledger, chapters=chapters)
+    if plan.items:
+        print(f"would pin {len(plan.items)} declaration(s) as T2 "
+              f"(toolchain {snapshot.toolchain}):")
+        name_w = max(len(i.decl_name) for i in plan.items)
+        for item in plan.items:
+            print(
+                f"  {item.decl_name:<{name_w}}  #{item.issue_num}  "
+                f"{item.fingerprint_type[:12]}…  cone={item.cone_size}"
+            )
+    else:
+        print("nothing to pin")
+    if plan.skipped:
+        print(f"skipped {len(plan.skipped)} citation(s):")
+        for skip in plan.skipped:
+            print(f"  {skip.name} (#{skip.issue_num}): {skip.reason}")
+    if not plan.items:
+        return
+    if not args.attest:
+        print(
+            "dry run — nothing written. These pins assert 'current main "
+            "matches what I verified back then'; re-run with --attest to "
+            "make that attestation and write the T2 events."
+        )
+        return
+    written = apply_backfill(ledger, snapshot, plan)
+    print(
+        f"wrote {written} T2 verdict event(s) (source=backfill) to "
+        f"{ledger.db_path}"
+    )
 
 
 def _run_landing_run(args) -> None:
@@ -1402,8 +1560,8 @@ def main() -> None:
             sys.exit(130)
     elif args.command == "audit":
         # Dispatch via the subparser's set_defaults(func=…) handler. All
-        # three subcommands are short-lived synchronous calls; `run`'s
-        # lake subprocess dies with us on Ctrl-C.
+        # subcommands are short-lived synchronous calls; `run`'s lake
+        # subprocess dies with us on Ctrl-C.
         try:
             args.func(args)
         except KeyboardInterrupt:

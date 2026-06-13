@@ -94,7 +94,7 @@ def test_init_idempotent_and_status_empty(tmp_path):
     assert first.is_file()
 
     info = ledger.status()
-    assert info["schema_version"] == SCHEMA_VERSION == 1
+    assert info["schema_version"] == SCHEMA_VERSION == 2
     assert set(info["tables"]) == set(TABLES)
     assert all(count == 0 for count in info["tables"].values())
 
@@ -415,6 +415,7 @@ def test_import_all_is_idempotent(tmp_path):
     assert info["tables"] == {
         "issues": 2,
         "verdict_events": 2,
+        "decl_verdicts": 0,  # v2 table; import_all never writes it
         "chapters": 1,
         "wall_time": 2,
         "prompt_log": 2,
