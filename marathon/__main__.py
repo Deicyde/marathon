@@ -11,6 +11,8 @@ from marathon.refine import refine_command
 from marathon.referee import referee_command
 from marathon.skeleton import skeleton_command
 from marathon.fill import add_fill_subparsers
+from marathon.audit.probes import ProbeKind
+from marathon.probes_aristotle import DEFAULT_MAX_PROBES as _VAC_DEFAULT_MAX
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1071,6 +1073,129 @@ def _add_audit_subparser(subparsers) -> None:
     )
     p_card.set_defaults(func=_run_audit_card)
 
+    p_vac = sub.add_parser(
+        "vacuity-probe",
+        help="OPT-IN, BUDGET-SPENDING: ask Aristotle to DISPROVE a "
+             "theorem's hypotheses (success = broken/vacuous spec).",
+        description=(
+            "!! SPENDS REAL ARISTOTLE BUDGET !! A vacuity probe asks "
+            "Aristotle to prove a target theorem's hypotheses entail "
+            "`False`. A SUCCESS means the hypotheses are jointly "
+            "unsatisfiable, so the theorem is VACUOUSLY TRUE — a "
+            "broken/misformalized spec (the documented typo-exploit "
+            "failure mode). This is the only probe that ACTIVELY HUNTS "
+            "misformalization with a prover, and it is the expensive one, "
+            "so it is OPT-IN ONLY (never wired into the auto pipeline) and "
+            "governed: a HARD per-invocation cap (--max-probes, default "
+            f"{_VAC_DEFAULT_MAX}), and a persisted per-goal DEDUP "
+            "(content-hash under .marathon/audit/vacuity/) so the same "
+            "vacuity goal is never resubmitted across runs.\n\n"
+            "EVIDENCE IS ASYMMETRIC: a SUCCESSFUL disproof is HIGH-SIGNAL "
+            "and writes a structured finding (it does NOT auto-file a "
+            "rejection this phase — review and reject manually). A "
+            "failure-to-disprove is WEAK negative evidence ('no vacuity "
+            "found, inconclusive') and NEVER raises any tier or trust "
+            "level — Aristotle gives up opaquely, so absence of a finding "
+            "proves nothing.\n\n"
+            "The probe goal is staged into a THROWAWAY COPY of your repo "
+            "(filtered by .gitignore); your working tree is never touched "
+            "and the probe .lean is never committed. Pure-Lean probes "
+            "(unfolding/sanity) are free and ship first; reach for this "
+            "only when you want a prover to hunt vacuous statements."
+        ),
+    )
+    p_vac.add_argument(
+        "decl", nargs="+", metavar="DECL",
+        help=(
+            "One or more target theorem names to probe (fully qualified; a "
+            "unique dotted suffix also resolves). Only theorem-like decls "
+            "are probeable; defs/structures are skipped."
+        ),
+    )
+    p_vac.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root (lake workspace). Default: current directory.",
+    )
+    p_vac.add_argument(
+        "--max-probes", type=int, default=_VAC_DEFAULT_MAX, metavar="N",
+        help=(
+            f"HARD cap on probes submitted this invocation (default "
+            f"{_VAC_DEFAULT_MAX}). Each probe spends real Aristotle budget; "
+            "eligible goals beyond the cap are skipped (reported)."
+        ),
+    )
+    p_vac.add_argument(
+        "--polling-interval", type=int, default=30, metavar="SECONDS",
+        help="Seconds between task-status polls. Default: 30.",
+    )
+    p_vac.add_argument(
+        "--dry-run", action="store_true",
+        help=(
+            "Plan only: print which goals WOULD be submitted (under the cap, "
+            "minus dedups) and exit WITHOUT spending any budget. Generates "
+            "and prints the goal files but submits nothing."
+        ),
+    )
+    p_vac.set_defaults(func=_run_audit_vacuity_probe)
+
+    p_probe = sub.add_parser(
+        "probe",
+        help="Generate (and optionally build) pure-Lean probes for a decl "
+             "(unfolding / sanity — FREE, no Aristotle).",
+        description=(
+            "Generate the PURE-LEAN probes for DECL (plan §2 ruling 5, "
+            "Phase 6b cheap-first tier — NO Aristotle, no budget): an "
+            "UNFOLDING probe (a def's wellformedness / total-ness, degrading "
+            "honestly to a typecheck when no expected value is supplied — it "
+            "does NOT emit rfl-trivial probes that prove nothing) and a "
+            "SANITY probe (the PUnit-collapse catcher, referee.md #1, for "
+            "structures/classes — emitted as 'needs witness' when the "
+            "snapshot can't supply a non-collapsing model, never a vacuous "
+            "pass). Prints the generated probe source. With --run (and lake "
+            "present) it BUILDS each probe OUTSIDE the repo tree (so probe "
+            "files can never enter an Aristotle bundle) against the repo's "
+            "built modules and reports pass/fail/error/needs_witness — a "
+            "FAILING unfolding/sanity probe is a high-signal finding; a "
+            "FAILING shrink certificate rejects the shrink. Pure over the "
+            "latest snapshot; --run additionally needs the repo built. "
+            "(For the BUDGET-SPENDING vacuity probe, see `audit "
+            "vacuity-probe`.)"
+        ),
+    )
+    p_probe.add_argument(
+        "decl", metavar="DECL",
+        help=(
+            "Fully qualified declaration name (a unique dotted suffix also "
+            "works)."
+        ),
+    )
+    p_probe.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root. Default: current directory.",
+    )
+    p_probe.add_argument(
+        "--kind", action="append", choices=[k.value for k in ProbeKind],
+        metavar="KIND",
+        help=(
+            "Restrict to a probe kind (unfolding / sanity); repeatable. "
+            "Default: the kinds that apply to the decl. shrink_certificate "
+            "needs a spec-auditor obligation and is never auto-generated "
+            "from a decl."
+        ),
+    )
+    p_probe.add_argument(
+        "--run", action="store_true",
+        help=(
+            "Build the generated probes via `lake env lean` (outside the "
+            "repo tree) and report outcomes. Default: print source only."
+        ),
+    )
+    p_probe.add_argument(
+        "--timeout", type=int, default=600, metavar="SECONDS",
+        help="Timeout for each probe's `lake env lean` build. Default: 600.",
+    )
+    p_probe.set_defaults(func=_run_audit_probe)
+
 
 def _run_audit_run(args) -> None:
     from marathon.audit.engine import run_audit, save_snapshot
@@ -1546,6 +1671,151 @@ def _run_audit_card(args) -> None:
     ledger = Ledger.for_repo(repo_dir)
     card = SpecCard.from_snapshot(target, snapshot, ledger)
     print(card.render_markdown())
+
+
+def _run_audit_probe(args) -> None:
+    from marathon.audit.engine import load_snapshot
+    from marathon.audit.probes import probes_for_decl, run_probes
+
+    repo_dir: Path = args.repo_dir.resolve()
+    snapshot = load_snapshot(repo_dir)
+    if snapshot is None:
+        print("no latest audit snapshot; run `marathon audit run` first")
+        raise SystemExit(1)
+    resolved = _resolve_snapshot_decl(args.decl, snapshot)
+    if resolved is None:
+        print(
+            f"declaration {args.decl!r} not in latest snapshot "
+            f"({len(snapshot.by_name())} decl(s) audited)"
+        )
+        raise SystemExit(1)
+    decl = snapshot.by_name()[resolved]
+    kinds = (
+        tuple(ProbeKind(k) for k in args.kind) if args.kind else None
+    )
+    probes = probes_for_decl(decl, kinds=kinds)
+    if not probes:
+        # The kinds that auto-generate (unfolding/sanity) don't apply to
+        # this decl — say so honestly rather than print nothing.
+        print(
+            f"no auto-generatable probes for {resolved} (kind {decl.kind!r}): "
+            "unfolding applies to def/abbrev/instance, sanity to "
+            "structure/class. (shrink_certificate needs a spec-auditor "
+            "obligation, not a decl.)"
+        )
+        return
+    print(f"generated {len(probes)} probe(s) for {resolved} (kind {decl.kind}):")
+    for probe in probes:
+        marker = " [needs witness]" if probe.needs_witness else ""
+        print(f"\n--- {probe.kind.value} probe{marker} ---")
+        print(probe.source.rstrip())
+    if not args.run:
+        print(
+            "\n(generated only — pass --run to build them with `lake env "
+            "lean` and report outcomes.)"
+        )
+        return
+    report = run_probes(repo_dir, probes, timeout=args.timeout)
+    print()
+    print(report.render())
+    # A high-signal finding (a failing unfolding/sanity probe, or a rejected
+    # shrink) is a nonzero exit so scripts notice — an `error` (toolchain
+    # trouble) or `needs_witness` is honest absence of evidence, not a fail.
+    if report.findings:
+        raise SystemExit(1)
+
+
+def _run_audit_vacuity_probe(args) -> None:
+    from marathon.audit.engine import load_snapshot
+    from marathon.probes_aristotle import run_probes, select_targets
+
+    repo_dir: Path = args.repo_dir.resolve()
+    snapshot = load_snapshot(repo_dir)
+    if snapshot is None:
+        print("no latest audit snapshot; run `marathon audit run` first")
+        raise SystemExit(1)
+
+    # Resolve every selector against the snapshot (exact / unique suffix);
+    # an unresolved one is a hard error, never a silent no-op.
+    resolved_names: list[str] = []
+    for raw in args.decl:
+        resolved = _resolve_snapshot_decl(raw, snapshot)
+        if resolved is None:
+            print(f"declaration {raw!r} not in latest snapshot")
+            raise SystemExit(1)
+        resolved_names.append(resolved)
+
+    if args.dry_run:
+        # Plan only — generate goals, report the governor's decision, spend
+        # nothing. (Dedup index is still consulted so the dry run is honest
+        # about what a real run would skip.)
+        plan = select_targets(
+            snapshot, resolved_names, repo_dir, max_probes=args.max_probes
+        )
+        print(
+            f"DRY RUN — no Aristotle budget spent. cap={args.max_probes}; "
+            f"would submit {len(plan.to_run)} probe(s):"
+        )
+        for goal in plan.to_run:
+            print(f"  {goal.decl_name}  (goal-hash {goal.goal_hash[:8]})")
+        if plan.skipped_dedup:
+            print(
+                "  skipped (already submitted): "
+                + ", ".join(plan.skipped_dedup)
+            )
+        if plan.skipped_cap:
+            print(f"  skipped (over cap): {', '.join(plan.skipped_cap)}")
+        if plan.skipped_unprobeable:
+            print(
+                "  skipped (not a probeable theorem): "
+                + ", ".join(plan.skipped_unprobeable)
+            )
+        # Print one generated goal so the operator can eyeball it.
+        if plan.to_run:
+            sample = plan.to_run[0]
+            print(
+                f"\n--- generated goal for {sample.decl_name} "
+                f"({sample.relpath}) ---"
+            )
+            print(sample.lean_source)
+        return
+
+    print(
+        f"!! vacuity probe — spending real Aristotle budget !! "
+        f"cap={args.max_probes}"
+    )
+    plan, outcomes = asyncio.run(
+        run_probes(
+            repo_dir,
+            snapshot,
+            resolved_names,
+            max_probes=args.max_probes,
+            polling_interval=args.polling_interval,
+        )
+    )
+    if plan.skipped_dedup:
+        print(f"skipped (already submitted): {', '.join(plan.skipped_dedup)}")
+    if plan.skipped_cap:
+        print(f"skipped (over cap, not spent): {', '.join(plan.skipped_cap)}")
+    if plan.skipped_unprobeable:
+        print(
+            "skipped (not a probeable theorem): "
+            + ", ".join(plan.skipped_unprobeable)
+        )
+    broken = [o for o in outcomes if o.broken_spec]
+    for outcome in outcomes:
+        print(f"  {outcome.summary}")
+    if broken:
+        print(
+            f"\n{len(broken)} BROKEN-SPEC finding(s) written to "
+            ".marathon/audit/vacuity/findings/ — review and reject "
+            "manually (no auto-rejection filed this phase)."
+        )
+        raise SystemExit(2)
+    print(
+        "no broken specs found (all probes inconclusive — WEAK negative "
+        "evidence, no tier change)."
+    )
 
 
 def _run_landing_run(args) -> None:

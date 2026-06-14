@@ -150,6 +150,64 @@ async def submit_from_directory(
     return project, task
 
 
+async def submit_vacuity_probe(
+    project_dir: Path,
+    goal_relpath: str,
+    *,
+    polling_interval: int = 30,
+    prompt: Optional[str] = None,
+) -> tuple[Project, AgentTask]:
+    """Submit a single vacuity-probe goal over a cached repo bundle and
+    await a terminal status — the one narrow Aristotle path phase-6b's
+    budget-capped vacuity prober needs.
+
+    ``project_dir`` is a *staged copy* of the consumer repo (the caller is
+    responsible for staging — never the live repo, and the probe ``.lean``
+    must already be excluded from every other Aristotle bundle) containing
+    the single vacuity goal at ``goal_relpath``. We bundle + submit via the
+    existing :func:`submit_from_directory`, then block on the existing
+    :func:`run_task_to_completion` poll loop — this is a thin orchestration
+    over those primitives, NOT a new poll implementation.
+
+    Returns ``(project, task)`` with the task refreshed to a terminal
+    ``TaskStatus``. Evidence interpretation is the caller's job and is
+    deliberately ASYMMETRIC (see ``marathon.probes_aristotle``): a
+    ``COMPLETE`` here means Aristotle PROVED the hypotheses contradictory
+    (a broken/vacuous spec — high signal); any non-``COMPLETE`` terminal
+    status (``COMPLETE_WITH_ERRORS`` / ``FAILED`` / ``CANCELED`` /
+    ``OUT_OF_BUDGET``) is WEAK negative evidence (failure-to-disprove,
+    Aristotle gives up opaquely) that must never raise a tier.
+
+    This call spends real Aristotle budget; the caller's budget governor
+    (caps, dedup, opt-in) is the load-bearing guard, not this helper.
+    """
+    if prompt is None:
+        prompt = vacuity_probe_prompt(goal_relpath)
+    project, task = await submit_from_directory(prompt=prompt, project_dir=project_dir)
+    await run_task_to_completion(task, project, polling_interval=polling_interval)
+    return project, task
+
+
+def vacuity_probe_prompt(goal_relpath: str) -> str:
+    """The submission prompt for a vacuity probe.
+
+    Tells Aristotle to prove the single ``sorry`` in ``goal_relpath`` — a
+    ``... → False`` goal whose success would establish that the target
+    theorem's hypotheses are jointly unsatisfiable (a vacuous spec). The
+    prompt forbids editing anything but the goal file, so the cached repo
+    bundle is read-only context."""
+    return (
+        "There is exactly ONE Lean file with a `sorry` to discharge: "
+        f"`{goal_relpath}`. It states that a theorem's hypotheses are "
+        "jointly contradictory (they entail `False`). Try to prove it "
+        "using the surrounding repository as context. If the hypotheses "
+        "are genuinely satisfiable you will not be able to close the goal "
+        "— that is the expected outcome for a correct specification; do "
+        "NOT fabricate a proof. Edit ONLY "
+        f"`{goal_relpath}`; do not modify any other file in the repository."
+    )
+
+
 async def continue_via_ask(
     project: Project,
     prompt: str,

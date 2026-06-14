@@ -3,7 +3,19 @@
 # GeometricAnalysis pins (v4.28.0) so dev machines already have it.
 name = "auditfixture"
 version = "0.1.0"
-defaultTargets = ["AuditFixture"]
+defaultTargets = ["AuditFixture", "AuditFixtureProbes"]
 
+# The audited surface. `marathon.audit.engine.run_audit` walks the
+# `AuditFixture/` folder to derive its modules (Basic + Deception), so this
+# lib is exactly what the audit golden covers.
 [[lean_lib]]
 name = "AuditFixture"
+
+# Probe targets for `tests/test_probes.py` (Phase 6b). A SEPARATE top-level
+# lib so its module (`AuditFixtureProbes`) lives OUTSIDE the audited
+# `AuditFixture/` folder — folder-based module discovery in `run_audit` never
+# picks it up, so it stays out of the audit golden's surface — while still
+# being built by `lake build` (it is a default target) and importable by the
+# probe tests.
+[[lean_lib]]
+name = "AuditFixtureProbes"

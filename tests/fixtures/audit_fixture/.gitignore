@@ -1,1 +1,7 @@
+# Lake build output (oleans/ilean/ir for AuditFixture + AuditFixtureProbes).
 .lake/
+# Marathon derived caches written when a test runs the audit engine or a
+# probe against this fixture (audit snapshots, vacuity dedup index/findings).
+# Recomputable, never committed — same convention as a consumer repo's
+# self-gitignored .marathon/ dir.
+.marathon/
