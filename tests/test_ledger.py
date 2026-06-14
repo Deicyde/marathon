@@ -94,7 +94,9 @@ def test_init_idempotent_and_status_empty(tmp_path):
     assert first.is_file()
 
     info = ledger.status()
-    assert info["schema_version"] == SCHEMA_VERSION == 3
+    # Pin to the module's current version (bumped additively over phases:
+    # v1 issues, v2 decl_verdicts, v3 targets, v4 referee_tasks).
+    assert info["schema_version"] == SCHEMA_VERSION
     assert set(info["tables"]) == set(TABLES)
     assert all(count == 0 for count in info["tables"].values())
 
@@ -418,6 +420,7 @@ def test_import_all_is_idempotent(tmp_path):
         "decl_verdicts": 0,  # v2 table; import_all never writes it
         "targets": 0,  # v3 tables; import_all never writes them
         "target_deps": 0,
+        "referee_tasks": 0,  # v4 table; import_all never writes it
         "chapters": 1,
         "wall_time": 2,
         "prompt_log": 2,

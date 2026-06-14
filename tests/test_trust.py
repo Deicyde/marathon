@@ -486,14 +486,16 @@ def test_v1_db_upgrades_in_place_with_rows_intact(tmp_path):
     db_path = write_v1_db(tmp_path)
     ledger = Ledger.for_repo(tmp_path)
     info = ledger.status()  # any op migrates on open
-    assert info["schema_version"] == SCHEMA_VERSION == 3
+    # A v1 db upgrades all the way to the CURRENT schema version on open
+    # (the additive migration is a single version-stamp bump).
+    assert info["schema_version"] == SCHEMA_VERSION
     assert info["tables"]["issues"] == 1
     assert info["tables"]["verdict_events"] == 1
     assert info["tables"]["decl_verdicts"] == 0
     with sqlite3.connect(db_path) as conn:
         assert conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
-        ).fetchone() == ("3",)
+        ).fetchone() == (str(SCHEMA_VERSION),)
     # And the new table is live.
     ledger.append_decl_verdict(
         "Foo.bar", tier_claimed="T2", verdict="verified",
@@ -507,7 +509,7 @@ def test_migration_is_idempotent(tmp_path):
     write_v1_db(tmp_path)
     ledger = Ledger.for_repo(tmp_path)
     assert ledger.status() == ledger.status()
-    assert ledger.status()["schema_version"] == 3
+    assert ledger.status()["schema_version"] == SCHEMA_VERSION
 
 
 def test_future_schema_version_still_refused(tmp_path):
@@ -515,7 +517,8 @@ def test_future_schema_version_still_refused(tmp_path):
     ledger.init()
     with sqlite3.connect(ledger.db_path) as conn:
         conn.execute(
-            "UPDATE meta SET value = '4' WHERE key = 'schema_version'"
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+            (str(SCHEMA_VERSION + 1),),
         )
     with pytest.raises(LedgerError, match="newer"):
         ledger.status()

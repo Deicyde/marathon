@@ -314,9 +314,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ref.add_argument(
         "--repo-dir",
         type=Path,
-        required=True,
+        default=None,
         metavar="PATH",
-        help="Lean repo containing referee.md (must be a git repo).",
+        help=(
+            "Lean repo containing referee.md (must be a git repo). Required "
+            "for the default prose pass; the `tasks` subcommand takes its "
+            "own --repo-dir."
+        ),
     )
     p_ref.add_argument(
         "--referee",
@@ -363,6 +367,47 @@ def _build_parser() -> argparse.ArgumentParser:
             "After auto-committing, also `git push` the current branch. "
             "Default: off. Ignored under --review or --no-commit."
         ),
+    )
+    p_ref.add_argument(
+        "--emit-tasks",
+        action="store_true",
+        help=(
+            "After the prose pass, persist STRUCTURED referee fix-tasks to "
+            "the ledger (the 'teeth'): mechanical cross-chapter dedup tasks "
+            "from audit fingerprints, plus Claude-proposed "
+            "deception/naming/doc/structural tasks, plus a self-"
+            "accountability pass that closes resolved prior tasks and "
+            "escalates overdue ones. Default OFF — without this flag the "
+            "referee is the unchanged prose-only standing-items.md rewriter. "
+            "List the persisted tasks with `marathon referee tasks`."
+        ),
+    )
+
+    # `marathon referee tasks` — list referee-origin fix-tasks (read-only).
+    p_ref_sub = p_ref.add_subparsers(dest="referee_command")
+    p_ref_tasks = p_ref_sub.add_parser(
+        "tasks",
+        help="List referee-origin fix-tasks (status + overdue counts).",
+        description=(
+            "Read-only listing of the structured fix-tasks the referee has "
+            "emitted into the ledger (via `marathon referee --emit-tasks`), "
+            "with each task's status, severity, kind, the decls it spans, "
+            "the planner target it blocks, and how many referee passes it is "
+            "overdue. No Claude call, no git mutation."
+        ),
+    )
+    p_ref_tasks.add_argument(
+        "--repo-dir",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Lean repo whose ledger holds the referee tasks.",
+    )
+    p_ref_tasks.add_argument(
+        "--open",
+        dest="open_only",
+        action="store_true",
+        help="Show only open (unresolved) tasks.",
     )
 
     # Review tree: `marathon review list/next/show/verify/reject/...`
@@ -807,6 +852,24 @@ def _add_conductor_subparser(subparsers) -> None:
             "stack has soaked."
         ),
     )
+    p_run.add_argument(
+        "--referee-every", type=int, default=0, metavar="N",
+        help=(
+            "Phase-8 opt-in: after every N successful landings (counted "
+            "from .marathon/landing/landings.jsonl) fire `marathon referee "
+            "--emit-tasks` to refresh the standing items AND persist "
+            "structured fix-tasks. Those referee fix-tasks then GATE "
+            "SCHEDULING: a target/rejection whose chapter is named by an "
+            "unresolved BLOCKING referee task (one carrying a blocks_target) "
+            "is deferred — never dispatched around — until the task "
+            "resolves (the Ch.11 coordinateCoframe item survived twelve "
+            "advisory iterations; this gives the referee teeth). The "
+            "trigger is best-effort and idempotent (a referee failure warns "
+            "and never fails a landing/dispatch). Default: 0 = OFF "
+            "(manual-only referee, today's behavior — the scheduler is "
+            "byte-identical when no referee tasks exist)."
+        ),
+    )
     p_run.set_defaults(func=_run_conductor_run)
 
     p_stat = sub.add_parser(
@@ -838,6 +901,7 @@ def _run_conductor_run(args) -> None:
         ),
         worktree_parent=args.worktree_parent,
         land=args.land,
+        referee_every=args.referee_every,
     )
     if rc:
         raise SystemExit(rc)

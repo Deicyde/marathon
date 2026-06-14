@@ -119,6 +119,13 @@ WORKTREE_START_POINT = "origin/main"
 # operator happens to have checked out.
 METADATA_BASE_BRANCH = WORKTREE_START_POINT.rsplit("/", 1)[-1]
 
+# Referee-cadence default: 0 = OFF (manual-only referee, today's
+# behavior — BINDING parity). Raised explicitly via --referee-every N:
+# after every N successful landings the conductor fires a referee
+# --emit-tasks pass, whose structured fix-tasks then gate scheduling
+# (see referee_blocked_chapters / _pick_dispatchable).
+DEFAULT_REFEREE_EVERY = 0
+
 # Loop cadence: short ticks while jobs are running (reap promptly, keep
 # the snapshot fresh); the daemon's drained-queue interval otherwise.
 TICK_SECONDS = 10
@@ -293,6 +300,138 @@ def _target_relpath(cfg: ReviewConfig, chapter: int) -> str:
     return cfg.target_path_template.format(chapter=chapter).strip("/")
 
 
+# --- referee fix-task blocking (the "teeth" the scheduler respects) -----------
+#
+# A referee fix-task (marathon.ledger.RefereeTask, emitted by the
+# concurrently-built `marathon referee --emit-tasks` — see referee.py) gains
+# scheduling TEETH when it carries a BLOCKING relation: the ledger models
+# this as the task's ``blocks_target`` column (the schema comment:
+# "blocks_target names the planner target this task must land before; NULL =
+# advisory, no scheduling teeth"). An OPEN task with a non-NULL blocks_target
+# (or any decl in its ``target_decls``) is the depends_on/blocks edge the plan
+# §2 "referee with teeth" ruling requires the conductor to honor: the
+# scheduler must NOT dispatch a target/rejection around it (the Ch.11
+# coordinateCoframe item survived twelve advisory iterations precisely because
+# nothing blocked).
+#
+# The accessor below is a THIN, DOCUMENTED bridge between two units the
+# referee-emit task and the conductor speak in:
+#   * referee tasks block by DECL NAME (blocks_target / target_decls);
+#   * the conductor schedules by (issue, CHAPTER) — its collision/dispatch
+#     unit is the chapter target folder (Phase-3 grade; decl-level overlap
+#     arrives with the audit dep graph).
+# We resolve a blocking task's decls to chapters via the audit snapshot's
+# decl->module map (module ``A.B.Chapter11.X`` lives under the chapter folder
+# ``A/B/Chapter11`` = ``target_path_template.format(chapter=11)``). If the
+# referee-emit task's exact field names shift, ONLY ``_blocking_decls`` and
+# ``_task_chapters`` below need adjusting — they are the entire coupling
+# surface, kept tiny on purpose.
+
+
+def _blocking_decls(task) -> list[str]:
+    """The decls a referee task blocks ON, or [] if the task has no teeth.
+
+    A task has teeth iff it carries a non-NULL ``blocks_target`` (the
+    ledger's blocks edge); an advisory task (blocks_target is None) is
+    deliberately ignored here — it changes nothing about scheduling, by
+    design. The blocked-decl set is ``blocks_target`` plus every name in
+    ``target_decls`` (a dedup defect spans several decls; blocking any one
+    of their chapters is correct — the fix touches them together)."""
+    blocks_target = getattr(task, "blocks_target", None)
+    if not blocks_target:
+        return []
+    decls = [blocks_target]
+    for d in getattr(task, "target_decls", None) or []:
+        if d and d not in decls:
+            decls.append(d)
+    return decls
+
+
+def _module_to_relpath(module: str) -> str:
+    """Lean module ``A.B.C`` -> repo-relative dir ``A/B/C`` (the module
+    name with its final component still attached: ``A.B.Chapter11.Basic``
+    -> ``A/B/Chapter11/Basic``). Chapter membership is then a prefix test
+    against the chapter's target folder."""
+    return "/".join(module.split("."))
+
+
+def _chapter_for_decl(cfg: ReviewConfig, decl_name: str, by_module: dict) -> Optional[int]:
+    """Resolve one decl name to its chapter number, or None.
+
+    ``by_module`` maps decl name -> its audit module. A decl belongs to
+    chapter N iff its module path lives under chapter N's target folder
+    (``target_path_template.format(chapter=N)``): the decl's module-as-path
+    equals that folder or is nested beneath it. Deterministic; no Lean, no
+    network — pure over the snapshot already in memory."""
+    module = by_module.get(decl_name)
+    if not module:
+        return None
+    module_path = _module_to_relpath(module)
+    for chapter in cfg.chapters:
+        folder = _target_relpath(cfg, chapter)
+        if module_path == folder or module_path.startswith(folder + "/"):
+            return chapter
+    return None
+
+
+def referee_blocked_chapters(
+    cfg: ReviewConfig, repo_dir: Optional[Path] = None
+) -> dict[int, tuple]:
+    """Map ``chapter -> (task_id, title)`` for every chapter an OPEN
+    blocking referee fix-task gates. Empty dict = nothing blocked (today's
+    state: no referee tasks → byte-identical scheduling).
+
+    Read-only and fully degrading: a missing/newer ledger, a missing audit
+    snapshot, or zero blocking tasks each yield ``{}`` with at most one
+    printed note — a referee defect must never crash the scheduler (binding:
+    the scheduler stays pure deterministic Python; this only READS the rows
+    the referee already persisted). When several tasks block one chapter the
+    lowest task id wins the displayed reason (deterministic, stable)."""
+    repo = Path(repo_dir) if repo_dir is not None else cfg.repo_dir
+    # 1. Open referee tasks (the ledger is the referee-emit task's output).
+    try:
+        from marathon.ledger import Ledger, LedgerError
+
+        ledger = Ledger.for_repo(repo)
+        ledger.init()
+        tasks = ledger.all_referee_tasks(status="open")
+    except (LedgerError, Exception) as e:  # noqa: BLE001 — degrade, never crash
+        # A ledger that won't open (newer schema / corrupt) must not stop
+        # the conductor; it simply schedules without referee teeth.
+        print(f"  conductor: referee fix-task gate skipped (ledger unavailable: {e})")
+        return {}
+    blocking = [t for t in tasks if _blocking_decls(t)]
+    if not blocking:
+        return {}
+    # 2. decl -> module, from the latest audit snapshot (the only place the
+    #    referee's decl names can be located in a chapter folder).
+    try:
+        from marathon.audit.engine import load_snapshot
+
+        snapshot = load_snapshot(repo)
+    except Exception as e:  # noqa: BLE001 — snapshot is optional evidence
+        print(f"  conductor: referee fix-task gate skipped (audit snapshot unavailable: {e})")
+        return {}
+    if snapshot is None:
+        # Blocking tasks exist but we cannot locate their decls in any
+        # chapter — report it (the operator should run `marathon audit run`),
+        # and schedule unblocked rather than guessing a chapter.
+        print(
+            f"  conductor: {len(blocking)} blocking referee fix-task(s) present "
+            "but no audit snapshot to resolve their decls to chapters — run "
+            "`marathon audit run`; scheduling proceeds unblocked this pass"
+        )
+        return {}
+    by_module = {d.name: d.module for d in snapshot.decls}
+    blocked: dict[int, tuple] = {}
+    for task in sorted(blocking, key=lambda t: (t.id if t.id is not None else 0)):
+        for decl in _blocking_decls(task):
+            chapter = _chapter_for_decl(cfg, decl, by_module)
+            if chapter is not None and chapter not in blocked:
+                blocked[chapter] = (task.id, task.title)
+    return blocked
+
+
 def _eligible_issues(
     cfg: ReviewConfig, warned_unknown: set[int]
 ) -> list[tuple[int, int]]:
@@ -324,6 +463,8 @@ def _pick_dispatchable(
     now: float,
     slots: int,
     warned_unknown: Optional[set[int]] = None,
+    blocked_chapters: Optional[dict[int, tuple]] = None,
+    warned_blocked: Optional[set[int]] = None,
 ) -> list[tuple[int, int]]:
     """The deterministic scheduling decision: up to ``slots`` (issue,
     chapter) pairs to dispatch this tick.
@@ -331,14 +472,24 @@ def _pick_dispatchable(
     Rules, in order: oldest verdict first across all chapters; never the
     same issue twice (a running job's rejection still satisfies
     ``needs_iteration`` until its clean exit records the iteration);
-    never before the issue's backoff ``not_before``; never two jobs with
-    equal target chapter folders — the younger is deferred (Phase-3
-    collision unit; decl-level overlap arrives with the Phase-5 audit
-    engine)."""
+    never before the issue's backoff ``not_before``; never a chapter
+    gated by an unresolved BLOCKING referee fix-task (the ADDITIONAL
+    Phase-8 defer condition — ``blocked_chapters`` maps chapter ->
+    (task_id, title); the same-chapter-folder collision and the Phase-0
+    retry/stall machine are untouched); never two jobs with equal target
+    chapter folders — the younger is deferred (Phase-3 collision unit;
+    decl-level overlap arrives with the Phase-5 audit engine).
+
+    When ``blocked_chapters`` is empty/None (today's state — no referee
+    tasks) every byte of this decision is identical to before the gate."""
     if slots <= 0:
         return []
     if warned_unknown is None:
         warned_unknown = set()
+    if blocked_chapters is None:
+        blocked_chapters = {}
+    if warned_blocked is None:
+        warned_blocked = set()
     running = [j for j in jobs if j.status == "running"]
     busy_issues = {j.issue_num for j in running}
     busy_targets = {j.target for j in running}
@@ -349,6 +500,21 @@ def _pick_dispatchable(
         if issue_num in busy_issues:
             continue
         if not_before.get(issue_num, 0.0) > now:
+            continue
+        gate = blocked_chapters.get(chapter)
+        if gate is not None:
+            # Referee fix-task with teeth gates this chapter: DEFER (never
+            # crash, never dispatch around it). One reason line per blocked
+            # issue per pass so the log isn't spammed every tick.
+            if issue_num not in warned_blocked:
+                warned_blocked.add(issue_num)
+                task_id, title = gate
+                print(
+                    f"--- deferred #{issue_num} (chapter {chapter}): blocked by "
+                    f"referee task #{task_id} — {title} (resolve it, or close "
+                    "the task, to unblock) ---",
+                    flush=True,
+                )
             continue
         target = _target_relpath(cfg, chapter)
         if target in busy_targets:
@@ -883,6 +1049,33 @@ def print_status(repo_dir: Path) -> int:
     return 0
 
 
+# --- Referee cadence (landings-count trigger) ---------------------------------
+
+
+def _maybe_trigger_referee_cadence(
+    cfg: ReviewConfig, referee_every: int, worktree_parent: Optional[Path]
+) -> None:
+    """Best-effort referee-cadence trigger (plan §2: cadence by landings-
+    count). Delegates to :func:`marathon.landing.maybe_trigger_referee`,
+    which counts landings.jsonl and fires ``marathon referee --emit-tasks``
+    once per crossed multiple of ``referee_every`` (idempotent across ticks
+    via its own state file). NEVER raises: a referee failure must not fail a
+    conductor tick — the import and call are both guarded so even a broken
+    landing module degrades to "no cadence this run".
+
+    The worktree parent is forwarded so the count reads the landing
+    worktree's marathon/next copy first (freshest), falling back to the
+    repo checkout."""
+    try:
+        from marathon.landing import maybe_trigger_referee
+
+        maybe_trigger_referee(
+            cfg.repo_dir, referee_every, worktree_parent=worktree_parent
+        )
+    except Exception as e:  # noqa: BLE001 — cadence must never fail a tick
+        print(f"  warning: referee cadence skipped ({type(e).__name__}: {e})")
+
+
 # --- Main loop ----------------------------------------------------------------------
 
 
@@ -894,17 +1087,26 @@ def run_conductor(
     max_attempts: int = daemon.DEFAULT_MAX_ATTEMPTS,
     worktree_parent: Optional[Path] = None,
     land: Optional[str] = None,
+    referee_every: int = DEFAULT_REFEREE_EVERY,
 ) -> int:
     """Run the conductor loop. Returns the final exit code.
 
-    Each tick: reap finished jobs (Phase-0 state machine), pick up to
-    ``concurrency - running`` dispatchable rejections (oldest verdict
-    first across all chapters, collision/backoff/double-dispatch rules
-    in :func:`_pick_dispatchable`), spawn them in fresh worktrees, and
-    rewrite the jobs.json snapshot. ``--once``: exit when the queue is
-    drained and all jobs finished. SIGTERM/SIGINT: stop dispatching,
-    wait for running jobs (never cancel), record nothing for
-    interrupted ones.
+    Each tick: reap finished jobs (Phase-0 state machine); compute the
+    chapters gated by unresolved BLOCKING referee fix-tasks
+    (:func:`referee_blocked_chapters` — read-only, fully degrading); pick
+    up to ``concurrency - running`` dispatchable rejections (oldest
+    verdict first across all chapters, with the collision/backoff/
+    double-dispatch rules AND the referee-block gate in
+    :func:`_pick_dispatchable`); spawn them in fresh worktrees; rewrite
+    the jobs.json snapshot; and — when ``referee_every > 0`` — fire the
+    referee on the landings-count cadence (best-effort, never blocking).
+    ``--once``: exit when the queue is drained and all jobs finished.
+    SIGTERM/SIGINT: stop dispatching, wait for running jobs (never
+    cancel), record nothing for interrupted ones.
+
+    ``referee_every`` defaults to 0 (OFF — manual-only referee, today's
+    behavior); with no referee tasks on disk the scheduler is
+    byte-identical to the pre-Phase-8 conductor.
     """
     cfg = load_config(repo_dir)
     n = resolve_concurrency(concurrency)
@@ -940,6 +1142,7 @@ def run_conductor(
     not_before: dict[int, float] = {}
     kept_worktrees: dict[int, str] = {}
     warned_unknown: set[int] = set()
+    warned_blocked: set[int] = set()
     dispatch_count = 0
     ticks = 0
 
@@ -953,12 +1156,25 @@ def run_conductor(
             _reap_finished(
                 cfg, jobs, not_before, kept_worktrees, max_attempts, land=land
             )
+            # Referee-cadence: fire the referee --emit-tasks pass once the
+            # landings-count crosses a multiple of referee_every. Best-effort
+            # and OFF by default (referee_every == 0): a referee failure
+            # warns and never fails the loop (the binding best-effort rule).
+            # Done BEFORE computing the gate so a pass that just emitted a
+            # blocking task can take effect on the NEXT tick.
+            if referee_every > 0 and not _STOP_REQUESTED:
+                _maybe_trigger_referee_cadence(cfg, referee_every, worktree_parent)
+            # Compute the chapters gated by unresolved BLOCKING referee
+            # fix-tasks (read-only; {} when no referee tasks exist → the
+            # scheduler is byte-identical to before Phase 8).
+            blocked_chapters = referee_blocked_chapters(cfg)
             running = [j for j in jobs if j.status == "running"]
 
             picks: list[tuple[int, int]] = []
             if not _STOP_REQUESTED:
                 picks = _pick_dispatchable(
-                    cfg, jobs, not_before, _now(), n - len(running), warned_unknown
+                    cfg, jobs, not_before, _now(), n - len(running),
+                    warned_unknown, blocked_chapters, warned_blocked,
                 )
                 for issue_num, chapter in picks:
                     job = _dispatch_job(
@@ -991,8 +1207,28 @@ def run_conductor(
                 continue
 
             if once:
-                if not running and not _eligible_issues(cfg, warned_unknown):
-                    print("\n=== one-shot mode: queue drained; exiting ===", flush=True)
+                # The queue is "drained" for one-shot purposes when nothing
+                # is running and every still-eligible issue is referee-
+                # blocked (a blocked-only queue would otherwise spin to the
+                # MAX_TICKS_ONCE safety cap — the block is resolved by a
+                # human/referee action, not by waiting).
+                eligible = _eligible_issues(cfg, warned_unknown)
+                unblocked = [
+                    pair for pair in eligible if pair[1] not in blocked_chapters
+                ]
+                if not running and not unblocked:
+                    if eligible:
+                        print(
+                            f"\n=== one-shot mode: queue drained "
+                            f"({len(eligible)} issue(s) deferred by referee "
+                            "fix-tasks); exiting ===",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "\n=== one-shot mode: queue drained; exiting ===",
+                            flush=True,
+                        )
                     break
                 if ticks >= MAX_TICKS_ONCE:
                     print(

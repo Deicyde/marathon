@@ -31,6 +31,14 @@ You will receive:
 - **Per-chapter `marathon-refine-log.md`** — Hermes' historical
   drafted prompts.
 - **Recent git log** on the repo — which iterations landed when.
+- **Ledger digest** (when running with `--emit-tasks`) — a STRUCTURED
+  summary Python derived from the runtime ledger and latest audit
+  snapshot: target status counts, blocked/overdue targets, recently
+  tier-invalidated declarations, the deception-tag census, the tier
+  distribution, the mechanically-detected cross-chapter duplicate
+  groups, and **the referee's own previously-emitted fix-tasks with
+  their open/done status and how many passes each open one is overdue**.
+  This is the ledger-fed input that gives you memory across passes.
 
 You do **not** see any `.tex` source files.
 
@@ -46,6 +54,61 @@ The output should be a continuation of the existing referee.md voice:
 imperative second-person ("watch for...", "demand..."), failure modes
 named with concrete declarations/files, ordered by leverage (heaviest
 first).
+
+## Structured fix-tasks (only when asked for them)
+
+When the user message includes a **`# Structured fix-task request`**
+section, you MUST, AFTER the prose tail, emit a SECOND block: a fenced
+```json``` code block (and nothing else after it) holding a JSON object
+of the form:
+
+```json
+{"tasks": [
+  {"title": "...", "kind": "dedup|deception|naming|doc|structural",
+   "target_decls": ["Fully.Qualified.Name", "..."],
+   "severity": "low|medium|high|critical",
+   "rationale": "one sentence of why this matters"}
+]}
+```
+
+Rules for the task block:
+
+- **Teeth, not prose.** These rows are persisted to the ledger and the
+  scheduler respects them; a `kind: dedup` or `deception` task with
+  blocking force makes the conductor NOT schedule the blocked target
+  until the defect is fixed. Propose only defects you can name by
+  declaration.
+- **Do NOT emit `dedup` tasks for the duplicate groups already listed in
+  the ledger digest** — Python generates those mechanically from audit
+  fingerprints whether or not you mention them. You may add a `dedup`
+  task ONLY for a structural duplicate the fingerprint check could not
+  see (e.g. two decls that are morally the same but not fingerprint-
+  identical). For the mechanical groups, your job is only to set their
+  `severity`/rationale in prose; do not re-file them.
+- **`deception`/`naming`/`doc`/`structural`** tasks are yours: name the
+  decls, set a severity proportional to leverage, keep the rationale to
+  one sentence.
+- Emit `{"tasks": []}` if you have no structured defect to add beyond
+  the mechanical ones — that is a valid, common answer.
+- The JSON block is OPTIONAL output: if the request section is absent,
+  emit only the prose tail and no JSON.
+
+## Self-accountability (when the digest carries your prior tasks)
+
+The ledger digest lists **your own previously-emitted fix-tasks** with
+their status and overdue count. Python has already re-checked each
+against the current ledger/snapshot and marked the resolved ones done
+and escalated the unresolved ones — you do not need to repeat that
+bookkeeping. But you DO own the prose consequence:
+
+- For an open task that is now **N passes overdue**, the prose tail must
+  call it out by name in **Top-leverage open items** with the overdue
+  count ("coordinateCoframe — 12 referee passes overdue"). An item that
+  has survived several passes is, by definition, the heaviest item.
+- For a task the digest shows as **freshly resolved this pass**, move it
+  to **Recent iteration closures** (do not leave it in Top-leverage).
+- Never silently drop an overdue item to keep the line count down —
+  escalation beats pruning for items with an overdue count > 0.
 
 ## Rules
 

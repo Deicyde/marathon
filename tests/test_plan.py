@@ -122,10 +122,12 @@ def test_v2_to_v3_migration_is_additive_and_idempotent(tmp_path):
     _make_real_v2_db(db)
     ledger = Ledger.for_repo(tmp_path)
 
-    # First open upgrades in place to v3.
+    # First open upgrades in place to the CURRENT version (the additive
+    # migration brings a v2 db all the way up — the targets and
+    # referee_tasks tables appear together).
     ledger.init()
     info = ledger.status()
-    assert info["schema_version"] == SCHEMA_VERSION == 3
+    assert info["schema_version"] == SCHEMA_VERSION
     assert "targets" in info["tables"] and "target_deps" in info["tables"]
 
     # The pre-existing v2 row is untouched.
@@ -135,16 +137,19 @@ def test_v2_to_v3_migration_is_additive_and_idempotent(tmp_path):
         ).fetchone()
     assert row == ("verified",)
 
-    # Re-opening is a no-op (still v3, no error).
+    # Re-opening is a no-op (still current version, no error).
     ledger.init()
-    assert ledger.status()["schema_version"] == 3
+    assert ledger.status()["schema_version"] == SCHEMA_VERSION
 
 
-def test_future_version_guard_still_fires_for_v4(tmp_path):
+def test_future_version_guard_still_fires(tmp_path):
     ledger = Ledger.for_repo(tmp_path)
     ledger.init()
     with sqlite3.connect(ledger.db_path) as conn:
-        conn.execute("UPDATE meta SET value = '4' WHERE key = 'schema_version'")
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+            (str(SCHEMA_VERSION + 1),),
+        )
     with pytest.raises(LedgerError):
         ledger.init()
     with pytest.raises(LedgerError):

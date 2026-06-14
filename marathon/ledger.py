@@ -80,19 +80,36 @@ earlier table or row); the migration logic below tolerates an arbitrary
 v<current gap (the version stamp is just bumped after the idempotent
 ``executescript``).
 
-**Mutability distinction (binding).** ``targets`` is the project's first
-MUTABLE table: a target's ``status`` moves ``planned`` →
-``in_progress`` → ``done``/``blocked`` over its life, so
-:meth:`Ledger.set_target_status` issues an in-place ``UPDATE`` and
-:meth:`Ledger.upsert_target` overwrites mutable columns on conflict.
-This is the deliberate opposite of the append-only verdict logs
-(``verdict_events``, ``decl_verdicts``): a human VERDICT is a historical
-fact that is never rewritten (supersede by appending), whereas a target
-is a unit of WORK whose live state is the thing callers query. The two
-models coexist — targets reference verdicts by decl name, never the
-reverse. ``target_deps`` is an immutable edge set (re-deriving a
-target's deps replaces its outgoing edges wholesale; nothing rewrites a
-single edge).
+Schema v4 (Phase 8 — referee with teeth) is again purely **additive**:
+one new table, ``referee_tasks``, the referee's structured fix-task
+emission (plan §2 "Referee with teeth": the advisory standing-items.md
+rewriter gains TEETH — structured rows Python persists and the scheduler
+respects, vs Claude-proposed prose that changes nothing). It is a SECOND
+MUTABLE table (like ``targets``): a referee task's ``status`` moves
+``open`` → ``done`` as its underlying defect resolves, and its
+``severity``/``passes_overdue`` escalate in place across referee passes
+(the coordinateCoframe-survives-twelve-iterations fix — each pass that
+finds the defect still present bumps the count). ``referee_tasks`` is a
+DISTINCT table rather than a ``targets`` row kind because its unit is a
+DEFECT spanning multiple decls (``target_decls`` is a list), not the
+planner's single-decl work unit, and its dedup/escalation lifecycle is
+the referee's, not the conductor's; the two reference each other only by
+decl name. A v3 db upgrades in place on first open (``IF NOT EXISTS``,
+no earlier table touched).
+
+**Mutability distinction (binding).** ``targets`` and ``referee_tasks``
+are the project's MUTABLE tables: a target's ``status`` moves ``planned``
+→ ``in_progress`` → ``done``/``blocked`` over its life (and a referee
+task's ``open`` → ``done``), so :meth:`Ledger.set_target_status` issues
+an in-place ``UPDATE`` and :meth:`Ledger.upsert_target` overwrites
+mutable columns on conflict. This is the deliberate opposite of the
+append-only verdict logs (``verdict_events``, ``decl_verdicts``): a human
+VERDICT is a historical fact that is never rewritten (supersede by
+appending), whereas a target / referee-task is a unit of WORK whose live
+state is the thing callers query. The two models coexist — targets
+reference verdicts by decl name, never the reverse. ``target_deps`` is an
+immutable edge set (re-deriving a target's deps replaces its outgoing
+edges wholesale; nothing rewrites a single edge).
 
 Stdlib only (sqlite3 / json / tomllib), per the project ground rules.
 """
@@ -104,7 +121,7 @@ import re
 import sqlite3
 import tomllib
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Optional
@@ -115,7 +132,7 @@ if TYPE_CHECKING:  # pragma: no cover — type-only; avoids review-package dep
     from marathon.review.config import ReviewConfig
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LEDGER_RELPATH = Path(".marathon") / "marathon.db"
 
 #: Allowed ``targets.kind`` values (the planner's intake taxonomy):
@@ -131,6 +148,22 @@ TARGET_GATE_POLICIES = ("auto", "human")
 
 #: Allowed ``targets.status`` values — the MUTABLE work-state machine.
 TARGET_STATUSES = ("planned", "in_progress", "done", "blocked")
+
+#: Allowed ``referee_tasks.kind`` values (plan §2 "Referee with teeth").
+#: 'dedup' (cross-chapter duplicate decls), 'deception' (a deception tag
+#: to clear), 'naming'/'doc'/'structural' (idiomatic-code defects). dedup
+#: tasks are generated mechanically from audit fingerprints (dedup.py),
+#: not Claude — the rest are Claude-proposed prose annotations.
+REFEREE_TASK_KINDS = ("dedup", "deception", "naming", "doc", "structural")
+
+#: Allowed ``referee_tasks.severity`` values — escalation ladder. The
+#: referee bumps these up (never down) when a task survives a pass.
+REFEREE_TASK_SEVERITIES = ("low", "medium", "high", "critical")
+
+#: Allowed ``referee_tasks.status`` values — the MUTABLE work-state. 'open'
+#: tasks block the conductor (when emitted with a depends_on edge); 'done'
+#: is set by the self-accountability pass when the defect has cleared.
+REFEREE_TASK_STATUSES = ("open", "done")
 
 # How long a writer waits on a locked db before giving up. Generous:
 # the only contention is CLI verdicts racing a daemon's record_iteration,
@@ -152,6 +185,7 @@ TABLES = (
     "decl_verdicts",
     "targets",
     "target_deps",
+    "referee_tasks",
     "chapters",
     "wall_time",
     "prompt_log",
@@ -326,6 +360,45 @@ CREATE TABLE IF NOT EXISTS target_deps (
 
 CREATE INDEX IF NOT EXISTS target_deps_by_dependency
     ON target_deps (depends_on_target_id);
+
+-- v4: the referee's structured fix-task emission (Phase 8 "referee with
+-- teeth"). MUTABLE like `targets`: `status` moves open -> done and
+-- `severity`/`passes_overdue` escalate in place as the self-accountability
+-- pass re-checks each task against the live ledger/snapshot. `dedup_key`
+-- is the IDENTITY of the defect (for dedup tasks: the shared fingerprint;
+-- for others: a kind+decl signature) — UNIQUE so a re-run of the referee
+-- escalates the SAME task in place rather than filing a duplicate every
+-- pass (the bug that let coordinateCoframe accrete twelve advisory notes).
+-- `target_decls` is the JSON list of decls the defect spans (a defect can
+-- cross several decls; the planner's single `lean_decl` can't model that).
+-- `origin` is always 'referee' (the origin flag the conductor reads to
+-- recognize referee-filed work); kept as a column for forward-compat with
+-- other task origins. `blocks_target` names the planner target this task
+-- must land before (NULL = advisory, no scheduling teeth).
+CREATE TABLE IF NOT EXISTS referee_tasks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedup_key     TEXT NOT NULL UNIQUE,
+    origin        TEXT NOT NULL DEFAULT 'referee',
+    kind          TEXT NOT NULL
+                  CHECK (kind IN ('dedup', 'deception', 'naming', 'doc',
+                                  'structural')),
+    title         TEXT NOT NULL,
+    target_decls  TEXT NOT NULL DEFAULT '[]',
+    severity      TEXT NOT NULL DEFAULT 'medium'
+                  CHECK (severity IN ('low', 'medium', 'high', 'critical')),
+    status        TEXT NOT NULL DEFAULT 'open'
+                  CHECK (status IN ('open', 'done')),
+    blocks_target TEXT,
+    rationale     TEXT,
+    passes_seen   INTEGER NOT NULL DEFAULT 1,
+    passes_overdue INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    resolved_at   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS referee_tasks_by_status
+    ON referee_tasks (status, id);
 """
 
 
@@ -333,6 +406,16 @@ def _now_iso() -> str:
     """ISO-8601 UTC timestamp — the targets table's ``created_at``
     default (same shape the audit engine stamps)."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _severity_rank(severity: Optional[str]) -> int:
+    """Ladder index of a referee-task severity (higher = more severe).
+    Unknown/NULL ranks -1 so it never wins a max comparison. Registered as
+    the ``_sev_rank`` SQLite scalar function (see :meth:`Ledger._connect`)."""
+    try:
+        return REFEREE_TASK_SEVERITIES.index(severity)  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        return -1
 
 
 class LedgerError(RuntimeError):
@@ -393,6 +476,36 @@ class Target:
 
 
 @dataclass(frozen=True)
+class RefereeTask:
+    """One row of the MUTABLE ``referee_tasks`` table — a structured
+    fix-task the referee emitted (plan §2 "referee with teeth").
+
+    ``dedup_key`` is the defect's stable identity (the same defect across
+    referee passes carries the same key, so it escalates in place rather
+    than re-filing). ``target_decls`` is the parsed JSON list of decls the
+    defect spans. ``passes_overdue`` counts the consecutive referee passes
+    that found the defect STILL present after first filing — the
+    self-accountability escalation signal. ``id`` is ``None`` for an
+    in-memory task not yet persisted; a stored task always has one."""
+
+    dedup_key: str
+    kind: str  # one of REFEREE_TASK_KINDS
+    title: str
+    target_decls: list[str] = field(default_factory=list)
+    severity: str = "medium"  # one of REFEREE_TASK_SEVERITIES
+    status: str = "open"  # 'open' | 'done'
+    blocks_target: Optional[str] = None
+    rationale: Optional[str] = None
+    origin: str = "referee"
+    passes_seen: int = 1
+    passes_overdue: int = 0
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    resolved_at: Optional[str] = None
+    id: Optional[int] = None
+
+
+@dataclass(frozen=True)
 class Ledger:
     """Handle on one consumer repo's ledger db.
 
@@ -439,6 +552,15 @@ class Ledger:
         # reference targets(id) ON DELETE CASCADE, and the planner relies
         # on that cascade (deleting a target drops its edges).
         conn.execute("PRAGMA foreign_keys=ON")
+        # _sev_rank maps a referee-task severity to its ladder index so the
+        # upsert/escalate SQL can keep the HIGHER severity without a CASE
+        # over every pair. Deterministic, no I/O — registered per-connection
+        # (SQLite scalar functions are connection-scoped). An unknown value
+        # ranks -1 so it never wins (the CHECK constraint already rejects
+        # bad severities on write; this is belt-and-braces).
+        conn.create_function(
+            "_sev_rank", 1, _severity_rank, deterministic=True
+        )
         return conn
 
     @contextmanager
@@ -721,6 +843,153 @@ class Ledger:
             ).fetchall()
         return [(int(a), int(b)) for a, b in rows]
 
+    # --- referee tasks (v4, MUTABLE — upsert-by-dedup-key + escalate) ----
+
+    def upsert_referee_task(self, task: RefereeTask) -> int:
+        """Insert or escalate one referee task, keyed on its
+        ``dedup_key``; returns the row id.
+
+        The referee's idempotent emission surface (the analog of the
+        planner's ``upsert_target``): a re-run of the referee that finds
+        the SAME defect escalates the EXISTING row in place rather than
+        filing a duplicate every pass — the fix for the
+        coordinateCoframe-accretes-twelve-notes bug. On conflict:
+
+        * mutable annotation columns (``title``, ``target_decls``,
+          ``rationale``, ``blocks_target``, ``kind``) take the new value;
+        * ``severity`` takes the HIGHER of old/new (escalation never
+          de-escalates a task within a pass; the dedicated
+          :meth:`escalate_referee_task` bumps it across passes);
+        * ``status`` is NOT clobbered (a re-emit of an already-``done``
+          task must not silently reopen it — resolution is owned by the
+          self-accountability pass via :meth:`resolve_referee_task`);
+        * ``created_at``/``passes_seen``/``passes_overdue`` are preserved
+          (write-once / escalate-only — see escalate/resolve);
+        * ``updated_at`` always refreshes.
+
+        CHECK constraints reject bad kind/severity/status (surfaced as
+        ``sqlite3.IntegrityError``)."""
+        now = task.updated_at or _now_iso()
+        created = task.created_at or now
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO referee_tasks
+                    (dedup_key, origin, kind, title, target_decls, severity,
+                     status, blocks_target, rationale, passes_seen,
+                     passes_overdue, created_at, updated_at, resolved_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dedup_key) DO UPDATE SET
+                    kind          = excluded.kind,
+                    title         = excluded.title,
+                    target_decls  = excluded.target_decls,
+                    -- escalate-only within a single emit: keep the higher
+                    -- severity (the across-pass bump lives in escalate_*).
+                    severity      = CASE
+                        WHEN _sev_rank(excluded.severity)
+                             > _sev_rank(referee_tasks.severity)
+                        THEN excluded.severity
+                        ELSE referee_tasks.severity END,
+                    -- status is owned by the resolve pass; a re-emit never
+                    -- reopens a done task.
+                    status        = referee_tasks.status,
+                    blocks_target = excluded.blocks_target,
+                    rationale     = excluded.rationale,
+                    created_at    = COALESCE(referee_tasks.created_at,
+                                             excluded.created_at),
+                    updated_at    = excluded.updated_at
+                """,
+                (task.dedup_key, task.origin, task.kind, task.title,
+                 json.dumps(list(task.target_decls)), task.severity,
+                 task.status, task.blocks_target, task.rationale,
+                 task.passes_seen, task.passes_overdue, created, now,
+                 task.resolved_at),
+            )
+            row = conn.execute(
+                "SELECT id FROM referee_tasks WHERE dedup_key = ?",
+                (task.dedup_key,),
+            ).fetchone()
+            return int(row[0])
+
+    def escalate_referee_task(
+        self, dedup_key: str, *, severity: Optional[str] = None
+    ) -> bool:
+        """Record that an OPEN task survived another referee pass: bump
+        ``passes_overdue`` by one and, optionally, raise ``severity`` (the
+        self-accountability escalation — "N referee passes overdue").
+        Returns True if a row changed. A done task is never escalated."""
+        now = _now_iso()
+        with self._tx() as conn:
+            if severity is not None:
+                cur = conn.execute(
+                    """
+                    UPDATE referee_tasks
+                    SET passes_overdue = passes_overdue + 1,
+                        passes_seen    = passes_seen + 1,
+                        severity = CASE
+                            WHEN _sev_rank(?) > _sev_rank(severity)
+                            THEN ? ELSE severity END,
+                        updated_at = ?
+                    WHERE dedup_key = ? AND status = 'open'
+                    """,
+                    (severity, severity, now, dedup_key),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE referee_tasks
+                    SET passes_overdue = passes_overdue + 1,
+                        passes_seen    = passes_seen + 1,
+                        updated_at = ?
+                    WHERE dedup_key = ? AND status = 'open'
+                    """,
+                    (now, dedup_key),
+                )
+            return cur.rowcount > 0
+
+    def resolve_referee_task(self, dedup_key: str) -> bool:
+        """Mark an open task ``done`` (the self-accountability pass found
+        its defect cleared: the duplicate is gone / the deception tag
+        cleared / the decl reached its target tier). Stamps
+        ``resolved_at``. Returns True if a row changed. Idempotent: a task
+        already done is a no-op (rowcount 0)."""
+        now = _now_iso()
+        with self._tx() as conn:
+            cur = conn.execute(
+                """
+                UPDATE referee_tasks
+                SET status = 'done', resolved_at = ?, updated_at = ?
+                WHERE dedup_key = ? AND status = 'open'
+                """,
+                (now, now, dedup_key),
+            )
+            return cur.rowcount > 0
+
+    def referee_task(self, dedup_key: str) -> Optional[RefereeTask]:
+        """One referee task by its dedup key, or None."""
+        with self._tx() as conn:
+            row = conn.execute(
+                _REFEREE_TASK_SELECT + " WHERE dedup_key = ?", (dedup_key,)
+            ).fetchone()
+        return _referee_task_from_row(row) if row is not None else None
+
+    def all_referee_tasks(
+        self, *, status: Optional[str] = None
+    ) -> list[RefereeTask]:
+        """Every referee task (optionally filtered by ``status``), ordered
+        by id (emission order)."""
+        with self._tx() as conn:
+            if status is not None:
+                rows = conn.execute(
+                    _REFEREE_TASK_SELECT + " WHERE status = ? ORDER BY id",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    _REFEREE_TASK_SELECT + " ORDER BY id"
+                ).fetchall()
+        return [_referee_task_from_row(r) for r in rows]
+
     # --- introspection ---------------------------------------------------
 
     def status(self) -> dict:
@@ -754,6 +1023,39 @@ _TARGET_SELECT = (
     "SELECT id, name, kind, source_ref, lean_file, lean_decl, "
     "gate_policy, status, created_at, notes FROM targets"
 )
+
+_REFEREE_TASK_SELECT = (
+    "SELECT id, dedup_key, origin, kind, title, target_decls, severity, "
+    "status, blocks_target, rationale, passes_seen, passes_overdue, "
+    "created_at, updated_at, resolved_at FROM referee_tasks"
+)
+
+
+def _referee_task_from_row(row: tuple) -> RefereeTask:
+    (row_id, dedup_key, origin, kind, title, target_decls_json, severity,
+     status, blocks_target, rationale, passes_seen, passes_overdue,
+     created_at, updated_at, resolved_at) = row
+    try:
+        decls = json.loads(target_decls_json) or []
+    except (ValueError, TypeError):
+        decls = []
+    return RefereeTask(
+        id=int(row_id),
+        dedup_key=dedup_key,
+        origin=origin,
+        kind=kind,
+        title=title,
+        target_decls=list(decls),
+        severity=severity,
+        status=status,
+        blocks_target=blocks_target,
+        rationale=rationale,
+        passes_seen=int(passes_seen),
+        passes_overdue=int(passes_overdue),
+        created_at=created_at,
+        updated_at=updated_at,
+        resolved_at=resolved_at,
+    )
 
 
 def _target_from_row(row: tuple) -> Target:

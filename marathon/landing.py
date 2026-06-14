@@ -90,6 +90,15 @@ LANDINGS_RELPATH = Path(".marathon/landing/landings.jsonl")
 # `git status` or leaks into Aristotle bundles.
 BREAKER_FILENAME = "comment-breaker.json"
 
+# Referee-cadence bookkeeping (plan §2 "Referee with teeth": cadence by
+# landings-count, not manual runs). Self-gitignoring runtime state under
+# .marathon/landing/ (same convention as queue/ and bounces/): it records
+# the landings-count at which the referee last fired, so the cadence hook
+# is IDEMPOTENT across conductor ticks/restarts and never re-fires for a
+# count it already handled.
+REFEREE_CADENCE_RELDIR = Path(".marathon/landing")
+REFEREE_CADENCE_FILENAME = "referee-cadence.json"
+
 # Single landing PID lock, beside the daemon/conductor locks.
 LANDING_LOCK_FILENAME = "landing.lock"
 LANDING_WORKTREE_NAME = "next"
@@ -960,3 +969,171 @@ def print_landing_status(
     else:
         print("lock: free")
     return 0
+
+
+# --- referee cadence (plan §2 "Referee with teeth": landings-count) ----------
+#
+# The referee runs on a CADENCE driven by successful-landing count, not
+# manual invocations. ``count_landings`` reads the authoritative
+# landings.jsonl (the same precedence print_landing_status uses: the
+# landing worktree's copy rides marathon/next and is freshest, falling
+# back to the repo checkout). ``maybe_trigger_referee`` fires the referee
+# once per crossed multiple of N, best-effort, and is the ONLY teeth-
+# bearing trigger here — it never blocks or fails a landing/dispatch (a
+# referee hiccup prints a warning and is swallowed). Idempotency lives in
+# a tiny self-gitignored state file so two conductor ticks (or a restart)
+# at the same count never double-fire.
+
+
+def count_landings(repo_dir: Path, worktree_parent: Optional[Path] = None) -> int:
+    """Number of successful landings recorded in landings.jsonl.
+
+    Prefers the landing worktree's tracked copy (it rides marathon/next
+    and is the freshest), falling back to the repo checkout — the same
+    precedence :func:`print_landing_status` uses. Returns 0 when no record
+    exists (a missing/unreadable file is "no landings yet", never an
+    error: the cadence must degrade silently, like the rest of this hook).
+    """
+    repo_dir = Path(repo_dir)
+    parent = (
+        Path(worktree_parent) if worktree_parent
+        else default_landing_parent(repo_dir)
+    ).expanduser()
+    landings_path = parent / LANDING_WORKTREE_NAME / LANDINGS_RELPATH
+    if not landings_path.is_file():
+        landings_path = repo_dir / LANDINGS_RELPATH
+    if not landings_path.is_file():
+        return 0
+    count = 0
+    try:
+        for line in landings_path.read_text().splitlines():
+            if line.strip():
+                count += 1
+    except OSError:
+        return 0
+    return count
+
+
+def referee_cadence_state_path(repo_dir: Path) -> Path:
+    return Path(repo_dir) / REFEREE_CADENCE_RELDIR / REFEREE_CADENCE_FILENAME
+
+
+def _load_cadence_state(repo_dir: Path) -> dict:
+    """``{"last_triggered_count": int}`` or an empty dict. A corrupt/absent
+    file is "never fired" — the cadence re-derives from the live count, so
+    a lost state file at worst re-fires the referee once (harmless: the
+    referee is idempotent on the ledger)."""
+    path = referee_cadence_state_path(repo_dir)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_cadence_state(repo_dir: Path, last_triggered_count: int) -> None:
+    path = referee_cadence_state_path(repo_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Self-gitignore the landing dir's runtime droppings (queue/ and
+    # bounces/ already do this for their own subdirs; the cadence file
+    # lives at the landing-dir root, so ignore it by name rather than a
+    # bare ``*`` that would also hide landings.jsonl — the one TRACKED
+    # file in this directory).
+    gitignore = path.parent / ".gitignore"
+    existing = gitignore.read_text() if gitignore.is_file() else ""
+    if REFEREE_CADENCE_FILENAME not in existing:
+        with gitignore.open("a") as f:
+            f.write(f"{REFEREE_CADENCE_FILENAME}\n")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"last_triggered_count": int(last_triggered_count)}) + "\n")
+    os.replace(tmp, path)
+
+
+def _default_referee_trigger(repo_dir: Path) -> bool:
+    """Default referee trigger: ``marathon referee --emit-tasks`` as a
+    detached-enough subprocess. Returns True on a clean exit. Best-effort
+    — any exec/exit failure is reported by the caller, never raised here.
+
+    A SUBPROCESS (not the library call) so a long referee pass — it bundles
+    the whole repo's Lean files into one Claude call — never blocks the
+    conductor loop's reap/dispatch cadence: the conductor fires it and
+    moves on; the structured fix-tasks it persists are read on a LATER tick
+    (the scheduler-blocking side is decoupled from the emit side by the
+    ledger, exactly the "Claude proposes, Python enforces" split)."""
+    cmd = [
+        sys.executable, "-m", "marathon", "referee",
+        "--repo-dir", str(repo_dir),
+        "--emit-tasks",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:
+        print(f"  referee-cadence: could not exec referee ({e})", flush=True)
+        return False
+    if proc.returncode != 0:
+        err = ((proc.stderr or proc.stdout) or "").strip()[:300]
+        print(
+            f"  referee-cadence: referee --emit-tasks exited "
+            f"{proc.returncode}: {err}",
+            flush=True,
+        )
+        return False
+    return True
+
+
+def maybe_trigger_referee(
+    repo_dir: Path,
+    every: int,
+    *,
+    worktree_parent: Optional[Path] = None,
+    trigger=None,
+) -> bool:
+    """Fire the referee on the landings-count cadence — best-effort, never
+    blocking, idempotent.
+
+    When ``every`` is 0 (the default — preserving today's manual-only
+    referee) this is a no-op. Otherwise it counts successful landings and
+    fires ``trigger`` (default: ``marathon referee --emit-tasks`` via
+    subprocess) once per CROSSED multiple of ``every``: the referee runs
+    when the count's ``// every`` bucket advances past the last one a
+    trigger handled. Crossing several multiples at once (a batch of
+    landings between two ticks) fires exactly ONCE — the latest count is
+    what matters, not each intermediate one.
+
+    Returns True iff the referee was fired this call. A trigger failure
+    (referee exited non-zero / could not exec) returns False and DOES NOT
+    advance the bookkeeping, so the next pass retries — the cadence is a
+    floor on freshness, not a fragile one-shot. Any unexpected error is
+    swallowed with a warning (a referee hiccup must never fail the landing
+    or dispatch path — the binding best-effort rule)."""
+    if every <= 0:
+        return False
+    try:
+        count = count_landings(repo_dir, worktree_parent)
+        if count <= 0:
+            return False
+        state = _load_cadence_state(repo_dir)
+        last = int(state.get("last_triggered_count", 0) or 0)
+        # Fire only when a NEW multiple-of-every boundary has been crossed
+        # since the last successful trigger: the bucket index advanced.
+        if count // every <= last // every:
+            return False
+        fn = trigger or _default_referee_trigger
+        print(
+            f"  referee-cadence: {count} landing(s) reached a multiple of "
+            f"{every}; triggering referee --emit-tasks",
+            flush=True,
+        )
+        ok = bool(fn(repo_dir))
+        if ok:
+            _save_cadence_state(repo_dir, count)
+        else:
+            print(
+                "  referee-cadence: trigger did not succeed; cadence "
+                "bookkeeping not advanced (will retry next pass)",
+                flush=True,
+            )
+        return ok
+    except Exception as e:  # noqa: BLE001 — best-effort; must not fail landing
+        print(f"  warning: referee cadence trigger failed ({type(e).__name__}: {e})")
+        return False
