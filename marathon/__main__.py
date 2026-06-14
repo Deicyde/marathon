@@ -13,6 +13,7 @@ from marathon.skeleton import skeleton_command
 from marathon.fill import add_fill_subparsers
 from marathon.audit.probes import ProbeKind
 from marathon.probes_aristotle import DEFAULT_MAX_PROBES as _VAC_DEFAULT_MAX
+from marathon.extraction import DEFAULT_K, SOURCE_MODES
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -387,13 +388,165 @@ def _build_parser() -> argparse.ArgumentParser:
     # elaborator-grade audit engine (see marathon.audit.engine).
     _add_audit_subparser(subparsers)
 
+    # Plan tree: `marathon plan sorries/axiom/repo` — the Phase-7 planner
+    # intake (see marathon.plan): build target-ledger rows from a repo's
+    # sorries or a named axiom. The `textbook` mode is declared by the
+    # OTHER (extraction) agent on the SAME `plan` parser via the
+    # extension point left in _add_plan_subparser — do not add a
+    # conflicting subparser here.
+    _add_plan_subparser(subparsers)
+
     # Fill tree: `marathon fill` (single decl) and `marathon fill-file`
     # (every sorry in a file). Both wrap `refine_command` with a focus
     # directive so the slash commands can shell out without knowing the
     # focus-directive incantation.
     add_fill_subparsers(subparsers)
 
+    # Plan tree: `marathon plan {sorries,axiom,repo,textbook}` — the
+    # Phase-7 planner intake that fills the target ledger. `textbook`
+    # (firewall-gated extraction) is wired here; the other intake modes
+    # register on the same `plan` parent via `_plan_subparsers()`.
+    _add_plan_textbook_subparser(subparsers)
+
     return parser
+
+
+def _plan_subparsers(subparsers):
+    """Return the `marathon plan` subparsers action — the extension point
+    the OTHER (plan-layer) agent's ``_add_plan_subparser`` creates and
+    leaves ``textbook`` unclaimed on. ``_add_plan_subparser`` runs first in
+    ``_build_parser``, so by the time the textbook registrar calls this the
+    `plan` parent and its ``add_subparsers`` action already exist; we
+    recover the live action from the parser's ``_actions`` (no shared global
+    state — robust to the CLI being rebuilt afresh in every test).
+
+    Falls back to creating the `plan` parent if it is somehow absent (the
+    textbook registrar called in isolation), so this module is self-
+    contained."""
+    existing = subparsers._name_parser_map.get("plan")
+    if existing is not None:
+        for action in existing._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                return action
+    p_plan = subparsers.add_parser(
+        "plan",
+        help=(
+            "Planner intake (Phase 7): build the target ledger from an "
+            "axiom, a repo's sorries, or a textbook."
+        ),
+        description=(
+            "Point marathon at a source and it produces target rows for "
+            "the ledger. `textbook` extracts targets from a source text "
+            "under a firewall-gated mode (copyrighted: human-supplied "
+            "informal statements only, Claude never reads the book; open: "
+            "the autoform chunk -> K-extractor consensus -> merge "
+            "pipeline). Other intake modes (sorries/axiom/repo) attach to "
+            "this same `plan` parent."
+        ),
+    )
+    return p_plan.add_subparsers(dest="plan_command", required=True)
+
+
+def _add_plan_textbook_subparser(subparsers) -> None:
+    """Wire `marathon plan textbook` — firewall-gated textbook extraction
+    (see ``marathon.extraction``). Owns ONLY the `textbook` sub-subcommand;
+    the `plan` parent is shared via `_plan_subparsers`."""
+    sub = _plan_subparsers(subparsers)
+    p_tb = sub.add_parser(
+        "textbook",
+        help="Extract targets from a source text (firewall-gated).",
+        description=(
+            "Build target rows from a textbook. The firewall is per-"
+            "project and mode-gated. `--mode copyrighted` (DEFAULT) NEVER "
+            "lets Claude read the source: targets come from a human-"
+            "authored informal-statements markdown file (one section per "
+            "named result) and/or `--named-result` labels; passing a .tex "
+            "is refused. `--mode open` runs the autoform consensus "
+            "pipeline over an open-licensed `--source` (chunk -> K "
+            "extractor calls -> consensus -> reviewer arbitration -> "
+            "merge dedup). Output targets are flagged with their "
+            "source_mode so downstream knows whether the informal "
+            "statement was human-authored or LLM-extracted."
+        ),
+    )
+    p_tb.add_argument(
+        "--source", type=Path, default=None, metavar="PATH",
+        help=(
+            "Open-mode: path to the open-licensed source text (a file or a "
+            "directory of .md/.tex). Required for --mode open; ignored "
+            "(and refused if a .tex) under --mode copyrighted."
+        ),
+    )
+    p_tb.add_argument(
+        "--mode", choices=SOURCE_MODES, default=None,
+        help=(
+            "Firewall mode override. Default: the per-project `source_mode` "
+            "from .marathon/review/config.toml (absent → the SAFE "
+            "'copyrighted'). copyrighted: human-supplied statements only, "
+            "the book is never read by Claude. open: the autoform "
+            "extraction pipeline reads the source."
+        ),
+    )
+    p_tb.add_argument(
+        "--informal-statements", type=Path, default=None, metavar="FILE",
+        help=(
+            "Copyrighted-mode: human-authored informal-statements markdown "
+            "file (one section per named result). Required for --mode "
+            "copyrighted unless --named-result is given."
+        ),
+    )
+    p_tb.add_argument(
+        "--named-result", action="append", default=None, metavar="LABEL",
+        dest="named_results",
+        help=(
+            "Copyrighted-mode: a named result to seed as a target (repeat "
+            "for several). Alternative/supplement to --informal-statements."
+        ),
+    )
+    p_tb.add_argument(
+        "--normalize", action="store_true",
+        help=(
+            "Copyrighted-mode: run Claude to normalize the human wording "
+            "(the book is never shown — only the human's statement). "
+            "Off by default; the human's verbatim text is used as-is."
+        ),
+    )
+    p_tb.add_argument(
+        "--k", type=int, default=DEFAULT_K, metavar="N",
+        help=(
+            "Open-mode: number of independent extractor calls per chunk "
+            f"(consensus over survivors). Default {DEFAULT_K}."
+        ),
+    )
+    p_tb.add_argument(
+        "--model", default=None,
+        help="Claude model override (else MARATHON_CLAUDE_MODEL / default).",
+    )
+    p_tb.add_argument(
+        "--gate-policy", choices=("auto", "human", "mixed"),
+        default="human", metavar="MODE",
+        help=(
+            "Gate-policy resolution mode for the produced targets (plan §2 "
+            "ruling 6), matching the other `plan` modes. auto: every "
+            "target hands-off. human (default): every target the per-"
+            "declaration ceremony. mixed: milestone-named targets human, "
+            "the rest auto."
+        ),
+    )
+    p_tb.add_argument(
+        "--repo-dir", type=Path, default=None, metavar="PATH",
+        help=(
+            "Consumer repo root (for the firewall config + persisting "
+            "targets). Default: walk up from the current directory."
+        ),
+    )
+    p_tb.add_argument(
+        "--dry-run", action="store_true",
+        help=(
+            "Extract and print the targets without writing the ledger."
+        ),
+    )
+    p_tb.set_defaults(func=_run_plan_textbook)
 
 
 def _add_formalization_subparser(subparsers) -> None:
@@ -1197,6 +1350,155 @@ def _add_audit_subparser(subparsers) -> None:
     p_probe.set_defaults(func=_run_audit_probe)
 
 
+def _add_plan_subparser(subparsers) -> None:
+    """Adds `marathon plan sorries/axiom/repo` — the Phase-7 planner
+    intake (see ``marathon.plan``): point marathon at a repo's sorries or
+    a named axiom and it builds target-ledger rows (the per-statement work
+    model that ``order.txt``'s chapter granularity could never give).
+
+    EXTENSION POINT (do not collide): the `plan` PARENT parser is shared
+    via :func:`_plan_subparsers` (the idempotent coordination point the
+    extraction agent's `textbook` mode also uses) — this builder owns ONLY
+    the firewall-safe non-textbook sub-subcommands (sorries / axiom /
+    repo) and never recreates the parent. Registration order between this
+    and `_add_plan_textbook_subparser` is therefore irrelevant: whichever
+    runs first creates the parent, the other reuses it. The dispatcher in
+    ``main`` routes every `plan ...` subcommand through the subparser's
+    ``set_defaults(func=…)`` handler."""
+    sub = _plan_subparsers(subparsers)
+
+    def _add_common(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--repo-dir", type=Path, default=None, metavar="PATH",
+            help=(
+                "Consumer repo root (must be a git repo for the "
+                "gitignore filter). Default: walk up from the current "
+                "directory."
+            ),
+        )
+        p.add_argument(
+            "--gate-policy", choices=("auto", "human", "mixed"),
+            default="human", metavar="MODE",
+            help=(
+                "Gate-policy resolution mode (plan §2 ruling 6). auto: "
+                "every target hands-off. human (default): every target "
+                "the per-declaration ceremony. mixed: milestone-named "
+                "targets (Stokes-critical) human, the rest auto."
+            ),
+        )
+        p.add_argument(
+            "--dry-run", action="store_true",
+            help="Print the target table and exit WITHOUT writing the ledger.",
+        )
+
+    p_sorries = sub.add_parser(
+        "sorries",
+        help="One target per sorry-bodied decl under a folder (or the repo).",
+    )
+    p_sorries.add_argument(
+        "--target", type=Path, default=None, metavar="FOLDER",
+        help=(
+            "Folder of .lean files to scan, relative to --repo-dir (a "
+            "single .lean file works too). Default: the whole "
+            "gitignore-filtered repo (same as `plan repo`)."
+        ),
+    )
+    _add_common(p_sorries)
+    p_sorries.set_defaults(func=_run_plan_sorries)
+
+    p_repo = sub.add_parser(
+        "repo",
+        help="Every sorry across the gitignore-filtered repo.",
+    )
+    _add_common(p_repo)
+    p_repo.set_defaults(func=_run_plan_repo)
+
+    p_axiom = sub.add_parser(
+        "axiom",
+        help="A single target for a named axiom/decl to discharge.",
+    )
+    p_axiom.add_argument(
+        "axiom_name", metavar="NAME",
+        help="Fully-qualified axiom/declaration name to discharge.",
+    )
+    _add_common(p_axiom)
+    p_axiom.set_defaults(func=_run_plan_axiom)
+
+
+def _plan_repo_dir(args) -> Path:
+    from marathon.review.config import find_repo_dir
+
+    return args.repo_dir.resolve() if args.repo_dir else find_repo_dir()
+
+
+def _emit_plan(plan, repo_dir: Path, *, dry_run: bool) -> None:
+    """Print the target table + summary, and (unless dry-run) commit the
+    plan to the ledger. Shared by every `plan` subcommand."""
+    from marathon.ledger import Ledger
+    from marathon.plan import source_mode
+
+    targets = plan.targets
+    if not targets:
+        print("no targets found")
+        return
+    name_w = max(len(t.name) for t in targets)
+    kind_w = max(len(t.kind) for t in targets)
+    print(f"{len(targets)} target(s) [firewall source_mode="
+          f"{source_mode(repo_dir)}]:")
+    # Count how many targets have at least one outgoing dep edge.
+    with_deps = {src for src, _ in plan.edges}
+    for t in sorted(targets, key=lambda t: t.name):
+        dep_mark = " *" if t.name in with_deps else ""
+        ref = t.source_ref or "-"
+        print(
+            f"  {t.name:<{name_w}}  {t.kind:<{kind_w}}  "
+            f"{t.gate_policy:<5}  {ref}{dep_mark}"
+        )
+    breakdown = plan.gate_breakdown()
+    print(
+        f"summary: {len(targets)} target(s), {len(plan.edges)} dep edge(s) "
+        f"across {len(with_deps)} target(s); gate_policy "
+        + ", ".join(f"{k}={v}" for k, v in breakdown.items() if v)
+    )
+    if dry_run:
+        print("dry run — nothing written. Re-run without --dry-run to "
+              "write these target rows to the ledger.")
+        return
+    written = plan.commit(Ledger.for_repo(repo_dir))
+    print(
+        f"wrote {written['targets']} target(s) and {written['edges']} dep "
+        f"edge(s) to {Ledger.for_repo(repo_dir).db_path}"
+    )
+
+
+def _run_plan_sorries(args) -> None:
+    from marathon.plan import plan_from_sorries
+
+    repo_dir = _plan_repo_dir(args)
+    plan = plan_from_sorries(
+        repo_dir, args.target, gate_mode=args.gate_policy
+    )
+    _emit_plan(plan, repo_dir, dry_run=args.dry_run)
+
+
+def _run_plan_repo(args) -> None:
+    from marathon.plan import plan_from_repo
+
+    repo_dir = _plan_repo_dir(args)
+    plan = plan_from_repo(repo_dir, gate_mode=args.gate_policy)
+    _emit_plan(plan, repo_dir, dry_run=args.dry_run)
+
+
+def _run_plan_axiom(args) -> None:
+    from marathon.plan import plan_from_axiom
+
+    repo_dir = _plan_repo_dir(args)
+    plan = plan_from_axiom(
+        repo_dir, args.axiom_name, gate_mode=args.gate_policy
+    )
+    _emit_plan(plan, repo_dir, dry_run=args.dry_run)
+
+
 def _run_audit_run(args) -> None:
     from marathon.audit.engine import run_audit, save_snapshot
     from marathon.gate import AXIOM_WHITELIST, SORRY_AXIOM
@@ -1901,6 +2203,98 @@ def _run_ledger_status(args) -> None:
         print(f"  {table}: {count} row(s)")
 
 
+def _run_plan_textbook(args) -> None:
+    """`marathon plan textbook` — firewall-gated textbook extraction.
+
+    Produces Target-shaped dicts via ``marathon.extraction.extract_targets``,
+    maps them onto the plan layer's ``Target`` rows, and reuses the plan
+    layer's ``Plan.from_targets`` + ``_emit_plan`` (so the table print,
+    summary, `--dry-run`, and ledger commit are identical to the other
+    `plan` modes).
+
+    The firewall mode defaults to the PER-PROJECT ``source_mode`` config
+    (the binding "firewall policy becomes per-project config" ruling), and
+    is overridable with ``--mode``.
+    """
+    from marathon.extraction import ExtractionError, extract_targets
+    from marathon.plan import Plan, resolve_gate_policy, source_mode
+
+    repo_dir = _plan_repo_dir(args)
+
+    # Mode: explicit --mode wins; else the per-project firewall config
+    # (absent → the SAFE 'copyrighted').
+    mode = args.mode or source_mode(repo_dir)
+
+    try:
+        target_dicts = extract_targets(
+            args.source,
+            mode=mode,
+            k=args.k,
+            model=args.model,
+            informal_statements=args.informal_statements,
+            named_results=args.named_results,
+            normalize=args.normalize,
+        )
+    except ExtractionError as e:
+        raise SystemExit(str(e))
+
+    targets = [
+        _textbook_dict_to_target(d, gate_mode=args.gate_policy, resolver=resolve_gate_policy)
+        for d in target_dicts
+    ]
+    print(f"firewall mode: {mode}")
+    # Textbook intake derives no dependency edges (the statement cone is the
+    # audit engine's domain, not the extractor's) — targets only.
+    plan = Plan.from_targets(targets)
+    _emit_plan(plan, repo_dir, dry_run=args.dry_run)
+
+
+# Map an extractor kind (theorem/lemma/definition/...) onto a ledger
+# TARGET_KIND. Anything statement-shaped that isn't already a def collapses
+# to the generic 'statement' kind (the ledger kind reserved for textbook-
+# extracted targets); definitions map to 'def'.
+_EXTRACT_KIND_TO_TARGET_KIND = {
+    "theorem": "theorem",
+    "lemma": "theorem",
+    "proposition": "theorem",
+    "corollary": "theorem",
+    "claim": "theorem",
+    "conjecture": "theorem",
+    "definition": "def",
+    "construction": "def",
+    "axiom": "axiom",
+}
+
+
+def _textbook_dict_to_target(d: dict, *, gate_mode: str, resolver):
+    """Map one extraction dict onto a plan-layer ``Target``.
+
+    The single named seam between the extraction module's documented dict
+    interface (``{name, kind, source_ref, statement, source_mode}``) and the
+    plan layer's ``Target`` row. The informal statement goes into ``notes``;
+    the firewall ``source_mode`` is appended to ``source_ref`` so the honesty
+    marker (human-authored vs LLM-extracted) survives into the ledger."""
+    from marathon.ledger import Target
+
+    name = d["name"]
+    kind = _EXTRACT_KIND_TO_TARGET_KIND.get(d.get("kind", ""), "statement")
+    src = d.get("source_ref") or None
+    source_mode_flag = d.get("source_mode", "")
+    if src and source_mode_flag:
+        src = f"{src} [source_mode={source_mode_flag}]"
+    elif source_mode_flag:
+        src = f"[source_mode={source_mode_flag}]"
+    return Target(
+        name=name,
+        kind=kind,
+        source_ref=src,
+        gate_policy=resolver(
+            gate_mode=gate_mode, decl=name, source_ref=d.get("source_ref")
+        ),
+        notes=d.get("statement") or None,
+    )
+
+
 def _run_formalization_init(args) -> None:
     from marathon.formalization import (
         FORMALIZATION_FILENAME, update_formalization,
@@ -2237,6 +2631,21 @@ def main() -> None:
         # subprocess dies with us on Ctrl-C.
         try:
             args.func(args)
+        except KeyboardInterrupt:
+            print("\ninterrupted", file=sys.stderr)
+            sys.exit(130)
+    elif args.command == "plan":
+        # Dispatch via the subparser's set_defaults(func=…) handler. The
+        # non-textbook modes (sorries/axiom/repo) are pure Python; the
+        # textbook mode (owned by the extraction agent) manages its own
+        # asyncio internally but may also register an async func — handle
+        # both. A Ctrl-C is safe everywhere here (the sorry/axiom planner
+        # holds no durable state until commit; `plan textbook`'s K Claude
+        # calls hold none until persist).
+        try:
+            result = args.func(args)
+            if asyncio.iscoroutine(result):
+                asyncio.run(result)
         except KeyboardInterrupt:
             print("\ninterrupted", file=sys.stderr)
             sys.exit(130)

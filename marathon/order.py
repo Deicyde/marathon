@@ -13,6 +13,10 @@ from the continuation block. Blank lines and ``#`` comments are ignored
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover — type-only; avoids an import cycle
+    from marathon.ledger import Target
 
 
 @dataclass(frozen=True)
@@ -93,3 +97,50 @@ def parse_order_file(path: Path) -> list[OrderEntry]:
 
     finalize()
     return entries
+
+
+def import_order_as_targets(order_path: Path) -> list["Target"]:
+    """Phase-7 legacy importer: map an existing ``order.txt`` into coarse
+    ledger targets, so order.txt-driven projects migrate into the targets
+    ledger (plan §3 Phase 7: ``order.txt`` is *demoted* to a legacy
+    importer, NOT deleted).
+
+    This is a SEPARATE, additive entry point — :func:`parse_order_file`
+    and every existing caller of it are UNCHANGED. One ``kind='statement'``
+    target per chapter (the chapter is the coarsest unit ``order.txt``
+    expresses; the per-statement sorry/axiom intake modes in
+    ``marathon.plan`` produce the fine-grained targets). Mapping:
+
+    * ``name`` = ``order:<output_folder>`` (unique per chapter, since the
+      parser already rejects duplicate output folders);
+    * ``kind`` = ``'statement'`` (a coarse book-chapter unit, not a single
+      Lean decl);
+    * ``source_ref`` = the chapter's input ``.tex`` filename (the human
+      origin), so the firewall is respected — this records the *citation*,
+      never the file's contents;
+    * ``lean_file`` = the output folder (where the chapter's Lean lands);
+    * ``notes`` = the chapter's free-form per-chapter instructions, so the
+      operator-curated targets survive the migration;
+    * ``gate_policy`` defaults to the Target default ('human') — coarse
+      chapter targets are a human-review unit until the per-statement
+      planner refines them.
+
+    Edges are NOT derived here: ``order.txt``'s top-to-bottom order is a
+    submission order, not a semantic dependency DAG (the plan keeps that
+    distinction — real dep edges come from kernel cones, not file order).
+    """
+    from marathon.ledger import Target
+
+    targets: list["Target"] = []
+    for entry in parse_order_file(order_path):
+        targets.append(
+            Target(
+                name=f"order:{entry.output_folder}",
+                kind="statement",
+                source_ref=entry.input_file,
+                lean_file=entry.output_folder,
+                lean_decl=None,
+                notes=entry.instructions or None,
+            )
+        )
+    return targets

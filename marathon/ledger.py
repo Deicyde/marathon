@@ -71,6 +71,29 @@ A v1 db upgrades in place on first open (the new DDL is ``IF NOT
 EXISTS`` and v1 rows are untouched); the future-version guard keeps
 its v1 semantics for v3+ dbs.
 
+Schema v3 (Phase 7 — planner intake) is again purely **additive**: two
+new tables, ``targets`` and ``target_deps``, the planner's per-statement
+work ledger (plan §2 ruling 6 "one machinery, two modes": every target
+carries a ``gate_policy`` of ``auto`` or ``human``). A v2 db upgrades in
+place on first open (the new DDL is ``IF NOT EXISTS`` and touches no
+earlier table or row); the migration logic below tolerates an arbitrary
+v<current gap (the version stamp is just bumped after the idempotent
+``executescript``).
+
+**Mutability distinction (binding).** ``targets`` is the project's first
+MUTABLE table: a target's ``status`` moves ``planned`` →
+``in_progress`` → ``done``/``blocked`` over its life, so
+:meth:`Ledger.set_target_status` issues an in-place ``UPDATE`` and
+:meth:`Ledger.upsert_target` overwrites mutable columns on conflict.
+This is the deliberate opposite of the append-only verdict logs
+(``verdict_events``, ``decl_verdicts``): a human VERDICT is a historical
+fact that is never rewritten (supersede by appending), whereas a target
+is a unit of WORK whose live state is the thing callers query. The two
+models coexist — targets reference verdicts by decl name, never the
+reverse. ``target_deps`` is an immutable edge set (re-deriving a
+target's deps replaces its outgoing edges wholesale; nothing rewrites a
+single edge).
+
 Stdlib only (sqlite3 / json / tomllib), per the project ground rules.
 """
 
@@ -82,6 +105,7 @@ import sqlite3
 import tomllib
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Optional
 
@@ -91,8 +115,22 @@ if TYPE_CHECKING:  # pragma: no cover — type-only; avoids review-package dep
     from marathon.review.config import ReviewConfig
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEDGER_RELPATH = Path(".marathon") / "marathon.db"
+
+#: Allowed ``targets.kind`` values (the planner's intake taxonomy):
+#: 'sorry' (a sorry-bodied declaration to discharge), 'axiom' (a named
+#: axiom/decl to discharge), 'theorem'/'def'/'statement' (textbook-extracted
+#: targets, filled by the OTHER agent's extraction path).
+TARGET_KINDS = ("theorem", "def", "axiom", "sorry", "statement")
+
+#: Allowed ``targets.gate_policy`` values (plan §2 ruling 6). Note 'mixed'
+#: is a CLI-time *resolution mode*, not a stored value — it resolves to a
+#: per-target choice of 'auto' or 'human' (see marathon.plan).
+TARGET_GATE_POLICIES = ("auto", "human")
+
+#: Allowed ``targets.status`` values — the MUTABLE work-state machine.
+TARGET_STATUSES = ("planned", "in_progress", "done", "blocked")
 
 # How long a writer waits on a locked db before giving up. Generous:
 # the only contention is CLI verdicts racing a daemon's record_iteration,
@@ -112,6 +150,8 @@ TABLES = (
     "issues",
     "verdict_events",
     "decl_verdicts",
+    "targets",
+    "target_deps",
     "chapters",
     "wall_time",
     "prompt_log",
@@ -241,7 +281,58 @@ BEFORE DELETE ON decl_verdicts
 BEGIN
     SELECT RAISE(ABORT, 'decl_verdicts is append-only');
 END;
+
+-- v3: the planner's per-statement work ledger (Phase 7 intake). UNLIKE
+-- the append-only verdict logs above, `targets` is MUTABLE: `status`
+-- moves planned -> in_progress -> done/blocked in place. No triggers
+-- here — mutation is the point (see module docstring). `name` is unique
+-- so re-planning a repo upserts existing rows instead of duplicating
+-- (the planner is idempotent the same way import_all is). source_ref is
+-- the human-meaningful origin: "file.lean:42" for sorries, an axiom
+-- name, or a book citation for textbook targets.
+CREATE TABLE IF NOT EXISTS targets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL
+                CHECK (kind IN ('theorem', 'def', 'axiom', 'sorry',
+                                'statement')),
+    source_ref  TEXT,
+    lean_file   TEXT,
+    lean_decl   TEXT,
+    gate_policy TEXT NOT NULL DEFAULT 'human'
+                CHECK (gate_policy IN ('auto', 'human')),
+    status      TEXT NOT NULL DEFAULT 'planned'
+                CHECK (status IN ('planned', 'in_progress', 'done',
+                                  'blocked')),
+    created_at  TEXT NOT NULL,
+    notes       TEXT
+);
+
+-- v3: dependency edges between targets (the DAG the conductor will
+-- schedule against). A row says target_id depends on (must land after)
+-- depends_on_target_id. Both FKs cascade-delete so removing a target
+-- removes its edges; the PK makes a re-derived edge an idempotent
+-- no-op. The CHECK forbids self-loops. This edge set is IMMUTABLE per
+-- edge (re-deriving deps replaces a target's outgoing edges wholesale
+-- via replace_target_deps; nothing rewrites one edge in place).
+CREATE TABLE IF NOT EXISTS target_deps (
+    target_id            INTEGER NOT NULL
+                         REFERENCES targets(id) ON DELETE CASCADE,
+    depends_on_target_id INTEGER NOT NULL
+                         REFERENCES targets(id) ON DELETE CASCADE,
+    PRIMARY KEY (target_id, depends_on_target_id),
+    CHECK (target_id <> depends_on_target_id)
+);
+
+CREATE INDEX IF NOT EXISTS target_deps_by_dependency
+    ON target_deps (depends_on_target_id);
 """
+
+
+def _now_iso() -> str:
+    """ISO-8601 UTC timestamp — the targets table's ``created_at``
+    default (same shape the audit engine stamps)."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 class LedgerError(RuntimeError):
@@ -272,6 +363,33 @@ class DeclVerdictEvent:
     ts: str
     source: str  # 'cli' | 'backfill' | 'repin' | 'sync'
     notes: Optional[str]
+
+
+@dataclass(frozen=True)
+class Target:
+    """One row of the MUTABLE ``targets`` table (the planner's work unit).
+
+    A ``Target`` is the planner's per-statement unit of work, the v2-plan
+    answer to "is theorem X done?" that ``order.txt``'s chapter granularity
+    could never give. ``id`` is ``None`` for a target that hasn't been
+    written yet (the planner builds these in memory for a ``--dry-run``,
+    then upserts the ones it keeps); a persisted target always has an id.
+
+    Unlike :class:`DeclVerdictEvent` (an immutable historical fact), a
+    target's ``status`` is LIVE and mutable — see the module docstring's
+    mutability distinction.
+    """
+
+    name: str
+    kind: str  # one of TARGET_KINDS
+    source_ref: Optional[str] = None
+    lean_file: Optional[str] = None
+    lean_decl: Optional[str] = None
+    gate_policy: str = "human"  # 'auto' | 'human'
+    status: str = "planned"  # 'planned' | 'in_progress' | 'done' | 'blocked'
+    created_at: Optional[str] = None
+    notes: Optional[str] = None
+    id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -316,6 +434,11 @@ class Ledger:
         # immediately.
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        # FK enforcement is OFF by default in SQLite and is per-connection,
+        # so it must be set on every connection — the v3 target_deps edges
+        # reference targets(id) ON DELETE CASCADE, and the planner relies
+        # on that cascade (deleting a target drops its edges).
+        conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
     @contextmanager
@@ -477,6 +600,127 @@ class Ledger:
             out.setdefault(event.decl_name, []).append(event)
         return out
 
+    # --- targets (v3, MUTABLE — upsert + in-place status update) --------
+
+    def upsert_target(self, target: Target) -> int:
+        """Insert or update one target by its unique ``name``; returns the
+        row id.
+
+        Idempotent re-planning surface (the planner's analog of
+        ``import_all``'s keyed upserts): re-running the planner over a repo
+        overwrites a target's mutable columns in place rather than
+        duplicating it. ``created_at`` is write-once (the first plan's
+        timestamp survives re-plans, COALESCEd from the existing row);
+        ``status`` is NOT clobbered on conflict — once work has moved a
+        target to in_progress/done, a re-plan must not silently reset it to
+        planned, so the existing status wins (set it explicitly via
+        :meth:`set_target_status`). The other columns take the new value.
+
+        CHECK constraints reject bad kind/gate_policy/status (surfaced as
+        ``sqlite3.IntegrityError``)."""
+        created = target.created_at or _now_iso()
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO targets
+                    (name, kind, source_ref, lean_file, lean_decl,
+                     gate_policy, status, created_at, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    kind        = excluded.kind,
+                    source_ref  = excluded.source_ref,
+                    lean_file   = excluded.lean_file,
+                    lean_decl   = excluded.lean_decl,
+                    gate_policy = excluded.gate_policy,
+                    -- status is the live work-state: a re-plan never
+                    -- resets it (keep what the conductor/operator set).
+                    status      = targets.status,
+                    -- created_at is write-once: earliest plan wins.
+                    created_at  = COALESCE(targets.created_at,
+                                           excluded.created_at),
+                    notes       = excluded.notes
+                """,
+                (target.name, target.kind, target.source_ref,
+                 target.lean_file, target.lean_decl, target.gate_policy,
+                 target.status, created, target.notes),
+            )
+            # An ON CONFLICT UPDATE leaves lastrowid stale, so resolve the
+            # id by the unique name either way (insert or update).
+            row = conn.execute(
+                "SELECT id FROM targets WHERE name = ?", (target.name,)
+            ).fetchone()
+            return int(row[0])
+
+    def set_target_status(self, name: str, status: str) -> bool:
+        """Move a target's LIVE status in place (the mutable-table write
+        the verdict logs deliberately forbid). Returns True if a row
+        changed. ``status`` must be one of :data:`TARGET_STATUSES` (the
+        CHECK constraint enforces it)."""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE targets SET status = ? WHERE name = ?",
+                (status, name),
+            )
+            return cur.rowcount > 0
+
+    def get_target(self, name: str) -> Optional[Target]:
+        """One target by unique name, or None."""
+        with self._tx() as conn:
+            row = conn.execute(
+                _TARGET_SELECT + " WHERE name = ?", (name,)
+            ).fetchone()
+        return _target_from_row(row) if row is not None else None
+
+    def all_targets(self) -> list[Target]:
+        """Every target, ordered by id (creation order)."""
+        with self._tx() as conn:
+            rows = conn.execute(
+                _TARGET_SELECT + " ORDER BY id"
+            ).fetchall()
+        return [_target_from_row(r) for r in rows]
+
+    def replace_target_deps(
+        self, target_id: int, depends_on_ids: list[int]
+    ) -> int:
+        """Set a target's outgoing dependency edges to exactly
+        ``depends_on_ids`` (wholesale replace, not per-edge merge — the
+        immutable-edge-set semantics). Self-edges and duplicates are
+        dropped silently. Returns the number of edges written.
+
+        Idempotent: re-deriving the same deps (the planner re-running)
+        produces the same edge set. One transaction so a partial
+        re-derivation never leaves a half-updated edge set."""
+        wanted = sorted({d for d in depends_on_ids if d != target_id})
+        with self._tx() as conn:
+            conn.execute(
+                "DELETE FROM target_deps WHERE target_id = ?", (target_id,)
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO target_deps "
+                "(target_id, depends_on_target_id) VALUES (?, ?)",
+                [(target_id, dep) for dep in wanted],
+            )
+            return len(wanted)
+
+    def target_deps(self, target_id: int) -> list[int]:
+        """The ids this target depends on (its outgoing edges), sorted."""
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT depends_on_target_id FROM target_deps "
+                "WHERE target_id = ? ORDER BY depends_on_target_id",
+                (target_id,),
+            ).fetchall()
+        return [int(r[0]) for r in rows]
+
+    def all_target_deps(self) -> list[tuple[int, int]]:
+        """Every ``(target_id, depends_on_target_id)`` edge, sorted."""
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT target_id, depends_on_target_id FROM target_deps "
+                "ORDER BY target_id, depends_on_target_id"
+            ).fetchall()
+        return [(int(a), int(b)) for a, b in rows]
+
     # --- introspection ---------------------------------------------------
 
     def status(self) -> dict:
@@ -505,6 +749,28 @@ _DECL_VERDICT_SELECT = (
     "SELECT id, decl_name, tier_claimed, verdict, fingerprint_type, "
     "cone_json, toolchain, issue_num, ts, source, notes FROM decl_verdicts"
 )
+
+_TARGET_SELECT = (
+    "SELECT id, name, kind, source_ref, lean_file, lean_decl, "
+    "gate_policy, status, created_at, notes FROM targets"
+)
+
+
+def _target_from_row(row: tuple) -> Target:
+    (row_id, name, kind, source_ref, lean_file, lean_decl,
+     gate_policy, status, created_at, notes) = row
+    return Target(
+        id=int(row_id),
+        name=name,
+        kind=kind,
+        source_ref=source_ref,
+        lean_file=lean_file,
+        lean_decl=lean_decl,
+        gate_policy=gate_policy,
+        status=status,
+        created_at=created_at,
+        notes=notes,
+    )
 
 
 def _decl_verdict_from_row(row: tuple) -> DeclVerdictEvent:
@@ -543,11 +809,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     ).fetchone()
     found = int(row[0])
     if found < SCHEMA_VERSION:
-        # In-place additive migration (v1 -> v2: the decl_verdicts DDL
-        # above is IF NOT EXISTS and touches no v1 table or row, so the
-        # executescript already brought the db up to date — only the
-        # version stamp remains). Idempotent: a re-opened v2 db takes
-        # neither branch.
+        # In-place additive migration (v1 -> v2 added decl_verdicts;
+        # v2 -> v3 adds targets/target_deps). Every DDL above is IF NOT
+        # EXISTS and touches no earlier table or row, so the executescript
+        # already brought the db up to date — only the version stamp
+        # remains, and a single bump covers any v<current gap. Idempotent:
+        # a re-opened current-version db takes neither branch.
         conn.execute(
             "UPDATE meta SET value = ? WHERE key = 'schema_version'",
             (str(SCHEMA_VERSION),),
