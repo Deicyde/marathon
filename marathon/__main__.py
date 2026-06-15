@@ -441,6 +441,13 @@ def _build_parser() -> argparse.ArgumentParser:
     # conflicting subparser here.
     _add_plan_subparser(subparsers)
 
+    # Deck tree: `marathon deck` — the Phase-8 human review surface (the
+    # local "Code Tinder" web app; see marathon.deck). Ready cards in,
+    # verify/reject/defer out, status pane streaming conductor/landing
+    # events. verify/reject route through the committed review verdict
+    # path (ledger + GitHub + tracker + daemon/conductor).
+    _add_deck_subparser(subparsers)
+
     # Fill tree: `marathon fill` (single decl) and `marathon fill-file`
     # (every sorry in a file). Both wrap `refine_command` with a focus
     # directive so the slash commands can shell out without knowing the
@@ -902,6 +909,72 @@ def _run_conductor_run(args) -> None:
         worktree_parent=args.worktree_parent,
         land=args.land,
         referee_every=args.referee_every,
+    )
+    if rc:
+        raise SystemExit(rc)
+
+
+def _add_deck_subparser(subparsers) -> None:
+    """Adds `marathon deck` — the Phase-8 deck (see ``marathon.deck``):
+    the local-web-app "Code Tinder" review surface. Serves ready cards
+    (green SHA, gated, dep-ordered), routes verify/reject/defer through
+    the committed review verdict path, and streams conductor/landing
+    events to a live status pane.
+
+    SAFETY: the server binds 127.0.0.1 ONLY and requires a per-session
+    token on the irreversible POST /api/verdict; verify/reject fire only
+    on a deliberate swipe, never on page load."""
+    p_deck = subparsers.add_parser(
+        "deck",
+        help=(
+            "Local 'Code Tinder' review surface (Phase 8): a 127.0.0.1 "
+            "web app serving ready spec cards; v/r/defer/deep-dive."
+        ),
+        description=(
+            "Start the deck: a local web app (bound to 127.0.0.1 only) "
+            "that serves dependency-ordered, ready-only spec cards and "
+            "lets you verify / reject / defer them with a live "
+            "conductor/landing status pane. verify and reject are REAL, "
+            "IRREVERSIBLE actions routed through the same review verdict "
+            "logic as `marathon review verify/reject` (verify merges the "
+            "marathon PR + flips the tracker; reject dispatches Aristotle "
+            "with your note verbatim). They fire ONLY on a deliberate, "
+            "token-bearing swipe — never on page load or navigation. "
+            "Reads the chapter registry + audit snapshot + ledger from "
+            "the consumer repo (run from inside it)."
+        ),
+    )
+    p_deck.add_argument(
+        "--chapter", type=int, default=None, metavar="N",
+        help=(
+            "Default chapter to scope the queue to (the UI can still "
+            "switch). Default: all registered chapters."
+        ),
+    )
+    p_deck.add_argument(
+        "--port", type=int, default=0, metavar="PORT",
+        help=(
+            "Port to bind on 127.0.0.1. Default: 0 = an OS-assigned "
+            "ephemeral port (the chosen URL is printed)."
+        ),
+    )
+    p_deck.add_argument(
+        "--no-open", action="store_true",
+        help="Do not open a browser automatically (just print the URL).",
+    )
+    p_deck.set_defaults(func=_run_deck)
+
+
+def _run_deck(args) -> None:
+    from marathon.deck.server import serve
+    from marathon.review.config import load_config
+
+    cfg = load_config()
+    rc = serve(
+        cfg,
+        port=args.port,
+        default_chapter=args.chapter,
+        open_browser=not args.no_open,
     )
     if rc:
         raise SystemExit(rc)
@@ -2710,6 +2783,16 @@ def main() -> None:
             result = args.func(args)
             if asyncio.iscoroutine(result):
                 asyncio.run(result)
+        except KeyboardInterrupt:
+            print("\ninterrupted", file=sys.stderr)
+            sys.exit(130)
+    elif args.command == "deck":
+        # Dispatch via the subparser's set_defaults(func=…) handler. The
+        # deck's `serve` blocks in serve_forever and handles its own
+        # KeyboardInterrupt (clean shutdown + server_close); a bare Ctrl-C
+        # here is the fallback.
+        try:
+            args.func(args)
         except KeyboardInterrupt:
             print("\ninterrupted", file=sys.stderr)
             sys.exit(130)

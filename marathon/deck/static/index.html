@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>marathon deck — Code Tinder</title>
+
+  <!--
+    Session token injection hook. The backend (marathon/deck/server.py) renders
+    index.html and replaces the placeholder below with the per-session
+    CSRF-style token before serving. The browser reads it from this meta tag
+    (and the bootstrap global) and echoes it on every POST /api/verdict so a
+    stray/other-origin tab cannot fire an irreversible verdict.
+
+    SECURITY: this is the ONLY secret on the page. There must be no other
+    inline credential, no API key, no GitHub token. The token is per-session
+    and only authorizes verdicts back to the same 127.0.0.1 server that issued
+    it. tests/test_deck_frontend.py asserts this is the only inline secret.
+  -->
+  <meta name="marathon-session-token" content="__MARATHON_SESSION_TOKEN__" />
+
+  <!--
+    KaTeX from CDN for informal-statement math. local-first: if this fails to
+    load (offline / no CDN), app.js detects the absence of window.katex and
+    degrades to the raw LaTeX shown in a styled code span — never a blank.
+    The stylesheet + script are best-effort; the page is fully functional
+    without them.
+  -->
+  <link
+    rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"
+    integrity="sha384-n8MVd4RsNIU0tAv4ct0nTaAbDJwPJzDEaqSD1odI+WdtXRGWt2kTvGFasHpSy3SV"
+    crossorigin="anonymous"
+    onerror="window.__KATEX_CSS_FAILED=true" />
+  <script
+    defer
+    src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"
+    integrity="sha384-XjKyOOlGwcjNTAIQHIpgOno0Hl1YQqzUOEleOLALmuqehneUG+vnGctmUb0ZY0l8"
+    crossorigin="anonymous"
+    onerror="window.__KATEX_JS_FAILED=true"></script>
+
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1 class="brand">marathon <span class="brand-accent">deck</span></h1>
+    <div class="chapter-picker">
+      <label for="chapter-select">chapter</label>
+      <select id="chapter-select" aria-label="Chapter filter">
+        <option value="">all</option>
+      </select>
+    </div>
+    <div id="status-strip" class="status-strip" role="status" aria-live="polite">
+      <span id="status-building">— building</span>
+      <span class="status-sep">·</span>
+      <span id="status-landed">— landed today</span>
+      <span id="status-conn" class="status-conn" title="live status connection"></span>
+    </div>
+  </header>
+
+  <main id="deck" class="deck">
+    <!-- The card stack and overlays are rendered by app.js into here. -->
+    <section id="card-stage" class="card-stage" aria-live="polite"></section>
+
+    <!-- Action bar: every swipe has a visible button + keyboard equivalent. -->
+    <nav class="action-bar" aria-label="Card actions">
+      <button id="btn-reject" class="act act-reject" title="Reject (←)">
+        <span class="act-glyph">✗</span>
+        <span class="act-label">reject</span>
+        <kbd>←</kbd>
+      </button>
+      <button id="btn-defer" class="act act-defer" title="Defer (space)">
+        <span class="act-glyph">↺</span>
+        <span class="act-label">defer</span>
+        <kbd>space</kbd>
+      </button>
+      <button id="btn-deps" class="act act-deps" title="Dependencies (d)">
+        <span class="act-glyph">⛓</span>
+        <span class="act-label">deps</span>
+        <kbd>d</kbd>
+      </button>
+      <button id="btn-deepdive" class="act act-deep" title="Deep dive (o)">
+        <span class="act-glyph">⤢</span>
+        <span class="act-label">open</span>
+        <kbd>o</kbd>
+      </button>
+      <button id="btn-verify" class="act act-verify" title="Verify (→)">
+        <span class="act-glyph">✓</span>
+        <span class="act-label">verify</span>
+        <kbd>→</kbd>
+      </button>
+    </nav>
+  </main>
+
+  <!-- Modal host for reject-note / verify-confirm / deps / errors. -->
+  <div id="modal-root" class="modal-root" hidden></div>
+
+  <!-- Keyboard legend (also reachable for screen readers). -->
+  <footer class="legend">
+    <span><kbd>←</kbd> reject</span>
+    <span><kbd>→</kbd> verify</span>
+    <span><kbd>space</kbd> defer</span>
+    <span><kbd>d</kbd> deps</span>
+    <span><kbd>o</kbd> open deep-dive</span>
+    <span><kbd>?</kbd> help</span>
+  </footer>
+
+  <!--
+    Bootstrap global: a second, JS-readable copy of the session token, also
+    injected by the backend. app.js prefers the meta tag and falls back to
+    this. No other configuration secret lives here.
+  -->
+  <script>
+    window.MARATHON_DECK = {
+      sessionToken: "__MARATHON_SESSION_TOKEN__"
+    };
+  </script>
+  <script src="/static/katex-fallback.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
