@@ -357,8 +357,34 @@ def _handle_refine_exit(
     return backoff
 
 
+def _maybe_automerge(
+    cfg,
+    enabled: bool,
+    *,
+    exclude_heads: "frozenset[str]" = frozenset(),
+    scope: str = "any",
+) -> None:
+    """Best-effort: land every eligible open PR on the base branch (the merge
+    orchestrator). ``exclude_heads`` protects the head branches of in-flight
+    refines (merging+deleting one would break a running push). Wrapped so a
+    ``gh`` hiccup NEVER crashes the loop — a failed cycle just retries next
+    tick. No-op when disabled."""
+    if not enabled:
+        return
+    try:
+        from marathon.review.automerge import automerge
+
+        automerge(cfg, exclude_heads=exclude_heads, scope=scope)
+    except Exception as exc:  # noqa: BLE001 — never let merge housekeeping kill the daemon
+        print(f"  automerge: WARN — cycle skipped ({exc})", flush=True)
+
+
 def run_daemon(
-    chapter: int, once: bool = False, max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    chapter: int,
+    once: bool = False,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    automerge: bool = True,
+    merge_scope: str = "any",
 ) -> int:
     """Run the daemon loop for ``chapter``. Returns final exit code.
 
@@ -371,6 +397,11 @@ def run_daemon(
     human re-rejects if the fix didn't land); failed exits are retried
     with exponential backoff up to ``max_attempts`` times, then
     stalled + notified.
+
+    When ``automerge`` is on (the default), each poll first lands every
+    eligible open PR on the base branch (:mod:`marathon.review.automerge`),
+    so mechanical infra PRs (chapter registration) and green refine PRs reach
+    ``main`` without the human babysitting a merge.
     """
     cfg = load_config()
 
@@ -384,7 +415,8 @@ def run_daemon(
     mode = "one-shot" if once else "daemon"
     print(
         f"=== review refine daemon chapter={chapter} pid={os.getpid()} "
-        f"mode={mode} starting {datetime.now().isoformat()} ===",
+        f"mode={mode} automerge={'on' if automerge else 'off'} "
+        f"starting {datetime.now().isoformat()} ===",
         flush=True,
     )
 
@@ -393,6 +425,17 @@ def run_daemon(
     try:
         while not _STOP_REQUESTED:
             queue = pending_rejections_needing_iteration(cfg, chapter)
+            # Land eligible PRs first so infra/registration stays on main and the
+            # refine that follows builds against an up-to-date base (best-effort).
+            # Exclude the branches of issues queued for iteration THIS loop —
+            # merging+deleting a branch we are about to refine would break its
+            # push.
+            _maybe_automerge(
+                cfg, automerge, scope=merge_scope,
+                exclude_heads=frozenset(
+                    f"marathon/refine-c{chapter}-i{issue}" for issue, _ in queue
+                ),
+            )
 
             if queue:
                 target_issue, target_state = queue[0]

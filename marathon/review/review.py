@@ -546,25 +546,11 @@ def cmd_reject(args) -> None:
     print(f"❌ #{num} rejected and queued for refinement.")
 
     if not args.no_refine:
-        conductor_pid = _live_conductor_pid(cfg)
-        if conductor_pid is not None:
-            # Phase-3 routing: the repo-level conductor polls
-            # pending_rejections_needing_iteration across ALL chapters,
-            # so this rejection is already in its queue — launching a
-            # per-chapter daemon too would double-dispatch the issue
-            # (the worktree branch guard would catch it, but as noisy
-            # deferrals, not a clean hand-off).
-            print(
-                f"  repo-level conductor is active (pid {conductor_pid}); "
-                "rejection queued in state.json — the conductor will "
-                "dispatch it (no per-chapter daemon launched)"
-            )
-            return
-        chapter = cfg.chapter_of_issue(num)
-        if chapter is None:
-            print(f"  cannot auto-launch refine: #{num} not in any registered chapter")
-        else:
-            _launch_or_queue_refine(cfg, chapter)
+        # The single repo-level CONDUCTOR (the global orchestrator) dispatches
+        # this rejection across ALL chapters and auto-merges eligible PRs — it
+        # replaces the old per-chapter refine daemons. Ensure it is running;
+        # the rejection is already queued in state.json for it to pick up.
+        _ensure_conductor(cfg)
 
 
 # --- refine daemon control ---------------------------------------------------
@@ -599,43 +585,42 @@ def _runner_lock_path(cfg: ReviewConfig, chapter: int) -> Path:
     return cfg.runner_lock_dir / f"refine-c{chapter}.lock"
 
 
-def _launch_or_queue_refine(cfg: ReviewConfig, chapter: int) -> None:
-    """Single-flight launch of the auto-refine daemon per chapter.
+def _ensure_conductor(cfg: ReviewConfig) -> None:
+    """Ensure the single repo-level CONDUCTOR — the global orchestrator that
+    replaces the old per-chapter refine daemons — is running.
 
-    If a daemon is already alive for this chapter, just print a note
-    that the rejection is queued (the daemon picks it up via referee.md
-    on its next loop iteration). Otherwise spawn ``python -m
-    marathon.review.daemon --chapter N`` in a detached subprocess.
-    """
-    lock = _runner_lock_path(cfg, chapter)
-    if lock.is_file():
-        try:
-            pid = int(lock.read_text().strip())
-            if _process_alive(pid):
-                print(
-                    f"  refine daemon already active for c{chapter} "
-                    f"(pid {pid}); this rejection is queued in state.json "
-                    "and the daemon will dispatch its own iteration for "
-                    "this issue (one-rejection-per-iteration dispatch)"
-                )
-                return
-        except (ValueError, OSError):
-            pass
-        lock.unlink(missing_ok=True)
+    The conductor polls ``pending_rejections_needing_iteration`` across ALL
+    chapters (oldest verdict first), dispatches Aristotle refines in isolated
+    worktrees, AND auto-merges eligible PRs each cycle. Singleton via the
+    conductor lock: if one is already alive this is a no-op note; otherwise
+    spawn ``marathon conductor run`` detached (it survives this process). The
+    rejection is already recorded in state.json for it to pick up."""
+    pid = _live_conductor_pid(cfg)
+    if pid is not None:
+        print(
+            f"  repo-level conductor already active (pid {pid}); this rejection "
+            "is queued in state.json — it dispatches on its next poll"
+        )
+        return
 
     cfg.runner_log_dir.mkdir(parents=True, exist_ok=True)
     log_path = (
         cfg.runner_log_dir
-        / f"refine-c{chapter}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+        / f"conductor-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
     )
     log_fh = log_path.open("w")
     proc = subprocess.Popen(
-        [sys.executable, "-m", "marathon.review.daemon", "--chapter", str(chapter)],
+        [sys.executable, "-m", "marathon", "conductor", "run",
+         "--repo-dir", str(cfg.repo_dir)],
         stdout=log_fh,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        cwd=str(cfg.repo_dir),
     )
-    print(f"  refine daemon launched (pid {proc.pid}); log: {log_path}")
+    print(
+        f"  repo-level conductor launched (pid {proc.pid}); it dispatches "
+        f"refines + auto-merges PRs across all chapters. log: {log_path}"
+    )
 
 
 def cmd_refine_status(args) -> None:
@@ -695,8 +680,11 @@ def cmd_refine_stop(args) -> None:
 
 
 def cmd_refine_start(args) -> None:
+    # The per-chapter daemon is retired: "start refining" now ensures the single
+    # repo-level conductor (the global orchestrator) is up. ``--chapter`` is
+    # accepted for backward compatibility but ignored (the conductor spans all).
     cfg = load_config()
-    _launch_or_queue_refine(cfg, args.chapter)
+    _ensure_conductor(cfg)
 
 
 # --- subissues bulk commands -------------------------------------------------

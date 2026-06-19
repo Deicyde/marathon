@@ -15,9 +15,9 @@ files move to Conductor-side regeneration — never committed by workers
 * the conductor's completion hook fires only on successful jobs, only
   when the primary checkout is on the base branch and clean (deferral
   note otherwise), with push following the jobs' auto-push setting;
-* ``marathon review reject`` routes to a LIVE conductor (no per-chapter
-  daemon launch) and falls back to the daemon exactly as before when no
-  conductor is running.
+* ``marathon review reject`` ENSURES the single global conductor is running
+  (no-op note when one is already alive; spawns ``marathon conductor run``
+  otherwise) — the per-chapter refine daemon is retired.
 
 Every subprocess / git boundary is monkeypatched: no test invokes
 Aristotle, Claude, gh, or real git commands.
@@ -518,29 +518,29 @@ def reject_env(tmp_path, monkeypatch):
     return SimpleNamespace(cfg=cfg, gh=gh_calls)
 
 
-def test_reject_routes_to_live_conductor(reject_env, monkeypatch, capsys):
-    """A live conductor lock means the rejection is already in the
-    conductor's cross-chapter queue: no per-chapter daemon launch."""
+def test_reject_under_live_conductor_does_not_relaunch(reject_env, monkeypatch, capsys):
+    """A live conductor lock means the rejection is already in the conductor's
+    cross-chapter queue: nothing is (re)launched."""
     lock = conductor.conductor_lock_path(reject_env.cfg)
     lock.parent.mkdir(parents=True, exist_ok=True)
     lock.write_text(str(os.getpid()))  # provably-alive pid: our own
     monkeypatch.setattr(
         review.subprocess, "Popen",
         lambda *a, **kw: pytest.fail(
-            "per-chapter daemon must not launch under a live conductor"
+            "nothing must (re)launch under a live conductor"
         ),
     )
 
     review.cmd_reject(reject_args())
 
     out = capsys.readouterr().out
-    assert "conductor" in out
-    assert "no per-chapter daemon launched" in out
+    assert "conductor already active" in out
     assert load_state(reject_env.cfg).issues[22].status == "rejected"  # still queued
 
 
-def test_reject_launches_daemon_without_conductor(reject_env, monkeypatch, capsys):
-    """No conductor lock: per-chapter daemon behavior unchanged."""
+def test_reject_starts_the_global_conductor(reject_env, monkeypatch, capsys):
+    """No conductor running: reject STARTS the single global conductor (the
+    per-chapter daemon is retired) — never a `marathon.review.daemon` spawn."""
     spawned: list[list[str]] = []
     monkeypatch.setattr(
         review.subprocess, "Popen",
@@ -549,15 +549,16 @@ def test_reject_launches_daemon_without_conductor(reject_env, monkeypatch, capsy
 
     review.cmd_reject(reject_args())
 
-    assert spawned == [
-        [sys.executable, "-m", "marathon.review.daemon", "--chapter", "14"]
-    ]
-    assert "refine daemon launched" in capsys.readouterr().out
+    assert spawned == [[
+        sys.executable, "-m", "marathon", "conductor", "run",
+        "--repo-dir", str(reject_env.cfg.repo_dir),
+    ]]
+    assert "conductor launched" in capsys.readouterr().out
 
 
 def test_reject_ignores_stale_conductor_lock(reject_env, monkeypatch, capsys):
-    """A dead PID in conductor.lock reads as 'no conductor' — the
-    fallback must be exactly the pre-Phase-3 daemon launch."""
+    """A dead PID in conductor.lock reads as 'no conductor' — reject starts a
+    fresh global conductor (never the retired per-chapter daemon)."""
     lock = conductor.conductor_lock_path(reject_env.cfg)
     lock.parent.mkdir(parents=True, exist_ok=True)
     lock.write_text("99999999")  # provably dead
@@ -570,4 +571,5 @@ def test_reject_ignores_stale_conductor_lock(reject_env, monkeypatch, capsys):
     review.cmd_reject(reject_args())
 
     assert len(spawned) == 1
-    assert "refine daemon launched" in capsys.readouterr().out
+    assert spawned[0][:4] == [sys.executable, "-m", "marathon", "conductor"]
+    assert "conductor launched" in capsys.readouterr().out

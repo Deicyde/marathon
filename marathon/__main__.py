@@ -877,6 +877,26 @@ def _add_conductor_subparser(subparsers) -> None:
             "byte-identical when no referee tasks exist)."
         ),
     )
+    p_run.add_argument(
+        "--no-automerge",
+        dest="automerge",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable the per-cycle auto-merge of eligible open PRs onto the "
+            "base branch (on by default; throttled to ~once/min — keeps "
+            "infra/registration and green refine PRs on main)."
+        ),
+    )
+    p_run.add_argument(
+        "--merge-scope",
+        choices=("any", "infra"),
+        default="any",
+        help=(
+            "Scope of the per-cycle auto-merge — any (default) or infra "
+            "(.marathon/ config PRs only; proof PRs stay deck-gated)."
+        ),
+    )
     p_run.set_defaults(func=_run_conductor_run)
 
     p_stat = sub.add_parser(
@@ -909,6 +929,8 @@ def _run_conductor_run(args) -> None:
         worktree_parent=args.worktree_parent,
         land=args.land,
         referee_every=args.referee_every,
+        automerge=getattr(args, "automerge", True),
+        merge_scope=getattr(args, "merge_scope", "any"),
     )
     if rc:
         raise SystemExit(rc)
@@ -962,19 +984,32 @@ def _add_deck_subparser(subparsers) -> None:
         "--no-open", action="store_true",
         help="Do not open a browser automatically (just print the URL).",
     )
+    p_deck.add_argument(
+        "--demo", action="store_true",
+        help=(
+            "Demo mode: serve self-contained synthetic cards (no consumer "
+            "repo / audit snapshot / GitHub needed). Shipping a subdeck is "
+            "SIMULATED — fires nothing irreversible. For trying the UX."
+        ),
+    )
     p_deck.set_defaults(func=_run_deck)
 
 
 def _run_deck(args) -> None:
     from marathon.deck.server import serve
-    from marathon.review.config import load_config
 
-    cfg = load_config()
+    demo = getattr(args, "demo", False)
+    if demo:
+        cfg = None  # demo mode serves synthetic cards; no consumer repo needed
+    else:
+        from marathon.review.config import load_config
+        cfg = load_config()
     rc = serve(
         cfg,
         port=args.port,
         default_chapter=args.chapter,
         open_browser=not args.no_open,
+        demo=demo,
     )
     if rc:
         raise SystemExit(rc)
@@ -1362,6 +1397,46 @@ def _add_audit_subparser(subparsers) -> None:
         help="Consumer repo root. Default: current directory.",
     )
     p_card.set_defaults(func=_run_audit_card)
+
+    p_spec = sub.add_parser(
+        "spec-audit",
+        help="Generate + cache the spec-auditor's informal renderings "
+             "(one firewalled Claude call per declaration).",
+        description=(
+            "Run the spec-auditor over declarations in the latest snapshot "
+            "and cache the result in .marathon/audit/spec_audits.json. For "
+            "each decl, Claude renders the plain-English statement FROM THE "
+            "LEAN TYPE ALONE (never the source .tex — the firewall) plus an "
+            "advisory semantic-delta sentence; the deck and `audit card` then "
+            "show it, LLM-flagged and pinned to the type fingerprint (a stale "
+            "rendering for a changed statement is dropped). Bills the Claude "
+            "Max subscription, not Aristotle. Without --decl, audits every "
+            "OK declaration in --target (use --limit to cap)."
+        ),
+    )
+    p_spec.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Consumer repo root. Default: current directory.",
+    )
+    p_spec.add_argument(
+        "--target", metavar="FOLDER", default=None,
+        help=(
+            "Restrict to declarations whose module is under this repo-"
+            "relative folder (e.g. GeometricAnalysis/LeeSM/Chapter14). "
+            "Default: every OK declaration in the snapshot."
+        ),
+    )
+    p_spec.add_argument(
+        "--decl", action="append", metavar="NAME", default=None,
+        help="A specific declaration to (re)render; repeatable. Overrides "
+             "--target/--limit when given.",
+    )
+    p_spec.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help="Cap the number of declarations rendered this run (each is a "
+             "Claude call). Default: no cap.",
+    )
+    p_spec.set_defaults(func=_run_audit_spec_audit)
 
     p_vac = sub.add_parser(
         "vacuity-probe",
@@ -2110,6 +2185,64 @@ def _run_audit_card(args) -> None:
     ledger = Ledger.for_repo(repo_dir)
     card = SpecCard.from_snapshot(target, snapshot, ledger)
     print(card.render_markdown())
+
+
+def _run_audit_spec_audit(args) -> None:
+    from marathon.audit.engine import load_snapshot
+    from marathon.audit.spec_store import generate_spec_audits
+    from marathon.formalization import module_from_file_path  # noqa: F401
+    from marathon.ledger import Ledger
+
+    repo_dir: Path = args.repo_dir.resolve()
+    snapshot = load_snapshot(repo_dir)
+    if snapshot is None:
+        print("no latest audit snapshot; run `marathon audit run` first")
+        raise SystemExit(1)
+
+    # Resolve the set of declarations to render.
+    if args.decl:
+        names = []
+        for sel in args.decl:
+            r = _resolve_snapshot_decl(sel, snapshot)
+            names.append(r if r is not None else sel)
+    else:
+        ok = [d for d in snapshot.decls if not getattr(d, "is_unknown", False)]
+        if args.target:
+            # Module path under the target folder: dotted module ->
+            # repo-relative slashes, prefix-matched on the target.
+            tgt = str(args.target).strip("/")
+            tgt_mod = tgt.replace("/", ".")
+            ok = [d for d in ok if (d.module or "").startswith(tgt_mod)]
+        names = [d.name for d in ok]
+        if args.limit is not None:
+            names = names[: args.limit]
+
+    if not names:
+        print("no declarations matched (check --target / --decl / the snapshot)")
+        raise SystemExit(1)
+
+    ledger = Ledger.for_repo(repo_dir)
+    total = len(names)
+    print(
+        f"spec-audit: rendering {total} declaration(s) "
+        f"(one firewalled Claude call each; bills Claude Max)…"
+    )
+    state = {"n": 0, "ok": 0}
+
+    def progress(name: str, ok_flag: bool) -> None:
+        state["n"] += 1
+        if ok_flag:
+            state["ok"] += 1
+        mark = "✓" if ok_flag else "·"
+        print(f"  [{state['n']}/{total}] {mark} {name}")
+
+    generate_spec_audits(
+        repo_dir, snapshot, ledger, names, progress=progress
+    )
+    print(
+        f"spec-audit: cached {state['ok']}/{total} rendering(s) -> "
+        f".marathon/audit/spec_audits.json"
+    )
 
 
 def _run_audit_probe(args) -> None:

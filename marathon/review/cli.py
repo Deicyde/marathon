@@ -325,9 +325,13 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
 
     p_start = cv_sub.add_parser(
         "refine-start",
-        help="Start the refine daemon explicitly (without rejecting anything).",
+        help=(
+            "Start the global conductor (the orchestrator) without rejecting "
+            "anything. --chapter is accepted for back-compat but ignored — the "
+            "conductor spans all chapters."
+        ),
     )
-    p_start.add_argument("--chapter", type=int, required=True)
+    p_start.add_argument("--chapter", type=int, required=False, default=None)
     p_start.set_defaults(func=r.cmd_refine_start)
 
     p_stop = cv_sub.add_parser(
@@ -348,8 +352,9 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
     p_daemon = cv_sub.add_parser(
         "daemon",
         help=(
-            "Run the auto-refine daemon directly (normally launched "
-            "indirectly via `reject` or `refine-start`)."
+            "LEGACY single-chapter refine daemon (superseded by the global "
+            "`marathon conductor run`). Kept for manual/one-shot use; the "
+            "automatic flow no longer spawns it."
         ),
     )
     p_daemon.add_argument("--chapter", type=int, required=True)
@@ -368,7 +373,65 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
             "(default: the daemon's DEFAULT_MAX_ATTEMPTS)."
         ),
     )
+    p_daemon.add_argument(
+        "--no-automerge",
+        dest="automerge",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable the per-cycle auto-merge of eligible open PRs onto the "
+            "base branch (on by default — keeps infra/registration on main)."
+        ),
+    )
+    p_daemon.add_argument(
+        "--merge-scope",
+        choices=("any", "infra"),
+        default="any",
+        help=(
+            "Scope of the per-cycle auto-merge — any (default) or infra "
+            "(.marathon/ config PRs only; proof PRs stay deck-gated)."
+        ),
+    )
     p_daemon.set_defaults(func=_run_daemon_subcommand)
+
+    # --- automerge (the merge orchestrator, standalone) -----------------
+    p_am = cv_sub.add_parser(
+        "automerge",
+        help=(
+            "Merge every eligible open PR (conflict-free, non-draft, checks "
+            "green) onto the base branch once — the same step the daemon runs "
+            "each cycle. Use --dry-run to preview."
+        ),
+    )
+    p_am.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List what WOULD merge; call no `gh pr merge`.",
+    )
+    p_am.add_argument(
+        "--base",
+        default=None,
+        metavar="BRANCH",
+        help="Base branch whose PRs are merged (default: the config's auto-PR base, else main).",
+    )
+    p_am.add_argument(
+        "--allow-pending-checks",
+        dest="require_checks",
+        action="store_false",
+        default=True,
+        help="Merge a conflict-free PR even if checks are still pending (never a FAILING one).",
+    )
+    p_am.add_argument(
+        "--merge-scope",
+        choices=("any", "infra"),
+        default="any",
+        help=(
+            "any (default): merge any eligible PR; infra: ONLY PRs whose every "
+            "changed file is under .marathon/ (chapter registration / config) — "
+            "proof PRs stay deck-gated."
+        ),
+    )
+    p_am.set_defaults(func=_run_automerge_subcommand)
 
     # --- subissues bulk operations -------------------------------------
     p_subs = cv_sub.add_parser(
@@ -476,11 +539,45 @@ def _run_daemon_subcommand(args) -> None:
         else DEFAULT_MAX_ATTEMPTS
     )
     sys_exit = run_daemon(
-        chapter=args.chapter, once=args.once, max_attempts=max_attempts
+        chapter=args.chapter,
+        once=args.once,
+        max_attempts=max_attempts,
+        automerge=getattr(args, "automerge", True),
+        merge_scope=getattr(args, "merge_scope", "any"),
     )
     if sys_exit:
         import sys
         sys.exit(sys_exit)
+
+
+def _run_automerge_subcommand(args) -> None:
+    """Dispatch ``marathon review automerge ...`` — one merge cycle."""
+    from marathon.review.automerge import automerge
+    from marathon.review.config import load_config
+
+    cfg = load_config()
+    results = automerge(
+        cfg,
+        base=getattr(args, "base", None),
+        scope=getattr(args, "merge_scope", "any"),
+        require_checks=getattr(args, "require_checks", True),
+        dry_run=getattr(args, "dry_run", False),
+    )
+    merged = [r for r in results if r.action in ("merged", "would-merge")]
+    skipped = [r for r in results if r.action == "skipped"]
+    failed = [r for r in results if r.action == "failed"]
+    if not results:
+        print("automerge: no open PRs to consider.")
+        return
+    print(
+        f"automerge: {len(merged)} merged/would-merge, "
+        f"{len(skipped)} skipped, {len(failed)} failed."
+    )
+    for r in skipped:
+        print(r.line())
+    if failed:
+        import sys
+        sys.exit(1)
 
 
 def review_command(args) -> None:

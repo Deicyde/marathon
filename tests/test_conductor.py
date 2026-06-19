@@ -200,7 +200,10 @@ def e2e(cfg, clock, subprocess_calls, popen_factory, monkeypatch, tmp_path):
     )
 
 
-def run_once(e2e, concurrency=1, max_attempts=3, prune=False):
+def run_once(e2e, concurrency=1, max_attempts=3, prune=False, automerge=False):
+    # automerge defaults OFF here so the scheduling/dispatch tests are isolated
+    # from the merge orchestrator's `gh pr list` calls; the dedicated automerge
+    # tests opt in explicitly.
     return conductor.run_conductor(
         repo_dir=e2e.cfg.repo_dir,
         concurrency=concurrency,
@@ -208,6 +211,7 @@ def run_once(e2e, concurrency=1, max_attempts=3, prune=False):
         prune=prune,
         max_attempts=max_attempts,
         worktree_parent=e2e.runs_parent,
+        automerge=automerge,
     )
 
 
@@ -612,3 +616,27 @@ def test_concurrency_default_and_env_fallback(monkeypatch):
     assert conductor.resolve_concurrency(2) == 2  # explicit flag beats env
     monkeypatch.setenv(conductor.CONCURRENCY_ENV_VAR, "lots")
     assert conductor.resolve_concurrency(None) == 1  # malformed env: warn + default
+
+
+# --- automerge integration (the merge orchestrator runs in the conductor) -----
+
+
+def test_conductor_runs_automerge_each_cycle(e2e):
+    """With automerge on (default), the conductor lands eligible PRs each cycle
+    — a `gh pr list` against the base appears among the subprocess calls."""
+    seed_rejections(e2e.cfg, {22: "2026-06-10T12:00:00-04:00"})
+    e2e.popen.script = {22: {"rc": 0, "polls": 1}}
+
+    assert run_once(e2e, automerge=True) == 0
+
+    assert any(c[:3] == ["gh", "pr", "list"] for c in e2e.git)
+
+
+def test_conductor_no_automerge_skips_the_cycle(e2e):
+    """`automerge=False` runs the dispatch loop with NO merge cycle."""
+    seed_rejections(e2e.cfg, {22: "2026-06-10T12:00:00-04:00"})
+    e2e.popen.script = {22: {"rc": 0, "polls": 1}}
+
+    assert run_once(e2e, automerge=False) == 0
+
+    assert not any(c[:3] == ["gh", "pr", "list"] for c in e2e.git)

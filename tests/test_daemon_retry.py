@@ -279,7 +279,7 @@ def test_run_daemon_retries_then_stalls(cfg, gh_calls, monkeypatch):
     sleeps: list[int] = []
     monkeypatch.setattr(daemon, "_interruptible_sleep", sleeps.append)
 
-    assert daemon.run_daemon(chapter=CHAPTER, once=True, max_attempts=3) == 0
+    assert daemon.run_daemon(chapter=CHAPTER, once=True, max_attempts=3, automerge=False) == 0
 
     assert dispatched == [ISSUE, ISSUE, ISSUE]  # retried, not consumed
     assert sleeps == [120, 240]  # 2^1*60, 2^2*60; none after the stall
@@ -295,7 +295,7 @@ def test_run_daemon_clean_exit_keeps_legacy_behavior(cfg, gh_calls, monkeypatch)
     monkeypatch.setattr(daemon, "load_config", lambda: cfg)
     monkeypatch.setattr(daemon, "run_one_refine", lambda cfg_, ch, focus_issue: 0)
 
-    assert daemon.run_daemon(chapter=CHAPTER, once=True) == 0
+    assert daemon.run_daemon(chapter=CHAPTER, once=True, automerge=False) == 0
 
     entry = load_state(cfg).issues[ISSUE]
     assert entry.status == "rejected"
@@ -317,7 +317,7 @@ def test_run_daemon_sigterm_mid_refine_records_nothing(cfg, gh_calls, monkeypatc
 
     monkeypatch.setattr(daemon, "run_one_refine", interrupted_refine)
 
-    assert daemon.run_daemon(chapter=CHAPTER, once=False) == 0  # loop exits on flag
+    assert daemon.run_daemon(chapter=CHAPTER, once=False, automerge=False) == 0  # loop exits on flag
 
     entry = load_state(cfg).issues[ISSUE]
     assert entry.attempts == 0
@@ -325,3 +325,29 @@ def test_run_daemon_sigterm_mid_refine_records_nothing(cfg, gh_calls, monkeypatc
     assert entry.needs_iteration()  # next daemon launch picks it up
     assert [n for n, _ in pending_rejections_needing_iteration(cfg, CHAPTER)] == [ISSUE]
     assert gh_calls == []
+
+
+# --- automerge integration (the merge orchestrator runs in the loop) ----------
+
+
+def test_daemon_default_runs_automerge_cycle(cfg, gh_calls, monkeypatch):
+    """With automerge on (the default), each poll first runs the merge
+    orchestrator — a `gh pr list` against the base appears in the calls."""
+    record_rejection(cfg, ISSUE, "notes")
+    monkeypatch.setattr(daemon, "load_config", lambda: cfg)
+    monkeypatch.setattr(daemon, "run_one_refine", lambda cfg_, ch, focus_issue: 0)
+
+    daemon.run_daemon(chapter=CHAPTER, once=True)  # automerge default ON
+
+    assert any(c[:3] == ["gh", "pr", "list"] for c in gh_calls)
+
+
+def test_daemon_no_automerge_skips_the_cycle(cfg, gh_calls, monkeypatch):
+    """`automerge=False` runs the refine loop with NO merge cycle."""
+    record_rejection(cfg, ISSUE, "notes")
+    monkeypatch.setattr(daemon, "load_config", lambda: cfg)
+    monkeypatch.setattr(daemon, "run_one_refine", lambda cfg_, ch, focus_issue: 0)
+
+    daemon.run_daemon(chapter=CHAPTER, once=True, automerge=False)
+
+    assert not any(c[:3] == ["gh", "pr", "list"] for c in gh_calls)

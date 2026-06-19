@@ -1088,6 +1088,8 @@ def run_conductor(
     worktree_parent: Optional[Path] = None,
     land: Optional[str] = None,
     referee_every: int = DEFAULT_REFEREE_EVERY,
+    automerge: bool = True,
+    merge_scope: str = "any",
 ) -> int:
     """Run the conductor loop. Returns the final exit code.
 
@@ -1145,6 +1147,7 @@ def run_conductor(
     warned_blocked: set[int] = set()
     dispatch_count = 0
     ticks = 0
+    last_automerge = float("-inf")  # run the merge orchestrator on tick 1, then ~once/min
 
     try:
         if prune:
@@ -1156,6 +1159,20 @@ def run_conductor(
             _reap_finished(
                 cfg, jobs, not_before, kept_worktrees, max_attempts, land=land
             )
+            # Land eligible PRs (the merge orchestrator) so infra/registration
+            # stays on main across all chapters. Throttled to ~once/min so the
+            # short tick cadence does not hammer `gh`; best-effort (a failure
+            # warns, never crashes the tick) via the shared daemon helper.
+            # Exclude the head branches of RUNNING jobs — merging+deleting a
+            # branch a live refine worktree is pushing to would fail its push.
+            if automerge and not _STOP_REQUESTED and _now() - last_automerge > 60:
+                last_automerge = _now()
+                daemon._maybe_automerge(
+                    cfg, True, scope=merge_scope,
+                    exclude_heads=frozenset(
+                        j.branch for j in jobs if j.status == "running"
+                    ),
+                )
             # Referee-cadence: fire the referee --emit-tasks pass once the
             # landings-count crosses a multiple of referee_every. Best-effort
             # and OFF by default (referee_every == 0): a referee failure
