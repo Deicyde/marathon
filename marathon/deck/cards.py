@@ -46,7 +46,7 @@ carries its issue title/body, so the deck works on an unaudited chapter.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -64,6 +64,82 @@ READY_TIER_FLOOR = "T1"
 # card no longer blocks its dependents. "rejected"/"stalled"/unreviewed
 # do NOT resolve a dependency.
 RESOLVED_DEP_STATUSES = frozenset({"verified", "deferred"})
+
+# The trust-tier floor at/above which a decl is eligible to be classed
+# "easy API" (the same machine-audit floor as readiness — never auto-approve
+# anything the audit hasn't gated). Below it, a decl is always MAIN.
+_API_TIER_FLOOR = "T1"
+
+# Name segments/suffixes that mark a declaration as boilerplate API —
+# projection/simp lemmas and bundled-map plumbing that a human reviewing the
+# MAIN textbook results does not need to read line-by-line. Conservative and
+# transparent: each entry yields a one-phrase ``api_reason``. A SEGMENT
+# matches a dotted component anywhere in the name (``Foo.IsSmooth.bar``); a
+# SUFFIX matches the final component's ending (``foo_apply``). When in doubt,
+# a decl is MAIN (not API).
+_API_NAME_SUFFIXES = (
+    "_apply", "_smul", "_id", "_comp", "_zero", "_add", "_neg",
+    "_fun", "_of_",
+)
+_API_NAME_SEGMENTS = ("IsSmooth", "coordChange")
+# CamelCase suffixes on the final name component (matched as endings, not
+# whole components) marking bundled-map plumbing: `pullbackLM` etc.
+_API_CAMEL_SUFFIXES = ("LM",)
+
+
+def classify_api(decl_view: "DeclView", headline_name: Optional[str]) -> tuple:
+    """``(is_api, reason)`` — is ``decl_view`` an "easy API" declaration the
+    skip-API toggle may auto-approve at ship? Conservative + transparent.
+
+    A decl is ``api`` ONLY IF (the CONTRACT heuristic):
+
+    * its tier is at/above :data:`_API_TIER_FLOOR` (machine-audited), AND
+    * it carries NO deception tags, AND
+    * it is found IN THE CODE (``in_code`` — never a stale citation), AND
+    * it is NOT the issue's headline decl (``headline_name``), AND
+    * it is an ``instance`` OR its name matches a helper/projection pattern
+      (an ``_apply``/``_smul``/… suffix, or an ``LM``/``IsSmooth``/
+      ``coordChange`` segment).
+
+    Everything else — textbook-named results, the headline, anything below
+    the floor, deception-tagged, or not-in-code — is a MAIN result the human
+    always reviews. Returns ``(False, None)`` for MAIN. Pure."""
+    from marathon.audit.trust import TIER_ORDER
+
+    name = decl_view.name
+    # Never auto-approve: the headline, a below-floor / unknown-tier decl, a
+    # deception-tagged decl, or a stale citation (not in the code).
+    if headline_name is not None and name == headline_name:
+        return False, None
+    if not getattr(decl_view, "in_code", True):
+        return False, None
+    tier = decl_view.tier
+    if tier not in TIER_ORDER:
+        return False, None
+    if TIER_ORDER.index(tier) < TIER_ORDER.index(_API_TIER_FLOOR):
+        return False, None
+    if (decl_view.evidence or {}).get("deception_tags"):
+        return False, None
+
+    if decl_view.kind == "instance":
+        return True, "instance"
+
+    short = name.rsplit(".", 1)[-1]
+    for suffix in _API_NAME_SUFFIXES:
+        if short.endswith(suffix):
+            return True, f"projection/helper lemma ({suffix})"
+    # CamelCase suffix on the final component marking a bundled-map variant
+    # (e.g. `pullbackLM`, `coordChangeLM` — the linear-map plumbing beside a
+    # main `pullback`). A whole-component check misses these (the component
+    # is `pullbackLM`, not a standalone `LM`), so match the suffix directly.
+    for cs in _API_CAMEL_SUFFIXES:
+        if short.endswith(cs) and short != cs:
+            return True, f"bundled-map variant (…{cs})"
+    components = name.split(".")
+    for seg in _API_NAME_SEGMENTS:
+        if seg in components:
+            return True, f"bundled-map plumbing (.{seg}.)"
+    return False, None
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +210,71 @@ class KernelEntry:
 
 
 @dataclass(frozen=True)
+class DeclView:
+    """One declaration's full face within a card.
+
+    A review issue bundles every declaration of one textbook result (e.g.
+    the covariant/mixed/contravariant `pullback` defs + their helpers all
+    live under one sub-issue), so a card carries a ``DeclView`` per cited
+    declaration — each with its own source, trust kernel, evidence, tier,
+    and (LLM-flagged) informal rendering. The card-level tier is the WORST
+    of these; the views are ordered worst-tier-first so the declaration
+    holding the card back leads."""
+
+    name: str
+    kind: Optional[str]
+    tier: str
+    qualifiers: list[str]
+    source_block: Optional[str]
+    source_file: Optional[str]
+    statement_pp: Optional[str]
+    kernel: list[KernelEntry]
+    evidence: dict
+    informal_rendering: Optional[str]
+    informal_is_llm: bool
+    semantic_delta: Optional[dict]
+    # ``in_code`` is true iff the declaration was located in the repo
+    # source — in the audit snapshot OR by a repo-wide source scan. False
+    # means the issue cites a name no longer present in the code: a STALE
+    # CITATION (renamed/deleted), for which ``source_block`` is None and the
+    # tier stays ``'-'``.
+    in_code: bool = True
+    # ``api`` marks a conservatively-classified "easy API" declaration the
+    # skip-API toggle auto-approves at ship (the human only reviews MAIN
+    # results); ``api_reason`` is one short phrase explaining the call.
+    api: bool = False
+    api_reason: Optional[str] = None
+    # ``surfaced`` marks a declaration the RECONCILIATION auto-added so the
+    # deck matches the CODE: a decl found in the code in one of the issue's
+    # namespaces but NOT cited by the issue body. ``surfaced_reason`` is one
+    # short phrase explaining why it was surfaced. A normally-cited decl has
+    # ``surfaced=False`` / ``surfaced_reason=None``.
+    surfaced: bool = False
+    surfaced_reason: Optional[str] = None
+
+    def to_json(self) -> dict:
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "tier": self.tier,
+            "qualifiers": list(self.qualifiers),
+            "source_block": self.source_block,
+            "source_file": self.source_file,
+            "statement_pp": self.statement_pp,
+            "kernel": [k.to_json() for k in self.kernel],
+            "evidence": dict(self.evidence),
+            "informal_rendering": self.informal_rendering,
+            "informal_is_llm": self.informal_is_llm,
+            "semantic_delta": self.semantic_delta,
+            "in_code": self.in_code,
+            "api": self.api,
+            "api_reason": self.api_reason,
+            "surfaced": self.surfaced,
+            "surfaced_reason": self.surfaced_reason,
+        }
+
+
+@dataclass(frozen=True)
 class CardDetail:
     """The full spec card for one issue (the deep face of a queue card).
 
@@ -143,14 +284,29 @@ class CardDetail:
     Built purely from the audit snapshot, ledger, and the issue body."""
 
     id: int  # issue_num
-    decl: str
+    decl: str  # the headline (worst-tier) decl name — decls[0].name
     title: str  # the issue title (the card's human headline)
     chapter: Optional[int]
-    tier: str
+    tier: str  # the WORST tier over all cited decls (the card's gate)
     qualifiers: list[str]
+    # Every declaration this issue bundles, each with its own source /
+    # kernel / evidence / tier / informal rendering, ordered worst-tier
+    # first. The top-level scalar fields below mirror ``decls[0]`` (the
+    # headline) for backward compatibility / degraded rendering.
+    decls: list[DeclView]
     statement_pp: Optional[str]
+    source_block: Optional[str]
+    source_file: Optional[str]  # repo-relative path of the .lean file
     informal_rendering: Optional[str]  # LLM-flagged (see informal_is_llm)
     informal_is_llm: bool
+    # The issue's TOP-LEVEL informal statement — the ``### Informal Statement``
+    # section of the body (the textbook result, e.g. "Proposition 12.19"), with
+    # the LLM-rendered marker stripped. ``issue_informal_is_llm`` is True iff
+    # that section still carries the "verification pending" marker (not yet
+    # human-verified). This is the ONE text the leading approval card shows —
+    # NOT the per-declaration renderings.
+    issue_informal: Optional[str]
+    issue_informal_is_llm: bool
     kernel: list[KernelEntry]
     evidence: dict  # {axioms_beyond_whitelist, sorry, deception_tags}
     semantic_delta: Optional[dict]  # {class, members[]} | None
@@ -166,9 +322,14 @@ class CardDetail:
             "chapter": self.chapter,
             "tier": self.tier,
             "qualifiers": list(self.qualifiers),
+            "decls": [d.to_json() for d in self.decls],
             "statement_pp": self.statement_pp,
+            "source_block": self.source_block,
+            "source_file": self.source_file,
             "informal_rendering": self.informal_rendering,
             "informal_is_llm": self.informal_is_llm,
+            "issue_informal": self.issue_informal,
+            "issue_informal_is_llm": self.issue_informal_is_llm,
             "kernel": [k.to_json() for k in self.kernel],
             "evidence": dict(self.evidence),
             "semantic_delta": self.semantic_delta,
@@ -229,7 +390,7 @@ def _load_context(
     snapshot = load_snapshot(cfg.repo_dir)
     tiers_by_decl = _tiers_by_decl(cfg, snapshot)
     issue_meta = fetch_issues_bulk(issue_nums, cfg.github_repo) or {}
-    verdict_status = _verdict_status(cfg)
+    verdict_status = _verdict_status(cfg, issue_meta)
     target_deps_by_decl = _planner_deps_by_decl(cfg)
     return _DeckContext(
         snapshot=snapshot,
@@ -255,18 +416,27 @@ def _tiers_by_decl(cfg: "ReviewConfig", snapshot) -> dict:
         return {}
 
 
-def _verdict_status(cfg: "ReviewConfig") -> dict:
+def _verdict_status(cfg: "ReviewConfig", issue_meta: Optional[dict] = None) -> dict:
     """``{issue_num: status}`` for the readiness gate.
 
-    The base is the committed review state (the read-side verdict truth in
-    this phase: 'verified' / 'rejected' / 'stalled'); on top of it the
-    deck's own DEFER markers are overlaid as status ``'deferred'`` (the
-    deck-only verdict that touches neither Aristotle nor GitHub — see
-    :mod:`marathon.deck.verdicts`). A live verify/reject always wins over a
-    stale defer (the committed verdict is authoritative), so the base map
-    is applied last for issues it knows. A missing/corrupt file on either
-    side is an empty contribution, never an error."""
+    Layered, later wins:
+
+    1. the deck's own DEFER markers (deck-local; touch neither Aristotle nor
+       GitHub — see :mod:`marathon.deck.verdicts`);
+    2. the committed local review state (``state.json`` — operational truth
+       like ``'stalled'``, plus any locally-recorded verdicts);
+    3. **the GitHub labels** (``review:verified`` / ``review:rejected``),
+       which are AUTHORITATIVE for human verdicts (the Phase-1 sync policy)
+       and so are applied last — a card verified on GitHub drops out of the
+       swipe queue even when the local ``state.json`` never recorded it
+       (the documented state.json-lags-labels drift; recon §2). The labels
+       come from ``issue_meta`` the queue already fetched, so this costs no
+       extra GitHub call.
+
+    A missing/corrupt source on any layer is an empty contribution, never an
+    error."""
     from marathon.deck.verdicts import deferred_issue_nums
+    from marathon.review.review import _status_from_labels
     from marathon.review.state import load_state
 
     out: dict[int, str] = {}
@@ -277,11 +447,19 @@ def _verdict_status(cfg: "ReviewConfig") -> dict:
         pass
     try:
         state = load_state(cfg)
-    except Exception:  # noqa: BLE001 — degrade to "no verdicts known"
-        return out
-    # The committed verdict is authoritative over a stale defer.
-    for num, st in state.issues.items():
-        out[num] = st.status
+        for num, st in state.issues.items():
+            out[num] = st.status
+    except Exception:  # noqa: BLE001 — degrade to "no local verdicts"
+        pass
+    # GitHub labels win for human verdicts (verified/rejected). 'inflight' and
+    # unlabelled issues do not override a more specific local state.
+    for num, meta in (issue_meta or {}).items():
+        labels = meta.get("labels")
+        if not labels:
+            continue
+        gh_status = _status_from_labels(cfg, set(labels))
+        if gh_status in ("verified", "rejected"):
+            out[num] = gh_status
     return out
 
 
@@ -316,6 +494,58 @@ def _planner_deps_by_decl(cfg: "ReviewConfig") -> dict:
 # ---------------------------------------------------------------------------
 # Issue ↔ decl resolution (reusing the single committed parser)
 # ---------------------------------------------------------------------------
+
+
+#: A line carries the LLM-rendered "verification pending" marker when it
+#: mentions both halves (matches both textual variants the project emits —
+#: spec_auditor's "LLM-rendered, verification pending" and the coreviewer's
+#: "LLM-rendered from common knowledge; verification pending").
+def _is_llm_marker_line(line: str) -> bool:
+    return "LLM-rendered" in line and "verification pending" in line
+
+
+def _issue_informal_statement(body: Optional[str]) -> tuple[Optional[str], bool]:
+    """The issue's TOP-LEVEL informal statement — the ``### Informal Statement``
+    section of the body (the textbook result, e.g. "Proposition 12.19").
+
+    Returns ``(text, is_pending)``: ``text`` is the section's prose with the
+    LLM-rendered marker line(s) and blockquote ``>`` prefixes stripped (None
+    when there is no such section or it is empty); ``is_pending`` is True iff
+    the section still carries the ``⚠️ LLM-rendered … verification pending``
+    marker (i.e. not yet human-verified). PURE — reads only the body string."""
+    if not body:
+        return None, False
+    lines = body.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == "### Informal Statement":
+            start = i
+            break
+    if start is None:
+        return None, False
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("### "):
+            end = j
+            break
+    section = lines[start + 1:end]
+    is_pending = any(_is_llm_marker_line(ln) for ln in section)
+    kept = []
+    for ln in section:
+        # Strip a leading markdown blockquote marker FIRST so a blockquoted
+        # status-marker line (e.g. "> *⚠️ …*") is still recognized and dropped.
+        if ln.startswith("> "):
+            ln = ln[2:]
+        elif ln.startswith(">"):
+            ln = ln[1:]
+        # Drop the status-marker line — pending (⚠️) or already-verified (✅) —
+        # whether or not it is wrapped in markdown italic asterisks.
+        marker = ln.strip().strip("*").strip()
+        if marker.startswith("⚠️") or marker.startswith("✅"):
+            continue
+        kept.append(ln)
+    text = "\n".join(kept).strip()
+    return (text or None), is_pending
 
 
 def _decls_for_issue(ctx: _DeckContext, num: int) -> list[str]:
@@ -621,37 +851,277 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
     )
 
 
-def build_card_detail(cfg: "ReviewConfig", issue_num: int) -> CardDetail:
-    """Assemble the full spec card for one issue.
+def _module_to_lean_path(repo_dir: Path, module: str) -> Optional[Path]:
+    """Inverse of ``module_from_file_path``: a dotted module name maps to
+    ``<repo>/<dotted/as/slashes>.lean``. Returns the path if it exists."""
+    if not module:
+        return None
+    rel = Path(*module.split(".")).with_suffix(".lean")
+    candidate = repo_dir / rel
+    return candidate if candidate.is_file() else None
 
-    Reuses :meth:`SpecCard.from_snapshot` for the statement / kernel /
-    evidence (so the deck's deep card is byte-for-byte the same machine
-    facts as ``marathon audit card``), attaches the spec-auditor's Claude
-    half (informal rendering, semantic-delta prose) if it is present on
-    disk, and resolves the card's deps back to predecessor cards. Pure +
-    read-only; degrades honestly when the decl is absent/unknown (empty
-    kernel, '-' tier) or no snapshot exists."""
-    ctx = _load_context(cfg, [issue_num])
-    tier, qualifiers, decl = _issue_tier(ctx, issue_num)
-    chapter = cfg.chapter_of_issue(issue_num)
 
+# Cap a source block so a pathological mega-declaration can't blow up the
+# card payload / page; the deep-dive (`o`) is the escape hatch for the rest.
+_SOURCE_BLOCK_MAX_LINES = 400
+
+
+# Caps for the repo-wide source fallback so a pathological repo can't blow up
+# a card build: bound the number of .lean files scanned and each file's size.
+# Deterministic regardless of which cap is hit (files are scanned in sorted
+# order; the first matching site wins).
+_REPO_SCAN_MAX_FILES = 4000
+_REPO_SCAN_MAX_FILE_BYTES = 2 * 1024 * 1024
+
+# Cap on how many declarations the reconciliation may auto-SURFACE for one
+# issue (decls present in the code under the issue's namespaces but not cited
+# by the body). Conservative: a runaway namespace can't flood the subdeck with
+# dozens of uncited cards. Surfaced decls are added in deterministic (sorted)
+# order, so the cap is stable.
+_MAX_SURFACED_DECLS = 12
+
+
+def _locate_decl_site(text: str, decl_name: str):
+    """``(sites, target_i)`` — the :func:`scan_lean_source` sites and the
+    index of the one matching ``decl_name``, or ``(sites, None)`` when absent.
+
+    Matching is on the FULL cited name: an exact qualified/name match, or
+    ``decl_name`` as a whole trailing dotted segment of a site's qualified
+    name (so cited ``A.B`` matches ``X.A.B`` but NOT ``Y.B``). It deliberately
+    NEVER matches on the bare last component alone — across a repo-wide scan
+    that collides catastrophically (e.g. every ``*.IsSmooth`` would match one
+    cited ``Foo.IsSmooth``, surfacing a wrong declaration's source in a review
+    tool). When no site matches the full name, the decl is absent here."""
+    from marathon.formalization import scan_lean_source
+
+    sites, _ = scan_lean_source(text)
+    if not sites:
+        return sites, None
+    for i, s in enumerate(sites):
+        if s.qualified == decl_name or s.name == decl_name:
+            return sites, i
+    suffix = "." + decl_name
+    for i, s in enumerate(sites):  # full cited name as a whole dotted suffix
+        if (s.qualified or "").endswith(suffix):
+            return sites, i
+    return sites, None
+
+
+def _slice_decl_block(text: str, sites, target_i: int) -> str:
+    """The verbatim source block for ``sites[target_i]``: the full
+    ``def``/``theorem``/… body plus the docstring + attribute/modifier lines
+    immediately above it, with trailing blanks / next-decl comments trimmed.
+
+    The single extraction slice shared by the snapshot path
+    (:func:`_read_decl_source`) and the repo-wide fallback
+    (:func:`_find_decl_source_in_repo`) so both render identically. Capped at
+    :data:`_SOURCE_BLOCK_MAX_LINES`."""
+    lines = text.splitlines()
+    kw_line = sites[target_i].line  # 1-based, the decl keyword line
+
+    def has_open(idx: int) -> bool:  # 1-based: line opens a block comment
+        return "/-" in lines[idx - 1]
+
+    def is_modifier(idx: int) -> bool:  # 1-based: a lone modifier line
+        s = lines[idx - 1].strip()
+        return s in {"noncomputable", "private", "protected", "scoped", "@[simp]"} \
+            or s.startswith("@[")
+
+    # START: include attributes/modifiers directly above, then the full
+    # docstring block (walk up to its `/-…` opener) if one sits directly
+    # above with no blank gap. Stops at the blank line separating this decl
+    # from the previous one (Mathlib-style spacing).
+    start = kw_line
+    j = kw_line - 1
+    while j >= 1 and is_modifier(j):
+        start = j
+        j -= 1
+    if j >= 1 and lines[j - 1].strip() != "":
+        s = lines[j - 1].rstrip()
+        if s.endswith("-/"):  # tail of a block docstring — include all of it
+            k = j
+            while k >= 1 and not has_open(k):
+                k -= 1
+            if k >= 1:
+                start = k
+        elif s.lstrip().startswith("--"):  # contiguous line-comment doc
+            k = j
+            while k >= 1 and lines[k - 1].lstrip().startswith("--"):
+                start = k
+                k -= 1
+
+    # END: next decl keyword (or EOF), then trim BACKWARD past trailing
+    # blank lines and any comment / section blocks (`/-! … -/`, `/-- … -/`,
+    # `--`) that belong to the NEXT declaration, not this one.
+    end = sites[target_i + 1].line - 1 if target_i + 1 < len(sites) else len(lines)
+    while end > kw_line:
+        s = lines[end - 1].strip()
+        if s == "":
+            end -= 1
+        elif s.endswith("-/"):  # a trailing block comment — drop the block
+            k = end
+            while k > kw_line and not has_open(k):
+                k -= 1
+            end = k - 1
+        elif s.startswith("--"):
+            end -= 1
+        else:
+            break
+
+    block_lines = lines[start - 1 : end]
+    if len(block_lines) > _SOURCE_BLOCK_MAX_LINES:
+        block_lines = block_lines[:_SOURCE_BLOCK_MAX_LINES] + [
+            f"  -- … ({len(block_lines) - _SOURCE_BLOCK_MAX_LINES} more "
+            "lines truncated — open the deep-dive to read the rest) …"
+        ]
+    return "\n".join(block_lines)
+
+
+def _read_decl_source(
+    repo_dir: Path, module: str, decl_name: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(source_block, repo_relative_file)`` — the declaration as
+    written in its snapshot-recorded ``.lean`` file (resolved from ``module``).
+
+    Pure, read-only, best-effort. Locates the decl with the committed
+    namespace-aware :func:`scan_lean_source`, then slices the block with the
+    shared :func:`_slice_decl_block`. Returns ``(None, None)`` when the file
+    or decl can't be found — the caller then tries the repo-wide fallback."""
+    path = _module_to_lean_path(repo_dir, module)
+    if path is None:
+        return None, None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+
+    sites, target_i = _locate_decl_site(text, decl_name)
+    if target_i is None:
+        return None, None
+    try:
+        rel = str(path.relative_to(repo_dir))
+    except ValueError:
+        rel = str(path)
+    return _slice_decl_block(text, sites, target_i), rel
+
+
+def _tracked_lean_files(repo_dir: Path) -> list[Path]:
+    """The repo's git-tracked (and untracked-but-not-ignored) ``.lean``
+    files, sorted, capped at :data:`_REPO_SCAN_MAX_FILES`. Uses the SAME
+    ``git ls-files --cached --others --exclude-standard`` mechanism as the
+    rest of the harness; falls back to a deterministic ``rglob`` walk when
+    git is unavailable (so the fallback still works on a non-git checkout).
+    Pure read-only."""
+    import subprocess
+
+    rels: list[str] = []
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "--cached", "--others",
+             "--exclude-standard", "-z"],
+            cwd=str(repo_dir),
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            rels = [
+                r.decode("utf-8", errors="replace")
+                for r in proc.stdout.split(b"\0")
+                if r and r.endswith(b".lean")
+            ]
+    except (OSError, ValueError):  # noqa: BLE001 — git missing → walk instead
+        rels = []
+    if rels:
+        paths = [repo_dir / r for r in sorted(set(rels))]
+    else:  # non-git checkout / git failed: deterministic filesystem walk
+        try:
+            paths = sorted(repo_dir.rglob("*.lean"))
+        except OSError:
+            return []
+    return paths[:_REPO_SCAN_MAX_FILES]
+
+
+def _find_decl_source_in_repo(
+    repo_dir: Path, decl_name: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Repo-wide source fallback: scan the git-tracked ``.lean`` files for
+    ``decl_name`` (via :func:`scan_lean_source`) and return its
+    ``(source_block, repo_relative_file)`` using the same extraction slice as
+    :func:`_read_decl_source`. ``(None, None)`` when the decl is found in no
+    file — the issue cites a name absent from the current code.
+
+    Used when the snapshot path yields no source (a decl that EXISTS in the
+    code but was not in the audited snapshot, or not quoted in the issue).
+    Deterministic (files scanned in sorted order; the first matching site
+    wins), capped on file count + per-file size. Pure read-only."""
+    for path in _tracked_lean_files(repo_dir):
+        try:
+            if path.stat().st_size > _REPO_SCAN_MAX_FILE_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        sites, target_i = _locate_decl_site(text, decl_name)
+        if target_i is None:
+            continue
+        try:
+            rel = str(path.relative_to(repo_dir))
+        except ValueError:
+            rel = str(path)
+        return _slice_decl_block(text, sites, target_i), rel
+    return None, None
+
+
+def _build_decl_view(
+    ctx: _DeckContext, ledger, raw_name: str, repo_dir: Optional[Path] = None
+) -> DeclView:
+    """One declaration's full face: source, kernel, evidence, tier, and the
+    cached (LLM-flagged) informal rendering. Pure + read-only; degrades to a
+    name-only view ('-' tier, no source) when the decl is unresolved/absent
+    or no snapshot exists, so a card still lists everything its issue cites.
+
+    Source resolution (the request-1 fix): the source block is read from the
+    snapshot record first; failing that, a repo-wide scan over ``repo_dir``'s
+    git-tracked ``.lean`` files locates a decl that EXISTS in the code but was
+    not in the audited snapshot. ``in_code`` is true when the decl was found
+    either way, and false when it is cited but absent everywhere (a STALE
+    CITATION — ``source_block`` stays None and the tier stays ``'-'``)."""
+    resolved = _resolve_to_snapshot(ctx, raw_name) if ctx.snapshot is not None else None
+
+    tier = "-"
+    qualifiers: list[str] = []
+    if resolved is not None and resolved in ctx.tiers_by_decl:
+        tr = ctx.tiers_by_decl[resolved]
+        tier, qualifiers = tr.tier, list(tr.qualifiers)
+
+    name = resolved or raw_name
+    kind: Optional[str] = None
     statement_pp: Optional[str] = None
-    informal_rendering: Optional[str] = None
-    informal_is_llm = False
+    source_block: Optional[str] = None
+    source_file: Optional[str] = None
     kernel: list[KernelEntry] = []
     evidence: dict = {
         "axioms_beyond_whitelist": [],
         "sorry": None,
         "deception_tags": [],
     }
+    informal_rendering: Optional[str] = None
+    informal_is_llm = False
     semantic_delta: Optional[dict] = None
 
-    resolved = _resolve_to_snapshot(ctx, decl) if decl else None
     if ctx.snapshot is not None and resolved is not None:
         from marathon.audit.spec_card import SpecCard
 
-        card = SpecCard.from_snapshot(resolved, ctx.snapshot, _ledger(cfg))
+        card = SpecCard.from_snapshot(resolved, ctx.snapshot, ledger)
         statement_pp = card.type_pp
+        snap_decl = ctx.snapshot.by_name().get(resolved)
+        if snap_decl is not None:
+            kind = snap_decl.kind
+            # The declaration as written (docstring + full body), verbatim.
+            if ctx.snapshot.repo_dir:
+                source_block, source_file = _read_decl_source(
+                    Path(ctx.snapshot.repo_dir), snap_decl.module, resolved
+                )
         kernel = [
             KernelEntry(
                 name=m.name, kind=m.kind,
@@ -666,24 +1136,290 @@ def build_card_detail(cfg: "ReviewConfig", issue_num: int) -> CardDetail:
             "sorry": card.evidence.sorry,
             "deception_tags": list(card.evidence.deception_tags),
         }
-        # The Claude half (informal rendering, semantic-delta prose) is
-        # attached by the spec-auditor later and may be absent. When the
-        # slot is empty the deck flags any rendering it falls back to as
-        # LLM-pending so the human knows it was not human-attested.
-        if card.informal_rendering:
+        # The Claude half (informal rendering, semantic-delta prose) — cached
+        # by `marathon audit spec-audit`, pinned to the type fingerprint so a
+        # stale rendering for a changed statement is dropped. Always
+        # LLM-flagged: rendered from the Lean type, never attested.
+        if card.informal_rendering:  # in-object slot (rare; future-proof)
             informal_rendering = card.informal_rendering
             informal_is_llm = True
         if card.semantic_delta_prose:
             semantic_delta = {
-                "class": "advisory",
-                "members": [],
+                "class": "advisory", "members": [],
                 "prose": card.semantic_delta_prose,
             }
+        if snap_decl is not None and ctx.snapshot.repo_dir:
+            from marathon.audit.spec_store import lookup as _spec_lookup
+
+            cached = _spec_lookup(
+                ctx.snapshot.repo_dir, resolved, snap_decl.fingerprint_type
+            )
+            if cached:
+                if cached.get("informal_rendering") and not informal_rendering:
+                    informal_rendering = cached["informal_rendering"]
+                    informal_is_llm = True
+                if cached.get("delta_prose") and not semantic_delta:
+                    semantic_delta = {
+                        "class": "advisory", "members": [],
+                        "prose": cached["delta_prose"],
+                    }
+
+    # SOURCE RESOLUTION (request-1): if the snapshot path yielded no source
+    # (no snapshot, the decl wasn't audited, or its module's file moved), fall
+    # back to a repo-wide scan for the declaration BY NAME. This shows the
+    # snippet for decls that exist in the code but were absent from the
+    # snapshot. ``in_code`` is true when the decl is found in EITHER place —
+    # a snapshot-RESOLVED decl was elaborated FROM the repo source, so it
+    # exists in the code even if the source-text slice couldn't be extracted;
+    # a repo-scan hit likewise proves existence. Only a decl found in NEITHER
+    # is a stale citation (in_code=false, source null, tier '-').
+    scan_dir = repo_dir
+    if scan_dir is None and ctx.snapshot is not None and ctx.snapshot.repo_dir:
+        scan_dir = Path(ctx.snapshot.repo_dir)
+    in_code = resolved is not None or source_block is not None
+    if source_block is None and scan_dir is not None:
+        scanned_block, scanned_file = _find_decl_source_in_repo(scan_dir, name)
+        if scanned_block is not None:
+            source_block, source_file = scanned_block, scanned_file
+            in_code = True
+
+    view = DeclView(
+        name=name, kind=kind, tier=tier, qualifiers=qualifiers,
+        source_block=source_block, source_file=source_file,
+        statement_pp=statement_pp, kernel=kernel, evidence=evidence,
+        informal_rendering=informal_rendering, informal_is_llm=informal_is_llm,
+        semantic_delta=semantic_delta, in_code=in_code,
+    )
+    # Classify api WITHOUT a headline here (single-card detail also carries
+    # api/api_reason); build_card_detail re-classifies with the real headline
+    # so the headline is never auto-approvable.
+    is_api, reason = classify_api(view, headline_name=None)
+    return replace(view, api=is_api, api_reason=reason)
+
+
+def _namespace_prefixes(cited_resolved: list[str]) -> list[str]:
+    """The dotted-prefix NAMESPACES of a set of (snapshot-resolved) cited decl
+    names: for each name, the part up to (but not including) its last dotted
+    component (e.g. ``CovariantTensorField.pullback`` → ``CovariantTensorField``,
+    ``Foo.Bar.baz`` → ``Foo.Bar``). De-duplicated and sorted (deterministic);
+    names with no dot (no namespace) contribute nothing. Pure."""
+    prefixes: set[str] = set()
+    for name in cited_resolved:
+        if "." in name:
+            prefixes.add(name.rsplit(".", 1)[0])
+    return sorted(prefixes)
+
+
+def _surface_namespace_decls(
+    ctx: _DeckContext,
+    cited_names: list[str],
+    ledger,
+    repo_dir: Optional[Path] = None,
+    *,
+    exclude_names: "Optional[set[str]]" = None,
+    result_keys: "Optional[set[str]]" = None,
+) -> list[DeclView]:
+    """Auto-SURFACE the declarations the issue body does NOT cite but which are
+    the likely RENAME of one of its now-missing citations — so the deck matches
+    the CODE, not a stale issue body.
+
+    Scope (deliberately tight, to recover renames without flooding the subdeck
+    with declarations that belong to OTHER review issues):
+
+    * candidates are DIRECT members of a namespace ``N`` shared by the issue's
+      cited decls (qualified name ``<N>.<leaf>``, no further dot), AND
+    * NOT already cited by this issue, AND
+    * NOT cited by any OTHER chapter issue (``exclude_names`` — so e.g. the
+      ``*.pullback`` decls that belong to the pullback issue never surface into
+      the smoothness issue), AND
+    * their leaf-name MATCHES the leaf of one of this issue's own citations
+      (the result family — e.g. a stale ``Foo.IsSmooth`` surfaces a renamed
+      ``Bar.IsSmooth``, never an unrelated ``Bar.pullback``).
+
+    Each surfaced decl is a full :class:`DeclView` via the shared
+    :func:`_build_decl_view` (same source / kernel / evidence / tier), flagged
+    ``surfaced=True``. Deterministic (sorted), capped at
+    :data:`_MAX_SURFACED_DECLS`. **Pure + read-only** (snapshot-based; writes
+    nothing). ``[]`` when there is no snapshot."""
+    if ctx.snapshot is None or not ctx.tiers_by_decl:
+        return []
+
+    exclude_names = exclude_names or set()
+    result_keys = result_keys or set()
+
+    # The set of decls the body already cites, resolved to snapshot names so we
+    # never re-surface a cited decl (matching is on the resolved/qualified name).
+    cited_resolved = {
+        _resolve_to_snapshot(ctx, raw) or raw for raw in cited_names
+    }
+    # Without textbook-result keys (an un-numbered "def" issue) the body's
+    # citations are authoritative — surface nothing.
+    if not result_keys:
+        return []
+
+    namespaces = _namespace_prefixes(sorted(cited_resolved))
+    if not namespaces:
+        return []
+
+    # Candidate names: a DIRECT member of one of the issue's namespaces, not
+    # already cited here AND not cited by any OTHER chapter issue (so a sibling
+    # result's decls never surface in). Deterministic order.
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for name in sorted(ctx.tiers_by_decl):
+        if name in cited_resolved or name in seen or name in exclude_names:
+            continue
+        for ns in namespaces:
+            prefix = ns + "."
+            if name.startswith(prefix) and "." not in name[len(prefix):]:
+                candidates.append(name)
+                seen.add(name)
+                break
+
+    # Keep only candidates whose SOURCE DOCSTRING references the issue's
+    # textbook result (e.g. "Proposition 12.19(b)") — the precise signal that a
+    # decl is ANOTHER PART of the same result (the missing (b)/(d)
+    # characterizations), vs unrelated plumbing (algebra instances, pullback
+    # helpers) that merely shares the namespace.
+    out: list[DeclView] = []
+    for name in candidates:
+        if len(out) >= _MAX_SURFACED_DECLS:
+            break
+        view = _build_decl_view(ctx, ledger, name, repo_dir)
+        src = view.source_block or ""
+        match = next((k for k in result_keys if k in src), None)
+        if match is None:
+            continue
+        out.append(replace(
+            view,
+            surfaced=True,
+            surfaced_reason=f"another part of {match} — in the code, not cited by the issue",
+        ))
+    return out
+
+
+def surfaced_decls_for_issue(
+    cfg: "ReviewConfig", issue_num: int, cited_names: list[str]
+) -> list[DeclView]:
+    """Public, PURE entry point for the RECONCILIATION's surfacing step: the
+    DeclViews for decls present in the code under ``issue_num``'s cited
+    namespaces but NOT cited by ``cited_names`` (the body's decls).
+
+    Builds the same read-only snapshot/ledger context a card build uses, then
+    delegates to :func:`_surface_namespace_decls`. ``cited_names`` is the raw
+    list the issue body cites (the subdeck already has it from the kept views'
+    names) so this never re-parses the body. Writes nothing; returns ``[]``
+    when there is no audit snapshot. Used by :func:`subdeck.build_subdeck`.
+
+    Surfacing excludes every decl cited by ANOTHER issue in the same chapter,
+    so a sibling result's declarations (e.g. the pullback issue's
+    ``*.pullback`` decls) never surface into this one."""
+    chapter = cfg.chapter_of_issue(issue_num)
+    chapter_nums = _chapter_issue_nums(cfg, chapter)
+    if issue_num not in chapter_nums:
+        chapter_nums = [issue_num, *chapter_nums]
+    ctx = _load_context(cfg, chapter_nums)
+    ledger = _ledger(cfg)
+
+    # Decls cited by OTHER chapter issues — never surface a sibling result's
+    # declarations into this subdeck. Resolved to snapshot names for matching.
+    exclude: set[str] = set()
+    for other in chapter_nums:
+        if other == issue_num:
+            continue
+        for raw in _decls_for_issue(ctx, other):
+            exclude.add(_resolve_to_snapshot(ctx, raw) or raw)
+
+    # Textbook-result key(s) from the issue title (e.g. {"12.19"}): a candidate
+    # only surfaces when its docstring references the SAME result.
+    meta = ctx.issue_meta.get(issue_num) or {}
+    result_keys = _textbook_result_keys(meta.get("title") or "")
+
+    return _surface_namespace_decls(
+        ctx, cited_names, ledger, Path(cfg.repo_dir),
+        exclude_names=exclude, result_keys=result_keys,
+    )
+
+
+def _textbook_result_keys(title: str) -> "set[str]":
+    """Textbook-result numbers in an issue title, e.g. ``"Proposition 12.19 —
+    …"`` → ``{"12.19"}`` and ``"Lemma 12.24/12.26"`` → ``{"12.24", "12.26"}``.
+
+    These key the namespace-surfacing: a same-namespace decl is surfaced only
+    when its source docstring references one of these numbers (so the other
+    parts of a multi-part result are pulled in, but unrelated plumbing is not).
+    Empty for un-numbered issues (e.g. a "def" issue) — then nothing surfaces."""
+    import re
+
+    return set(re.findall(r"\b\d+\.\d+\b", title or ""))
+
+
+def build_card_detail(cfg: "ReviewConfig", issue_num: int) -> CardDetail:
+    """Assemble the full spec card for one issue.
+
+    A card carries a :class:`DeclView` for EVERY declaration the issue cites
+    (an issue bundles all the decls of one textbook result), each with its
+    own source / kernel / evidence / tier / informal rendering, ordered
+    worst-tier first. The card-level ``tier`` is the worst of these (the
+    gate). The top-level scalar fields mirror the headline (``decls[0]``)
+    for backward-compatible / degraded rendering. Pure + read-only."""
+    from marathon.audit.trust import TIER_ORDER
+
+    ctx = _load_context(cfg, [issue_num])
+    tier, qualifiers, decl = _issue_tier(ctx, issue_num)
+    chapter = cfg.chapter_of_issue(issue_num)
+
+    # One view per cited declaration, de-duplicated by resolved name,
+    # ordered worst-tier first (the gating decl leads), then by name.
+    ledger = _ledger(cfg)
+    repo_dir = Path(cfg.repo_dir)
+    views: list[DeclView] = []
+    seen: set[str] = set()
+    for raw in _decls_for_issue(ctx, issue_num):
+        view = _build_decl_view(ctx, ledger, raw, repo_dir)
+        if view.name in seen:
+            continue
+        seen.add(view.name)
+        views.append(view)
+    views.sort(
+        key=lambda v: (
+            TIER_ORDER.index(v.tier) if v.tier in TIER_ORDER else 0,
+            v.name,
+        )
+    )
+
+    # Re-classify api with the issue's HEADLINE decl now known (the worst-tier
+    # decl that leads the sorted views) so the headline is never auto-approved.
+    headline_name = views[0].name if views else None
+    views = [
+        replace(v, **dict(zip(("api", "api_reason"),
+                             classify_api(v, headline_name))))
+        for v in views
+    ]
+
+    # Top-level scalar fields mirror the headline view (decls[0]) for
+    # backward-compatible / degraded clients.
+    head = views[0] if views else None
+    statement_pp = head.statement_pp if head else None
+    source_block = head.source_block if head else None
+    source_file = head.source_file if head else None
+    informal_rendering = head.informal_rendering if head else None
+    informal_is_llm = head.informal_is_llm if head else False
+    kernel = list(head.kernel) if head else []
+    evidence = dict(head.evidence) if head else {
+        "axioms_beyond_whitelist": [], "sorry": None, "deception_tags": [],
+    }
+    semantic_delta = head.semantic_delta if head else None
 
     # Issue-derived fields (permalink, iteration log) — pure read.
     meta = ctx.issue_meta.get(issue_num) or {}
     permalink = _issue_permalink(cfg, issue_num)
     iteration_log = _iteration_log(cfg, issue_num, meta)
+    # The issue's TOP-LEVEL informal statement (the body's ### Informal
+    # Statement) — the one text the leading approval card shows.
+    issue_informal, issue_informal_is_llm = _issue_informal_statement(
+        meta.get("body")
+    )
 
     # Deps back to predecessor cards (same chapter scope as the queue).
     chapter_nums = _chapter_issue_nums(cfg, chapter)
@@ -706,9 +1442,14 @@ def build_card_detail(cfg: "ReviewConfig", issue_num: int) -> CardDetail:
         chapter=chapter,
         tier=tier,
         qualifiers=qualifiers,
+        decls=views,
         statement_pp=statement_pp,
+        source_block=source_block,
+        source_file=source_file,
         informal_rendering=informal_rendering,
         informal_is_llm=informal_is_llm,
+        issue_informal=issue_informal,
+        issue_informal_is_llm=issue_informal_is_llm,
         kernel=kernel,
         evidence=evidence,
         semantic_delta=semantic_delta,

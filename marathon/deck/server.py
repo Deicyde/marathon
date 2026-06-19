@@ -13,9 +13,13 @@ API surface (shared contract — the gate reconciles any drift):
 * ``GET  /static/<path>``     → static assets (tolerates a missing dir)
 * ``GET  /api/queue?chapter=N`` → ``{cards, building, landed_today}``
 * ``GET  /api/card/{id}``     → the full :class:`CardDetail`
+* ``GET  /api/subdeck/{id}``  → the issue's per-declaration SUBDECK (read)
 * ``GET  /api/status``        → live conductor/landing events (poll)
 * ``GET  /api/events``        → the same, as Server-Sent Events
 * ``POST /api/verdict``       → route a verdict (IRREVERSIBLE — guarded)
+* ``POST /api/decl-verdict``  → record one per-decl verdict (LOCAL — guarded)
+* ``POST /api/ship``          → ship a subdeck's issue (IRREVERSIBLE — guarded)
+* ``POST /api/refresh-issue`` → push-refresh signatures to GitHub (WRITE — guarded)
 
 BINDING SAFETY:
 
@@ -85,6 +89,20 @@ _CONTENT_TYPES = {
 MAX_POST_BYTES = 256 * 1024
 
 
+def _truthy_flag(value) -> bool:
+    """Interpret a ``skip_api`` flag from a query string (``"1"``/``"0"``/
+    ``"true"``) or a JSON body (``True``/``1``/``"1"``). Anything else —
+    ``None``, ``""``, ``"0"``, ``False`` — is falsy. Shared by the GET
+    (?skip_api=) and POST (body) paths so both interpret the flag identically."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
 class DeckServer(ThreadingHTTPServer):
     """A ThreadingHTTPServer that carries the deck's request context (the
     ReviewConfig, the per-session token, the default chapter). The handler
@@ -100,10 +118,15 @@ class DeckServer(ThreadingHTTPServer):
         cfg: "ReviewConfig",
         token: str,
         default_chapter: Optional[int] = None,
+        demo: bool = False,
     ):
         self.cfg = cfg
         self.token = token
         self.default_chapter = default_chapter
+        # Demo mode: the API routes to marathon.deck.demo (synthetic cards,
+        # in-memory verdicts, a SIMULATED ship that fires nothing). No cfg /
+        # repo / GitHub / Aristotle is touched.
+        self.demo = demo
         super().__init__(server_address, DeckHandler)
 
 
@@ -166,6 +189,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                 return self._api_queue(query)
             if path.startswith("/api/card/"):
                 return self._api_card(path[len("/api/card/"):])
+            if path.startswith("/api/subdeck/"):
+                return self._api_subdeck(path[len("/api/subdeck/"):], query)
             if path == "/api/status":
                 return self._api_status()
             if path == "/api/events":
@@ -226,7 +251,14 @@ class DeckHandler(BaseHTTPRequestHandler):
         )
         self._send_bytes(candidate.read_bytes(), content_type)
 
+    @property
+    def _demo(self) -> bool:
+        return bool(getattr(self.server, "demo", False))  # type: ignore[attr-defined]
+
     def _api_queue(self, query: dict) -> None:
+        if self._demo:
+            from marathon.deck.demo import demo_queue
+            return self._send_json(demo_queue())
         from marathon.deck.cards import build_queue
 
         chapter = self._chapter_from_query(query)
@@ -244,6 +276,27 @@ class DeckHandler(BaseHTTPRequestHandler):
             )
         detail = build_card_detail(self.cfg, issue_num)
         self._send_json(detail.to_json())
+
+    def _api_subdeck(self, raw_id: str, query: dict) -> None:
+        """The issue's per-declaration subdeck — a PURE read (the contract's
+        GET /api/subdeck/{issue}?skip_api=0|1). Assembling it reads the issue's
+        card detail + the LOCAL per-decl store; it records nothing and fires no
+        verdict. The ``skip_api`` flag only changes the assembled VIEW (which
+        decls land in ``cards`` vs the ``auto_approved`` LIST); it NEVER writes
+        and NEVER auto-approves — auto-approval is realized only at ship."""
+        try:
+            issue_num = int(raw_id)
+        except ValueError:
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad subdeck id {raw_id!r}"
+            )
+        skip_api = _truthy_flag((query.get("skip_api") or [None])[0])
+        if self._demo:
+            from marathon.deck.demo import demo_subdeck
+            return self._send_json(demo_subdeck(issue_num, skip_api=skip_api))
+        from marathon.deck.subdeck import build_subdeck
+
+        self._send_json(build_subdeck(self.cfg, issue_num, skip_api=skip_api))
 
     def _api_status(self) -> None:
         """Poll endpoint: the live conductor/landing events as one JSON
@@ -268,63 +321,96 @@ class DeckHandler(BaseHTTPRequestHandler):
 
     # --- POST (the single irreversible route — token-guarded) -------------
 
+    # The POST routes. Every one is token-guarded (see ``_read_guarded_body``);
+    # ``/api/verdict``, ``/api/ship`` and ``/api/refresh-issue`` are
+    # side-effecting (the last is the SOLE GitHub-write of the reconcile/refresh
+    # feature), ``/api/decl-verdict`` is LOCAL-only. A path not here is a 404
+    # with no side effect.
+    _POST_ROUTES = (
+        "/api/verdict", "/api/decl-verdict", "/api/ship", "/api/refresh-issue",
+    )
+
     def do_POST(self) -> None:  # noqa: N802 (stdlib handler name)
         parsed = urlsplit(self.path)
-        if parsed.path != "/api/verdict":
+        if parsed.path not in self._POST_ROUTES:
             return self._send_error_json(
                 HTTPStatus.NOT_FOUND, f"no POST route {parsed.path!r}"
             )
         try:
-            self._api_verdict()
+            if parsed.path == "/api/verdict":
+                self._api_verdict()
+            elif parsed.path == "/api/decl-verdict":
+                self._api_decl_verdict()
+            elif parsed.path == "/api/refresh-issue":
+                self._api_refresh_issue()
+            else:  # /api/ship
+                self._api_ship()
         except BrokenPipeError:
             return
 
-    def _api_verdict(self) -> None:
-        # (1) Cross-origin guard: a verdict may only come from a page this
-        #     server served (same-origin). A present Origin that is not our
-        #     own loopback origin is a stray/other-origin POST — refuse it
-        #     BEFORE reading the body or touching the token.
+    def _read_guarded_body(self) -> Optional[dict]:
+        """Shared POST preamble for every side-effecting route: the
+        cross-origin guard, the (small) JSON body read, and the per-session
+        token check — in that order, BEFORE any handler logic runs.
+
+        Returns the parsed JSON body (a dict) on success, or ``None`` after
+        having already sent the appropriate 4xx (cross-origin / bad body /
+        missing-or-invalid token). The token comes from the header (preferred)
+        or the body's ``token`` field; a constant-time compare avoids leaking
+        it via timing. NO token / wrong token / foreign Origin => the handler
+        returns without firing any side effect."""
+        # (1) Cross-origin guard: a POST may only come from a page this server
+        #     served (same-origin). A present Origin that is not our own
+        #     loopback origin is a stray/other-origin POST — refuse it BEFORE
+        #     reading the body or touching the token.
         origin = self.headers.get("Origin")
         if origin is not None and not self._origin_is_self(origin):
-            return self._send_error_json(
+            self._send_error_json(
                 HTTPStatus.FORBIDDEN,
-                "cross-origin verdict refused (verdicts are loopback-only)",
+                "cross-origin request refused (this surface is loopback-only)",
             )
+            return None
 
         # (2) Read the (small) body.
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            return self._send_error_json(
-                HTTPStatus.BAD_REQUEST, "bad Content-Length"
-            )
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "bad Content-Length")
+            return None
         if length > MAX_POST_BYTES:
-            return self._send_error_json(
-                HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "verdict body too large"
+            self._send_error_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request body too large"
             )
+            return None
         raw = self.rfile.read(length) if length > 0 else b""
         try:
             data = json.loads(raw.decode("utf-8")) if raw else {}
         except (ValueError, UnicodeDecodeError):
-            return self._send_error_json(
-                HTTPStatus.BAD_REQUEST, "verdict body is not valid JSON"
+            self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "request body is not valid JSON"
             )
+            return None
         if not isinstance(data, dict):
-            return self._send_error_json(
-                HTTPStatus.BAD_REQUEST, "verdict body must be a JSON object"
+            self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "request body must be a JSON object"
             )
+            return None
 
-        # (3) Per-session token check — the gate on the irreversible action.
-        #     Accept the token from the header (preferred) or the body. A
-        #     constant-time compare avoids leaking it via timing. NO token /
-        #     wrong token => 403 and NO side effect.
+        # (3) Per-session token check — the gate on the side effect.
         supplied = self.headers.get(TOKEN_HEADER) or data.get("token")
         expected = self.server.token  # type: ignore[attr-defined]
         if not supplied or not secrets.compare_digest(str(supplied), expected):
-            return self._send_error_json(
+            self._send_error_json(
                 HTTPStatus.FORBIDDEN,
-                "missing or invalid session token; verdict not applied",
+                "missing or invalid session token; request not applied",
             )
+            return None
+        return data
+
+    def _api_verdict(self) -> None:
+        data = self._read_guarded_body()
+        if data is None:
+            return  # the guard already sent the 4xx (origin / body / token)
 
         # (4) Validate the request shape, THEN route through the committed
         #     verdict path. apply_verdict raises VerdictError on a bad
@@ -351,6 +437,145 @@ class DeckHandler(BaseHTTPRequestHandler):
                 f"verdict routing failed: {exc}",
             )
         self._send_json(result.to_json())
+
+    def _api_decl_verdict(self) -> None:
+        """Record one per-(issue,decl) verdict — LOCAL ONLY (the contract's
+        POST /api/decl-verdict). Token-guarded like every POST, but it fires
+        NO irreversible action: it writes only the local subdeck sidecar (no
+        cmd_verify / cmd_reject, no gh, no git, no Aristotle). A ``reject``
+        without a non-empty note is a 400 (raised before any write)."""
+        data = self._read_guarded_body()
+        if data is None:
+            return  # the guard already sent the 4xx (origin / body / token)
+
+        issue_raw = data.get("issue")
+        decl = data.get("decl")
+        verdict = data.get("verdict")
+        note = data.get("note")
+        try:
+            issue_num = int(issue_raw)
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad or missing issue {issue_raw!r}"
+            )
+        if not decl or not isinstance(decl, str):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad or missing decl {decl!r}"
+            )
+
+        if self._demo:
+            from marathon.deck.demo import demo_record_verdict
+            try:
+                return self._send_json(
+                    demo_record_verdict(issue_num, decl, verdict, note)
+                )
+            except ValueError as exc:
+                return self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+
+        from marathon.deck.subdeck import (
+            build_subdeck,
+            next_unreviewed_card,
+            record_decl_verdict,
+        )
+
+        try:
+            record_decl_verdict(self.cfg, issue_num, decl, verdict, note)
+        except ValueError as exc:  # unknown verdict / empty reject note
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
+            return self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"decl-verdict failed: {exc}",
+            )
+
+        subdeck = build_subdeck(self.cfg, issue_num)
+        self._send_json({
+            "ok": True,
+            "progress": subdeck["progress"],
+            "complete": subdeck["complete"],
+            "summary": subdeck["summary"],
+            # The informal-approval slot rides the response so a __informal__
+            # verdict (the leading approval card) is reflected authoritatively;
+            # it is OUTSIDE progress/complete/summary (see _informal_slot).
+            "informal": subdeck.get("informal"),
+            "next_decl": next_unreviewed_card(subdeck),
+        })
+
+    def _api_ship(self) -> None:
+        """Ship a subdeck's issue (the contract's POST /api/ship) — the ONLY
+        endpoint besides /api/verdict that fires an irreversible action.
+        Composes the per-issue outcome from the LOCAL subdeck and routes it
+        through the committed verdict path (verify, or reject with the
+        composed note carried verbatim). An incomplete subdeck returns
+        ``{ok:false, reason}`` with NO side effect."""
+        data = self._read_guarded_body()
+        if data is None:
+            return  # the guard already sent the 4xx (origin / body / token)
+
+        issue_raw = data.get("issue")
+        try:
+            issue_num = int(issue_raw)
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad or missing issue {issue_raw!r}"
+            )
+        # skip_api: when truthy the ship auto-approves the issue's easy-API
+        # decls (the realization of the toggle). It is read from the BODY of
+        # this explicit, token-bearing POST — never inferred from a GET.
+        skip_api = _truthy_flag(data.get("skip_api"))
+
+        if self._demo:
+            from marathon.deck.demo import demo_ship
+            return self._send_json(demo_ship(issue_num, skip_api=skip_api))
+
+        from marathon.deck.subdeck import ship_issue
+
+        try:
+            result = ship_issue(self.cfg, issue_num, skip_api=skip_api)
+        except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
+            return self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, f"ship failed: {exc}"
+            )
+        self._send_json(result)
+
+    def _api_refresh_issue(self) -> None:
+        """Push-refresh the issue body's ``### Lean signatures`` section to the
+        CURRENT code/SHA (the contract's POST /api/refresh-issue) — the SOLE new
+        GitHub WRITE of the reconcile/refresh feature.
+
+        Token-guarded like every POST (a missing/invalid token => 403 with NO
+        ``gh`` call). It routes through the MECHANICAL
+        :func:`marathon.deck.refresh.refresh_issue_signatures` (NO Claude): that
+        re-quotes ONLY the signatures section against the current source +
+        HEAD-pinned permalinks (dropping stale citations, adding surfaced
+        decls), preserving every other section verbatim, and writes the new body
+        via a SINGLE ``gh issue edit``. The reconciling GET never reaches this —
+        only this explicit, token-bearing POST mutates the issue."""
+        data = self._read_guarded_body()
+        if data is None:
+            return  # the guard already sent the 4xx (origin / body / token)
+
+        issue_raw = data.get("issue")
+        try:
+            issue_num = int(issue_raw)
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad or missing issue {issue_raw!r}"
+            )
+
+        if self._demo:
+            from marathon.deck.demo import demo_refresh
+            return self._send_json(demo_refresh(issue_num))
+
+        from marathon.deck.refresh import refresh_issue_signatures
+
+        try:
+            result = refresh_issue_signatures(self.cfg, issue_num)
+        except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
+            return self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, f"refresh failed: {exc}"
+            )
+        self._send_json(result)
 
     # --- helpers ----------------------------------------------------------
 
@@ -467,14 +692,16 @@ def make_server(
     port: int = 0,
     token: Optional[str] = None,
     default_chapter: Optional[int] = None,
+    demo: bool = False,
 ) -> DeckServer:
     """Construct (do not start) a :class:`DeckServer` bound to 127.0.0.1
     on ``port`` (0 = an ephemeral OS-assigned port, used by tests). A fresh
     per-session token is minted unless one is supplied. The caller starts
-    it via ``serve_forever`` (or drives the handler directly in tests)."""
+    it via ``serve_forever`` (or drives the handler directly in tests).
+    ``demo`` serves synthetic cards (no cfg/repo needed)."""
     if token is None:
         token = secrets.token_urlsafe(32)
-    return DeckServer((BIND_HOST, port), cfg, token, default_chapter)
+    return DeckServer((BIND_HOST, port), cfg, token, default_chapter, demo=demo)
 
 
 def serve(
@@ -483,6 +710,7 @@ def serve(
     port: int = 0,
     default_chapter: Optional[int] = None,
     open_browser: bool = True,
+    demo: bool = False,
 ) -> int:
     """Start the deck server and block in ``serve_forever`` until Ctrl-C.
 
@@ -490,19 +718,28 @@ def serve(
     irreversible, then (unless ``open_browser`` is False) opens the URL in
     the default browser. Returns 0 on a clean Ctrl-C shutdown. The CLI
     (``marathon deck``) is a thin wrapper over this."""
-    server = make_server(cfg, port=port, default_chapter=default_chapter)
+    server = make_server(cfg, port=port, default_chapter=default_chapter, demo=demo)
     host, bound_port = server.server_address[:2]
     url = f"http://{host}:{bound_port}/"
 
     print("=" * 70)
     print(f"marathon deck — http://127.0.0.1:{bound_port}/")
-    print(
-        "  WARNING: verify and reject are REAL, IRREVERSIBLE actions —\n"
-        "  verify MERGES the marathon PR + flips the tracker; reject\n"
-        "  DISPATCHES Aristotle with your note verbatim. Only the swipe\n"
-        "  buttons (a deliberate POST) fire them; loading or navigating\n"
-        "  the page never does."
-    )
+    if demo:
+        print(
+            "  DEMO MODE: synthetic cards, no consumer repo / GitHub / "
+            "Aristotle.\n"
+            "  Swipe each declaration; shipping a subdeck is SIMULATED "
+            "(fires nothing).\n"
+            "  Per-decl verdicts are in-memory and reset on restart."
+        )
+    else:
+        print(
+            "  WARNING: verify and reject are REAL, IRREVERSIBLE actions —\n"
+            "  verify MERGES the marathon PR + flips the tracker; reject\n"
+            "  DISPATCHES Aristotle with your note verbatim. Only the swipe\n"
+            "  buttons (a deliberate POST) fire them; loading or navigating\n"
+            "  the page never does."
+        )
     print(f"  bound to {host} (loopback only); chapter="
           f"{default_chapter if default_chapter is not None else 'all'}")
     print("  press Ctrl-C to stop.")

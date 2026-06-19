@@ -255,6 +255,49 @@ def test_card_detail_reuses_spec_card(tmp_path, monkeypatch):
     assert [d.id for d in detail.deps] == [22]
 
 
+def test_card_detail_includes_every_cited_decl(tmp_path, monkeypatch):
+    """An issue bundles several declarations; the card must carry a DeclView
+    for EACH (not just the headline), ordered worst-tier first, with the
+    card-level tier = the worst over them."""
+    cfg = make_cfg(tmp_path)
+    snapshot = make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="def", type_pp="Nat", value_pp="0"),
+        # A non-whitelisted axiom caps Bar at T0 (the worst of the three).
+        _decl("Demo.Chapter14.Bar", kind="def", type_pp="Int", value_pp="1",
+              axioms=["propext", "Demo.cheat"]),
+        _decl("Demo.Chapter14.Baz", kind="theorem", type_pp="Foo = Foo"),
+    ])
+    install_snapshot(cfg, snapshot)
+    body = (
+        "### Lean signatures\n\n```lean\n"
+        "def Foo : Nat := 0\n"
+        "def Bar : Int := 1\n"
+        "theorem Baz : Foo = Foo := by rfl\n"
+        "```"
+    )
+    patch_bulk(monkeypatch, {
+        30: {"title": "#30 bundle", "state": "OPEN", "body": body, "labels": set()},
+    })
+
+    detail = cards.build_card_detail(cfg, 30)
+
+    # One view per cited declaration — not just the headline.
+    assert {v.name for v in detail.decls} == {
+        "Demo.Chapter14.Foo", "Demo.Chapter14.Bar", "Demo.Chapter14.Baz",
+    }
+    # Worst tier gates the card and leads the list; headline mirrors it.
+    assert detail.tier == "T0"
+    assert detail.decls[0].name == "Demo.Chapter14.Bar"
+    assert detail.decls[0].tier == "T0"
+    assert detail.decl == "Demo.Chapter14.Bar"
+    # Each view carries its OWN tier (not the card-level worst).
+    by_name = {v.name: v for v in detail.decls}
+    assert by_name["Demo.Chapter14.Foo"].tier == "T1"
+    assert by_name["Demo.Chapter14.Baz"].tier == "T1"
+    # The top-level scalar fields mirror the headline view (backward-compat).
+    assert detail.statement_pp == detail.decls[0].statement_pp
+
+
 # ---------------------------------------------------------------------------
 # apply_verdict — routes through cmd_verify / cmd_reject; defer is local
 # ---------------------------------------------------------------------------

@@ -97,6 +97,230 @@ html, body {
   white-space: pre; margin: 0;
 }
 
+/* --- declaration source block (the human-readable face) --- */
+.sec-source { margin-bottom: 0.6rem; }
+.src-file {
+  font-weight: 400; font-size: 0.72rem; color: var(--muted);
+  margin-left: 0.6rem;
+}
+.source-block {
+  background: #0b0e14; border: 1px solid var(--line); border-radius: 10px;
+  padding: 0.8rem 1rem; margin: 0;
+  font-size: 0.84rem; line-height: 1.55;
+  /* Wrap the whole declaration on screen — no horizontal scroll. Long
+     binder lines break rather than overflow; indentation is preserved. */
+  white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal;
+  overflow-x: hidden; tab-size: 2;
+}
+.source-block code.lean { font-family: var(--mono); background: none; color: var(--ink); }
+/* Lean token colours (GitHub-dark-ish, on the #0b0e14 block). */
+.lh-comment { color: #7ee787; font-style: italic; }
+.lh-kw { color: #ff7b72; }
+.lh-string { color: #a5d6ff; }
+.lh-sorry { color: #f0883e; font-weight: 600; }
+/* Elaborated type demoted to a collapsible secondary. */
+.elab-type > summary {
+  cursor: pointer; color: var(--muted); font-size: 0.8rem;
+  padding: 0.2rem 0; user-select: none;
+}
+.elab-type[open] > summary { margin-bottom: 0.4rem; }
+
+/* --- subdeck header (parent issue + progress on a per-decl card) --- */
+.subdeck-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 0.75rem; flex-wrap: wrap; margin-bottom: 0.7rem;
+  padding-bottom: 0.6rem; border-bottom: 1px solid var(--line);
+}
+.subdeck-issue { display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; }
+.subdeck-title { font-style: italic; color: var(--ink); font-size: 0.92rem; }
+.subdeck-progress { display: flex; flex-direction: column; align-items: flex-end; gap: 0.2rem; }
+.progress-pill {
+  background: var(--panel-2); border: 1px solid var(--accent); color: var(--accent);
+  border-radius: 999px; padding: 0.12rem 0.6rem; font-size: 0.78rem;
+  font-variant-numeric: tabular-nums; font-weight: 600;
+}
+.subdeck-local-note { font-size: 0.68rem; color: var(--muted); text-align: right; }
+
+/* header controls row: skip-API toggle + push-refresh button */
+.subdeck-controls { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; justify-content: flex-end; }
+
+/* --- push-refresh button (header; the ONLY GitHub WRITE in this feature) --- */
+.refresh-issue-btn {
+  white-space: nowrap; font-size: 0.72rem; padding: 0.18rem 0.55rem;
+  display: inline-flex; align-items: center; gap: 0.3rem;
+}
+/* When the reconciliation found DRIFT the button is enabled + emphasised
+   (it writes GitHub). When there is no drift it is disabled (a no-op write). */
+.refresh-issue-btn.has-drift {
+  border-color: var(--warn); color: var(--warn); font-weight: 600;
+}
+.refresh-issue-btn.has-drift:hover:not(:disabled) { background: #d2992218; }
+.refresh-issue-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.modal-refresh-drop strong { color: var(--warn); }
+.modal-refresh-add strong { color: var(--accent); }
+
+/* --- stale-citation FOOTNOTE (reconciliation: dropped, never cards) --- */
+.stale-footnote {
+  display: flex; align-items: flex-start; gap: 0.5rem;
+  margin: 0.9rem auto 0; max-width: 760px;
+  background: #d2992212; border: 1px solid var(--warn);
+  border-left: 3px solid var(--warn); border-radius: 10px;
+  padding: 0.55rem 0.75rem; font-size: 0.78rem; line-height: 1.45;
+}
+.stale-foot-icon { color: var(--warn); font-size: 0.95rem; line-height: 1.3; }
+.stale-foot-lead { color: var(--warn); font-weight: 600; }
+.stale-foot-names { color: var(--ink); }
+.stale-foot-tail { color: var(--muted); }
+
+/* --- surfaced-from-code badge/banner (reconciliation: a reviewable card) --- */
+.surfaced-badge {
+  font-size: 0.62rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--accent);
+  border: 1px solid #6ea8fe66; background: #6ea8fe18;
+  border-radius: 5px; padding: 0.08rem 0.4rem; white-space: nowrap;
+}
+.surfaced-banner {
+  display: flex; align-items: flex-start; gap: 0.55rem;
+  background: #6ea8fe14; border: 1px solid var(--accent);
+  border-left: 3px solid var(--accent); border-radius: 10px;
+  padding: 0.6rem 0.8rem; margin: 0.6rem 0;
+}
+.surfaced-icon { color: var(--accent); font-size: 1.05rem; line-height: 1.3; }
+.surfaced-text strong { color: var(--accent); }
+.surfaced-sub { color: var(--muted); font-size: 0.78rem; margin-top: 0.2rem; }
+
+/* --- skip-API toggle (header; pure VIEW change — never POSTs) --- */
+.skip-api-toggle {
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  font-size: 0.72rem; color: var(--muted); cursor: pointer;
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 0.12rem 0.55rem; background: var(--panel-2); user-select: none;
+}
+.skip-api-toggle:hover { border-color: var(--accent); color: var(--ink); }
+.skip-api-box { accent-color: var(--accent); margin: 0; cursor: pointer; }
+.skip-api-label { font-weight: 600; letter-spacing: 0.02em; }
+
+/* --- stale-citation banner (request 1: cited but absent from the code) --- */
+.stale-citation {
+  display: flex; align-items: flex-start; gap: 0.55rem;
+  background: #d2992218; border: 1px solid var(--warn);
+  border-left: 3px solid var(--warn); border-radius: 10px;
+  padding: 0.6rem 0.8rem; margin: 0.6rem 0;
+}
+.stale-icon { color: var(--warn); font-size: 1.05rem; line-height: 1.3; }
+.stale-text strong { color: var(--warn); }
+.stale-sub { color: var(--muted); font-size: 0.78rem; margin-top: 0.2rem; }
+
+/* --- auto-approved API panel (skip-API; collapsible, beneath the deck) --- */
+.api-panel {
+  margin: 0.9rem auto 0; max-width: 760px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 12px; overflow: hidden;
+}
+.api-panel-head {
+  width: 100%; display: flex; align-items: center; gap: 0.5rem;
+  background: var(--panel-2); border: 0; color: var(--ink);
+  padding: 0.55rem 0.8rem; cursor: pointer; text-align: left; font: inherit;
+}
+.api-panel-head:hover { background: #222a3a; }
+.api-panel-caret { color: var(--accent); font-size: 0.8rem; }
+.api-panel-title { font-size: 0.84rem; font-weight: 600; }
+.api-panel-note {
+  color: var(--muted); font-size: 0.78rem; line-height: 1.5;
+  margin: 0.6rem 0.85rem 0.3rem;
+}
+.api-panel-note strong { color: var(--warn); }
+.api-list { list-style: none; margin: 0; padding: 0 0.85rem 0.7rem; }
+.api-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 0.6rem; padding: 0.4rem 0; border-bottom: 1px solid var(--line);
+}
+.api-row:last-child { border-bottom: 0; }
+.api-row-main { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.api-name { font-size: 0.85rem; font-weight: 600; }
+.api-reason {
+  font-size: 0.7rem; color: var(--muted); font-style: italic;
+  border: 1px dashed var(--line); border-radius: 4px; padding: 0 0.32rem;
+}
+.api-empty { color: var(--muted); font-style: italic; font-size: 0.82rem; padding: 0.4rem 0; }
+.api-pull { white-space: nowrap; }
+
+/* auto-approved (API) rows surfaced in the ship summary's KEEP section */
+.keep-row-api { align-items: center; }
+.keep-api-main { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.api-tag {
+  font-size: 0.64rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--defer);
+  border: 1px solid #b0883a66; background: #b0883a18;
+  border-radius: 5px; padding: 0.08rem 0.4rem;
+}
+.keep-api-note { color: var(--muted); font-size: 0.76rem; line-height: 1.5; margin: 0.4rem 0 0; }
+.keep-api-note strong { color: var(--defer); }
+.modal-api-warn strong { color: var(--defer); }
+
+/* per-decl review verdict tag (LOCAL state, shown on a revisited card) */
+.decl-verdict-tag {
+  font-size: 0.66rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.05em; border-radius: 5px; padding: 0.1rem 0.4rem;
+  border: 1px solid var(--line);
+}
+.dv-verified { color: var(--verify); border-color: #2ea04366; background: #2ea04318; }
+.dv-rejected { color: var(--reject); border-color: #d1374b66; background: #d1374b18; }
+.dv-deferred { color: var(--defer); border-color: #b0883a66; background: #b0883a18; }
+
+/* --- confirm-and-ship summary card --- */
+.summary-card { /* shares the base .card chrome; the completion surface */ }
+.summary-title { font-size: 1.15rem; margin: 0.4rem 0 0.8rem; }
+.summary-sec { margin-bottom: 1rem; }
+.summary-list { list-style: none; margin: 0.3rem 0 0; padding: 0; }
+.summary-row { padding: 0.35rem 0; border-bottom: 1px solid var(--line); }
+.summary-row:last-child { border-bottom: 0; }
+.keep-row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.fix-row { display: flex; flex-direction: column; gap: 0.25rem; }
+.fix-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.fix-note {
+  background: #0b0e14; border: 1px solid var(--line); border-left: 3px solid var(--reject);
+  border-radius: 8px; padding: 0.45rem 0.65rem; font-size: 0.82rem; color: var(--ink);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.summary-keep .sec-title { color: var(--verify); }
+.summary-fix .sec-title { color: var(--reject); }
+.summary-empty { color: var(--muted); font-style: italic; font-size: 0.85rem; }
+.summary-deferred { color: var(--defer); font-size: 0.82rem; }
+.summary-actions { display: flex; justify-content: space-between; gap: 0.6rem; margin-top: 1rem; flex-wrap: wrap; }
+.ship-btn { font-weight: 700; }
+.ship-warn { color: var(--muted); font-size: 0.74rem; margin: 0.6rem 0 0; text-align: center; }
+.btn-tiny { padding: 0.18rem 0.5rem; font-size: 0.72rem; }
+.deferred-list { margin-top: 0.6rem; }
+.revisit-decl { white-space: nowrap; }
+
+/* --- per-declaration panels (an issue bundles several decls) --- */
+.card-title-main { font-size: 1.05rem; font-weight: 600; color: var(--ink); }
+.decls-count {
+  font-size: 0.82rem; color: var(--muted); margin: 0.3rem 0 0.6rem;
+}
+.decl-panel { margin: 0 0 0.5rem; }
+/* When a card has more than one decl, box each so the boundaries are clear. */
+.decl-panel-multi {
+  border: 1px solid var(--line); border-radius: 12px;
+  padding: 0.7rem 0.85rem; background: rgba(255, 255, 255, 0.015);
+}
+.decl-panel-head {
+  display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+  margin-bottom: 0.4rem;
+}
+.decl-panel-name { font-size: 0.92rem; font-weight: 600; color: var(--ink); }
+.decl-panel-kind {
+  font-size: 0.7rem; color: var(--muted); text-transform: uppercase;
+  letter-spacing: 0.04em; border: 1px solid var(--line);
+  border-radius: 5px; padding: 0.02rem 0.32rem;
+}
+.decl-nosource {
+  font-size: 0.8rem; color: var(--muted); font-style: italic;
+  background: #0b0e14; border: 1px dashed var(--line); border-radius: 8px;
+  padding: 0.5rem 0.7rem; margin: 0;
+}
+
 /* --- tier badges --- */
 .tier-badge { display: inline-flex; align-items: center; gap: 0.3rem; }
 .tier-label { font-weight: 700; font-size: 0.78rem; padding: 0.18rem 0.55rem; border-radius: 6px; letter-spacing: 0.04em; }
@@ -111,6 +335,7 @@ html, body {
 /* --- informal (LLM) --- */
 .informal { background: var(--panel-2); border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: 10px; padding: 0.7rem 0.85rem; }
 .informal-flag { font-size: 0.72rem; color: var(--warn); font-weight: 600; margin-bottom: 0.45rem; }
+.informal-flag-ok { color: var(--ok); }
 .informal-text { line-height: 1.55; font-size: 0.92rem; }
 .informal-empty { color: var(--muted); font-style: italic; }
 
@@ -120,18 +345,16 @@ html, body {
 .latex-degraded::after { content: " (raw LaTeX — math renderer offline)"; color: var(--muted); font-size: 0.72rem; font-style: italic; }
 .katex-display-wrap { display: block; overflow-x: auto; }
 
-/* --- kernel --- */
-.kernel-title { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 0.45rem; }
-.kernel-empty { color: var(--ok); font-size: 0.85rem; }
-.kernel-member { border: 1px solid var(--line); border-radius: 10px; margin-bottom: 0.5rem; overflow: hidden; }
-.kernel-head { width: 100%; display: flex; align-items: center; gap: 0.55rem; background: var(--panel-2); border: 0; color: var(--ink); padding: 0.5rem 0.7rem; cursor: pointer; text-align: left; font: inherit; }
-.kernel-head:hover { background: #222a3a; }
-.kernel-name { font-weight: 600; font-size: 0.85rem; }
-.kernel-kind { font-size: 0.68rem; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 0.3rem; }
-.kernel-toggle { margin-left: auto; font-size: 0.72rem; color: var(--accent); }
-.kernel-body { padding: 0.55rem 0.7rem; }
-.kernel-type, .kernel-value { background: #0b0e14; border: 1px solid var(--line); border-radius: 8px; padding: 0.5rem 0.7rem; font-size: 0.8rem; overflow-x: auto; white-space: pre; margin: 0 0 0.4rem; }
-.kernel-value { border-color: var(--accent); }
+/* --- informal-approval card (the leading "verify the LLM text" card) --- */
+.approval-card { border-color: var(--accent); }
+.approval-panel { border-left: 3px solid var(--accent); }
+.approval-head { display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; margin-bottom: 0.4rem; }
+.approval-badge { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 0.1rem 0.5rem; }
+.approval-title { font-size: 1.0rem; margin: 0; }
+.approval-sub { color: var(--muted); font-size: 0.84rem; line-height: 1.5; margin: 0 0 0.8rem; }
+.approval-item { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 0.6rem 0.8rem; margin-bottom: 0.55rem; }
+.approval-item-name { font-size: 0.74rem; color: var(--muted); margin-bottom: 0.35rem; }
+.approval-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.7rem; }
 
 /* --- evidence --- */
 .evidence-row { display: flex; flex-wrap: wrap; gap: 0.45rem; }
