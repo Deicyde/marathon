@@ -1245,3 +1245,9 @@ def test_hotkey_legend_hidden_off_review_tab(app_js: str):
     body = _fn_body(code, "function switchTab")
     assert ".legend" in body
     assert '!== "review"' in body
+
+
+def test_legend_hidden_attr_actually_hides(style_css: str):
+    """The legend has display:flex (a fixed footer), so the `hidden` attribute
+    set off the review tab needs an explicit rule to take effect."""
+    assert ".legend[hidden]" in style_css

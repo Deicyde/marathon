@@ -417,6 +417,9 @@ html, body {
 
 /* --- legend --- */
 .legend { display: none; }
+/* The `hidden` attribute (set off the review tab) must beat the `display: flex`
+   below — a bare `[hidden]` would lose to `.legend`, so match the class too. */
+.legend[hidden] { display: none !important; }
 @media (min-width: 720px) {
   .legend { display: flex; gap: 1rem; justify-content: center; color: var(--muted); font-size: 0.75rem; padding: 0.4rem; position: fixed; bottom: 5.2rem; left: 0; right: 0; pointer-events: none; }
 }
