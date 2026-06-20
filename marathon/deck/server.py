@@ -844,6 +844,7 @@ def serve(
     open_browser: bool = True,
     demo: bool = False,
     trusted_origins: "Sequence[str]" = (),
+    pull_every: int = 0,
 ) -> int:
     """Start the deck server and block in ``serve_forever`` until Ctrl-C.
 
@@ -851,7 +852,9 @@ def serve(
     irreversible, then (unless ``open_browser`` is False) opens the URL in
     the default browser. Returns 0 on a clean Ctrl-C shutdown. The CLI
     (``marathon deck``) is a thin wrapper over this. ``trusted_origins`` widen
-    the same-origin POST guard for a fronting proxy (see ``--trusted-origin``)."""
+    the same-origin POST guard for a fronting proxy (see ``--trusted-origin``).
+    ``pull_every`` > 0 starts a background loop that fast-forwards the repo every
+    that-many seconds, keeping a HOSTED deck's working tree current."""
     server = make_server(
         cfg, port=port, default_chapter=default_chapter, demo=demo,
         trusted_origins=trusted_origins,
@@ -895,6 +898,13 @@ def serve(
             "  not the rejecting collaborator. Pass --no-host-conductor so each\n"
             "  collaborator's own conductor refines under their own key."
         )
+    # Hosted deck: keep the working tree current so cards reflect merged code.
+    if pull_every and pull_every > 0 and cfg is not None and not demo:
+        from marathon.deck.sync import start_repo_sync
+
+        print(f"  repo sync: fast-forward pull every {pull_every}s "
+              f"(keeps the hosted deck's source current)")
+        start_repo_sync(cfg.repo_dir, pull_every)
     print("  press Ctrl-C to stop.")
     print("=" * 70)
 

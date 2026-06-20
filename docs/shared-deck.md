@@ -121,8 +121,23 @@ cloudflared tunnel run marathon
 ```bash
 marathon deck --port 8770 --no-open \
   --trusted-origin https://marathon.example.com \
-  --no-host-conductor
+  --no-host-conductor \
+  --pull-every 60
 ```
+
+`--pull-every 60` keeps a HOSTED deck current: a fast-forward `git pull` every 60
+seconds, so the cards reflect the latest merged Lean source (issues come live
+from GitHub regardless). It only fast-forwards — it never clobbers, because a
+hosted deck never commits locally (merges happen on GitHub). Omit it for a local
+single-user deck, which manages its own checkout.
+
+> **Audit caveat.** The trust-tier data (`.marathon/audit/latest.json`) is
+> *gitignored* — a local compute artifact (Lean elaboration) the thin deck can't
+> regenerate, so `--pull-every` does **not** sync it. The deck degrades
+> gracefully (empty trust tiers) without one; to show fresh trust tiers on a
+> hosted box, ship a `latest.json` there from a machine that runs `marathon
+> audit`. The cards themselves (source + issue) stay current via the pull + live
+> GitHub reads.
 
 ### 5. Each collaborator's compute
 

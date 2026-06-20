@@ -1030,6 +1030,16 @@ def _add_deck_subparser(subparsers) -> None:
         ),
     )
     p_deck.add_argument(
+        "--pull-every", type=int, default=0, metavar="SECONDS",
+        help=(
+            "For a HOSTED deck: fast-forward `git pull` the repo every SECONDS "
+            "so the cards reflect the latest merged code (issues come live from "
+            "GitHub regardless). Default: 0 = off (a local deck manages its own "
+            "checkout). The gitignored audit snapshot is NOT pulled — the deck "
+            "degrades to empty trust tiers without a local one."
+        ),
+    )
+    p_deck.add_argument(
         "--no-host-conductor", action="store_true",
         help=(
             "Do NOT spawn a conductor on this host when a reject is fired (sets "
@@ -1064,6 +1074,7 @@ def _run_deck(args) -> None:
         open_browser=not args.no_open,
         demo=demo,
         trusted_origins=getattr(args, "trusted_origin", []) or [],
+        pull_every=getattr(args, "pull_every", 0),
     )
     if rc:
         raise SystemExit(rc)
