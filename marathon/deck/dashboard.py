@@ -145,8 +145,47 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
         "updated_ts": snap.get("updated_ts"),
         "running": sum(1 for j in jobs if j["status"] == "running"),
         "jobs": jobs,
+        "queued": _pending_queue(cfg, jobs, snap.get("concurrency")),
         "landings": _recent_landings(cfg, limit=8),
     }
+
+
+def _pending_queue(
+    cfg: "ReviewConfig", jobs: list[dict], concurrency: Optional[int]
+) -> list[dict]:
+    """Rejections that are queued for a refine but NOT yet dispatched — the gap
+    between "I shipped a reject" and "it's a running job". Each carries WHY it is
+    waiting (the conductor is single-flight + same-chapter-aware). Pure read;
+    ``[]`` on any error."""
+    try:
+        from marathon.review.state import pending_rejections_needing_iteration
+        pending = pending_rejections_needing_iteration(cfg, None)
+    except Exception:  # noqa: BLE001 — never break the tab
+        return []
+    running = [j for j in jobs if (j.get("status") or "").startswith("running")]
+    running_nums = {j["issue_num"] for j in running}
+    running_chapters = {j["chapter"] for j in running if j["chapter"] is not None}
+    out: list[dict] = []
+    for num, st in pending:
+        if num in running_nums:
+            continue  # this one IS the running job
+        try:
+            chapter = cfg.chapter_of_issue(num)
+        except Exception:  # noqa: BLE001
+            chapter = None
+        if chapter is not None and chapter in running_chapters:
+            reason = f"waiting — chapter {chapter} is busy"
+        elif concurrency and len(running) >= concurrency:
+            reason = f"waiting — at concurrency limit ({concurrency})"
+        else:
+            reason = "queued — dispatches next cycle"
+        out.append({
+            "issue_num": num,
+            "chapter": chapter,
+            "reason": reason,
+            "verdict_ts": getattr(st, "verdict_ts", None),
+        })
+    return out
 
 
 def run_detail(cfg: "ReviewConfig", issue_num: int) -> dict:

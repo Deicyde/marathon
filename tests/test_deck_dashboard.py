@@ -73,7 +73,8 @@ def test_conductor_status_no_snapshot_degrades(tmp_path, monkeypatch):
     monkeypatch.setattr("marathon.conductor.load_jobs_snapshot", lambda repo_dir: None)
     d = dash.conductor_status(_cfg(tmp_path))
     assert d == {"alive": False, "pid": None, "concurrency": None,
-                 "updated_ts": None, "running": 0, "jobs": [], "landings": []}
+                 "updated_ts": None, "running": 0, "jobs": [], "queued": [],
+                 "landings": []}
 
 
 # --- issues_overview -------------------------------------------------------
@@ -270,3 +271,44 @@ def test_progress_pct_and_iteration_degrade_without_workdir():
     assert dash._refine_iteration(None) is None
     assert dash._refine_ratings(None) == []
     assert dash._refine_prompts(None) == ""
+
+
+def test_conductor_status_shows_queued_pending_rejections(tmp_path, monkeypatch):
+    """A rejection waiting behind a running same-chapter job appears in `queued`
+    with the reason — the 'I shipped a reject, where is it?' gap."""
+    from types import SimpleNamespace
+    lock = tmp_path / "conductor.lock"; lock.write_text("4242")
+    monkeypatch.setattr("marathon.conductor.conductor_lock_path", lambda cfg: lock)
+    monkeypatch.setattr(
+        "marathon.conductor.load_jobs_snapshot",
+        lambda repo_dir: {"concurrency": 1, "jobs": [
+            {"issue_num": 95, "chapter": 12, "status": "running", "pid": 4242}]},
+    )
+    monkeypatch.setattr("marathon.review.daemon.process_alive", lambda pid: True)
+    monkeypatch.setattr(
+        "marathon.review.state.pending_rejections_needing_iteration",
+        lambda cfg, ch=None: [(95, SimpleNamespace(verdict_ts="t1")),
+                              (98, SimpleNamespace(verdict_ts="t2"))],
+    )
+    cfg = SimpleNamespace(repo_dir=tmp_path, github_repo="o/r", chapters={},
+                          chapter_of_issue=lambda n: 12)
+    d = dash.conductor_status(cfg)
+    q = d["queued"]
+    assert [it["issue_num"] for it in q] == [98]   # #95 is the running job
+    assert "chapter 12 is busy" in q[0]["reason"]
+    assert q[0]["chapter"] == 12
+
+
+def test_pending_queue_concurrency_and_cycle_reasons(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(
+        "marathon.review.state.pending_rejections_needing_iteration",
+        lambda cfg, ch=None: [(40, SimpleNamespace(verdict_ts="t"))],
+    )
+    cfg = SimpleNamespace(repo_dir=tmp_path, chapter_of_issue=lambda n: 99)
+    # a running job in a DIFFERENT chapter, concurrency 1 → at the limit
+    q = dash._pending_queue(cfg, [{"issue_num": 7, "chapter": 11, "status": "running"}], 1)
+    assert "at concurrency limit" in q[0]["reason"]
+    # no running jobs → dispatches next cycle
+    q2 = dash._pending_queue(cfg, [], 1)
+    assert "next cycle" in q2[0]["reason"]

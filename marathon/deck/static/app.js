@@ -2098,6 +2098,7 @@
       ]));
       host.appendChild(el("div", { class: "stat-row dash-section" }, [
         statChip(d.running || 0, "running"),
+        statChip((d.queued || []).length, "queued"),
         statChip((d.jobs || []).length, "jobs tracked"),
         statChip((d.landings || []).length, "recent landings"),
       ]));
@@ -2140,6 +2141,24 @@
         jobsSec.appendChild(row);
       });
       host.appendChild(jobsSec);
+      // Queued (rejected, not yet a running job) — the "I shipped a reject,
+      // where is it?" gap. Single-flight + same-chapter means a reject waits
+      // behind a running same-chapter job; show it here with the reason.
+      var queued = d.queued || [];
+      var qSec = el("section", { class: "dash-section" },
+        [el("div", { class: "dash-h", text: "Queued (waiting to dispatch)" })]);
+      if (!queued.length) {
+        qSec.appendChild(el("div", { class: "dash-empty", text: "nothing queued" }));
+      }
+      queued.forEach(function (it) {
+        qSec.appendChild(el("div", { class: "job-row queued-row" }, [
+          el("span", { class: "job-issue", text: "#" + (it.issue_num == null ? "?" : it.issue_num) }),
+          el("span", { class: "job-chip", text: "c" + (it.chapter == null ? "?" : it.chapter) }),
+          el("span", { class: "sb sb-queued", text: "queued" }),
+          el("span", { class: "job-wait", text: it.reason || "queued" }),
+        ]));
+      });
+      host.appendChild(qSec);
       var landSec = el("section", { class: "dash-section" },
         [el("div", { class: "dash-h", text: "Recent landings" })]);
       if (!(d.landings || []).length)

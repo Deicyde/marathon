@@ -1197,3 +1197,12 @@ def test_informal_text_renders_inline_markdown(katex_js: str):
                   katex_js.find("function render(")]
     assert fn and "innerHTML" not in fn
     assert "createTextNode" in fn and "textContent" in fn
+
+
+def test_status_tab_renders_pending_queue(app_js: str):
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function renderStatusTab")
+    assert "d.queued" in body
+    assert "Queued (waiting to dispatch)" in body
+    assert "job-wait" in body          # the waiting-reason
+    assert "sb-queued" in body
