@@ -77,7 +77,7 @@ Copy the **Client ID** and generate a **Client Secret**.
 oauth2-proxy \
   --provider=github \
   --github-repo=<owner>/<repo> \
-  --scope=repo \
+  --scope="repo user:email" \
   --client-id="$GH_OAUTH_CLIENT_ID" \
   --client-secret="$GH_OAUTH_CLIENT_SECRET" \
   --cookie-secret="$(openssl rand -base64 32 | tr -- '+/' '-_')" \
