@@ -164,9 +164,11 @@ def test_issues_overview_degrades_when_github_down(tmp_path, monkeypatch):
 def test_history_reads_verdicts_and_merged_prs(tmp_path, monkeypatch):
     vpath = tmp_path / ".marathon" / "review" / "verdicts.jsonl"
     vpath.parent.mkdir(parents=True, exist_ok=True)
+    # The committed verdicts.jsonl uses the field name "issue" (NOT issue_num);
+    # the history reader must map it through so the UI doesn't render "#null".
     vpath.write_text(
-        json.dumps({"issue_num": 93, "verdict": "rejected", "ts": "2026-06-18T02:00:00", "notes": "fix it"}) + "\n"
-        + json.dumps({"issue_num": 91, "verdict": "verified", "ts": "2026-06-19T01:00:00"}) + "\n"
+        json.dumps({"issue": 93, "verdict": "rejected", "ts": "2026-06-18T02:00:00", "notes": "fix it"}) + "\n"
+        + json.dumps({"issue": 91, "verdict": "verified", "ts": "2026-06-19T01:00:00"}) + "\n"
     )
 
     def fake_run(cmd, **kw):

@@ -421,7 +421,9 @@ def _verdict_events(cfg: "ReviewConfig", limit: int) -> list[dict]:
             except (ValueError, TypeError):
                 continue
             rows.append({
-                "issue_num": ev.get("issue_num"),
+                # The committed verdicts.jsonl field is "issue" (fall back to
+                # "issue_num" for forward-compat); the UI key stays issue_num.
+                "issue_num": ev.get("issue", ev.get("issue_num")),
                 "verdict": ev.get("verdict"),
                 "ts": ev.get("ts"),
                 "notes": (ev.get("notes") or "")[:200],
