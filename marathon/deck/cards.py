@@ -1019,6 +1019,11 @@ def _slice_decl_block(text: str, sites, target_i: int) -> str:
             end = k - 1
         elif s.startswith("--"):
             end -= 1
+        elif is_modifier(end):
+            # An attribute/modifier line (@[simp], noncomputable, …) directly
+            # above the NEXT decl's keyword belongs to that next decl — drop it,
+            # which lets the loop go on to drop the next decl's docstring too.
+            end -= 1
         else:
             break
 

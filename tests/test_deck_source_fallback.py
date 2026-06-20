@@ -409,3 +409,24 @@ def test_classify_api_not_in_code_never_api():
     v = _view("Demo.foo_apply", in_code=False)
     is_api, _ = classify_api(v, "Demo.Head")
     assert is_api is False
+
+
+def test_slice_does_not_bleed_next_decls_attribute_and_docstring(tmp_path):
+    """The #96 pullback_comp bug: a decl followed by a @[simp]-tagged next decl
+    must NOT bleed the next decl's docstring + attribute into its slice."""
+    cfg = make_cfg(tmp_path)
+    (cfg.repo_dir / "Demo").mkdir(parents=True, exist_ok=True)
+    (cfg.repo_dir / "Demo" / "Chapter14.lean").write_text(
+        "namespace Demo.Chapter14\n\n"
+        "/-- First decl doc. -/\n"
+        "theorem first : True := trivial\n\n"
+        "/-- Second decl doc.\nThe identity is the identity. -/\n"
+        "@[simp]\n"
+        "theorem second : True := trivial\n\n"
+        "end Demo.Chapter14\n"
+    )
+    block, _rel = _find_decl_source_in_repo(cfg.repo_dir, "Demo.Chapter14.first")
+    assert block is not None
+    assert "First decl doc" in block and "theorem first" in block
+    assert "Second decl doc" not in block   # the next decl's docstring …
+    assert "@[simp]" not in block            # … and its attribute don't bleed in
