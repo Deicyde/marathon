@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import marathon.deck.dashboard as dash
 
 
@@ -17,6 +19,19 @@ def _cfg(tmp_path, chapters=None):
         repo_dir=tmp_path,
         github_repo="o/r",
         chapters=chapters or {},
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_gh(monkeypatch):
+    """Dashboard tests must never hit real gh — conductor_status now derives
+    landings from merged PRs. Default every gh call to a failed/empty result
+    (the history test overrides this with its own fake run), and clear the
+    per-repo landings cache so tests never see each other's data."""
+    dash._LANDINGS_CACHE.clear()
+    monkeypatch.setattr(
+        dash.subprocess, "run",
+        lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr=""),
     )
 
 
@@ -346,3 +361,38 @@ def test_conductor_status_job_carries_phase(tmp_path, monkeypatch):
     j = dash.conductor_status(_cfg(tmp_path))["jobs"][0]
     # aristotle COMPLETE + the workdir log has no post-prover marker → "building"
     assert j["phase"] == "building"
+
+
+# --- recent landings (merged refine PRs, not the unused --land next queue) ---
+
+def test_recent_landings_from_merged_refine_prs(tmp_path, monkeypatch):
+    """A landing is a merged marathon/refine PR — issue + PR extracted from the
+    branch. Non-refine merges are skipped; newest-first."""
+    monkeypatch.setattr(dash, "_merged_prs", lambda cfg, limit: [
+        {"number": 110, "title": "iter for #95", "merged_at": "2026-06-20T03:09:00",
+         "head": "marathon/refine-c12-i95", "author": "bot"},
+        {"number": 91, "title": "iter for #88", "merged_at": "2026-06-18T00:00:00",
+         "head": "marathon/refine-c11-i88", "author": "bot"},
+        {"number": 70, "title": "infra", "merged_at": "2026-06-20T09:00:00",
+         "head": "marathon/registration-c12", "author": "bot"},  # not a refine
+    ])
+    lands = dash._recent_landings(_cfg(tmp_path))
+    assert lands == [
+        {"issue": 95, "pr": 110, "ts": "2026-06-20T03:09:00"},
+        {"issue": 88, "pr": 91, "ts": "2026-06-18T00:00:00"},
+    ]
+
+
+def test_recent_landings_cached_per_repo(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def _counting(cfg, limit):
+        calls["n"] += 1
+        return [{"number": 110, "title": "t", "merged_at": "2026-06-20T03:09:00",
+                 "head": "marathon/refine-c12-i95", "author": "b"}]
+
+    monkeypatch.setattr(dash, "_merged_prs", _counting)
+    cfg = _cfg(tmp_path)
+    dash._recent_landings(cfg)
+    dash._recent_landings(cfg)            # second call within 60s → cache hit
+    assert calls["n"] == 1

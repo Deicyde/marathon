@@ -305,25 +305,55 @@ def _refine_prompts(workdir: Optional[str], max_bytes: int = 200000) -> str:
     return _read_tail(Path(workdir) / "marathon-refine-log.md", max_bytes)
 
 
+#: A merged marathon refine branch → the issue whose Aristotle fix LANDED.
+_REFINE_LAND_RE = re.compile(r"^marathon/refine-c\d+-i(\d+)$")
+#: Per-repo cache of the (gh-derived) landings so the Status poll doesn't call
+#: gh every tick. {repo_dir: (epoch, landings)}.
+_LANDINGS_CACHE: dict = {}
+
+
 def _recent_landings(cfg: "ReviewConfig", limit: int = 8) -> list[dict]:
+    """Recently LANDED issues — an issue's Aristotle fix MERGED onto main. The
+    default flow merges via the conductor's automerge (``gh pr merge``), so a
+    landing IS a merged ``marathon/refine-c*-i*`` PR; the opt-in ``--land next``
+    queue (``landings.jsonl``) is folded in when present. Newest-first, capped.
+
+    Cached ~60s per repo so the Status-tab poll doesn't hit ``gh`` every tick.
+    Pure read; ``[]`` on any failure."""
+    import time
+
+    key = str(getattr(cfg, "repo_dir", ""))
+    now = time.time()
+    ent = _LANDINGS_CACHE.get(key)
+    if ent is not None and now - ent[0] < 60:
+        return ent[1][:limit]
+
+    out: list[dict] = []
+    # Default flow: merged marathon/refine PRs (the issue's fix landed).
+    for pr in _merged_prs(cfg, max(limit * 3, 20)):
+        m = _REFINE_LAND_RE.match(pr.get("head") or "")
+        if m:
+            out.append({"issue": int(m.group(1)), "pr": pr.get("number"),
+                        "ts": pr.get("merged_at")})
+    # Opt-in --land next queue (landings.jsonl), folded in when present.
     try:
         from marathon.landing import LANDINGS_RELPATH
 
         path = Path(cfg.repo_dir) / LANDINGS_RELPATH
-        if not path.is_file():
-            return []
-        rows: list[dict] = []
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except (ValueError, TypeError):
-                continue
-        return rows[-limit:]
+        if path.is_file():
+            for line in path.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except (ValueError, TypeError):
+                    continue
     except Exception:  # noqa: BLE001
-        return []
+        pass
+    out.sort(key=lambda r: r.get("ts") or "", reverse=True)
+    _LANDINGS_CACHE[key] = (now, out)
+    return out[:limit]
 
 
 # ---------------------------------------------------------------------------

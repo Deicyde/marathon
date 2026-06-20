@@ -1257,3 +1257,9 @@ def test_status_job_shows_granular_phase(app_js: str):
     code = _strip_block_comments(app_js)
     body = _fn_body(code, "function renderStatusTab")
     assert "phase-chip" in body and "j.phase" in body
+
+
+def test_status_landings_link_issue_and_pr(app_js: str):
+    body = _fn_body(_strip_block_comments(app_js), "function renderStatusTab")
+    # a landing renders the issue + its merged PR (both as GitHub links)
+    assert "land-row" in body and "merged PR #" in body

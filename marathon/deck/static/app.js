@@ -2175,12 +2175,20 @@
         [el("div", { class: "dash-h", text: "Recent landings" })]);
       if (!(d.landings || []).length)
         landSec.appendChild(el("div", { class: "dash-empty", text: "none yet" }));
-      (d.landings || []).slice().reverse().forEach(function (l) {
-        landSec.appendChild(el("div", { class: "land-row" }, [
-          el("span", { class: "job-issue", text: "#" + (l.issue == null ? "?" : l.issue) }),
-          el("span", { class: "job-when", text: fmtTs(l.ts) }),
-          el("span", { class: "job-aristotle mono", text: (l.sha_landed || "").slice(0, 7) }),
-        ]));
+      // Backend is newest-first. A landing is a merged refine PR (issue + PR,
+      // both linked to GitHub); the opt-in --land next records carry a sha.
+      (d.landings || []).forEach(function (l) {
+        var kids = [
+          ghLink(d.repo, "issues", l.issue,
+                 "#" + (l.issue == null ? "?" : l.issue), "job-issue"),
+        ];
+        if (l.pr != null)
+          kids.push(ghLink(d.repo, "pull", l.pr, "merged PR #" + l.pr, "job-aristotle"));
+        else if (l.sha_landed)
+          kids.push(el("span", { class: "job-aristotle mono",
+                                 text: String(l.sha_landed).slice(0, 7) }));
+        kids.push(el("span", { class: "job-when", text: fmtTs(l.ts) }));
+        landSec.appendChild(el("div", { class: "land-row" }, kids));
       });
       host.appendChild(landSec);
     }).catch(function (e) { dashError("dash-status", e); });
