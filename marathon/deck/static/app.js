@@ -2131,8 +2131,31 @@
           el("span", { class: "job-chip", text: "c" + (j.chapter == null ? "?" : j.chapter) }),
           statusBadge(j.status),
         ];
+        // Live iteration + Aristotle progress for a running job.
+        var it = j.iteration;
+        if (it && (it.current != null || it.completed != null)) {
+          var n = it.current != null ? it.current : it.completed;
+          kids.push(el("span", { class: "job-iter", text: "iter " + n }));
+        }
+        if (j.progress_pct != null) {
+          kids.push(el("span", { class: "job-prog" }, [
+            el("span", { class: "job-prog-bar" }, [
+              el("span", { class: "job-prog-fill",
+                style: "width:" + j.progress_pct + "%" }),
+            ]),
+            el("span", { class: "job-prog-pct", text: j.progress_pct + "%" }),
+          ]));
+        }
         if (ar) kids.push(el("span", { class: "job-aristotle", text: ar }));
-        jobsSec.appendChild(el("div", { class: "job-row" }, kids));
+        kids.push(el("span", { class: "job-open", text: "details ›" }));
+        var row = el("div", {
+          class: "job-row job-row-click",
+          title: "Open this run's ratings + prompts",
+          onclick: (function (issue) {
+            return function () { if (issue != null) openRunDetail(issue); };
+          })(j.issue_num),
+        }, kids);
+        jobsSec.appendChild(row);
       });
       host.appendChild(jobsSec);
       var landSec = el("section", { class: "dash-section" },
@@ -2148,6 +2171,73 @@
       });
       host.appendChild(landSec);
     }).catch(function (e) { dashError("dash-status", e); });
+  }
+
+  // openRunDetail — the click-into-a-run panel (Status tab → a job): its live
+  // progress + iteration, the per-iteration auto-rater RATINGS, and the
+  // refine-reviewer PROMPTS drafted for Aristotle. A PURE READ (/api/run/{n}).
+  function openRunDetail(issue) {
+    getJSON("/api/run/" + encodeURIComponent(issue)).then(function (d) {
+      var panel = el("div", { class: "modal-panel run-detail" });
+      panel.appendChild(el("h2", { class: "modal-title", text: "Run #" + issue }));
+      if (!d || !d.found) {
+        panel.appendChild(el("p", { class: "dash-empty",
+          text: "no conductor run recorded for #" + issue }));
+        panel.appendChild(el("div", { class: "modal-actions" }, [
+          el("button", { class: "btn", type: "button",
+            onclick: function () { closeModal(); } }, ["Close"]),
+        ]));
+        openModal(panel);
+        return;
+      }
+      var meta = [];
+      if (d.status) meta.push("status " + d.status);
+      var it = d.iteration;
+      if (it && (it.current != null || it.completed != null))
+        meta.push("iteration " + (it.current != null ? it.current : it.completed));
+      if (d.progress_pct != null) meta.push(d.progress_pct + "% complete");
+      if (d.aristotle_status) meta.push("aristotle " + d.aristotle_status);
+      panel.appendChild(el("p", { class: "modal-sub run-meta", text: meta.join(" · ") }));
+
+      var rsec = el("section", { class: "run-sec" },
+        [el("h3", { class: "run-h", text: "Review ratings" })]);
+      if (!(d.ratings || []).length)
+        rsec.appendChild(el("p", { class: "dash-empty", text: "no ratings yet" }));
+      (d.ratings || []).forEach(function (r, i) {
+        var chips = Object.keys(r || {}).map(function (k) {
+          return el("span", { class: "rate-chip" }, [
+            el("b", { text: k + ": " }), String(r[k]),
+          ]);
+        });
+        rsec.appendChild(el("div", { class: "run-rating" }, [
+          el("span", { class: "run-rating-n", text: "#" + (i + 1) }),
+          el("span", { class: "run-rating-chips" }, chips),
+        ]));
+      });
+      panel.appendChild(rsec);
+
+      var psec = el("section", { class: "run-sec" },
+        [el("h3", { class: "run-h", text: "Refine-reviewer prompts (→ Aristotle)" })]);
+      psec.appendChild(el("pre", { class: "run-prompts mono",
+        text: d.prompts || "(none yet)" }));
+      panel.appendChild(psec);
+
+      panel.appendChild(el("div", { class: "modal-actions" }, [
+        el("button", { class: "btn", type: "button",
+          onclick: function () { closeModal(); } }, ["Close"]),
+      ]));
+      openModal(panel);
+    }).catch(function () {
+      var panel = el("div", { class: "modal-panel" }, [
+        el("h2", { class: "modal-title", text: "Run #" + issue }),
+        el("p", { class: "dash-empty", text: "could not load run detail" }),
+        el("div", { class: "modal-actions" }, [
+          el("button", { class: "btn", type: "button",
+            onclick: function () { closeModal(); } }, ["Close"]),
+        ]),
+      ]);
+      openModal(panel);
+    });
   }
 
   // --- Issues tab: every registered issue grouped by chapter ---

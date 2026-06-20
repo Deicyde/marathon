@@ -201,6 +201,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                 return self._api_events()
             if path == "/api/conductor-status":
                 return self._api_conductor_status()
+            if path.startswith("/api/run/"):
+                return self._api_run_detail(path[len("/api/run/"):])
             if path == "/api/issues-overview":
                 return self._api_issues_overview()
             if path == "/api/history":
@@ -358,6 +360,19 @@ class DeckHandler(BaseHTTPRequestHandler):
         per-job table + recent landings. Pure read (jobs.json + lock + log)."""
         from marathon.deck.dashboard import conductor_status
         self._send_json(conductor_status(self.cfg))
+
+    def _api_run_detail(self, raw_id: str) -> None:
+        """Drill-down for one conductor run (clicking a Status-tab job): its live
+        progress + iteration, auto-rater ratings, and refine-reviewer prompts.
+        Pure read from the job's workdir; degrades to {found:false}."""
+        try:
+            issue_num = int(raw_id)
+        except ValueError:
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad run id {raw_id!r}"
+            )
+        from marathon.deck.dashboard import run_detail
+        self._send_json(run_detail(self.cfg, issue_num))
 
     def _api_issues_overview(self) -> None:
         """The Issues tab: every registered issue grouped by chapter, each with

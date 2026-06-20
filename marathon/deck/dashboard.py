@@ -12,12 +12,67 @@ Nothing here writes anything.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:  # pragma: no cover — type-only
     from marathon.review.config import ReviewConfig
+
+#: Aristotle progress lines the refine subprocess writes to its conductor log,
+#: e.g. ``    status: IN_PROGRESS (15% complete)``. The LAST match is current.
+_PROGRESS_RE = re.compile(r"(\d{1,3})%\s*complete", re.IGNORECASE)
+
+
+def _read_tail(path: Path, max_bytes: int = 65536) -> str:
+    """The last ``max_bytes`` of a text file (whole file when smaller), or ``""``
+    on any error. Pure read — never raises."""
+    try:
+        with path.open("rb") as fh:
+            try:
+                fh.seek(-max_bytes, 2)
+            except OSError:
+                fh.seek(0)
+            return fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _refine_progress_pct(workdir: Optional[str]) -> Optional[int]:
+    """The latest Aristotle ``NN% complete`` the refine logged to
+    ``<workdir>/conductor-refine.log``, or ``None``. Pure read."""
+    if not workdir:
+        return None
+    text = _read_tail(Path(workdir) / "conductor-refine.log")
+    matches = _PROGRESS_RE.findall(text)
+    if not matches:
+        return None
+    try:
+        return max(0, min(100, int(matches[-1])))
+    except ValueError:
+        return None
+
+
+def _refine_iteration(workdir: Optional[str]) -> Optional[dict]:
+    """``{completed, current, status, duration_seconds, agent_task_id}`` from the
+    refine checkpoint ``<workdir>/marathon-refine-state.json``, or ``None``.
+    Pure read; degrades to None on any error."""
+    if not workdir:
+        return None
+    try:
+        data = json.loads(
+            (Path(workdir) / "marathon-refine-state.json").read_text()
+        )
+    except (OSError, ValueError):
+        return None
+    return {
+        "completed": data.get("iterations_completed"),
+        "current": data.get("current_iteration_idx"),
+        "status": data.get("status"),
+        "duration_seconds": data.get("duration_seconds"),
+        "agent_task_id": data.get("agent_task_id"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +118,8 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
                     status = "running (pid dead)"
             except (ValueError, TypeError):
                 pass
-        jobs.append({
+        workdir = raw.get("workdir")
+        job = {
             "issue_num": raw.get("issue_num"),
             "chapter": raw.get("chapter"),
             "status": status,
@@ -73,7 +129,14 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
             "started_ts": raw.get("started_ts"),
             "finished_ts": raw.get("finished_ts"),
             "branch": raw.get("branch"),
-        })
+            "workdir": workdir,
+        }
+        # Live Aristotle progress + iteration for a running job (cheap workdir
+        # reads; None for a finished/reaped job).
+        if status and status.startswith("running"):
+            job["progress_pct"] = _refine_progress_pct(workdir)
+            job["iteration"] = _refine_iteration(workdir)
+        jobs.append(job)
 
     return {
         "alive": alive,
@@ -84,6 +147,77 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
         "jobs": jobs,
         "landings": _recent_landings(cfg, limit=8),
     }
+
+
+def run_detail(cfg: "ReviewConfig", issue_num: int) -> dict:
+    """Drill-down for ONE conductor run (clicking a job on the Status tab): its
+    live progress + iteration, the per-iteration auto-rater RATINGS, and the
+    refine-reviewer PROMPTS drafted for Aristotle — all read from the job's
+    workdir. Pure read; everything degrades to empty/None.
+
+    ``{found, issue_num, status, branch, progress_pct, iteration, ratings,
+    prompts}`` where ``ratings`` is the parsed ``marathon-ratings.jsonl`` records
+    (oldest→newest) and ``prompts`` is the ``marathon-refine-log.md`` text."""
+    from marathon.conductor import load_jobs_snapshot
+
+    out = {
+        "found": False, "issue_num": issue_num, "status": None, "branch": None,
+        "progress_pct": None, "iteration": None, "ratings": [], "prompts": "",
+    }
+    try:
+        snap = load_jobs_snapshot(Path(cfg.repo_dir)) or {}
+    except Exception:  # noqa: BLE001
+        snap = {}
+    raw = next(
+        (j for j in snap.get("jobs", []) if j.get("issue_num") == issue_num), None
+    )
+    if raw is None:
+        return out
+    workdir = raw.get("workdir")
+    out.update({
+        "found": True,
+        "status": raw.get("status"),
+        "branch": raw.get("branch"),
+        "workdir": workdir,
+        "aristotle_status": raw.get("aristotle_status"),
+        "progress_pct": _refine_progress_pct(workdir),
+        "iteration": _refine_iteration(workdir),
+        "ratings": _refine_ratings(workdir),
+        "prompts": _refine_prompts(workdir),
+    })
+    return out
+
+
+def _refine_ratings(workdir: Optional[str]) -> list[dict]:
+    """The auto-rater records from ``<workdir>/marathon-ratings.jsonl`` (one JSON
+    object per iteration, oldest→newest), skipping malformed lines. ``[]`` on any
+    error. Pure read."""
+    if not workdir:
+        return []
+    path = Path(workdir) / "marathon-ratings.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    out: list[dict] = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            continue
+    return out
+
+
+def _refine_prompts(workdir: Optional[str], max_bytes: int = 200000) -> str:
+    """The per-iteration refine-reviewer PROMPTS drafted for Aristotle, from
+    ``<workdir>/marathon-refine-log.md`` (tailed to ``max_bytes``). ``""`` when
+    absent. Pure read."""
+    if not workdir:
+        return ""
+    return _read_tail(Path(workdir) / "marathon-refine-log.md", max_bytes)
 
 
 def _recent_landings(cfg: "ReviewConfig", limit: int = 8) -> list[dict]:

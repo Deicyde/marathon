@@ -523,3 +523,23 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .ms-snippet { font-size: 0.8rem; margin-top: 0.25rem; line-height: 1.4; }
 .ms-file { font-size: 0.72rem; opacity: 0.7; margin-top: 0.2rem; }
 .missing-suggest-actions { margin-top: 0.45rem; }
+
+/* --- Status tab: per-job progress + iteration + click-into-run --- */
+.job-row-click { cursor: pointer; }
+.job-row-click:hover { background: #6ea8fe14; }
+.job-iter { font-size: 0.74rem; opacity: 0.85; padding: 0 0.35rem; border: 1px solid currentColor; border-radius: 6px; }
+.job-prog { display: inline-flex; align-items: center; gap: 0.35rem; }
+.job-prog-bar { width: 70px; height: 6px; background: #ffffff1f; border-radius: 4px; overflow: hidden; }
+.job-prog-fill { display: block; height: 100%; background: var(--accent, #6ea8fe); }
+.job-prog-pct { font-size: 0.74rem; opacity: 0.85; min-width: 2.4em; }
+.job-open { margin-left: auto; font-size: 0.74rem; opacity: 0.6; }
+/* run-detail modal */
+.run-detail { max-width: 760px; }
+.run-meta { opacity: 0.85; }
+.run-sec { margin-top: 0.9rem; }
+.run-h { font-size: 0.86rem; margin: 0 0 0.4rem; opacity: 0.9; }
+.run-rating { display: flex; gap: 0.5rem; align-items: baseline; padding: 0.3rem 0; border-top: 1px solid #ffffff12; }
+.run-rating-n { font-size: 0.72rem; opacity: 0.6; }
+.run-rating-chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.rate-chip { font-size: 0.74rem; padding: 0.05rem 0.4rem; background: #ffffff10; border-radius: 6px; }
+.run-prompts { max-height: 340px; overflow: auto; white-space: pre-wrap; font-size: 0.76rem; line-height: 1.45; background: #00000026; border-radius: 8px; padding: 0.6rem; }

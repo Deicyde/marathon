@@ -564,6 +564,17 @@ def test_decl_verdict_endpoint_records_locally(running_server, monkeypatch):
         == "verify"
 
 
+def test_run_detail_is_a_pure_get(running_server):
+    _server, base, _token, _cfg = running_server
+    # Unknown run → 200 {found:false} (pure read, no token needed).
+    status, body = _get(base + "/api/run/999")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["found"] is False and payload["issue_num"] == 999
+    # malformed id → 400
+    assert _get(base + "/api/run/notanint")[0] == 400
+
+
 def test_missing_suggestions_is_pure_get(running_server, monkeypatch):
     server, base, _token, _cfg = running_server
     from marathon.review import review as review_mod

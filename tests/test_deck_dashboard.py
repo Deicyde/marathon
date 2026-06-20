@@ -190,3 +190,83 @@ def test_history_degrades_when_gh_fails(tmp_path, monkeypatch):
                         lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="", stderr="no gh"))
     d = dash.history(_cfg(tmp_path))      # no verdicts file, gh fails
     assert d == {"verdict_events": [], "merged_prs": []}
+
+
+# --- run observability: progress %, iteration, ratings, prompts -------------
+
+def _make_run_workdir(tmp_path):
+    wd = tmp_path / "wd-i93"
+    wd.mkdir()
+    (wd / "conductor-refine.log").write_text(
+        "starting\n    status: IN_PROGRESS (15% complete)\n"
+        "    status: IN_PROGRESS (42% complete)\n"
+    )
+    (wd / "marathon-refine-state.json").write_text(json.dumps({
+        "iterations_completed": 1, "current_iteration_idx": 2,
+        "status": "IN_PROGRESS", "duration_seconds": 120.0,
+        "agent_task_id": "task-abc",
+    }))
+    (wd / "marathon-ratings.jsonl").write_text(
+        json.dumps({"quality": 4, "math_correctness": 5}) + "\n"
+        + json.dumps({"quality": 5, "math_correctness": 5}) + "\n"
+    )
+    (wd / "marathon-refine-log.md").write_text(
+        "## iteration 1\nADD the CovariantTensorField smul lemma.\n"
+    )
+    return wd
+
+
+def test_conductor_status_adds_progress_and_iteration(tmp_path, monkeypatch):
+    wd = _make_run_workdir(tmp_path)
+    lock = tmp_path / "conductor.lock"; lock.write_text("4242")
+    monkeypatch.setattr("marathon.conductor.conductor_lock_path", lambda cfg: lock)
+    monkeypatch.setattr(
+        "marathon.conductor.load_jobs_snapshot",
+        lambda repo_dir: {"jobs": [
+            {"issue_num": 93, "chapter": 12, "status": "running", "pid": 4242,
+             "workdir": str(wd)},
+        ]},
+    )
+    monkeypatch.setattr("marathon.review.daemon.process_alive", lambda pid: True)
+
+    d = dash.conductor_status(_cfg(tmp_path))
+    j = d["jobs"][0]
+    assert j["progress_pct"] == 42                  # the LATEST % in the log
+    assert j["iteration"]["current"] == 2
+    assert j["iteration"]["completed"] == 1
+    assert j["workdir"] == str(wd)
+
+
+def test_run_detail_reads_ratings_and_prompts(tmp_path, monkeypatch):
+    wd = _make_run_workdir(tmp_path)
+    monkeypatch.setattr(
+        "marathon.conductor.load_jobs_snapshot",
+        lambda repo_dir: {"jobs": [
+            {"issue_num": 93, "chapter": 12, "status": "running",
+             "branch": "marathon/refine-c12-i93", "workdir": str(wd)},
+        ]},
+    )
+    d = dash.run_detail(_cfg(tmp_path), 93)
+    assert d["found"] is True
+    assert d["progress_pct"] == 42
+    assert d["iteration"]["current"] == 2
+    assert len(d["ratings"]) == 2 and d["ratings"][-1]["quality"] == 5
+    assert "CovariantTensorField" in d["prompts"]
+    assert d["branch"] == "marathon/refine-c12-i93"
+
+
+def test_run_detail_not_found_degrades(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "marathon.conductor.load_jobs_snapshot",
+        lambda repo_dir: {"jobs": []},
+    )
+    d = dash.run_detail(_cfg(tmp_path), 999)
+    assert d["found"] is False
+    assert d["ratings"] == [] and d["prompts"] == ""
+
+
+def test_progress_pct_and_iteration_degrade_without_workdir():
+    assert dash._refine_progress_pct(None) is None
+    assert dash._refine_iteration(None) is None
+    assert dash._refine_ratings(None) == []
+    assert dash._refine_prompts(None) == ""

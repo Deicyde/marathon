@@ -1155,3 +1155,28 @@ def test_dismiss_suggestion_does_not_save(app_js: str):
     body = _fn_body(code, "function renderMissingSuggestions")
     assert "closeModal()" in body
     assert "saveMissing" not in body and "postMissing" not in body
+
+
+# --- (b2) run observability: progress % + iteration + click-into-run ---------
+
+def test_status_jobs_show_progress_and_iteration(app_js: str):
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function renderStatusTab")
+    assert "progress_pct" in body
+    assert "job-prog-fill" in body
+    assert ".iteration" in body or "j.iteration" in body
+    # rows are clickable into the run detail
+    assert "openRunDetail(" in body
+    assert "job-row-click" in body
+
+
+def test_openRunDetail_is_a_pure_read(app_js: str):
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function openRunDetail")
+    assert "/api/run/" in body
+    assert "getJSON(" in body
+    # it only READS — never posts/ships
+    for forbidden in ("postJSON(", "postShip(", "/api/ship", "/api/verdict"):
+        assert forbidden not in body
+    # it surfaces ratings + prompts
+    assert "ratings" in body and "prompts" in body
