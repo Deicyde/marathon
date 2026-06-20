@@ -574,6 +574,121 @@ def prune_worktrees(repo_dir: Path, runs_parent: Path) -> None:
 # --- Dispatch / reap ----------------------------------------------------------------
 
 
+# How long to let `lake exe cache get` run when priming a worktree's Mathlib
+# oleans. A cold worktree's first run includes a dependency CLONE + cache-exe
+# build before the olean decompress, so this is generous.
+CACHE_GET_TIMEOUT_SECONDS = 1200
+
+# Mathlib's top-level olean — a PRESENCE PROXY for "this checkout has Mathlib
+# built", used to skip a redundant `cache get` decompress. It is a presence
+# stat, NOT a completeness proof: a build/decompress interrupted after this one
+# file landed would read as "built". That is acceptable — `lake build`
+# incrementally recompiles any missing oleans, so the only cost of a false
+# "built" is a slightly slower build, never a wrong result.
+_MATHLIB_BUILT_MARKER = Path(
+    ".lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean"
+)
+
+
+def _mathlib_already_built(worktree: Path) -> bool:
+    """True iff ``worktree`` holds Mathlib's top-level olean (:data:`_MATHLIB_BUILT_MARKER`)
+    — a cheap presence proxy that a prior build/prime populated Mathlib, so a
+    fresh ``cache get`` would be a redundant decompress. Mathlib-specific (the
+    only supported target); on a non-Mathlib project it is always False, which
+    just means the best-effort, swallowed-on-failure prime runs anyway. Cheap
+    stat; False on any error."""
+    try:
+        return (worktree / _MATHLIB_BUILT_MARKER).is_file()
+    except OSError:
+        return False
+
+
+def _prime_mathlib_cache(
+    worktree: Path, *, timeout: float = CACHE_GET_TIMEOUT_SECONDS
+) -> bool:
+    """Best-effort: seed ``worktree``'s Mathlib oleans via ``lake exe cache get``
+    so the refine's ``lake build`` SKIPS the multi-HOUR Mathlib source compile.
+
+    A fresh ``git worktree add`` has NO ``.lake`` at all (it is gitignored), so
+    Mathlib's source/oleans are absent and would otherwise be recompiled from
+    scratch. ``lake exe cache get`` clones the pinned deps, builds the small
+    ``cache`` exe, and DECOMPRESSES Mathlib's prebuilt oleans from the shared
+    ``~/.cache/mathlib`` store — minutes, not hours.
+
+    The store is resolved from the inherited HOME/XDG env (NOT cwd — cwd only
+    controls where ``.lake`` is written), so we run with the environment
+    inherited; with a warm store the decompress is an OFFLINE read into the
+    worktree's OWN ``.lake``, so concurrent worktrees don't race.
+
+    FAIL-SAFE: returns True only on a clean cache-get; False on EVERYTHING else
+    (skip flag set, no ``lake`` on PATH, non-zero exit, timeout, any exception)
+    and NEVER raises — a prime failure must never abort a dispatch (the refine
+    then just does its normal, slower build). On a timeout the ENTIRE cache-get
+    subtree (lake + its lean/leanc/curl workers) is killed via its process group,
+    so no orphaned compiler/downloader is left racing the refine's build in the
+    same worktree. No-op when ``MARATHON_SKIP_CACHE_GET`` is set."""
+    import shutil
+
+    if os.environ.get("MARATHON_SKIP_CACHE_GET"):
+        return False
+    if shutil.which("lake") is None:
+        return False
+    try:
+        # Own process group (start_new_session) so a timeout can kill the WHOLE
+        # subtree, not just the lake parent — subprocess.run's timeout would
+        # SIGKILL only the direct child and orphan its lean/curl workers.
+        proc = subprocess.Popen(
+            ["lake", "exe", "cache", "get"],
+            cwd=str(worktree),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except Exception as e:  # noqa: BLE001 — a prime must NEVER abort a dispatch
+        print(
+            f"    cache get skipped ({type(e).__name__}); will build Mathlib "
+            f"normally: {worktree}",
+            flush=True,
+        )
+        return False
+    try:
+        _out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=15)
+        except Exception:  # noqa: BLE001 — reaping must not raise
+            pass
+        print(
+            f"    cache get timed out after {int(timeout)}s (subtree killed); "
+            f"will build Mathlib normally: {worktree}",
+            flush=True,
+        )
+        return False
+    except Exception as e:  # noqa: BLE001 — a prime must NEVER abort a dispatch
+        print(
+            f"    cache get errored ({type(e).__name__}); will build Mathlib "
+            f"normally: {worktree}",
+            flush=True,
+        )
+        return False
+    if proc.returncode != 0:
+        tail = ((err or _out) or "").strip().splitlines()
+        why = tail[-1][:140] if tail else f"exit {proc.returncode}"
+        print(
+            f"    cache get exit {proc.returncode} ({why}); will build Mathlib "
+            f"normally: {worktree}",
+            flush=True,
+        )
+        return False
+    print(f"    primed Mathlib oleans (lake exe cache get): {worktree}", flush=True)
+    return True
+
+
 def _dispatch_job(
     cfg: ReviewConfig,
     issue_num: int,
@@ -596,6 +711,11 @@ def _dispatch_job(
     if reuse and Path(reuse).is_dir():
         worktree = Path(reuse)
         print(f"--- reusing kept worktree for #{issue_num}: {worktree} ---")
+        # A kept worktree from a FAILED attempt may already have Mathlib built
+        # (the failure was mid-refine, not mid-build); only prime when it isn't,
+        # so retries don't pay a redundant decompress.
+        if not _mathlib_already_built(worktree):
+            _prime_mathlib_cache(worktree)
     else:
         worktree = runs_parent / f"wt-i{issue_num}-{ts}"
         runs_parent.mkdir(parents=True, exist_ok=True)
@@ -620,6 +740,10 @@ def _dispatch_job(
                     flush=True,
                 )
             return None
+        # Seed the fresh worktree's Mathlib oleans so the refine's `lake build`
+        # skips the from-scratch Mathlib compile. Best-effort — a failure just
+        # means a slower (normal) build; it never blocks the dispatch.
+        _prime_mathlib_cache(worktree)
 
     workdir = runs_parent / f"wd-i{issue_num}-{ts}"
     workdir.mkdir(parents=True, exist_ok=True)
@@ -1153,6 +1277,15 @@ def run_conductor(
         if prune:
             prune_worktrees(cfg.repo_dir, runs_parent)
         _report_orphans(cfg, _known_project_ids(cfg.repo_dir))
+        # Warm the shared Mathlib olean store ONCE before dispatching any
+        # worktree, so each worktree's `lake exe cache get` is a pure OFFLINE
+        # read of ~/.cache/mathlib — concurrent workers then never curl+write the
+        # same archive into the shared store. Gated on the main checkout NOT
+        # being built already: when it is (the common operator-mid-work case) the
+        # store is already warm, and we must NOT run `cache get` into the
+        # operator's live checkout and race a build they may have running there.
+        if not _mathlib_already_built(cfg.repo_dir):
+            _prime_mathlib_cache(cfg.repo_dir)
 
         while True:
             ticks += 1

@@ -191,6 +191,10 @@ def e2e(cfg, clock, subprocess_calls, popen_factory, monkeypatch, tmp_path):
     loading, no orphan API calls, fake clock, recorded subprocesses."""
     monkeypatch.setattr(conductor, "load_config", lambda repo_dir=None: cfg)
     monkeypatch.setattr(conductor, "_report_orphans", lambda cfg_, ids: None)
+    # Scheduling tests are isolated from the Mathlib-cache prime (it spawns its
+    # own `lake exe cache get`, which the fake Popen would otherwise record);
+    # _prime_mathlib_cache is exercised directly in test_conductor_cache.py.
+    monkeypatch.setenv("MARATHON_SKIP_CACHE_GET", "1")
     return SimpleNamespace(
         cfg=cfg,
         clock=clock,
@@ -306,6 +310,49 @@ def test_worktree_add_remove_and_refine_args(e2e):
     entry = load_state(e2e.cfg).issues[22]
     assert entry.last_iteration_ts is not None  # record_iteration ran
     assert entry.attempts == 0
+
+
+def test_dispatch_primes_worktree_and_proceeds_when_prime_fails(e2e, monkeypatch):
+    """The fresh worktree is primed (`_prime_mathlib_cache`) before the refine
+    spawns — and a prime FAILURE never aborts the dispatch (the refine is still
+    spawned; it just does a normal, slower build)."""
+    primed: list[str] = []
+
+    def fake_prime(worktree, **kwargs):
+        primed.append(str(worktree))
+        return False  # simulate a cache-get failure
+
+    monkeypatch.setattr(conductor, "_prime_mathlib_cache", fake_prime)
+    seed_rejections(e2e.cfg, {22: "2026-06-10T12:00:00-04:00"})
+    e2e.popen.script = {22: {"rc": 0, "polls": 1}}
+
+    assert run_once(e2e) == 0
+
+    # The job worktree was primed…
+    add = [c for c in e2e.git if c[3:5] == ["worktree", "add"]][0]
+    wt_path = add[7]
+    assert wt_path in primed
+    # …and the dispatch proceeded despite the prime returning False.
+    [proc] = e2e.popen.spawned
+    assert proc.cmd[proc.cmd.index("--review-rejection") + 1] == "22"
+
+
+def test_startup_warms_main_checkout_before_dispatch(e2e, monkeypatch):
+    """The startup warm primes the MAIN checkout (cfg.repo_dir) before any
+    worktree is primed/dispatched, so the shared store is warm first."""
+    primed: list[str] = []
+    monkeypatch.setattr(conductor, "_prime_mathlib_cache",
+                        lambda w, **k: primed.append(str(w)) or False)
+    seed_rejections(e2e.cfg, {22: "2026-06-10T12:00:00-04:00"})
+    e2e.popen.script = {22: {"rc": 0, "polls": 1}}
+
+    run_once(e2e)
+
+    # The main checkout (tmp repo, not built) is warmed first…
+    assert primed, "startup warm should fire on an unbuilt main checkout"
+    assert primed[0] == str(e2e.cfg.repo_dir)
+    # …and the worktree prime comes after it.
+    assert any(p != str(e2e.cfg.repo_dir) for p in primed[1:])
 
 
 def test_concurrency_cap_respected(e2e):

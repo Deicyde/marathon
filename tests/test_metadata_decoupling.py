@@ -335,6 +335,9 @@ def test_dispatch_adds_no_metadata_commit_keeps_daemon_args_verbatim(
     """The conductor's one dispatch-site addition: --no-metadata-commit,
     with DEFAULT_REFINE_ARGS still the imported daemon set, verbatim."""
     cfg = make_cfg(tmp_path)
+    # Isolate from the Mathlib-cache prime (its own `lake exe cache get` Popen
+    # would otherwise be recorded in `spawned`); tested in test_conductor_cache.py.
+    monkeypatch.setenv("MARATHON_SKIP_CACHE_GET", "1")
     monkeypatch.setattr(
         conductor.subprocess, "run",
         lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
