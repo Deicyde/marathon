@@ -1180,3 +1180,20 @@ def test_openRunDetail_is_a_pure_read(app_js: str):
         assert forbidden not in body
     # it surfaces ratings + prompts
     assert "ratings" in body and "prompts" in body
+
+
+def test_informal_text_renders_inline_markdown(katex_js: str):
+    """The reported bug: **bold** showed literally in the informal section. The
+    LaTeX renderer's text segments now render inline markdown (bold/`code`/em) as
+    DOM nodes — XSS-safe (createElement + textContent, never innerHTML)."""
+    assert "appendInlineMarkdown" in katex_js
+    # the text-segment branch routes through the markdown renderer
+    assert "appendInlineMarkdown(container, seg.value)" in katex_js
+    # bold/code/italic tags are emitted
+    for tag in ('"strong"', '"code"', '"em"'):
+        assert tag in katex_js
+    # the markdown renderer is XSS-safe (no innerHTML; uses textContent)
+    fn = katex_js[katex_js.find("function appendInlineMarkdown"):
+                  katex_js.find("function render(")]
+    assert fn and "innerHTML" not in fn
+    assert "createTextNode" in fn and "textContent" in fn

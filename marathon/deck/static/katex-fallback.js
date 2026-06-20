@@ -96,6 +96,33 @@
     parent.appendChild(code);
   }
 
+  // Render the inline MARKDOWN of a (non-math) text segment into `parent`:
+  // **bold** -> <strong>, `code` -> <code>, *italic* -> <em>. Built as DOM
+  // nodes with textContent (never innerHTML), so the LLM-rendered informal text
+  // can't inject markup. Math has already been tokenized out, so a `$` won't
+  // appear here. Unmatched `*`/`` ` `` are emitted verbatim.
+  // Italic requires non-space just inside the *…* (standard markdown), so a
+  // plain "a * b" is NOT mistaken for emphasis. Bold + `code` are unambiguous.
+  var _MD_INLINE_RE = /\*\*([^*]+?)\*\*|`([^`]+?)`|\*(\S(?:[^*\n]*?\S)?)\*/g;
+  function appendInlineMarkdown(parent, text) {
+    var last = 0, m;
+    _MD_INLINE_RE.lastIndex = 0;
+    while ((m = _MD_INLINE_RE.exec(text)) !== null) {
+      if (m.index > last) {
+        parent.appendChild(document.createTextNode(text.slice(last, m.index)));
+      }
+      var tag = m[1] != null ? "strong" : (m[2] != null ? "code" : "em");
+      var inner = m[1] != null ? m[1] : (m[2] != null ? m[2] : m[3]);
+      var node = document.createElement(tag);
+      node.textContent = inner;
+      parent.appendChild(node);
+      last = _MD_INLINE_RE.lastIndex;
+    }
+    if (last < text.length) {
+      parent.appendChild(document.createTextNode(text.slice(last)));
+    }
+  }
+
   // Public: render the LaTeX-bearing text of `container.dataset.latexSource`
   // (or the container's textContent if no dataset) into rich nodes in place.
   function render(container) {
@@ -109,7 +136,7 @@
     var segments = tokenize(src);
     segments.forEach(function (seg) {
       if (seg.kind === "text") {
-        container.appendChild(document.createTextNode(seg.value));
+        appendInlineMarkdown(container, seg.value);
       } else {
         renderMath(container, seg.value, seg.kind === "display");
       }

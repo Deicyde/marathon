@@ -832,24 +832,6 @@
           "Verify the informal statement before you review the declarations" }),
       ])
     );
-    panel.appendChild(
-      el("p", { class: "approval-sub" }, [
-        "This is the issue's ",
-        el("strong", { text: "top-level informal statement" }),
-        " (the whole result), ",
-        el("strong", { text: "LLM-rendered" }),
-        ". Confirm it faithfully describes the result against the source — you " +
-          "review it ONCE here, not declaration-by-declaration. ",
-        el("strong", { text: "Approve" }),
-        " clears the LLM-rendered warning on every card below (and marks the " +
-          "issue's informal statement verified when you ship); ",
-        el("strong", { text: "reject" }),
-        " keeps the warning; ",
-        el("strong", { text: "defer" }),
-        " decides later.",
-      ])
-    );
-
     var math = el("div", { class: "informal-text" });
     math.dataset.latexSource = inf.statement || "";
     panel.appendChild(el("section", { class: "approval-item" }, [math]));
