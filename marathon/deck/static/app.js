@@ -2219,8 +2219,16 @@
 
       var psec = el("section", { class: "run-sec" },
         [el("h3", { class: "run-h", text: "Refine-reviewer prompts (→ Aristotle)" })]);
-      psec.appendChild(el("pre", { class: "run-prompts mono",
-        text: d.prompts || "(none yet)" }));
+      var pbody = el("div", { class: "run-prompts md-body" });
+      // The prompts are markdown (from marathon-refine-log.md) — render them
+      // fully; degrade to plain text if the renderer is unavailable.
+      if (window.MarathonLatex && window.MarathonLatex.renderMarkdown && d.prompts) {
+        try { window.MarathonLatex.renderMarkdown(pbody, d.prompts); }
+        catch (e) { pbody.textContent = d.prompts; }
+      } else {
+        pbody.textContent = d.prompts || "(none yet)";
+      }
+      psec.appendChild(pbody);
       panel.appendChild(psec);
 
       panel.appendChild(el("div", { class: "modal-actions" }, [

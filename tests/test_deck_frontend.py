@@ -1223,3 +1223,16 @@ def test_dashboard_numbers_link_to_github(app_js: str):
     hist = _fn_body(code, "function renderHistoryTab")
     assert 'ghLink(d.repo, "issues"' in hist   # verdict events -> issue
     assert 'ghLink(d.repo, "pull"' in hist     # merged PRs -> PR
+
+
+def test_run_prompts_render_as_markdown(app_js: str, katex_js: str):
+    """The refine-reviewer prompts (markdown from marathon-refine-log.md) render
+    via the block-level markdown renderer, not a raw <pre>."""
+    assert "function renderMarkdown" in katex_js
+    assert "renderMarkdown: renderMarkdown" in katex_js     # exported
+    for tok in ("md-code", "md-list", "md-h", "md-p"):       # block constructs
+        assert tok in katex_js
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function openRunDetail")
+    assert "renderMarkdown(" in body
+    assert "md-body" in body

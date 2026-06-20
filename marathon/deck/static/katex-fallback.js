@@ -158,5 +158,83 @@
     }
   }
 
-  window.MarathonLatex = { render: render, katexAvailable: katexAvailable, tokenize: tokenize };
+  // Block-level MARKDOWN renderer for the refine-reviewer prompts (and any rich
+  // markdown text): ATX headers (#…), fenced ``` code blocks (verbatim), bullet
+  // (-, *) and ordered (1.) lists, and paragraphs. Inline content runs through
+  // renderRich, so **bold** / `code` / *italic* / $math$ all work inside. Built
+  // as DOM nodes (no innerHTML). `container` is cleared and filled in place.
+  var _FENCE_RE = /^\s*```/;
+  var _ATX_RE = /^(#{1,6})\s+(.*)$/;
+  var _ULI_RE = /^\s*[-*]\s+(.*)$/;
+  var _OLI_RE = /^\s*\d+\.\s+(.*)$/;
+  function renderMarkdown(container, src) {
+    if (!container) return;
+    container.textContent = "";
+    var lines = String(src == null ? "" : src).split("\n");
+    var i = 0;
+    function appendList(items, ordered) {
+      var list = document.createElement(ordered ? "ol" : "ul");
+      list.className = "md-list";
+      items.forEach(function (it) {
+        var li = document.createElement("li");
+        renderRich(li, it);
+        list.appendChild(li);
+      });
+      container.appendChild(list);
+    }
+    while (i < lines.length) {
+      var line = lines[i];
+      if (_FENCE_RE.test(line)) {                       // ``` fenced code block
+        var code = [];
+        i++;
+        while (i < lines.length && !_FENCE_RE.test(lines[i])) { code.push(lines[i]); i++; }
+        i++;                                            // consume closing fence
+        var pre = document.createElement("pre");
+        pre.className = "md-code";
+        var c = document.createElement("code");
+        c.textContent = code.join("\n");
+        pre.appendChild(c);
+        container.appendChild(pre);
+        continue;
+      }
+      var h = _ATX_RE.exec(line);
+      if (h) {                                          // # ATX header
+        var lvl = h[1].length;
+        var hd = document.createElement("h" + Math.min(lvl + 2, 6));
+        hd.className = "md-h md-h" + lvl;
+        renderRich(hd, h[2]);
+        container.appendChild(hd);
+        i++;
+        continue;
+      }
+      if (_ULI_RE.test(line)) {                          // - / * bullet list
+        var u = [];
+        while (i < lines.length && _ULI_RE.test(lines[i])) { u.push(_ULI_RE.exec(lines[i])[1]); i++; }
+        appendList(u, false);
+        continue;
+      }
+      if (_OLI_RE.test(line)) {                          // 1. ordered list
+        var o = [];
+        while (i < lines.length && _OLI_RE.test(lines[i])) { o.push(_OLI_RE.exec(lines[i])[1]); i++; }
+        appendList(o, true);
+        continue;
+      }
+      if (line.trim() === "") { i++; continue; }         // blank line
+      var para = [];                                     // paragraph
+      while (i < lines.length && lines[i].trim() !== "" &&
+             !_FENCE_RE.test(lines[i]) && !_ATX_RE.test(lines[i]) &&
+             !_ULI_RE.test(lines[i]) && !_OLI_RE.test(lines[i])) {
+        para.push(lines[i]); i++;
+      }
+      var p = document.createElement("p");
+      p.className = "md-p";
+      renderRich(p, para.join(" "));
+      container.appendChild(p);
+    }
+  }
+
+  window.MarathonLatex = {
+    render: render, katexAvailable: katexAvailable, tokenize: tokenize,
+    renderMarkdown: renderMarkdown,
+  };
 })();
