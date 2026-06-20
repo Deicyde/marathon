@@ -1206,3 +1206,20 @@ def test_status_tab_renders_pending_queue(app_js: str):
     assert "Queued (waiting to dispatch)" in body
     assert "job-wait" in body          # the waiting-reason
     assert "sb-queued" in body
+
+
+def test_dashboard_numbers_link_to_github(app_js: str):
+    """Issue/PR numbers on the Issues + History tabs link to GitHub (the new
+    ghLink helper), opening in a new tab and not triggering the row's click."""
+    code = _strip_block_comments(app_js)
+    assert "function ghLink" in code
+    # the URL literal is checked on the RAW source — _strip_block_comments treats
+    # the `//` in `https://` as a line comment and would truncate it.
+    assert "https://github.com/" in app_js
+    fn = _fn_body(code, "function ghLink")
+    assert "target" in fn and "stopPropagation" in fn  # new tab; don't open review
+    iss = _fn_body(code, "function renderIssuesTab")
+    assert 'ghLink(d.repo, "issues"' in iss
+    hist = _fn_body(code, "function renderHistoryTab")
+    assert 'ghLink(d.repo, "issues"' in hist   # verdict events -> issue
+    assert 'ghLink(d.repo, "pull"' in hist     # merged PRs -> PR

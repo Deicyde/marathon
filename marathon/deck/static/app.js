@@ -2241,6 +2241,22 @@
     });
   }
 
+  // ghLink — a clickable GitHub link for an issue/PR number. `kind` is "issues"
+  // or "pull". Degrades to a plain span when the repo or number is unknown.
+  // stopPropagation so clicking the link (in a clickable row) opens GitHub only.
+  function ghLink(repo, kind, n, label, cls) {
+    var text = label != null ? label : ("#" + n);
+    var klass = (cls ? cls + " " : "") + "gh-num";
+    if (!repo || n == null) return el("span", { class: klass, text: text });
+    return el("a", {
+      class: klass + " gh-link",
+      href: "https://github.com/" + repo + "/" + kind + "/" + n,
+      target: "_blank", rel: "noopener noreferrer",
+      title: "open " + (kind === "pull" ? "PR" : "issue") + " #" + n + " on GitHub",
+      onclick: function (ev) { ev.stopPropagation(); },
+    }, [text]);
+  }
+
   // --- Issues tab: every registered issue grouped by chapter ---
   function renderIssuesTab() {
     var host = dashHost("dash-issues");
@@ -2267,7 +2283,7 @@
         ]);
         ch.issues.forEach(function (it) {
           var kids = [
-            el("span", { class: "issue-id", text: "#" + it.id }),
+            ghLink(d.repo, "issues", it.id, "#" + it.id, "issue-id"),
             statusBadge(it.status),
             el("span", { class: "issue-title", title: it.title || "", text: it.title || "(untitled)" }),
           ];
@@ -2301,7 +2317,7 @@
         vSec.appendChild(el("div", { class: "hist-row" }, [
           el("span", { class: "hist-ts", text: fmtTs(e.ts) }),
           el("div", { class: "hist-body" }, [
-            el("span", { class: "job-issue", text: "#" + e.issue_num }), " ",
+            ghLink(d.repo, "issues", e.issue_num, "#" + e.issue_num, "job-issue"), " ",
             statusBadge(e.verdict),
             e.notes ? el("div", { class: "dash-empty", text: e.notes }) : null,
           ]),
@@ -2316,7 +2332,7 @@
         pSec.appendChild(el("div", { class: "hist-row" }, [
           el("span", { class: "hist-ts", text: fmtTs(p.merged_at) }),
           el("div", { class: "hist-body" }, [
-            el("span", { class: "hist-pr", text: "#" + p.number }), " ",
+            ghLink(d.repo, "pull", p.number, "#" + p.number, "hist-pr"), " ",
             el("span", { text: p.title || "" }),
           ]),
         ]));

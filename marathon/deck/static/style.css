@@ -548,3 +548,7 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .queued-row { opacity: 0.92; }
 .sb-queued { font-size: 0.72rem; padding: 0.05rem 0.4rem; border-radius: 6px; background: #d9a40a22; border: 1px solid #d9a40a66; color: var(--warn, #d9a40a); }
 .job-wait { font-size: 0.76rem; opacity: 0.75; margin-left: auto; }
+
+/* --- clickable GitHub issue/PR numbers --- */
+.gh-link { color: var(--accent, #6ea8fe); text-decoration: none; cursor: pointer; }
+.gh-link:hover { text-decoration: underline; }

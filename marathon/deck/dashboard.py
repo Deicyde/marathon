@@ -141,6 +141,7 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
     return {
         "alive": alive,
         "pid": pid,
+        "repo": getattr(cfg, "github_repo", None),
         "concurrency": snap.get("concurrency"),
         "updated_ts": snap.get("updated_ts"),
         "running": sum(1 for j in jobs if j["status"] == "running"),
@@ -383,6 +384,7 @@ def issues_overview(cfg: "ReviewConfig") -> dict:
         out_chapters.append({"chapter": ch, "issues": rows})
 
     return {
+        "repo": cfg.github_repo,
         "chapters": out_chapters,
         "counts": counts,
         "total": len(registry),
@@ -399,6 +401,7 @@ def history(cfg: "ReviewConfig", *, limit: int = 30) -> dict:
     and MERGED PRs (one ``gh`` read). Each is newest-first, capped at
     ``limit``; either degrades to empty independently."""
     return {
+        "repo": cfg.github_repo,
         "verdict_events": _verdict_events(cfg, limit),
         "merged_prs": _merged_prs(cfg, limit),
     }
