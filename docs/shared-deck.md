@@ -131,13 +131,15 @@ from GitHub regardless). It only fast-forwards — it never clobbers, because a
 hosted deck never commits locally (merges happen on GitHub). Omit it for a local
 single-user deck, which manages its own checkout.
 
-> **Audit caveat.** The trust-tier data (`.marathon/audit/latest.json`) is
-> *gitignored* — a local compute artifact (Lean elaboration) the thin deck can't
-> regenerate, so `--pull-every` does **not** sync it. The deck degrades
-> gracefully (empty trust tiers) without one; to show fresh trust tiers on a
-> hosted box, ship a `latest.json` there from a machine that runs `marathon
-> audit`. The cards themselves (source + issue) stay current via the pull + live
-> GitHub reads.
+> **Audit (trust tiers).** The trust-tier data (`.marathon/audit/latest.json`)
+> is *gitignored* — a local compute artifact (Lean elaboration) the thin deck
+> can't regenerate, so `--pull-every` does **not** pull it. The deck degrades
+> gracefully (empty trust tiers) without one. To show fresh trust tiers on a
+> hosted box, have a machine that runs `marathon audit` **publish** its
+> `latest.json` (rsync to a path, or an http endpoint) and add
+> **`--audit-from <path-or-url>`** — the sync loop then refreshes the snapshot
+> each cycle (atomic + JSON-validated + fail-soft). The cards themselves (source
+> + issue) stay current via the pull + live GitHub reads regardless.
 
 ### 5. Each collaborator's compute
 

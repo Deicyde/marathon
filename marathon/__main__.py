@@ -1036,7 +1036,17 @@ def _add_deck_subparser(subparsers) -> None:
             "so the cards reflect the latest merged code (issues come live from "
             "GitHub regardless). Default: 0 = off (a local deck manages its own "
             "checkout). The gitignored audit snapshot is NOT pulled — the deck "
-            "degrades to empty trust tiers without a local one."
+            "degrades to empty trust tiers without a local one (see --audit-from)."
+        ),
+    )
+    p_deck.add_argument(
+        "--audit-from", default=None, metavar="PATH_OR_URL",
+        help=(
+            "For a HOSTED deck: each --pull-every cycle, refresh the (gitignored) "
+            "audit snapshot from this local path or http(s) URL — where a machine "
+            "that runs `marathon audit` PUBLISHES its latest.json — so the deck "
+            "shows fresh trust tiers without running Lean itself. Atomic + JSON-"
+            "validated + fail-soft."
         ),
     )
     p_deck.add_argument(
@@ -1075,6 +1085,7 @@ def _run_deck(args) -> None:
         demo=demo,
         trusted_origins=getattr(args, "trusted_origin", []) or [],
         pull_every=getattr(args, "pull_every", 0),
+        audit_from=getattr(args, "audit_from", None),
     )
     if rc:
         raise SystemExit(rc)

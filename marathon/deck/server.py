@@ -845,6 +845,7 @@ def serve(
     demo: bool = False,
     trusted_origins: "Sequence[str]" = (),
     pull_every: int = 0,
+    audit_from: Optional[str] = None,
 ) -> int:
     """Start the deck server and block in ``serve_forever`` until Ctrl-C.
 
@@ -903,8 +904,9 @@ def serve(
         from marathon.deck.sync import start_repo_sync
 
         print(f"  repo sync: fast-forward pull every {pull_every}s "
-              f"(keeps the hosted deck's source current)")
-        start_repo_sync(cfg.repo_dir, pull_every)
+              f"(keeps the hosted deck's source current)"
+              + (f"; audit from {audit_from}" if audit_from else ""))
+        start_repo_sync(cfg.repo_dir, pull_every, audit_from=audit_from)
     print("  press Ctrl-C to stop.")
     print("=" * 70)
 

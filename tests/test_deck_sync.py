@@ -68,3 +68,39 @@ def test_audit_age_note_reports_age(tmp_path):
 def test_start_repo_sync_noop_when_disabled(tmp_path):
     assert sync.start_repo_sync(tmp_path, 0) is None
     assert sync.start_repo_sync(tmp_path, -5) is None
+
+
+def test_refresh_audit_from_local_path(tmp_path):
+    src = tmp_path / "published.json"
+    src.write_text('{"schema":1,"decls":[]}')
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert sync.refresh_audit(repo, str(src)) == "audit refreshed"
+    dest = repo / ".marathon" / "audit" / "latest.json"
+    assert dest.read_text() == '{"schema":1,"decls":[]}'    # atomic copy landed
+
+
+def test_refresh_audit_rejects_non_json(tmp_path):
+    src = tmp_path / "garbage.json"
+    src.write_text("not json {{{")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    out = sync.refresh_audit(repo, str(src))
+    assert out.startswith("audit refresh failed")           # validation rejected it
+    assert not (repo / ".marathon" / "audit" / "latest.json").exists()  # live file untouched
+
+
+def test_refresh_audit_failsoft_missing_source(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    out = sync.refresh_audit(repo, str(tmp_path / "nope.json"))
+    assert out.startswith("audit refresh failed")           # never raises
+
+
+def test_refresh_audit_keeps_existing_on_failure(tmp_path):
+    repo = tmp_path / "repo"
+    dest = repo / ".marathon" / "audit" / "latest.json"
+    dest.parent.mkdir(parents=True)
+    dest.write_text('{"good":"prior"}')
+    sync.refresh_audit(repo, str(tmp_path / "missing.json"))
+    assert dest.read_text() == '{"good":"prior"}'           # prior snapshot preserved

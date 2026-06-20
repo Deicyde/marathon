@@ -16,6 +16,7 @@ fresh audit to a hosted box is a separate, optional compute-side step.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 import time
@@ -77,23 +78,59 @@ def audit_age_note(repo_dir: Path) -> str:
         return ""
 
 
+def refresh_audit(repo_dir: Path, source: str) -> str:
+    """Fetch the audit snapshot from ``source`` — a local path or an http(s) URL
+    — to ``<repo_dir>/.marathon/audit/latest.json``, atomically.
+
+    For a HOSTED deck whose compute machine PUBLISHES its audit (rsync to a path,
+    or an http endpoint), so the deck shows fresh trust tiers without running Lean
+    itself. Validates the payload parses as JSON before swapping the live file in,
+    and swaps via an atomic rename so the deck never reads a partial snapshot.
+    Fail-soft: any error keeps the existing snapshot."""
+    dest = Path(repo_dir) / ".marathon" / "audit" / "latest.json"
+    try:
+        if source.startswith(("http://", "https://")):
+            import urllib.request
+
+            with urllib.request.urlopen(source, timeout=30) as r:  # noqa: S310
+                data = r.read()
+        else:
+            data = Path(source).read_bytes()
+        json.loads(data)  # reject garbage before touching the live file
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(dest)  # atomic swap
+        return "audit refreshed"
+    except Exception as exc:  # noqa: BLE001
+        return f"audit refresh failed ({type(exc).__name__}); kept existing"
+
+
 def start_repo_sync(
     repo_dir: Path,
     interval: int,
     *,
+    audit_from: Optional[str] = None,
     log: Callable[[str], None] = print,
 ) -> Optional[threading.Thread]:
     """Start a daemon thread that fast-forwards ``repo_dir`` every ``interval``
     seconds (pulling once immediately), keeping a hosted deck's working tree
-    current. A no-op returning ``None`` when ``interval <= 0`` (the default — a
-    local single-user deck manages its own checkout)."""
+    current. When ``audit_from`` is set, ALSO refresh the (gitignored) audit
+    snapshot from that path/URL each cycle. A no-op returning ``None`` when
+    ``interval <= 0`` (the default — a local single-user deck manages its own
+    checkout)."""
     if interval is None or interval <= 0:
         return None
 
     def _loop() -> None:
         while True:
             try:
-                log(f"  [sync] {pull_once(repo_dir)}{audit_age_note(repo_dir)}")
+                msg = pull_once(repo_dir)
+                if audit_from:
+                    msg += " · " + refresh_audit(repo_dir, audit_from)
+                else:
+                    msg += audit_age_note(repo_dir)
+                log(f"  [sync] {msg}")
             except Exception:  # noqa: BLE001 — the sync thread must never die
                 pass
             time.sleep(interval)
