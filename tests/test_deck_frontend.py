@@ -1186,14 +1186,14 @@ def test_informal_text_renders_inline_markdown(katex_js: str):
     """The reported bug: **bold** showed literally in the informal section. The
     LaTeX renderer's text segments now render inline markdown (bold/`code`/em) as
     DOM nodes — XSS-safe (createElement + textContent, never innerHTML)."""
-    assert "appendInlineMarkdown" in katex_js
-    # the text-segment branch routes through the markdown renderer
-    assert "appendInlineMarkdown(container, seg.value)" in katex_js
+    assert "renderRich" in katex_js
+    # bold/italic spans recurse so a bold span MAY contain math
+    assert "renderRich(b, m[3])" in katex_js or "renderRich(b," in katex_js
     # bold/code/italic tags are emitted
     for tag in ('"strong"', '"code"', '"em"'):
         assert tag in katex_js
     # the markdown renderer is XSS-safe (no innerHTML; uses textContent)
-    fn = katex_js[katex_js.find("function appendInlineMarkdown"):
+    fn = katex_js[katex_js.find("function renderRich"):
                   katex_js.find("function render(")]
     assert fn and "innerHTML" not in fn
     assert "createTextNode" in fn and "textContent" in fn

@@ -96,34 +96,49 @@
     parent.appendChild(code);
   }
 
-  // Render the inline MARKDOWN of a (non-math) text segment into `parent`:
-  // **bold** -> <strong>, `code` -> <code>, *italic* -> <em>. Built as DOM
-  // nodes with textContent (never innerHTML), so the LLM-rendered informal text
-  // can't inject markup. Math has already been tokenized out, so a `$` won't
-  // appear here. Unmatched `*`/`` ` `` are emitted verbatim.
-  // Italic requires non-space just inside the *…* (standard markdown), so a
-  // plain "a * b" is NOT mistaken for emphasis. Bold + `code` are unambiguous.
-  var _MD_INLINE_RE = /\*\*([^*]+?)\*\*|`([^`]+?)`|\*(\S(?:[^*\n]*?\S)?)\*/g;
-  function appendInlineMarkdown(parent, text) {
-    var last = 0, m;
-    _MD_INLINE_RE.lastIndex = 0;
-    while ((m = _MD_INLINE_RE.exec(text)) !== null) {
-      if (m.index > last) {
-        parent.appendChild(document.createTextNode(text.slice(last, m.index)));
+  // UNIFIED inline renderer: math ($$…$$, $…$) AND markdown (**bold**, `code`,
+  // *italic*) in ONE left-to-right pass. A markdown span MAY contain math — the
+  // #98 case `**multilinear over $C^\infty(M)$**` renders as a bold node whose
+  // content is rendered RECURSIVELY (so the inner $…$ is typeset). Inside $…$,
+  // text is opaque LaTeX (no markdown). Italic needs non-space just inside the
+  // *…* so a plain "a * b" isn't mistaken for emphasis. DOM nodes only
+  // (createElement + textContent, never innerHTML) so the LLM-rendered text
+  // can't inject markup. An unclosed/unmatched delimiter is emitted verbatim.
+  var _RICH_RE =
+    /\$\$([\s\S]+?)\$\$|\$([^$\n]+?)\$|\*\*([\s\S]+?)\*\*|`([^`]+?)`|\*(\S(?:[^*\n]*?\S)?)\*/;
+  function renderRich(parent, text) {
+    var rest = text == null ? "" : String(text);
+    while (rest) {
+      var m = _RICH_RE.exec(rest);
+      if (!m) {
+        parent.appendChild(document.createTextNode(rest));
+        return;
       }
-      var tag = m[1] != null ? "strong" : (m[2] != null ? "code" : "em");
-      var inner = m[1] != null ? m[1] : (m[2] != null ? m[2] : m[3]);
-      var node = document.createElement(tag);
-      node.textContent = inner;
-      parent.appendChild(node);
-      last = _MD_INLINE_RE.lastIndex;
-    }
-    if (last < text.length) {
-      parent.appendChild(document.createTextNode(text.slice(last)));
+      if (m.index > 0) {
+        parent.appendChild(document.createTextNode(rest.slice(0, m.index)));
+      }
+      if (m[1] != null) {
+        renderMath(parent, m[1], true);            // $$display$$
+      } else if (m[2] != null) {
+        renderMath(parent, m[2], false);           // $inline$
+      } else if (m[3] != null) {
+        var b = document.createElement("strong");  // **bold** (may hold math)
+        renderRich(b, m[3]);
+        parent.appendChild(b);
+      } else if (m[4] != null) {
+        var c = document.createElement("code");    // `code` (opaque)
+        c.textContent = m[4];
+        parent.appendChild(c);
+      } else {
+        var e = document.createElement("em");       // *italic* (may hold math)
+        renderRich(e, m[5]);
+        parent.appendChild(e);
+      }
+      rest = rest.slice(m.index + m[0].length);
     }
   }
 
-  // Public: render the LaTeX-bearing text of `container.dataset.latexSource`
+  // Public: render the LaTeX+markdown text of `container.dataset.latexSource`
   // (or the container's textContent if no dataset) into rich nodes in place.
   function render(container) {
     if (!container) return;
@@ -133,14 +148,7 @@
         : container.textContent || "";
     container.textContent = "";
     var fellBack = !katexAvailable();
-    var segments = tokenize(src);
-    segments.forEach(function (seg) {
-      if (seg.kind === "text") {
-        appendInlineMarkdown(container, seg.value);
-      } else {
-        renderMath(container, seg.value, seg.kind === "display");
-      }
-    });
+    renderRich(container, src);
     if (fellBack) {
       container.classList.add("latex-degraded");
       container.setAttribute(
