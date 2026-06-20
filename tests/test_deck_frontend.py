@@ -1236,3 +1236,12 @@ def test_run_prompts_render_as_markdown(app_js: str, katex_js: str):
     body = _fn_body(code, "function openRunDetail")
     assert "renderMarkdown(" in body
     assert "md-body" in body
+
+
+def test_hotkey_legend_hidden_off_review_tab(app_js: str):
+    """The ←/→/space/d hotkey legend (a body-level footer) is shown only on the
+    review tab; switchTab hides it on the dashboard tabs."""
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function switchTab")
+    assert ".legend" in body
+    assert '!== "review"' in body

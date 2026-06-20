@@ -2058,6 +2058,10 @@
       if (t === name) pane.removeAttribute("hidden");
       else pane.setAttribute("hidden", "hidden");
     });
+    // The hotkey legend (←/→/space/d/o) only applies to the review/swipe flow;
+    // it lives at the body level, so hide it on the dashboard tabs.
+    var legend = document.querySelector(".legend");
+    if (legend) legend.hidden = name !== "review";
     // Stop any prior tab's auto-refresh.
     if (dashTimer) { clearInterval(dashTimer); dashTimer = null; }
     if (name === "status") {
