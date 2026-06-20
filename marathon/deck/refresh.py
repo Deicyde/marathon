@@ -437,6 +437,240 @@ def refresh_issue_signatures(
     }
 
 
+#: A rendered signatures block's trailing permalink line, e.g.
+#: ``[`Foo.bar` at path/F.lean:L10-L20](https://github.com/.../F.lean#L10-L20)``.
+#: Identifies which decl a block cites (group 1) for minimal-edit reconciliation.
+_PERMALINK_LINE_RE = re.compile(r"^\[`([^`]+)` at .+?#L\d+-L\d+\)\s*$")
+
+
+def _proven_rename(
+    repo_dir: Path, stale_name: str, candidate_names: "list[str]"
+) -> Optional[str]:
+    """The candidate that the stale decl ``stale_name`` was RENAMED to, proven by
+    git history: the single commit that REMOVED ``stale_name``'s leaf also ADDED
+    exactly one candidate's leaf. ``None`` when no such proof exists (then the
+    stale citation is KEPT — never dropped on a guess).
+
+    A symbol rename is not a git file-rename, so this is content-based: find the
+    most recent commit whose diff deletes the stale leaf, and check its added
+    lines for a candidate leaf. Pure read-only (``git log -S`` / ``git show``)."""
+    stale_leaf = stale_name.rsplit(".", 1)[-1]
+    cand_by_leaf = {c.rsplit(".", 1)[-1]: c for c in candidate_names}
+    if not stale_leaf or not cand_by_leaf:
+        return None
+    try:
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%H", "-S", stale_leaf],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
+        )
+        if log.returncode != 0 or not log.stdout.strip():
+            return None
+        commit = log.stdout.strip().splitlines()[0]
+        show = subprocess.run(
+            ["git", "show", "--format=", "--unified=0", commit],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
+        )
+        if show.returncode != 0:
+            return None
+    except OSError:
+        return None
+    diff = show.stdout
+    # The commit must REMOVE the stale leaf (a deleted line mentions it)…
+    removed = any(
+        ln.startswith("-") and not ln.startswith("---") and stale_leaf in ln
+        for ln in diff.splitlines()
+    )
+    if not removed:
+        return None
+    # …and ADD exactly one candidate leaf (an inserted line mentions it).
+    added = {
+        leaf for leaf, full in cand_by_leaf.items()
+        if any(
+            ln.startswith("+") and not ln.startswith("+++") and leaf in ln
+            for ln in diff.splitlines()
+        )
+    }
+    if len(added) != 1:
+        return None
+    return cand_by_leaf[next(iter(added))]
+
+
+def auto_reconcile_issue(
+    cfg: "ReviewConfig", issue_num: int, *, dry_run: bool = False
+) -> dict:
+    """SAFE automatic reconcile of one issue's ``### Lean signatures`` against the
+    LIVE code — the hands-off replacement for the manual "refresh from code"
+    button. MECHANICAL (no Claude); the ONLY write is one ``gh issue edit``.
+
+    Two safe edits, both MINIMAL (every other block stays byte-identical — no
+    permalink re-pin, so a human-verified body's anchors don't drift):
+
+    * ADD — uncited in-code decls that match the issue's textbook result-key and
+      that NO issue cites (``missing_suggestions_for_issue`` with empty
+      ``cited_by``). New blocks are APPENDED. This is what fixes #94: the in-code
+      ``smul_of_contMDiff`` (Prop 12.22, uncited) is added to the signatures.
+    * RENAME — a stale signature citation (cited but no longer in the code) is
+      replaced by its rename ONLY when :func:`_proven_rename` proves it via git.
+      A stale citation with NO proven rename is KEPT VERBATIM (never dropped on a
+      guess — that would erase a genuinely-missing-decl signal).
+
+    Returns ``{ok, updated, added, renamed, kept_stale, sha, message}``. Writes
+    NOTHING when there is no signatures section, nothing to add/rename, or
+    ``dry_run`` (then ``new_body`` is included for inspection)."""
+    from marathon.deck.cards import (
+        _build_decl_view, _load_context, _decls_for_issue, _ledger,
+        missing_suggestions_for_issue,
+    )
+    from marathon.review.github import issue_body as _issue_body
+
+    repo = cfg.github_repo
+    repo_dir = Path(cfg.repo_dir)
+    empty = {"ok": True, "updated": False, "added": [], "renamed": [],
+             "kept_stale": [], "sha": None}
+
+    sha = head_sha(repo_dir)
+    if not sha:
+        return {**empty, "message": "could not resolve HEAD SHA"}
+    body = _issue_body(issue_num, repo)
+    if body is None:
+        return {**empty, "ok": False,
+                "message": f"could not fetch issue #{issue_num} body"}
+    if SIGNATURES_HEADER not in body:
+        return {**empty, "sha": sha,
+                "message": f"#{issue_num}: no signatures section"}
+
+    ctx = _load_context(cfg, [issue_num])
+    ledger = _ledger(cfg)
+
+    # Stale signature citations: decls cited in the ```lean blocks that are no
+    # longer in the code. These are the ONLY drop/replace candidates.
+    cited_raw = _decls_for_issue(ctx, issue_num)
+    stale = []
+    for raw in cited_raw:
+        v = _build_decl_view(ctx, ledger, raw, repo_dir)
+        if not v.in_code and v.name not in stale:
+            stale.append(v.name)
+
+    # ADD candidates: uncited (cited_by empty) in-code decls matching the
+    # result-key — the orphaned-but-present decls the issue should cite.
+    suggestions = missing_suggestions_for_issue(cfg, issue_num)
+    add_names = [s["decl"] for s in suggestions if not s["cited_by"]]
+
+    # Resolve renames first: a stale S maps to an ADD candidate R proven by git.
+    renamed: list[dict] = []
+    renamed_targets: set[str] = set()
+    kept_stale: list[str] = []
+    for s in stale:
+        r = _proven_rename(repo_dir, s, add_names)
+        if r is not None:
+            renamed.append({"old": s, "new": r})
+            renamed_targets.add(r)
+        else:
+            kept_stale.append(s)
+    # ADD set = candidates not consumed by a rename.
+    add_only = [n for n in add_names if n not in renamed_targets]
+
+    if not renamed and not add_only:
+        return {**empty, "sha": sha,
+                "message": f"#{issue_num}: already reconciled ({len(kept_stale)} "
+                           "stale citation(s) kept — no proven rename)"}
+
+    # Render the blocks to write (ADD + rename targets); skip any whose source
+    # can't be located (never emit a broken block).
+    def _render(name: str) -> Optional[str]:
+        view = _build_decl_view(ctx, ledger, name, repo_dir)
+        file_rel, a, b, signature = _locate_in_source(repo_dir, view)
+        if file_rel is None:
+            return None
+        return (f"```lean\n{signature}\n```\n"
+                f"[`{name}` at {file_rel}:L{a}-L{b}]"
+                f"({_permalink(repo, sha, file_rel, a, b)})")
+
+    rename_blocks = {r["old"]: _render(r["new"]) for r in renamed}
+    add_rendered = [(n, _render(n)) for n in sorted(add_only)]
+    add_blocks = [b for (_n, b) in add_rendered if b]
+    added_names = [n for (n, b) in add_rendered if b]
+    renamed_ok = [r for r in renamed if rename_blocks.get(r["old"])]
+
+    new_body = _reconcile_body(body, rename_blocks, add_blocks)
+    if new_body == body:
+        return {**empty, "sha": sha,
+                "message": f"#{issue_num}: nothing to write (unlocatable sources)"}
+
+    result = {
+        "ok": True, "updated": True,
+        "added": added_names,
+        "renamed": renamed_ok,
+        "kept_stale": kept_stale, "sha": sha,
+        "message": (
+            f"#{issue_num} reconciled to {sha[:7]}: "
+            f"{len(added_names)} added, {len(renamed_ok)} renamed, "
+            f"{len(kept_stale)} stale kept"
+        ),
+    }
+    if dry_run:
+        result["new_body"] = new_body
+        result["updated"] = False
+        return result
+    _gh_edit_body(repo, issue_num, new_body)
+    return result
+
+
+def _reconcile_body(
+    body: str, rename_blocks: "dict[str, Optional[str]]", add_blocks: "list[str]"
+) -> str:
+    """Apply minimal signature-section edits: replace each block whose decl is a
+    proven-rename key with its new rendered block, and APPEND the add_blocks at
+    the end of the section. Every non-renamed block stays byte-identical. When a
+    rename's new block is None (unlocatable), the stale block is left as-is."""
+    lines = body.splitlines(keepends=True)
+    start = next(
+        (i for i, l in enumerate(lines)
+         if l.rstrip("\n").strip() == SIGNATURES_HEADER), None
+    )
+    if start is None:
+        return body
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("### "):
+            end = j
+            break
+    section = "".join(lines[start:end])
+
+    # Replace a renamed decl's whole block (the run ending at its permalink line).
+    if any(v for v in rename_blocks.values()):
+        out_lines: list[str] = []
+        buf: list[str] = []
+        for line in section.splitlines(keepends=True):
+            buf.append(line)
+            m = _PERMALINK_LINE_RE.match(line.rstrip("\n"))
+            if m:
+                name = m.group(1)
+                new_block = rename_blocks.get(name)
+                if new_block is not None:
+                    # Replace the buffered block; keep any leading non-block lines
+                    # (e.g. the ```lean fence start sits in buf) by swapping the
+                    # whole run for the new block + a trailing newline.
+                    out_lines.append(new_block + "\n")
+                else:
+                    out_lines.extend(buf)
+                buf = []
+        out_lines.extend(buf)  # trailing non-block remainder (header, blanks)
+        section = "".join(out_lines)
+
+    if add_blocks:
+        section = section.rstrip("\n") + "\n\n" + "\n\n".join(add_blocks)
+
+    before = "".join(lines[:start])
+    after = "".join(lines[end:])
+    rebuilt = before + section
+    if after:
+        rebuilt += "\n\n" + after
+    elif body.endswith("\n"):
+        rebuilt += "\n"
+    return rebuilt
+
+
 def _issue_link_fallback(repo: str, issue_num: int) -> str:
     """A non-permalink URL used only when a decl's source can't be located, so
     the rendered block still links somewhere sensible (the issue itself)."""

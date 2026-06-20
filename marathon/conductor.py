@@ -1203,6 +1203,41 @@ def _maybe_trigger_referee_cadence(
 # --- Main loop ----------------------------------------------------------------------
 
 
+def _maybe_reconcile_signatures(
+    cfg: ReviewConfig, last_sha: Optional[str], *, exclude_issues: "frozenset[int]"
+) -> Optional[str]:
+    """Best-effort project-wide signature reconcile, fired ONLY when HEAD moved
+    since ``last_sha``. For each registered issue (skipping ones with a running
+    job — a live refine may be editing that body), run the SAFE auto-reconcile:
+    ADD uncited in-code result-key decls + replace git-proven renames, never
+    dropping a stale citation on a guess (:func:`marathon.deck.refresh.
+    auto_reconcile_issue`). Returns the HEAD sha now reconciled-against (so the
+    caller throttles to once-per-code-change). NEVER raises — a reconcile
+    failure on one issue warns and the loop continues."""
+    from marathon.deck.refresh import auto_reconcile_issue, head_sha
+
+    try:
+        cur = head_sha(cfg.repo_dir)
+    except Exception:  # noqa: BLE001 — reconcile must never crash the tick
+        return last_sha
+    if not cur or cur == last_sha:
+        return last_sha
+    try:
+        nums = sorted({n for ch in cfg.chapters.values() for (n, _t) in ch.entries})
+    except Exception:  # noqa: BLE001
+        return cur
+    for num in nums:
+        if num in exclude_issues:
+            continue
+        try:
+            r = auto_reconcile_issue(cfg, num)
+            if r.get("updated"):
+                print(f"--- reconciled #{num}: {r.get('message', '')} ---", flush=True)
+        except Exception as e:  # noqa: BLE001 — one issue's failure isn't fatal
+            print(f"  warning: reconcile #{num} failed: {e}", flush=True)
+    return cur
+
+
 def run_conductor(
     repo_dir: Optional[Path] = None,
     concurrency: Optional[int] = None,
@@ -1214,6 +1249,7 @@ def run_conductor(
     referee_every: int = DEFAULT_REFEREE_EVERY,
     automerge: bool = True,
     merge_scope: str = "any",
+    reconcile: bool = True,
 ) -> int:
     """Run the conductor loop. Returns the final exit code.
 
@@ -1272,6 +1308,7 @@ def run_conductor(
     dispatch_count = 0
     ticks = 0
     last_automerge = float("-inf")  # run the merge orchestrator on tick 1, then ~once/min
+    last_reconcile_sha: Optional[str] = None  # reconcile only when HEAD changes
 
     try:
         if prune:
@@ -1304,6 +1341,19 @@ def run_conductor(
                     cfg, True, scope=merge_scope,
                     exclude_heads=frozenset(
                         j.branch for j in jobs if j.status == "running"
+                    ),
+                )
+            # Auto-reconcile issue signatures to the live code (ADD uncited
+            # in-code result-key decls; replace git-proven renames; never drop a
+            # stale citation on a guess). Fires only when HEAD MOVED since the
+            # last reconcile — the code is the only thing a signature edit
+            # tracks, so there is nothing to do between merges. Skips issues with
+            # a running job (a live refine may be editing that body). Best-effort.
+            if reconcile and not _STOP_REQUESTED:
+                last_reconcile_sha = _maybe_reconcile_signatures(
+                    cfg, last_reconcile_sha,
+                    exclude_issues=frozenset(
+                        j.issue_num for j in jobs if j.status == "running"
                     ),
                 )
             # Referee-cadence: fire the referee --emit-tasks pass once the

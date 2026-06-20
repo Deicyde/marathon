@@ -897,6 +897,19 @@ def _add_conductor_subparser(subparsers) -> None:
             "(.marathon/ config PRs only; proof PRs stay deck-gated)."
         ),
     )
+    p_run.add_argument(
+        "--no-reconcile",
+        dest="reconcile",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable the auto-reconcile of issue signatures to the live code "
+            "(on by default; fires only when HEAD moves). It ADDs uncited "
+            "in-code result-key decls and replaces git-proven renames, and "
+            "NEVER drops a stale citation without proof — the hands-off "
+            "replacement for the manual 'refresh from code' button."
+        ),
+    )
     p_run.set_defaults(func=_run_conductor_run)
 
     p_stat = sub.add_parser(
@@ -931,6 +944,7 @@ def _run_conductor_run(args) -> None:
         referee_every=args.referee_every,
         automerge=getattr(args, "automerge", True),
         merge_scope=getattr(args, "merge_scope", "any"),
+        reconcile=getattr(args, "reconcile", True),
     )
     if rc:
         raise SystemExit(rc)

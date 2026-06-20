@@ -186,19 +186,10 @@
     return postJSON("/api/ship", { issue: issue, skip_api: !!skipApi });
   }
 
-  // postRefreshIssue — THE SOLE CALLER OF /api/refresh-issue. The explicit
-  // "push refresh to GitHub" write: it re-quotes the issue body's "### Lean
-  // signatures" section against the CURRENT code/SHA (dropping stale citations,
-  // adding surfaced decls). This is a GitHub WRITE — the ONLY new side-effect
-  // in this feature. Reached ONLY from refreshIssue() (the refresh-button
-  // handler, gated behind an explicit confirm). It NEVER fires on a GET, on
-  // load/open/navigation, on a reconcile, or during card assembly — building
-  // the reconciled view (stale footnote + surfaced cards) is a PURE READ that
-  // POSTs nothing; only this token-bearing POST mutates the issue.
-  // (tests/test_deck_frontend.py statically enforces this single call site.)
-  function postRefreshIssue(issue) {
-    return postJSON("/api/refresh-issue", { issue: issue });
-  }
+  // The manual "refresh issue body from code" write was RETIRED: the conductor
+  // now auto-reconciles signatures to the live code (ADD uncited in-code
+  // result-key decls + replace git-proven renames; never drop a stale citation
+  // on a guess) whenever HEAD moves. There is no client-side push-refresh.
 
   // postMissing — LOCAL-ONLY. Records (or clears, with "") the issue's
   // "something is MISSING" note. Merges NOTHING, dispatches NO Aristotle; the
@@ -288,9 +279,9 @@
   // (it drops stale-cited decls into `stale_citations`, surfaces uncited
   // in-code decls as cards with surfaced:true, and summarises the drift in
   // `reconcile`). The frontend only READS these fields off the subdeck payload
-  // to render the footnote / the surfaced badge / the drift-gated button. None
-  // of these helpers writes anything — the only GitHub write is the explicit
-  // refresh button (postRefreshIssue), gated behind a confirm.
+  // to render the footnote / the surfaced badge. None of these helpers writes
+  // anything — signature drift is reconciled to the code by the CONDUCTOR
+  // (server-side, when HEAD moves), not by any client write.
 
   // The stale-cited decls (cited by the issue body but in_code=false) — shown
   // as a non-swipeable FOOTNOTE, never as cards. Tolerates an older backend
@@ -488,7 +479,6 @@
       el("div", { class: "subdeck-progress" }, [
         el("div", { class: "subdeck-controls" }, [
           skipApiToggle(),
-          refreshIssueButton(),
         ]),
         el("span", {
           class: "progress-pill",
@@ -503,35 +493,6 @@
       ]),
     ]);
     return head;
-  }
-
-  // The "Refresh issue body from code" button — the explicit push-refresh
-  // control, rendered into the subdeck header. It is ENABLED only when the
-  // reconciliation found DRIFT (stale citations to drop and/or surfaced decls
-  // to add); on a non-drifting issue it is disabled (a refresh would be a
-  // no-op write). It is a GitHub WRITE control — the label/title say so. The
-  // click asks an explicit confirm, then (and ONLY then) POSTs
-  // /api/refresh-issue. Rendering this button is a PURE READ — it never POSTs;
-  // the POST happens only inside the click handler, behind the confirm.
-  function refreshIssueButton() {
-    var drift = hasReconcileDrift();
-    var btn = el("button", {
-      class: "btn btn-tiny refresh-issue-btn" + (drift ? " has-drift" : ""),
-      id: "btn-refresh-issue",
-      type: "button",
-      title: drift
-        ? "WRITES GitHub: re-quote the issue body's ### Lean signatures " +
-          "section against the current code/SHA (drops stale citations, adds " +
-          "surfaced decls). Asks to confirm first."
-        : "No drift — the issue body already matches the current code.",
-    }, ["⟳ Refresh issue body from code"]);
-    btn.disabled = !drift || state.busy;
-    if (drift) {
-      // The SOLE wiring from the button to the refresh write — through the
-      // explicit confirm dialog. No other path POSTs /api/refresh-issue.
-      btn.addEventListener("click", function () { confirmAndRefreshIssue(); });
-    }
-    return btn;
   }
 
   // The persistent "Skip API" toggle, rendered into the subdeck header. It is
@@ -690,8 +651,9 @@
           " in the issue body not found in the current code: " }),
         el("span", { class: "stale-foot-names mono", text: names.join(", ") }),
         el("span", { class: "stale-foot-tail", text:
-          " — the issue is stale. These are NOT review cards; use " +
-          "“Refresh issue body from code” to drop them." }),
+          " — the issue is stale. These are NOT review cards. The conductor " +
+          "reconciles renames automatically; a citation with no proven rename " +
+          "is kept (it may signal genuinely-missing work)." }),
       ]),
     ]);
     return foot;
@@ -1727,99 +1689,6 @@
       });
   }
 
-  // === push-refresh: re-quote the issue body from the code (GitHub WRITE) ===
-
-  // confirmAndRefreshIssue — the explicit confirm gate for the push-refresh.
-  // Opened ONLY from the refresh button (refreshIssueButton's click handler).
-  // It spells out that this EDITS THE GITHUB ISSUE BODY (re-quoting the "###
-  // Lean signatures" section against the current code/SHA, dropping the stale
-  // citations and adding the surfaced decls) and fires refreshIssue() ONLY on
-  // an explicit confirm — never on open. Opening this dialog POSTs nothing.
-  function confirmAndRefreshIssue() {
-    if (state.busy || state.issue == null || !hasReconcileDrift()) return;
-    var rec = reconcileSummary();
-    var stale = staleCitations().map(function (s) {
-      return (s && s.name) || String(s);
-    });
-    var dropped = rec.dropped.length ? rec.dropped : stale;
-    var added = rec.surfaced;
-    var kids = [
-      el("h2", { class: "modal-title", text:
-        "Refresh issue body from code — #" + state.issue }),
-      el("p", { class: "modal-sub" }, [
-        "This ",
-        el("strong", { text: "EDITS the GitHub issue" }),
-        " — it re-quotes the issue body's “### Lean signatures” section " +
-        "against the current code and HEAD commit SHA. Every other section of " +
-        "the body is preserved verbatim.",
-      ]),
-    ];
-    if (dropped.length) {
-      kids.push(el("p", { class: "modal-sub modal-refresh-drop" }, [
-        el("strong", { text: "Drops " + dropped.length + " stale citation" +
-          (dropped.length === 1 ? "" : "s") }),
-        ": " + dropped.join(", ") + ".",
-      ]));
-    }
-    if (added.length) {
-      kids.push(el("p", { class: "modal-sub modal-refresh-add" }, [
-        el("strong", { text: "Adds " + added.length + " surfaced decl" +
-          (added.length === 1 ? "" : "s") }),
-        ": " + added.join(", ") + ".",
-      ]));
-    }
-    kids.push(
-      el("div", { class: "modal-actions" }, [
-        el("button", { class: "btn", type: "button",
-          onclick: function () { closeModal(); } }, ["Cancel"]),
-        el("button", {
-          class: "btn btn-primary",
-          type: "button",
-          onclick: function () { closeModal(); refreshIssue(); },
-        }, ["Confirm — refresh #" + state.issue + " on GitHub"]),
-      ])
-    );
-    openModal(el("div", { class: "modal-panel" }, kids));
-  }
-
-  // refreshIssue — THE SOLE CALLER OF postRefreshIssue. Fires the token-bearing
-  // POST /api/refresh-issue (the GitHub write). Reached ONLY from the confirm
-  // dialog opened by the refresh button — never on load, navigation, a GET, a
-  // reconcile, a decl-verdict, or status polling. On success it reports what
-  // changed (dropped/added + the SHA) and RE-FETCHES the subdeck so the deck
-  // reflects the freshly-quoted issue body.
-  function refreshIssue() {
-    if (state.busy || state.issue == null) return;
-    var issue = state.issue;
-    state.busy = true;
-    setActionsEnabled(false);
-    flashToast("refreshing issue #" + issue + " on GitHub…");
-    postRefreshIssue(issue)
-      .then(function (resp) {
-        state.busy = false;
-        var dropped = (resp && resp.dropped) || [];
-        var added = (resp && resp.added) || [];
-        var sha = (resp && resp.sha) || "";
-        var shaShort = sha ? sha.slice(0, 7) : "HEAD";
-        var msg = (resp && resp.message) ||
-          ("issue #" + issue + " refreshed" +
-            (resp && resp.updated === false ? " (no change)" : "") +
-            " — dropped " + dropped.length + ", added " + added.length +
-            " @ " + shaShort);
-        flashToast(msg);
-        // Re-fetch the subdeck (a PURE READ) so the reconciled view + the
-        // button's drift state reflect the now-current issue body.
-        refetchSubdeck();
-      })
-      .catch(function (err) {
-        state.busy = false;
-        showErrorCard("Refresh failed for issue #" + issue, err, function () {
-          // Nothing was applied on failure; drop back to the current view.
-          renderSubdeckStage();
-        });
-      });
-  }
-
   // --- modals --------------------------------------------------------------
   function isModalOpen() {
     return !modalRoot().hasAttribute("hidden");
@@ -2412,9 +2281,8 @@
     setSkipApi: setSkipApi,
     tierClass: tierClass,
     // Reconciliation read-model (PURE READS — never POST). Exposed so the
-    // footnote / surfaced-badge / drift-gated button can be exercised without
-    // simulating clicks. confirmAndRefreshIssue only OPENS the confirm dialog;
-    // the GitHub write fires solely from the dialog's confirm (refreshIssue).
+    // footnote / surfaced-badge can be exercised without simulating clicks.
+    // Signature drift is reconciled to the code by the conductor (server-side).
     hasReconcileDrift: hasReconcileDrift,
     staleCitations: staleCitations,
     reconcileSummary: reconcileSummary,

@@ -936,7 +936,7 @@ def test_stale_citations_are_not_turned_into_cards(app_js: str):
     code = _strip_block_comments(app_js)
     foot = _fn_body(code, "function staleFootnote")
     for forbidden in ("renderDeclCard(", "postDeclVerdict(", "commitDeclVerdict(",
-                      "postShip(", "postRefreshIssue(", "/api/decl-verdict"):
+                      "postShip(", "/api/decl-verdict"):
         assert forbidden not in foot, (
             f"the stale footnote must not {forbidden!r} (it is not a card)"
         )
@@ -997,159 +997,36 @@ def test_style_has_surfaced_styling(style_css: str):
         assert cls in style_css, f"missing style for {cls}"
 
 
-# --- push-refresh button: the ONLY /api/refresh-issue POST ------------------
+# --- the manual push-refresh button was RETIRED (auto-reconcile replaces it) -
 
-def test_refresh_issue_post_is_a_single_call_site(app_js: str):
-    # The push-refresh is a GitHub WRITE. It must have EXACTLY ONE
-    # /api/refresh-issue literal (inside postRefreshIssue's postJSON call) and
-    # never a raw fetch — mirroring the /api/ship single-call-site discipline.
+def test_no_manual_push_refresh_button(app_js: str):
+    # The conductor auto-reconciles signatures to the live code, so there is NO
+    # client-side "refresh issue body from code" button and no /api/refresh-issue
+    # POST anywhere in the deck.
     code = _strip_block_comments(app_js)
-    direct = re.findall(r"['\"]/api/refresh-issue['\"]", code)
-    assert len(direct) == 1, (
-        f"expected exactly one '/api/refresh-issue' literal, found {len(direct)}"
-    )
-    raw = re.findall(r"fetch\(\s*['\"]/api/refresh-issue['\"]", code)
-    assert len(raw) == 0, "refresh must route through postJSON, not a raw fetch"
-    # the literal lives inside postRefreshIssue, which routes through postJSON
-    body = _fn_body(code, "function postRefreshIssue")
-    assert "/api/refresh-issue" in body
-    assert "postJSON(" in body
+    assert "/api/refresh-issue" not in code
+    assert "postRefreshIssue" not in code
+    assert "function refreshIssueButton" not in code
+    assert "function confirmAndRefreshIssue" not in code
+    assert "btn-refresh-issue" not in code
 
 
-def test_refresh_post_carries_the_session_token(app_js: str):
-    # postRefreshIssue flows through the shared token-bearing postJSON (which
-    # attaches X-Marathon-Session-Token on every POST) — so the refresh write
-    # carries the per-session token like ship/decl-verdict.
+def test_stale_footnote_explains_auto_reconcile(app_js: str):
+    # The stale-citation footnote no longer points at a button; it explains that
+    # renames reconcile automatically and an unproven stale citation is kept.
     code = _strip_block_comments(app_js)
-    body = _fn_body(code, "function postRefreshIssue")
-    assert "postJSON(" in body, "refresh must use the token-bearing postJSON"
-
-
-def test_refresh_post_only_caller_is_refreshIssue(app_js: str):
-    # postRefreshIssue is invoked exactly once, and only inside the refreshIssue
-    # handler (the button -> confirm -> refreshIssue path).
-    code = _strip_block_comments(app_js)
-    callers = re.findall(r"postRefreshIssue\s*\(", code)
-    def_count = len(re.findall(r"function\s+postRefreshIssue\s*\(", code))
-    invoke_count = len(callers) - def_count
-    assert invoke_count == 1, (
-        f"postRefreshIssue must be invoked exactly once, found {invoke_count}"
-    )
-    # the invocation is inside refreshIssue (header carries the open paren so it
-    # is not confused with refreshIssueButton).
-    handler = _fn_body(code, "function refreshIssue(")
-    assert "postRefreshIssue(" in handler, "refreshIssue must call postRefreshIssue"
-    # NO read/nav/open/reconcile/verdict/ship path may POST the refresh.
-    for fn in (
-        "function init", "function refreshQueue", "function openIssue",
-        "function openFirstReadyIssue", "function renderSubdeckStage",
-        "function refetchSubdeck", "function commitDeclVerdict",
-        "function postDeclVerdict", "function applyDeclResult",
-        "function startStatus", "function refreshStatus", "function backToQueue",
-        "function shipIssue", "function setSkipApi",
-        "function autoApprovedPanel", "function staleFootnote",
-        "function subdeckHeader", "function refreshIssueButton",
-        "function renderDeclCard",
-    ):
-        body = _fn_body(code, fn)
-        assert "postRefreshIssue(" not in body, (
-            f"postRefreshIssue must not be called from {fn} (only refreshIssue may)"
-        )
-
-
-def test_refresh_is_not_fired_on_subdeck_load_or_reconcile(app_js: str):
-    # Opening an issue (a GET) and building the reconciled view must NEVER POST
-    # the refresh. The reconciliation (footnote + surfaced) is a pure read.
-    code = _strip_block_comments(app_js)
-    opn = _fn_body(code, "function openIssue")
-    assert "/api/refresh-issue" not in opn
-    assert "postRefreshIssue(" not in opn
-    refetch = _fn_body(code, "function refetchSubdeck")
-    assert "postRefreshIssue(" not in refetch
-    # the drift read-model helpers compute, never POST
-    for fn in ("function hasReconcileDrift", "function staleCitations",
-               "function reconcileSummary"):
-        body = _fn_body(code, fn)
-        for forbidden in ("postRefreshIssue(", "postShip(", "postDeclVerdict(",
-                          "postJSON(", "fetch(", "/api/refresh-issue"):
-            assert forbidden not in body, (
-                f"the reconcile helper {fn} must not {forbidden!r}"
-            )
-
-
-def test_refresh_button_confirms_before_writing(app_js: str):
-    # Clicking the refresh button asks an explicit confirm (it EDITS the GitHub
-    # issue) BEFORE the write. The button handler opens confirmAndRefreshIssue;
-    # the actual POST (refreshIssue) fires only from the dialog's confirm.
-    code = _strip_block_comments(app_js)
-    btn = _fn_body(code, "function refreshIssueButton")
-    assert "confirmAndRefreshIssue(" in btn, (
-        "the refresh button must open the confirm dialog, not POST directly"
-    )
-    # the button handler itself must NOT POST the refresh
-    assert "postRefreshIssue(" not in btn
-    assert "/api/refresh-issue" not in btn
-    # the confirm dialog makes the GitHub write explicit and fires refreshIssue
-    # only on confirm.
-    confirm = _fn_body(code, "function confirmAndRefreshIssue")
-    assert "EDITS the GitHub issue" in confirm or "EDITS the GitHub" in confirm
-    assert "refreshIssue()" in confirm
-    # opening the confirm dialog POSTs nothing.
-    assert "postRefreshIssue(" not in confirm
-    assert "/api/refresh-issue" not in confirm
-
-
-def test_refresh_button_is_drift_gated(app_js: str):
-    # The button is ENABLED only when the reconciliation found drift (stale
-    # citations and/or surfaced decls). On a non-drifting issue it is disabled
-    # (a refresh would be a no-op write).
-    code = _strip_block_comments(app_js)
-    btn = _fn_body(code, "function refreshIssueButton")
-    assert "hasReconcileDrift(" in btn
-    assert "disabled" in btn, "the refresh button must toggle its disabled state"
-    # drift is derived from the stale citations and the reconcile summary.
-    drift = _fn_body(code, "function hasReconcileDrift")
-    assert "staleCitations(" in drift
-    assert "reconcileSummary(" in drift or "surfaced" in drift
-
-
-def test_refresh_button_is_in_the_subdeck_header(app_js: str):
-    # The push-refresh button lives in the subdeck header, alongside the
-    # skip-API toggle.
-    code = _strip_block_comments(app_js)
-    head = _fn_body(code, "function subdeckHeader")
-    assert "refreshIssueButton(" in head
-    assert "function refreshIssueButton" in code
-    # it carries a stable id for the action surface.
-    btn = _fn_body(code, "function refreshIssueButton")
-    assert "btn-refresh-issue" in btn
-
-
-def test_refresh_success_refetches_the_subdeck(app_js: str):
-    # On success the handler re-fetches the subdeck (a PURE READ) so the
-    # reconciled view + the button's drift state reflect the now-current body,
-    # and reports what changed (dropped/added + the SHA).
-    code = _strip_block_comments(app_js)
-    handler = _fn_body(code, "function refreshIssue(")
-    assert "refetchSubdeck(" in handler, (
-        "a successful refresh must re-fetch the subdeck (a GET) to re-reconcile"
-    )
-    assert "dropped" in handler and "added" in handler
-    assert "sha" in handler.lower()
+    foot = _fn_body(code, "function staleFootnote")
+    assert "Refresh issue body from code" not in foot
+    assert "automatically" in foot
 
 
 def test_refresh_does_not_break_ship_single_call_site(app_js: str):
-    # Regression guard: the refresh work must not introduce a second /api/ship
-    # literal or a raw fetch — ship still has exactly one call site.
+    # Regression guard: ship still has exactly one call site / no raw fetch.
     code = _strip_block_comments(app_js)
     direct = re.findall(r"['\"]/api/ship['\"]", code)
     assert len(direct) == 1
     raw = re.findall(r"fetch\(\s*['\"]/api/ship['\"]", code)
     assert len(raw) == 0
-
-
-def test_style_has_refresh_button_styling(style_css: str):
-    assert ".refresh-issue-btn" in style_css, "the push-refresh button must be styled"
 
 
 # --- dashboard: tabbed shell (Status / Issues / History + Review) -----------
