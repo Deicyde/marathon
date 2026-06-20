@@ -9,13 +9,14 @@
     Session token injection hook. The backend (marathon/deck/server.py) renders
     index.html and replaces the placeholder below with the per-session
     CSRF-style token before serving. The browser reads it from this meta tag
-    (and the bootstrap global) and echoes it on every POST /api/verdict so a
-    stray/other-origin tab cannot fire an irreversible verdict.
+    (and the bootstrap global) and echoes it on every side-effecting POST (the
+    swipe/ship endpoints) so a stray/other-origin tab cannot fire an irreversible
+    action.
 
     SECURITY: this is the ONLY secret on the page. There must be no other
     inline credential, no API key, no GitHub token. The token is per-session
-    and only authorizes verdicts back to the same 127.0.0.1 server that issued
-    it. tests/test_deck_frontend.py asserts this is the only inline secret.
+    and only authorizes those writes back to the same 127.0.0.1 server that
+    issued it. tests/test_deck_frontend.py asserts this is the only inline secret.
   -->
   <meta name="marathon-session-token" content="__MARATHON_SESSION_TOKEN__" />
 
