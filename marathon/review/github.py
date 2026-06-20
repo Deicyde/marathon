@@ -194,3 +194,67 @@ def fetch_issues_bulk(
             "labels": {l["name"] for l in labels_nodes if l.get("name")},
         }
     return out
+
+
+def list_rejected_issues(cfg) -> "Optional[list[int]]":
+    """Open issues carrying the rejected review label — the GitHub-side
+    rejection-queue membership (the cheap Step-1 of a GitHub-discovered
+    conductor queue). One ``gh`` call; ``None`` on failure (including a missing
+    ``gh`` binary) so the caller can fall back to the local queue."""
+    try:
+        cp = gh(
+            "issue", "list", "--repo", cfg.github_repo,
+            "--label", cfg.labels.rejected, "--state", "open",
+            "--json", "number", "--limit", "300", check=False,
+        )
+    except OSError:  # gh binary missing/unrunnable
+        return None
+    if cp.returncode != 0:
+        return None
+    try:
+        data = json.loads(cp.stdout or "[]")
+        return [int(it["number"]) for it in data if "number" in it]
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def fetch_reject_note(issue_num: int, repo: str) -> "tuple[Optional[str], Optional[str]]":
+    """Recover ``(note, reject_ts)`` from an issue's comments: the verbatim note
+    embedded by :func:`marathon.review.reject_note.embed_reject_note` in the
+    LATEST marked comment, and the ``createdAt`` of the latest reject comment
+    (the GitHub proxy for ``verdict_ts``). ``(None, ts)`` when a reject comment
+    exists but carries no embedded note; ``(None, None)`` when there is none.
+
+    ``reject_ts`` is the NEWEST reject signal (so a later un-marked re-reject
+    still bumps verdict_ts). Comments are sorted by createdAt rather than trusting
+    gh's order, and a reject comment is recognised by the embed marker or the
+    exact ``❌ REJECTED`` lead cmd_reject emits — not a bare "REJECTED" anywhere."""
+    from marathon.review.reject_note import (
+        REJECT_NOTE_MARKER_OPEN, extract_reject_note,
+    )
+
+    try:
+        data = issue_view_json(issue_num, repo, "comments", check=False)
+    except OSError:  # gh binary missing/unrunnable
+        return (None, None)
+    if not data:
+        return (None, None)
+    note: Optional[str] = None
+    note_ts: Optional[str] = None
+    latest_reject_ts: Optional[str] = None
+    # gh createdAt are uniform UTC 'Z' ISO 8601 → lexical sort = chronological.
+    comments = sorted(
+        data.get("comments") or [], key=lambda c: c.get("createdAt") or "")
+    for c in comments:
+        body = c.get("body") or ""
+        created = c.get("createdAt")
+        recovered = extract_reject_note(body)
+        if recovered is not None:               # latest marked comment wins
+            note, note_ts = recovered, created
+        if REJECT_NOTE_MARKER_OPEN in body or "❌ REJECTED" in body:
+            latest_reject_ts = created
+    # Prefer the newest reject signal so a later note-less re-reject bumps the ts.
+    ts = note_ts
+    if latest_reject_ts and (ts is None or latest_reject_ts > ts):
+        ts = latest_reject_ts
+    return (note, ts)

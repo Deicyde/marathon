@@ -910,6 +910,19 @@ def _add_conductor_subparser(subparsers) -> None:
             "replacement for the manual 'refresh from code' button."
         ),
     )
+    p_run.add_argument(
+        "--queue-from-github",
+        action="store_true",
+        help=(
+            "Discover the rejection queue from the GitHub review:rejected "
+            "label (recovering each note from its reject comment) instead of "
+            "the local state.json. For a COLLABORATOR running their own "
+            "conductor on their own clone: they see rejections fired on a "
+            "shared deck and refine them under their own Aristotle key, with no "
+            "state.json syncing. Off by default (local queue). Also settable "
+            "via MARATHON_QUEUE_FROM_GITHUB=1."
+        ),
+    )
     p_run.set_defaults(func=_run_conductor_run)
 
     p_stat = sub.add_parser(
@@ -945,6 +958,7 @@ def _run_conductor_run(args) -> None:
         automerge=getattr(args, "automerge", True),
         merge_scope=getattr(args, "merge_scope", "any"),
         reconcile=getattr(args, "reconcile", True),
+        queue_from_github=getattr(args, "queue_from_github", False),
     )
     if rc:
         raise SystemExit(rc)

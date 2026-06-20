@@ -40,13 +40,20 @@ ADD_PREFIX = "ADD the missing declaration"
 # embed/extract pair lives here, beside the headers, so they can never desync.
 REJECT_NOTE_MARKER_OPEN = "<!-- marathon-reject-note"
 REJECT_NOTE_MARKER_CLOSE = "marathon-reject-note -->"
+# A note may itself contain '-->' (Lean/prose), which would prematurely close the
+# HTML comment — leaking the tail into the rendered issue AND truncating
+# extraction (it also covers the close marker, which ends in '-->'). Split the
+# arrow with a zero-width space on embed; restore it byte-exactly on extract.
+_ARROW = "-->"
+_ARROW_SAFE = "--​>"  # hyphen-hyphen, zero-width space, gt
 
 
 def embed_reject_note(note: str) -> str:
     """Wrap ``note`` in the stable HTML-comment marker block, for appending to a
     GitHub reject comment. The whole block is one HTML comment, so the note is
     invisible in rendered Markdown yet recoverable by :func:`extract_reject_note`."""
-    return f"{REJECT_NOTE_MARKER_OPEN}\n{note}\n{REJECT_NOTE_MARKER_CLOSE}"
+    safe = note.replace(_ARROW, _ARROW_SAFE)
+    return f"{REJECT_NOTE_MARKER_OPEN}\n{safe}\n{REJECT_NOTE_MARKER_CLOSE}"
 
 
 def extract_reject_note(comment_body: Optional[str]) -> Optional[str]:
@@ -61,7 +68,7 @@ def extract_reject_note(comment_body: Optional[str]) -> Optional[str]:
     end = comment_body.find(REJECT_NOTE_MARKER_CLOSE, inner)
     if end < 0:
         return None
-    return comment_body[inner:end].strip()
+    return comment_body[inner:end].strip().replace(_ARROW_SAFE, _ARROW)
 
 
 @dataclass

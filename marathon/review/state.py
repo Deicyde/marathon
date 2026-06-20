@@ -420,7 +420,14 @@ def record_iteration(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
             "state.json entry exists; skipping"
         )
         return None
-    entry.last_iteration_ts = _now_iso()
+    # Record "at or AFTER the verdict": normally _now_iso() (which postdates a
+    # locally-recorded verdict), but never earlier than verdict_ts. This makes
+    # needs_iteration() go False after one iteration even when verdict_ts is a
+    # GitHub instant slightly ahead of the local clock (the --queue-from-github
+    # path) — otherwise the conductor would re-dispatch every tick. verdict_ts and
+    # _now_iso() share this machine's local offset, so the string max is
+    # chronological.
+    entry.last_iteration_ts = max(_now_iso(), entry.verdict_ts or "")
     save_state(cfg, state)
     # Daemon bookkeeping, not a human verdict — mirror the row but
     # append no verdict_events entry.

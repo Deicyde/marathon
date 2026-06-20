@@ -108,6 +108,10 @@ LAND_NEXT = "next"
 # --concurrency always wins.
 DEFAULT_CONCURRENCY = 1
 CONCURRENCY_ENV_VAR = "MARATHON_ARISTOTLE_MAX_CONCURRENT"
+#: Discover the rejection queue from the GitHub review:rejected label instead of
+#: local state.json (so a collaborator's conductor on a fresh clone sees rejects
+#: fired on a shared deck). Set by --queue-from-github or this env var.
+QUEUE_FROM_GITHUB_ENV_VAR = "MARATHON_QUEUE_FROM_GITHUB"
 
 # Where job worktrees branch from. refine's --auto-pr resets the branch
 # to origin/<base> (default main) at iteration start anyway; this just
@@ -432,16 +436,67 @@ def referee_blocked_chapters(
     return blocked
 
 
+#: Throttle GitHub queue discovery (its gh calls) to at most once per this many
+#: seconds; between, the already-seeded local queue serves, so a frequent tick
+#: loop never hammers the GitHub API.
+GH_DISCOVERY_INTERVAL = 60.0
+_last_gh_discovery = 0.0
+
+
+def _github_discovered_rejections(cfg: ReviewConfig):
+    """GitHub-driven replacement for the local
+    ``pending_rejections_needing_iteration`` query (the conductor's
+    ``--queue-from-github``): list ``review:rejected`` issues, recover each note
+    from its embedded reject comment, SEED/refresh the local state.json (so local
+    iteration-tracking still decides what THIS conductor already refined), then
+    return the SAME (issue, IssueState) needing-iteration list. The point: a
+    collaborator's conductor on a fresh clone sees rejections fired on a shared
+    deck — with no state.json syncing.
+
+    gh discovery is throttled to once per :data:`GH_DISCOVERY_INTERVAL`; between,
+    the seeded local queue serves. Fail-soft: any gh failure logs once and the
+    function still returns the local queue, so a tick never crashes."""
+    global _last_gh_discovery
+    from marathon.review.github import fetch_reject_note, list_rejected_issues
+    from marathon.review.sync import reconcile_github_rejection
+
+    now = _now()
+    if now - _last_gh_discovery >= GH_DISCOVERY_INTERVAL:
+        _last_gh_discovery = now
+        nums = list_rejected_issues(cfg)
+        if nums is None:
+            print("  queue-from-github: gh discovery failed this cycle; "
+                  "using the local queue")
+        else:
+            for issue_num in nums:
+                try:
+                    note, gh_ts = fetch_reject_note(issue_num, cfg.github_repo)
+                    reconcile_github_rejection(cfg, issue_num, note, gh_ts)
+                except Exception as exc:  # noqa: BLE001 — never crash a tick
+                    print(f"  queue-from-github: reconcile #{issue_num} "
+                          f"failed ({exc}); skipping")
+    return pending_rejections_needing_iteration(cfg, None)
+
+
 def _eligible_issues(
-    cfg: ReviewConfig, warned_unknown: set[int]
+    cfg: ReviewConfig, warned_unknown: set[int],
+    queue_from_github: bool = False,
 ) -> list[tuple[int, int]]:
     """(issue, chapter) pairs that still need an iteration, oldest
     verdict first ACROSS ALL chapters (the project-wide query in
     review.state already sorts by verdict_ts). Issues not registered in
     any chapter have no target folder to refine — skipped with one
-    warning each per conductor run."""
+    warning each per conductor run.
+
+    With ``queue_from_github`` the candidate set is discovered from the GitHub
+    ``review:rejected`` label (seeding local state.json) rather than the local
+    queue — see :func:`_github_discovered_rejections`."""
     out: list[tuple[int, int]] = []
-    for issue_num, _entry in pending_rejections_needing_iteration(cfg, None):
+    source = (
+        _github_discovered_rejections(cfg) if queue_from_github
+        else pending_rejections_needing_iteration(cfg, None)
+    )
+    for issue_num, _entry in source:
         chapter = cfg.chapter_of_issue(issue_num)
         if chapter is None:
             if issue_num not in warned_unknown:
@@ -465,6 +520,7 @@ def _pick_dispatchable(
     warned_unknown: Optional[set[int]] = None,
     blocked_chapters: Optional[dict[int, tuple]] = None,
     warned_blocked: Optional[set[int]] = None,
+    queue_from_github: bool = False,
 ) -> list[tuple[int, int]]:
     """The deterministic scheduling decision: up to ``slots`` (issue,
     chapter) pairs to dispatch this tick.
@@ -494,7 +550,7 @@ def _pick_dispatchable(
     busy_issues = {j.issue_num for j in running}
     busy_targets = {j.target for j in running}
     picks: list[tuple[int, int]] = []
-    for issue_num, chapter in _eligible_issues(cfg, warned_unknown):
+    for issue_num, chapter in _eligible_issues(cfg, warned_unknown, queue_from_github):
         if len(picks) >= slots:
             break
         if issue_num in busy_issues:
@@ -1250,6 +1306,7 @@ def run_conductor(
     automerge: bool = True,
     merge_scope: str = "any",
     reconcile: bool = True,
+    queue_from_github: bool = False,
 ) -> int:
     """Run the conductor loop. Returns the final exit code.
 
@@ -1272,6 +1329,14 @@ def run_conductor(
     """
     cfg = load_config(repo_dir)
     n = resolve_concurrency(concurrency)
+    # --queue-from-github OR the env var: discover the queue from GitHub labels.
+    queue_from_github = queue_from_github or (
+        os.environ.get(QUEUE_FROM_GITHUB_ENV_VAR, "").strip().lower()
+        in ("1", "true", "yes")
+    )
+    if queue_from_github:
+        print("  queue source: GitHub review:rejected label "
+              "(discovering rejections from GitHub, not local state.json)")
     runs_parent = (
         Path(worktree_parent) if worktree_parent else default_runs_parent(cfg.repo_dir)
     ).expanduser().resolve()
@@ -1389,6 +1454,7 @@ def run_conductor(
                 picks = _pick_dispatchable(
                     cfg, jobs, not_before, _now(), n - len(running),
                     warned_unknown, blocked_chapters, warned_blocked,
+                    queue_from_github,
                 )
                 for issue_num, chapter in picks:
                     job = _dispatch_job(
@@ -1426,7 +1492,7 @@ def run_conductor(
                 # blocked (a blocked-only queue would otherwise spin to the
                 # MAX_TICKS_ONCE safety cap — the block is resolved by a
                 # human/referee action, not by waiting).
-                eligible = _eligible_issues(cfg, warned_unknown)
+                eligible = _eligible_issues(cfg, warned_unknown, queue_from_github)
                 unblocked = [
                     pair for pair in eligible if pair[1] not in blocked_chapters
                 ]

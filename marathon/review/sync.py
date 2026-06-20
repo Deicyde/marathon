@@ -57,6 +57,7 @@ from __future__ import annotations
 import json
 import sys
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
@@ -534,3 +535,88 @@ def cmd_sync(args) -> None:
             "(re-run with --apply --push-labels)"
         )
     print(line + ".")
+
+
+# ---------------------------------------------------------------------------
+# GitHub-discovered rejection reconcile (the conductor's --queue-from-github)
+# ---------------------------------------------------------------------------
+
+def _parse_ts(s: "Optional[str]") -> "Optional[datetime]":
+    """Parse an ISO-8601 timestamp to an aware datetime (assume UTC if naive);
+    None on missing/unparseable."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _ts_strictly_newer(a: "Optional[str]", b: "Optional[str]") -> bool:
+    """True iff ``a`` parses STRICTLY newer than ``b``. Both are ISO 8601 but
+    from different clocks — GitHub createdAt is UTC 'Z', local verdict_ts carries
+    a local offset — so compare aware datetimes, never strings. Unparseable or
+    missing ⇒ False (conservative: do not re-queue)."""
+    da, db = _parse_ts(a), _parse_ts(b)
+    if da is None or db is None:
+        return False
+    return da > db
+
+
+def _github_ts_to_local(github_ts: "Optional[str]") -> str:
+    """Normalize a GitHub UTC timestamp to the SAME local-offset ISO format
+    review_state writes (``_now_iso``). This is load-bearing: ``needs_iteration``
+    string-compares ``last_iteration_ts`` (written locally by record_iteration)
+    against ``verdict_ts`` — a raw UTC 'Z' verdict_ts would mis-order against a
+    local last_iteration_ts and re-dispatch forever. Missing/bad ⇒ now."""
+    dt = _parse_ts(github_ts)
+    if dt is None:
+        return review_state._now_iso()
+    return dt.astimezone().isoformat(timespec="seconds")
+
+
+def reconcile_github_rejection(
+    cfg: ReviewConfig,
+    issue_num: int,
+    note: "Optional[str]",
+    github_verdict_ts: "Optional[str]",
+) -> None:
+    """Idempotently fold ONE GitHub-discovered rejection into the local
+    state.json so the conductor dispatches it — WITHOUT clobbering this
+    conductor's own iteration progress.
+
+    Seeds a fresh rejected entry when the issue is unseen, or when GitHub shows
+    a STRICTLY NEWER reject than the one already recorded (a re-reject — which
+    also un-stalls a stalled entry). Otherwise leaves the local entry untouched:
+    that single strictly-newer guard is what stops an already-iterated issue
+    from being re-dispatched every tick. The note (recovered from the GitHub
+    reject comment) feeds the refine; a MISSING note seeds the SYNC_REJECT_NOTES
+    placeholder and PARKS the entry (marks it iterated) so no Aristotle run fires
+    on placeholder text."""
+    state = load_state(cfg)
+    existing = state.issues.get(issue_num)
+    if existing is not None and not _ts_strictly_newer(
+        github_verdict_ts, existing.verdict_ts
+    ):
+        return  # the same (or older) reject we already track — don't touch it
+    has_note = bool(note and note.strip())
+    # Store verdict_ts as the TRUE GitHub reject instant, in the LOCAL-offset
+    # format so needs_iteration()'s string compare against a local
+    # last_iteration_ts stays chronological. (We do NOT clamp a future instant:
+    # that would make the strictly-newer re-seed guard fire every tick. Instead
+    # record_iteration records "at or after the verdict", so a once-refined entry
+    # never re-satisfies needs_iteration — see state.record_iteration.)
+    vts = _github_ts_to_local(github_verdict_ts)
+    state.issues[issue_num] = review_state.IssueState(
+        status="rejected",
+        verdict_ts=vts,
+        notes=(note.strip() if has_note else SYNC_REJECT_NOTES),
+        # No real note recoverable → PARK by marking iterated AT the verdict
+        # (needs_iteration is then False — bulletproof regardless of clock), so
+        # the conductor never spends an Aristotle run on the placeholder; a later
+        # strictly-newer real re-reject un-parks it.
+        last_iteration_ts=None if has_note else vts,
+        attempts=0,
+    )
+    review_state.save_state(cfg, state)

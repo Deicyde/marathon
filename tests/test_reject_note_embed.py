@@ -66,3 +66,12 @@ def test_cmd_reject_embeds_note_in_github_comment(monkeypatch):
     assert "marathon-reject-note" in bodies[0]          # embedded marker
     assert "- A: do X" in bodies[0]                      # verbatim note
     assert recorded["note"] == note                      # still recorded locally
+
+
+def test_embed_extract_roundtrip_with_arrow_in_note():
+    """A note containing '-->' must not break the HTML comment / extraction."""
+    from marathon.review.reject_note import embed_reject_note, extract_reject_note
+    note = "FIX A: rewrite f x --> g x; keep B"
+    emb = embed_reject_note(note)
+    assert emb.count("-->") == 1                       # only the close marker
+    assert extract_reject_note(emb) == note            # byte-exact recovery
