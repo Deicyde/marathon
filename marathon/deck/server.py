@@ -42,12 +42,13 @@ BINDING SAFETY:
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 from urllib.parse import parse_qs, urlsplit
 
 if TYPE_CHECKING:  # pragma: no cover — type-only
@@ -64,6 +65,14 @@ TOKEN_PLACEHOLDER = "__MARATHON_SESSION_TOKEN__"
 # The header the browser echoes the session token on for POST /api/verdict.
 # A `token` field in the JSON body is also accepted (front-end convenience).
 TOKEN_HEADER = "X-Marathon-Session-Token"
+
+# When the deck is shared behind an authenticating proxy (e.g. oauth2-proxy with
+# --pass-access-token), the proxy forwards the signed-in collaborator's own
+# GitHub OAuth token on this header. The deck binds it as the acting GitHub
+# identity for the request (see review.github.actor_github_token) so every
+# GitHub write the verdict triggers is attributed to THEM, not the host. Absent
+# (the local single-user path) => the host's ambient gh auth, unchanged.
+ACCESS_TOKEN_HEADER = "X-Forwarded-Access-Token"
 
 # Static assets live in the OTHER track's dir. Served read-only; tolerated
 # absent (tests run without it; an early launch may pre-date app.js/style.css).
@@ -408,17 +417,24 @@ class DeckHandler(BaseHTTPRequestHandler):
             return self._send_error_json(
                 HTTPStatus.NOT_FOUND, f"no POST route {parsed.path!r}"
             )
+        # Bind the collaborator's forwarded GitHub OAuth token (if a proxy
+        # supplied one) for the whole dispatch, so every GitHub write the handler
+        # makes is attributed to them. No header (local use) => ambient gh auth.
+        from marathon.review.github import actor_github_token
+
+        actor_token = self.headers.get(ACCESS_TOKEN_HEADER)
         try:
-            if parsed.path == "/api/verdict":
-                self._api_verdict()
-            elif parsed.path == "/api/decl-verdict":
-                self._api_decl_verdict()
-            elif parsed.path == "/api/missing":
-                self._api_missing()
-            elif parsed.path == "/api/refresh-issue":
-                self._api_refresh_issue()
-            else:  # /api/ship
-                self._api_ship()
+            with actor_github_token(actor_token):
+                if parsed.path == "/api/verdict":
+                    self._api_verdict()
+                elif parsed.path == "/api/decl-verdict":
+                    self._api_decl_verdict()
+                elif parsed.path == "/api/missing":
+                    self._api_missing()
+                elif parsed.path == "/api/refresh-issue":
+                    self._api_refresh_issue()
+                else:  # /api/ship
+                    self._api_ship()
         except BrokenPipeError:
             return
 
@@ -694,16 +710,22 @@ class DeckHandler(BaseHTTPRequestHandler):
             return self.server.default_chapter  # type: ignore[attr-defined]
 
     def _origin_is_self(self, origin: str) -> bool:
-        """True iff ``origin`` is this server's own loopback origin. The
-        host:port is the actual bound address, so a browser POSTing from
-        the page we served passes and any other origin (file://, another
-        site, another port) is rejected."""
+        """True iff ``origin`` is this server's own loopback origin (or a
+        configured trusted origin). The host:port is the actual bound address,
+        so a browser POSTing from the page we served passes and any other origin
+        (file://, another site, another port) is rejected.
+
+        When the deck is fronted by an authenticating proxy on a public host,
+        the browser's Origin is that public origin — not loopback — so the
+        operator may add it via ``--trusted-origin`` (stored on the server) for
+        the same-origin guard to accept the proxied POSTs."""
         host, port = self.server.server_address[:2]  # type: ignore[attr-defined]
         ours = {
             f"http://{host}:{port}",
             f"http://127.0.0.1:{port}",
             f"http://localhost:{port}",
         }
+        ours |= set(getattr(self.server, "trusted_origins", ()) or ())
         return origin in ours
 
 
@@ -798,15 +820,20 @@ def make_server(
     token: Optional[str] = None,
     default_chapter: Optional[int] = None,
     demo: bool = False,
+    trusted_origins: "Sequence[str]" = (),
 ) -> DeckServer:
     """Construct (do not start) a :class:`DeckServer` bound to 127.0.0.1
     on ``port`` (0 = an ephemeral OS-assigned port, used by tests). A fresh
     per-session token is minted unless one is supplied. The caller starts
     it via ``serve_forever`` (or drives the handler directly in tests).
-    ``demo`` serves synthetic cards (no cfg/repo needed)."""
+    ``demo`` serves synthetic cards (no cfg/repo needed). ``trusted_origins``
+    are extra origins the same-origin POST guard accepts (for a fronting
+    proxy on a public host)."""
     if token is None:
         token = secrets.token_urlsafe(32)
-    return DeckServer((BIND_HOST, port), cfg, token, default_chapter, demo=demo)
+    server = DeckServer((BIND_HOST, port), cfg, token, default_chapter, demo=demo)
+    server.trusted_origins = tuple(trusted_origins or ())
+    return server
 
 
 def serve(
@@ -816,14 +843,19 @@ def serve(
     default_chapter: Optional[int] = None,
     open_browser: bool = True,
     demo: bool = False,
+    trusted_origins: "Sequence[str]" = (),
 ) -> int:
     """Start the deck server and block in ``serve_forever`` until Ctrl-C.
 
     Prints the localhost URL, a LOUD note that verify/reject are real and
     irreversible, then (unless ``open_browser`` is False) opens the URL in
     the default browser. Returns 0 on a clean Ctrl-C shutdown. The CLI
-    (``marathon deck``) is a thin wrapper over this."""
-    server = make_server(cfg, port=port, default_chapter=default_chapter, demo=demo)
+    (``marathon deck``) is a thin wrapper over this. ``trusted_origins`` widen
+    the same-origin POST guard for a fronting proxy (see ``--trusted-origin``)."""
+    server = make_server(
+        cfg, port=port, default_chapter=default_chapter, demo=demo,
+        trusted_origins=trusted_origins,
+    )
     host, bound_port = server.server_address[:2]
     url = f"http://{host}:{bound_port}/"
 
@@ -847,6 +879,22 @@ def serve(
         )
     print(f"  bound to {host} (loopback only); chapter="
           f"{default_chapter if default_chapter is not None else 'all'}")
+    if trusted_origins:
+        print("  trusted proxy origins (same-origin guard widened): "
+              + ", ".join(trusted_origins))
+    # A fronted (shared) deck without --no-host-conductor is an attribution
+    # footgun: a collaborator's REJECT spawns/feeds the HOST's conductor, so the
+    # PR merge that lands their refine + the Aristotle spend are billed to the
+    # HOST, not them. The per-request forwarded token covers only the
+    # synchronous issue comment/label writes, never the detached conductor.
+    if trusted_origins and not os.environ.get("MARATHON_NO_HOST_CONDUCTOR"):
+        print(
+            "  WARNING: shared/fronted deck WITHOUT --no-host-conductor — a\n"
+            "  collaborator's reject feeds the HOST conductor, so the refine's\n"
+            "  PR merge + Aristotle spend are attributed to the HOST's key,\n"
+            "  not the rejecting collaborator. Pass --no-host-conductor so each\n"
+            "  collaborator's own conductor refines under their own key."
+        )
     print("  press Ctrl-C to stop.")
     print("=" * 70)
 

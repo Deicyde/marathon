@@ -2,9 +2,44 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
+import os
 import subprocess
-from typing import Optional, Sequence
+from typing import Iterator, Optional, Sequence
+
+
+# Per-request GitHub identity. When the deck is shared behind an authenticating
+# proxy, each collaborator's OWN GitHub OAuth token is bound here for the life of
+# their request, so every gh() write (comment / label / PR merge / issue-body
+# edit) authenticates AND is attributed to *them*, not the host's ambient gh
+# auth. Unset — the default, and the entire single-user CLI path — means gh()
+# uses the host's ambient auth, exactly as before.
+_ACTOR_GH_TOKEN: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "marathon_actor_gh_token", default=None
+)
+
+
+@contextlib.contextmanager
+def actor_github_token(token: Optional[str]) -> "Iterator[None]":
+    """Bind ``token`` as the acting GitHub identity for every :func:`gh` call
+    made in this context (same thread). A falsy/blank token is a no-op — gh()
+    falls back to the host's ambient auth — so the local single-user path is
+    completely unchanged.
+
+    SCOPE: this covers only SYNCHRONOUS gh() writes made within the context (the
+    deck's verdict/ship/refresh handlers). It deliberately does NOT reach the
+    detached conductor (a separate process spawned with start_new_session) — its
+    later PR merges + Aristotle refines run under whatever credentials launched
+    it, never this short-lived per-request token. On a shared deck, run the
+    conductor per-collaborator (see ``--no-host-conductor``) for that half."""
+    tok = (token or "").strip() or None
+    reset = _ACTOR_GH_TOKEN.set(tok)
+    try:
+        yield
+    finally:
+        _ACTOR_GH_TOKEN.reset(reset)
 
 
 def gh(
@@ -17,12 +52,19 @@ def gh(
     Captures stdout+stderr by default. Raises ``RuntimeError`` on
     non-zero exit when ``check`` is True. Matches the helper used by
     the previously-bundled scripts so behavior is preserved exactly.
+
+    If a per-request actor token is bound (see :func:`actor_github_token`),
+    it is injected as ``GH_TOKEN`` so the call authenticates as that
+    collaborator; otherwise ``gh`` uses the host's ambient auth.
     """
+    tok = _ACTOR_GH_TOKEN.get()
+    env = {**os.environ, "GH_TOKEN": tok} if tok else None
     cp = subprocess.run(
         ["gh", *args],
         capture_output=capture,
         text=True,
         check=False,
+        env=env,
     )
     if check and cp.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args)} failed: {cp.stderr.strip()}")

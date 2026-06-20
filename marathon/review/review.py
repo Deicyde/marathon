@@ -594,7 +594,25 @@ def _ensure_conductor(cfg: ReviewConfig) -> None:
     worktrees, AND auto-merges eligible PRs each cycle. Singleton via the
     conductor lock: if one is already alive this is a no-op note; otherwise
     spawn ``marathon conductor run`` detached (it survives this process). The
-    rejection is already recorded in state.json for it to pick up."""
+    rejection is already recorded in state.json for it to pick up.
+
+    If ``MARATHON_NO_HOST_CONDUCTOR`` is set (a SHARED deck, where the expensive
+    Aristotle compute should be billed to a collaborator's OWN key, not the
+    host's), this spawns NOTHING: the rejection is still recorded in state.json
+    for that collaborator's own conductor — running on their machine with their
+    ARISTOTLE_API_KEY — to pick up and refine.
+
+    PRECONDITION for that guarantee: do NOT also run a host conductor on the
+    shared deck host. This flag only prevents THIS process from SPAWNING one; an
+    already-running host conductor polls the same shared state.json and would
+    drain the queue under the host's credentials regardless."""
+    if os.environ.get("MARATHON_NO_HOST_CONDUCTOR"):
+        print(
+            "  host-side conductor disabled (MARATHON_NO_HOST_CONDUCTOR); this "
+            "rejection is recorded in state.json for a collaborator's own "
+            "conductor to refine under their own key"
+        )
+        return
     pid = _live_conductor_pid(cfg)
     if pid is not None:
         print(

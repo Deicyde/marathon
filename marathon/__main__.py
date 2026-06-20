@@ -1006,10 +1006,33 @@ def _add_deck_subparser(subparsers) -> None:
             "SIMULATED — fires nothing irreversible. For trying the UX."
         ),
     )
+    p_deck.add_argument(
+        "--trusted-origin", action="append", default=[], metavar="ORIGIN",
+        help=(
+            "Extra browser Origin the same-origin POST guard accepts "
+            "(repeatable). Use when fronting the deck with an authenticating "
+            "proxy on a public host, e.g. "
+            "--trusted-origin https://marathon.example.com."
+        ),
+    )
+    p_deck.add_argument(
+        "--no-host-conductor", action="store_true",
+        help=(
+            "Do NOT spawn a conductor on this host when a reject is fired (sets "
+            "MARATHON_NO_HOST_CONDUCTOR). For a SHARED deck (recommended with "
+            "--trusted-origin): the rejection is recorded for a collaborator's "
+            "OWN conductor to refine under their own Aristotle key. PRECONDITION: "
+            "don't also run a host conductor here — an already-running one drains "
+            "the shared queue under the host's credentials; this flag only stops "
+            "THIS process from spawning one."
+        ),
+    )
     p_deck.set_defaults(func=_run_deck)
 
 
 def _run_deck(args) -> None:
+    import os
+
     from marathon.deck.server import serve
 
     demo = getattr(args, "demo", False)
@@ -1018,12 +1041,15 @@ def _run_deck(args) -> None:
     else:
         from marathon.review.config import load_config
         cfg = load_config()
+    if getattr(args, "no_host_conductor", False):
+        os.environ["MARATHON_NO_HOST_CONDUCTOR"] = "1"
     rc = serve(
         cfg,
         port=args.port,
         default_chapter=args.chapter,
         open_browser=not args.no_open,
         demo=demo,
+        trusted_origins=getattr(args, "trusted_origin", []) or [],
     )
     if rc:
         raise SystemExit(rc)

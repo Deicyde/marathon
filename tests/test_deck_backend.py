@@ -628,3 +628,80 @@ def test_sse_events_endpoint_emits_status(running_server):
     data_line = [l for l in body.splitlines() if l.startswith("data: ")][0]
     payload = json.loads(data_line[len("data: "):])
     assert "jobs" in payload and "landings" in payload
+
+
+# ---------------------------------------------------------------------------
+# Per-user credentials: forwarded GitHub token + trusted proxy origins
+# ---------------------------------------------------------------------------
+
+def test_post_binds_forwarded_actor_github_token(running_server, monkeypatch):
+    """A proxy-forwarded GitHub token (X-Forwarded-Access-Token) is bound as the
+    acting gh identity for the duration of the verdict's handler."""
+    _server, base, token = running_server
+    import marathon.review.github as github
+    from marathon.review import review as review_mod
+
+    seen = {}
+    monkeypatch.setattr(
+        review_mod, "cmd_verify",
+        lambda args: seen.setdefault("actor", github._ACTOR_GH_TOKEN.get()),
+    )
+    status, _ = _post(
+        base + "/api/verdict", {"id": 22, "verdict": "verify"},
+        headers={deck_server.TOKEN_HEADER: token,
+                 deck_server.ACCESS_TOKEN_HEADER: "ghu_collab"},
+    )
+    assert status == 200
+    assert seen["actor"] == "ghu_collab"        # collaborator's token was bound
+    # and it does NOT leak past the request
+    assert github._ACTOR_GH_TOKEN.get() is None
+
+
+def test_post_without_forwarded_token_is_ambient(running_server, monkeypatch):
+    """No forwarded token (the local single-user path) => ambient host gh auth."""
+    _server, base, token = running_server
+    import marathon.review.github as github
+    from marathon.review import review as review_mod
+
+    seen = {}
+    monkeypatch.setattr(
+        review_mod, "cmd_verify",
+        lambda args: seen.setdefault("actor", github._ACTOR_GH_TOKEN.get()),
+    )
+    _post(base + "/api/verdict", {"id": 22, "verdict": "verify"},
+          headers={deck_server.TOKEN_HEADER: token})
+    assert seen["actor"] is None
+
+
+def test_trusted_origin_widens_same_origin_guard(tmp_path, monkeypatch):
+    """A configured --trusted-origin is accepted by the POST same-origin guard;
+    an untrusted foreign origin is still refused."""
+    cfg = make_cfg(tmp_path)
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="def", value_pp="x")]))
+    patch_bulk(monkeypatch, _bodies_for({22: "Foo"}))
+    from marathon.review import review as review_mod
+    monkeypatch.setattr(review_mod, "cmd_verify", lambda args: None)
+
+    server = deck_server.make_server(
+        cfg, port=0, default_chapter=14,
+        trusted_origins=["https://marathon.example.com"])
+    host, port = server.server_address[:2]
+    base = f"http://{host}:{port}"
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        ok, _ = _post(
+            base + "/api/verdict", {"id": 22, "verdict": "verify"},
+            headers={deck_server.TOKEN_HEADER: server.token,
+                     "Origin": "https://marathon.example.com"})
+        assert ok == 200                         # trusted foreign origin allowed
+        bad, _ = _post(
+            base + "/api/verdict", {"id": 22, "verdict": "verify"},
+            headers={deck_server.TOKEN_HEADER: server.token,
+                     "Origin": "https://evil.example.com"})
+        assert bad == 403                        # untrusted foreign origin refused
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
