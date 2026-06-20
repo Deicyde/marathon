@@ -533,6 +533,13 @@ def cmd_reject(args) -> None:
         "❌ REJECTED — see body for findings; fix queued in "
         "`.marathon/review/state.json` (`marathon review reject` queue)."
     )
+    # Mirror the verbatim note into the comment inside an HTML-comment marker
+    # (invisible in render) so a collaborator's conductor that discovers its
+    # queue from GitHub can recover the exact note. Backward-compatible: old
+    # readers ignore it; a comment override still gets the note appended.
+    from marathon.review.reject_note import embed_reject_note
+
+    comment = f"{comment}\n\n{embed_reject_note(notes_text)}"
     gh("issue", "comment", str(num), "--repo", cfg.github_repo, "--body", comment)
     gh(
         "issue", "edit", str(num),

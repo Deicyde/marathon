@@ -13,6 +13,7 @@ parsing.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 # The exact header lines the composer emits.
 KEEP_HEADER = (
@@ -30,6 +31,37 @@ FOOTER = "Leave all other code untouched."
 KEEP_PREFIX = "KEEP these declarations"
 FIX_PREFIX = "FIX these declarations"
 ADD_PREFIX = "ADD the missing declaration"
+
+# --- GitHub reject-comment note embedding -----------------------------------
+# The verbatim reject note is also mirrored into the GitHub reject COMMENT inside
+# an HTML-comment marker: invisible in the rendered issue, yet recoverable via
+# the API by a collaborator's conductor that discovers its queue from GitHub
+# (the `review:rejected` label) rather than the host's local state.json. The
+# embed/extract pair lives here, beside the headers, so they can never desync.
+REJECT_NOTE_MARKER_OPEN = "<!-- marathon-reject-note"
+REJECT_NOTE_MARKER_CLOSE = "marathon-reject-note -->"
+
+
+def embed_reject_note(note: str) -> str:
+    """Wrap ``note`` in the stable HTML-comment marker block, for appending to a
+    GitHub reject comment. The whole block is one HTML comment, so the note is
+    invisible in rendered Markdown yet recoverable by :func:`extract_reject_note`."""
+    return f"{REJECT_NOTE_MARKER_OPEN}\n{note}\n{REJECT_NOTE_MARKER_CLOSE}"
+
+
+def extract_reject_note(comment_body: Optional[str]) -> Optional[str]:
+    """Recover the verbatim note :func:`embed_reject_note` wrote, or ``None`` if
+    ``comment_body`` carries no marker (an old/plain reject comment)."""
+    if not comment_body:
+        return None
+    start = comment_body.find(REJECT_NOTE_MARKER_OPEN)
+    if start < 0:
+        return None
+    inner = start + len(REJECT_NOTE_MARKER_OPEN)
+    end = comment_body.find(REJECT_NOTE_MARKER_CLOSE, inner)
+    if end < 0:
+        return None
+    return comment_body[inner:end].strip()
 
 
 @dataclass
