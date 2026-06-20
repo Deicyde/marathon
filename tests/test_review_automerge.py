@@ -116,7 +116,7 @@ def _install_gh(monkeypatch, prs, *, merge_rc=0, methods=None):
         "mergeCommitAllowed": False,
         "rebaseMergeAllowed": False,
     }
-    calls = {"merged": [], "list": 0, "method_flags": []}
+    calls = {"merged": [], "list": 0, "method_flags": [], "unlabeled": []}
 
     def fake_gh(*args, check=True, capture=True):
         if args[:2] == ("repo", "view"):
@@ -130,6 +130,10 @@ def _install_gh(monkeypatch, prs, *, merge_rc=0, methods=None):
                 if flag in args:
                     calls["method_flags"].append(flag)
             return _cp(returncode=merge_rc, stderr="boom" if merge_rc else "")
+        if args[:2] == ("issue", "edit"):
+            # capture the re-queue relabel: (issue, --remove-label, <label>)
+            calls["unlabeled"].append(int(args[2]))
+            return _cp()
         raise AssertionError(f"unexpected gh call: {args}")
 
     monkeypatch.setattr(am, "gh", fake_gh)
@@ -214,6 +218,39 @@ def test_automerge_targets_the_configured_base(monkeypatch):
     # explicit base arg overrides the config
     am.automerge(_cfg(base="develop"), base="release")
     assert seen["base"] == "release"
+
+
+def test_automerge_requeues_a_refined_issue(monkeypatch):
+    # Merging a marathon/refine-cN-iM PR re-queues issue M for re-review:
+    # removes review:rejected AND clears local state.
+    requeued = []
+    import marathon.review.state as state_mod
+    monkeypatch.setattr(state_mod, "requeue_for_rereview",
+                        lambda cfg, issue: requeued.append(issue) or True)
+    cfg = SimpleNamespace(github_repo="o/r", auto_pr_base="main",
+                          labels=SimpleNamespace(rejected="review:rejected"))
+    calls = _install_gh(monkeypatch, [_pr(109, head="marathon/refine-c12-i93")])
+
+    res = am.automerge(cfg)
+
+    assert calls["merged"] == [109]
+    assert calls["unlabeled"] == [93]      # review:rejected removed from #93
+    assert requeued == [93]                # local state cleared for #93
+    assert "re-queued #93 for re-review" in res[0].reason
+
+
+def test_automerge_non_refine_pr_does_not_requeue(monkeypatch):
+    requeued = []
+    import marathon.review.state as state_mod
+    monkeypatch.setattr(state_mod, "requeue_for_rereview",
+                        lambda cfg, issue: requeued.append(issue) or True)
+    # a config/registration PR head — NOT a refine branch
+    calls = _install_gh(monkeypatch, [_pr(108, head="chore/register-ch12")])
+
+    am.automerge(_cfg())
+
+    assert calls["merged"] == [108]
+    assert calls["unlabeled"] == [] and requeued == []   # nothing re-queued
 
 
 def test_automerge_handles_gh_list_failure(monkeypatch):

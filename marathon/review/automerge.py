@@ -30,6 +30,7 @@ tests can assert without a real ``gh``).
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -37,6 +38,11 @@ from marathon.review.github import gh
 
 if TYPE_CHECKING:  # pragma: no cover — type-only
     from marathon.review.config import ReviewConfig
+
+#: A merged PR on this branch is Aristotle's REFINE of a rejected issue; merging
+#: it re-queues issue ``M`` for the human to RE-REVIEW (reject -> refine ->
+#: merge -> re-review). Matches ``post_pipeline._branch_name_for_issue``.
+_REFINE_BRANCH_RE = re.compile(r"^marathon/refine-c\d+-i(\d+)$")
 
 #: PR JSON fields the gate needs. ``mergeable``/``mergeStateStatus`` are the
 #: conflict + protection signals; ``statusCheckRollup`` is the CI signal.
@@ -236,6 +242,32 @@ def _repo_merge_method(repo: str) -> Optional[str]:
     return None
 
 
+def _requeue_refined_issue(cfg: "ReviewConfig", head: Optional[str]) -> Optional[int]:
+    """If ``head`` is a refine branch (``marathon/refine-c<N>-i<M>``), re-queue
+    issue ``M`` for re-review now that Aristotle's fix has merged: remove the
+    ``review:rejected`` GitHub label AND clear the local verdict state, so the
+    issue reads as unreviewed and the deck surfaces it as a ready card again.
+    Returns the issue number it re-queued, or None. Best-effort — a failure here
+    never fails the merge (the fix already landed)."""
+    m = _REFINE_BRANCH_RE.match(head or "")
+    if not m:
+        return None
+    issue = int(m.group(1))
+    rejected_label = getattr(getattr(cfg, "labels", None), "rejected", "review:rejected")
+    try:
+        gh("issue", "edit", str(issue), "--repo", cfg.github_repo,
+           "--remove-label", rejected_label, check=False)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from marathon.review.state import requeue_for_rereview
+
+        requeue_for_rereview(cfg, issue)
+    except Exception:  # noqa: BLE001
+        pass
+    return issue
+
+
 def _merge_pr(repo: str, pr: int, method: str) -> tuple[bool, str]:
     """Merge one PR with the repo's allowed ``method`` + delete the source
     branch. Returns ``(ok, detail)``."""
@@ -310,6 +342,10 @@ def automerge(
         if method is None:
             method = _repo_merge_method(repo) or "--merge"
         merged, detail = _merge_pr(repo, num, method)
+        if merged:
+            requeued = _requeue_refined_issue(cfg, head)
+            if requeued is not None:
+                detail += f"; re-queued #{requeued} for re-review"
         results.append(AutoMergeResult(
             num, head, title, "merged" if merged else "failed", detail
         ))

@@ -361,3 +361,20 @@ def test_cmd_list_falls_back_per_issue_on_bulk_failure(tmp_path, monkeypatch, ca
     assert "bulk GraphQL issue fetch failed" in captured.err
     assert "title-14" in captured.out and "title-15" in captured.out
     assert "verified" in captured.out and "unreviewed" in captured.out
+
+
+# --- requeue_for_rereview: reject -> refine -> merge -> RE-REVIEW ------------
+
+def test_requeue_for_rereview_clears_local_verdict(tmp_path):
+    """After Aristotle's refine fix lands, the issue's local rejected verdict is
+    cleared so it re-enters the review queue (the deck surfaces it again)."""
+    from marathon.review.state import (
+        load_state, record_rejection, requeue_for_rereview,
+    )
+    cfg = make_cfg(tmp_path)
+    record_rejection(cfg, 14, "fix the smoothness proof")
+    assert load_state(cfg).issues[14].status == "rejected"
+
+    assert requeue_for_rereview(cfg, 14) is True     # an entry was removed
+    assert 14 not in load_state(cfg).issues          # now reads as unreviewed
+    assert requeue_for_rereview(cfg, 14) is False    # idempotent — already gone

@@ -382,6 +382,22 @@ def record_verification(cfg: ReviewConfig, issue_num: int) -> IssueState:
     return entry
 
 
+def requeue_for_rereview(cfg: ReviewConfig, issue_num: int) -> bool:
+    """Drop an issue's local verdict so it RE-ENTERS the review queue — used
+    after Aristotle's refine fix LANDS and the human must RE-REVIEW the result
+    (reject -> refine -> merge -> re-review). Removes the ``state.json`` entry
+    (the deck's read-side truth); paired with the caller removing the
+    ``review:rejected`` GitHub label, the issue reads as unreviewed and becomes a
+    ready card again. Returns True iff an entry was removed. Best-effort — no
+    ledger / GitHub / verdicts.jsonl write of its own."""
+    state = load_state(cfg)
+    if issue_num not in state.issues:
+        return False
+    del state.issues[issue_num]
+    save_state(cfg, state)
+    return True
+
+
 def record_iteration(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
     """Mark that the daemon dispatched a refine iteration for
     ``issue_num``. Sets ``last_iteration_ts = now()`` on the existing
