@@ -565,32 +565,30 @@ def compose_ship_note(
     Pure: derives entirely from ``summary`` + ``missing``. A KEEP/FIX section
     with no members still renders its header so the note's structure is stable;
     the ADD section is omitted entirely when nothing is missing."""
+    from marathon.review.reject_note import (
+        ADD_HEADER, FIX_HEADER, FOOTER, KEEP_HEADER,
+    )
+
     kept = summary.get("kept", [])
     rejected = summary.get("rejected", [])
 
     lines = [f"Per-declaration review of issue #{issue_num}.", ""]
-    lines.append(
-        "KEEP these declarations exactly as written (human-verified — do NOT "
-        "change their statements or signatures):"
-    )
+    lines.append(KEEP_HEADER)
     for name in kept:
         lines.append(f"- {name}")
     lines.append("")
-    lines.append("FIX these declarations (rejected):")
+    lines.append(FIX_HEADER)
     for item in rejected:
         lines.append(f"- {item.get('name')}: {item.get('note')}")
     lines.append("")
     missing_text = (missing or "").strip()
     if missing_text:
-        lines.append(
-            "ADD the missing declaration(s) — a result this issue's title "
-            "promises is not yet formalized; add it (and keep everything above):"
-        )
+        lines.append(ADD_HEADER)
         for ln in missing_text.splitlines():
             ln = ln.rstrip()
             lines.append(ln if ln.lstrip().startswith("-") else f"- {ln}")
         lines.append("")
-    lines.append("Leave all other code untouched.")
+    lines.append(FOOTER)
     return "\n".join(lines)
 
 
