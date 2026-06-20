@@ -442,7 +442,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_plan_subparser(subparsers)
 
     # Deck tree: `marathon deck` — the Phase-8 human review surface (the
-    # local "Code Tinder" web app; see marathon.deck). Ready cards in,
+    # local dashboard web app; see marathon.deck). Ready cards in,
     # verify/reject/defer out, status pane streaming conductor/landing
     # events. verify/reject route through the committed review verdict
     # path (ledger + GitHub + tracker + daemon/conductor).
@@ -938,7 +938,7 @@ def _run_conductor_run(args) -> None:
 
 def _add_deck_subparser(subparsers) -> None:
     """Adds `marathon deck` — the Phase-8 deck (see ``marathon.deck``):
-    the local-web-app "Code Tinder" review surface. Serves ready cards
+    the local-web-app review + operations dashboard. Serves ready cards
     (green SHA, gated, dep-ordered), routes verify/reject/defer through
     the committed review verdict path, and streams conductor/landing
     events to a live status pane.
@@ -949,8 +949,8 @@ def _add_deck_subparser(subparsers) -> None:
     p_deck = subparsers.add_parser(
         "deck",
         help=(
-            "Local 'Code Tinder' review surface (Phase 8): a 127.0.0.1 "
-            "web app serving ready spec cards; v/r/defer/deep-dive."
+            "Local review + ops dashboard (Phase 8): a 127.0.0.1 web app "
+            "serving ready spec cards + conductor/issue/history views."
         ),
         description=(
             "Start the deck: a local web app (bound to 127.0.0.1 only) "

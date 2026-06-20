@@ -1,4 +1,4 @@
-"""marathon.deck — the deck: the human-facing "Code Tinder" review surface
+"""marathon.deck — the deck: the human-facing review + operations dashboard
 (plan §2 "marathon deck" box + Phase 8 row).
 
 The medium is a LOCAL WEB APP with the full swipe loop (an explicit user

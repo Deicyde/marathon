@@ -1,4 +1,4 @@
-/* style.css — the marathon deck (Code Tinder). Vanilla, no build step. */
+/* style.css — the marathon deck dashboard. Vanilla, no build step. */
 
 :root {
   --bg: #0e1117;
@@ -425,3 +425,101 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 @media (prefers-reduced-motion: reduce) {
   .card, .toast { transition: none; }
 }
+
+/* ===================================================================== */
+/* Dashboard: tab bar + Status / Issues / History views                  */
+/* ===================================================================== */
+
+/* --- tab bar --- */
+.tab-nav { display: flex; gap: 0.3rem; padding: 0 1rem; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 56px; z-index: 4; overflow-x: auto; }
+.tab-btn { background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted); cursor: pointer; padding: 0.7rem 0.9rem; font: inherit; font-weight: 600; font-size: 0.92rem; white-space: nowrap; transition: color .15s, border-color .15s; }
+.tab-btn:hover { color: var(--ink); }
+.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.tab-pane[hidden] { display: none; }
+.tab-pane { display: block; }
+
+/* --- dashboard container --- */
+.dash { max-width: 880px; margin: 0 auto; padding: 1.1rem 1rem 3rem; }
+.dash-section { margin-bottom: 1.6rem; }
+.dash-h { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 0.6rem; font-weight: 700; }
+.dash-empty { color: var(--muted); font-style: italic; font-size: 0.88rem; padding: 0.5rem 0; }
+.dash-loading { color: var(--muted); padding: 1.5rem 0; text-align: center; }
+.dash-refresh { float: right; font-size: 0.72rem; color: var(--muted); font-style: normal; text-transform: none; letter-spacing: 0; }
+
+/* --- stat chips row --- */
+.stat-row { display: flex; flex-wrap: wrap; gap: 0.6rem; }
+.stat-chip { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 0.55rem 0.8rem; min-width: 92px; }
+.stat-num { font-size: 1.35rem; font-weight: 700; line-height: 1.1; }
+.stat-label { font-size: 0.72rem; color: var(--muted); }
+
+/* --- conductor banner --- */
+.cond-banner { display: flex; align-items: center; gap: 0.7rem; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 0.8rem 1rem; margin-bottom: 1.1rem; }
+.cond-dot { width: 11px; height: 11px; border-radius: 50%; flex: none; }
+.cond-dot.up { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.cond-dot.down { background: var(--reject); }
+.cond-title { font-weight: 700; }
+.cond-meta { color: var(--muted); font-size: 0.8rem; margin-left: auto; text-align: right; }
+.cond-meta .mono { font-family: var(--mono); }
+
+/* --- job rows (conductor jobs) --- */
+.job-row, .land-row { display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 0.7rem; border: 1px solid var(--line); border-radius: 9px; margin-bottom: 0.4rem; background: var(--panel); font-size: 0.86rem; }
+.job-issue { font-family: var(--mono); font-weight: 700; min-width: 3.2rem; }
+.job-chip { font-size: 0.7rem; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 0.3rem; }
+.job-aristotle { margin-left: auto; color: var(--muted); font-size: 0.78rem; font-family: var(--mono); }
+.job-when { color: var(--muted); font-size: 0.74rem; }
+
+/* --- status badges (shared by jobs, issues, history) --- */
+.sb { font-size: 0.7rem; font-weight: 700; padding: 0.1rem 0.45rem; border-radius: 999px; border: 1px solid var(--line); white-space: nowrap; }
+.sb-building { color: var(--accent); border-color: #6ea8fe66; }
+.sb-running  { color: var(--accent); border-color: #6ea8fe66; }
+.sb-verified { color: var(--ok); border-color: #2ea04366; }
+.sb-succeeded{ color: var(--ok); border-color: #2ea04366; }
+.sb-rejected { color: var(--reject); border-color: #d1374b66; }
+.sb-failed   { color: var(--reject); border-color: #d1374b66; }
+.sb-stalled  { color: var(--warn); border-color: #d2992266; }
+.sb-ready    { color: var(--ok); border-color: #2ea04366; }
+.sb-blocked  { color: var(--muted); }
+.sb-pending  { color: var(--muted); }
+
+/* --- issues overview --- */
+.chap-block { margin-bottom: 1.3rem; }
+.chap-title { font-weight: 700; font-size: 0.95rem; margin: 0 0 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
+.chap-count { color: var(--muted); font-weight: 400; font-size: 0.8rem; }
+.issue-row { display: flex; align-items: center; gap: 0.55rem; padding: 0.5rem 0.7rem; border: 1px solid var(--line); border-radius: 9px; margin-bottom: 0.35rem; background: var(--panel); }
+.issue-id { font-family: var(--mono); color: var(--muted); min-width: 2.8rem; font-size: 0.82rem; }
+.issue-title { flex: 1; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.issue-tier { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 0.3rem; }
+.issue-row.is-ready { cursor: pointer; }
+.issue-row.is-ready:hover { border-color: var(--accent); }
+
+/* --- history timeline --- */
+.hist-row { display: flex; align-items: baseline; gap: 0.6rem; padding: 0.45rem 0.7rem; border-left: 2px solid var(--line); margin-left: 0.3rem; font-size: 0.86rem; }
+.hist-ts { color: var(--muted); font-size: 0.74rem; font-family: var(--mono); min-width: 8.5rem; flex: none; }
+.hist-body { flex: 1; }
+.hist-pr { color: var(--accent); font-family: var(--mono); }
+
+/* --- carried-over verdict (kept across a reject -> refine -> re-review) --- */
+.carried-badge { font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ok); border: 1px solid #2ea04366; background: #2ea04318; border-radius: 5px; padding: 0.08rem 0.4rem; white-space: nowrap; }
+.changed-banner { display: flex; align-items: flex-start; gap: 0.5rem; background: #d2992212; border: 1px solid var(--warn); border-left: 3px solid var(--warn); border-radius: 10px; padding: 0.55rem 0.75rem; margin: 0.5rem 0; }
+.changed-icon { color: var(--warn); font-size: 1rem; line-height: 1.2; }
+.changed-banner strong { color: var(--warn); }
+.changed-sub { color: var(--muted); font-size: 0.78rem; margin-top: 0.2rem; }
+
+/* --- summary ADD section (flag a missing declaration) --- */
+.summary-add .sec-title { color: var(--accent); }
+.missing-note { background: #6ea8fe12; border: 1px solid var(--accent); border-left: 3px solid var(--accent); border-radius: 8px; padding: 0.55rem 0.75rem; font-size: 0.86rem; line-height: 1.45; white-space: pre-wrap; }
+.missing-actions { display: flex; gap: 0.4rem; margin-top: 0.4rem; }
+
+/* --- flag-missing "already exists" suggestions --- */
+.missing-suggest:empty { display: none; }
+.missing-suggest { margin: 0.25rem 0 0.75rem; }
+.missing-suggest-head { margin: 0 0 0.4rem; font-size: 0.86rem; color: var(--warn, #d9a40a); }
+.missing-suggest-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }
+.missing-suggest-row { border: 1px solid var(--warn, #d9a40a); border-left: 3px solid var(--warn, #d9a40a); border-radius: 8px; padding: 0.45rem 0.6rem; background: #d9a40a10; }
+.ms-head { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: baseline; }
+.ms-where { font-size: 0.74rem; opacity: 0.8; }
+.ms-key { font-size: 0.72rem; padding: 0 0.35rem; border: 1px solid currentColor; border-radius: 6px; opacity: 0.85; }
+.ms-snippet { font-size: 0.8rem; margin-top: 0.25rem; line-height: 1.4; }
+.ms-file { font-size: 0.72rem; opacity: 0.7; margin-top: 0.2rem; }
+.missing-suggest-actions { margin-top: 0.45rem; }

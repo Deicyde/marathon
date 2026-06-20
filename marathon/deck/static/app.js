@@ -1,5 +1,5 @@
 /*
- * app.js — the marathon deck "Code Tinder" swipe UI (vanilla JS, no build).
+ * app.js — the marathon deck dashboard + swipe review UI (vanilla JS, no build).
  *
  * SUBDECK FLOW (the shape this file implements):
  *   The ready QUEUE is the ISSUE picker. Picking a ready issue opens its
@@ -200,6 +200,14 @@
     return postJSON("/api/refresh-issue", { issue: issue });
   }
 
+  // postMissing — LOCAL-ONLY. Records (or clears, with "") the issue's
+  // "something is MISSING" note. Merges NOTHING, dispatches NO Aristotle; the
+  // note only takes effect at the explicit ship (it routes the outcome to
+  // Aristotle with an ADD section). Safe to call freely.
+  function postMissing(issue, note) {
+    return postJSON("/api/missing", { issue: issue, note: note });
+  }
+
   // --- skip-API toggle (per-session, persistent) ---------------------------
   // "Skip API" is a VIEW preference: when ON, the deck shows ONLY the
   // main-result declarations and lists the easy API decls that WILL be
@@ -240,6 +248,7 @@
     // is purely local view state — pulling one back does NOT post anything.
     overrides: {},      // { issueNum: { declName: true } }
     apiPanelOpen: false, // the auto-approved panel's expand/collapse state
+    activeTab: "review", // dashboard tab: review | status | issues | history
   };
   state.skipApi = readSkipApiPref();
 
@@ -747,6 +756,12 @@
         // human knows it isn't in the issue; it is still a normal reviewable
         // (swipeable) card.
         card.surfaced ? surfacedBadge() : null,
+        // Carried over from a prior review round (reject -> refine -> re-review):
+        // approved before AND unchanged, so it is pre-verified — no re-review.
+        card.carried_over ? el("span", { class: "carried-badge",
+          title: "You approved this last round and its source is unchanged, so "
+               + "it stays verified — no need to re-review." },
+          ["✓ kept from last review"]) : null,
         verdictTag(card),
       ])
     );
@@ -755,6 +770,20 @@
     // surfaced_reason (which namespace it was found in / why), so the human can
     // see why a card not in the issue body is here.
     if (card.surfaced) panel.appendChild(surfacedBanner(card));
+
+    // A decl the human approved last round whose SOURCE has since changed — the
+    // carried-over verdict was dropped, so this is back for re-review.
+    if (card.changed_since_review) {
+      panel.appendChild(el("div", { class: "changed-banner", role: "alert" }, [
+        el("span", { class: "changed-icon", text: "⟳" }),
+        el("div", {}, [
+          el("strong", { text: "Changed since your last approval" }),
+          el("div", { class: "changed-sub", text:
+            "you verified this before, but its source changed (Aristotle altered "
+            + "it) — please re-review." }),
+        ]),
+      ]));
+    }
 
     var delta = semanticDeltaBanner(card.semantic_delta);
     if (delta) panel.appendChild(delta);
@@ -1327,6 +1356,10 @@
     var rejected = summary.rejected || [];
     var deferred = summary.deferred || [];
     var anyRejected = rejected.length > 0;
+    // A flagged MISSING declaration (the issue is incomplete) also routes the
+    // ship to Aristotle (with an ADD instruction) even if nothing was rejected.
+    var missing = (sd && sd.missing) || "";
+    var anyAristotle = anyRejected || !!missing;
     // Under skip-API these API decls (with no human reject) join KEEP on ship.
     var autoApproved = autoApprovedForShip();
 
@@ -1405,6 +1438,30 @@
     }
     card.appendChild(fixSec);
 
+    // ADD section: flag that the issue is INCOMPLETE — a result its title
+    // promises has no declaration. The note ships to Aristotle as an ADD
+    // instruction (verbatim), routing to Aristotle even if all decls verified.
+    var addSec = el("section", { class: "summary-sec summary-add" }, [
+      el("h3", { class: "sec-title", text: "ADD — missing declaration(s)" }),
+    ]);
+    if (missing) {
+      addSec.appendChild(el("div", { class: "missing-note", text: missing }));
+      addSec.appendChild(el("div", { class: "missing-actions" }, [
+        el("button", { class: "btn btn-tiny", type: "button", onclick: openMissingNote }, ["edit"]),
+        el("button", { class: "btn btn-tiny", type: "button",
+          onclick: function () { saveMissing(""); } }, ["clear"]),
+      ]));
+    } else {
+      addSec.appendChild(el("p", { class: "summary-empty" }, [
+        "Everything cited is reviewed — but is a result the title promises ",
+        el("strong", { text: "missing" }),
+        " a declaration? ",
+        el("button", { class: "btn btn-tiny", type: "button", onclick: openMissingNote },
+          ["flag a missing declaration"]),
+      ]));
+    }
+    card.appendChild(addSec);
+
     if (deferred.length) {
       card.appendChild(
         el("p", { class: "summary-deferred", text:
@@ -1415,12 +1472,12 @@
     // Ship action. Label depends on whether anything was rejected:
     //   nothing rejected -> "Mark issue verified" (merges the PR, no Aristotle)
     //   any rejected     -> "Ship to Aristotle" (dispatches with the note)
-    var shipLabel = anyRejected ? "Ship to Aristotle" : "Mark issue verified";
+    var shipLabel = anyAristotle ? "Ship to Aristotle" : "Mark issue verified";
     var shipBtn = el("button", {
-      class: "btn ship-btn " + (anyRejected ? "btn-danger" : "btn-primary"),
+      class: "btn ship-btn " + (anyAristotle ? "btn-danger" : "btn-primary"),
       type: "button",
       id: "btn-ship",
-      onclick: function () { confirmAndShip(anyRejected); },
+      onclick: function () { confirmAndShip(anyAristotle); },
     }, [shipLabel]);
     card.appendChild(
       el("div", { class: "summary-actions" }, [
@@ -1435,13 +1492,116 @@
     card.appendChild(
       el("p", { class: "ship-warn", text:
         "This is the ONLY irreversible action — " +
-        (anyRejected
-          ? "it dispatches Aristotle with your fix notes verbatim."
+        (anyAristotle
+          ? "it dispatches Aristotle with your fix/add notes verbatim."
           : "it merges the marathon PR and marks the issue verified.") })
     );
 
     stage().appendChild(card);
     setActionsEnabled(false);
+  }
+
+  // saveMissing — record (or clear with "") the issue's missing-declaration
+  // note, fold the authoritative value back into our subdeck copy, and re-render
+  // the summary. A PURE LOCAL write (never ships).
+  function saveMissing(note) {
+    var issue = state.issue;
+    postMissing(issue, note)
+      .then(function (resp) {
+        if (state.subdeck) state.subdeck.missing = (resp && resp.missing) || null;
+        renderSummaryCard();
+      })
+      .catch(function (err) {
+        showErrorCard("Could not save the missing-declaration note", err,
+          function () { renderSummaryCard(); });
+      });
+  }
+
+  // openMissingNote — the modal to describe what the issue is MISSING. Recording
+  // it is LOCAL (nothing dispatches yet); it becomes an ADD instruction to
+  // Aristotle only at the explicit ship.
+  // fetchMissingSuggestions — PURE GET. Decls the issue's title-promised result
+  // may ALREADY be formalized as (the inverse of the surfacing exclusion). Used
+  // only to WARN; never blocks the flag-missing flow.
+  function fetchMissingSuggestions(issue) {
+    return getJSON("/api/missing-suggestions/" + encodeURIComponent(issue));
+  }
+
+  // renderMissingSuggestions — fill the async container with "this may already
+  // exist" rows. Each row names the existing decl, where it lives, and (when a
+  // sibling owns it) which issue cites it; a "Not missing — this is it" button
+  // dismisses WITHOUT saving (no Aristotle ADD). Empty -> nothing.
+  function renderMissingSuggestions(container, candidates) {
+    container.innerHTML = "";
+    if (!candidates || !candidates.length) return;
+    container.appendChild(el("p", { class: "missing-suggest-head" }, [
+      el("strong", { text: "⚠ This may already be formalized" }),
+      " — review before flagging it missing:",
+    ]));
+    var list = el("ul", { class: "missing-suggest-list" });
+    candidates.forEach(function (c) {
+      var where = c.cited_by && c.cited_by.length
+        ? "cited by #" + c.cited_by.join(", #")
+        : (c.in_code ? "in code, uncited" : "in the snapshot");
+      list.appendChild(el("li", { class: "missing-suggest-row" }, [
+        el("div", { class: "ms-head" }, [
+          el("span", { class: "mono", text: c.decl }),
+          el("span", { class: "ms-where", text: where }),
+          c.matched_key ? el("span", { class: "ms-key", text: c.matched_key }) : null,
+        ]),
+        c.snippet ? el("div", { class: "ms-snippet", text: c.snippet }) : null,
+        c.source_file ? el("div", { class: "ms-file mono", text: c.source_file }) : null,
+      ]));
+    });
+    container.appendChild(list);
+    container.appendChild(el("div", { class: "missing-suggest-actions" }, [
+      el("button", {
+        class: "btn btn-tiny", type: "button",
+        onclick: function () { closeModal(); },
+      }, ["Not missing — one of these is it"]),
+    ]));
+  }
+
+  function openMissingNote() {
+    var cur = (state.subdeck && state.subdeck.missing) || "";
+    var issue = state.issue;
+    // Async-fill container: inserted synchronously, populated after the GET.
+    var suggestBox = el("div", { class: "missing-suggest" });
+    var ta = el("textarea", {
+      class: "reject-note", rows: "5",
+      placeholder: "Which result does the issue's title promise that has NO "
+        + "declaration? Describe it so Aristotle can add it — e.g. \"the "
+        + "function-multiplication case: f • A is smooth when f and A are "
+        + "smooth — a MixedTensorField.IsSmooth.smul_* lemma\".",
+      "aria-label": "Missing-declaration note",
+    });
+    ta.value = cur;
+    var panel = el("div", { class: "modal-panel" }, [
+      el("h2", { class: "modal-title", text: "Flag a missing declaration" }),
+      el("p", { class: "modal-sub" }, [
+        "The existing declarations are fine, but the issue is ",
+        el("strong", { text: "incomplete" }),
+        " — a result its title promises is not formalized. Your note is ",
+        el("strong", { text: "composed verbatim into an ADD instruction for Aristotle" }),
+        " at ship (the issue routes to Aristotle even if every declaration is "
+        + "verified). Recording it now is LOCAL — nothing dispatches yet.",
+      ]),
+      suggestBox,
+      ta,
+      el("div", { class: "modal-actions" }, [
+        el("button", { class: "btn", type: "button", onclick: function () { closeModal(); } }, ["Cancel"]),
+        el("button", {
+          class: "btn btn-primary", type: "button",
+          onclick: function () { var n = ta.value.trim(); closeModal(); saveMissing(n); },
+        }, ["Save"]),
+      ]),
+    ]);
+    openModal(panel);
+    setTimeout(function () { ta.focus(); }, 0);
+    // Advisory-only: a fetch failure must NEVER block Save. Swallow errors.
+    fetchMissingSuggestions(issue)
+      .then(function (resp) { renderMissingSuggestions(suggestBox, resp && resp.candidates); })
+      .catch(function () { /* advisory — keep the modal fully usable */ });
   }
 
   // Fallback summary derivation from the local subdeck if the server did not
@@ -1897,6 +2057,7 @@
     var dragging = false, startX = 0, startY = 0, dx = 0, dy = 0, target = null;
     var THRESH = 110;
     function onDown(e) {
+      if (state.activeTab !== "review") return;   // swipe is Review-only
       var card = document.getElementById("active-card");
       // A decl card (canAct) OR the leading informal-approval card (canActInformal)
       // is draggable; both route through actVerify/actReject on release.
@@ -1940,13 +2101,21 @@
       }
       // ignore typing into inputs
       if (e.target && /^(input|textarea|select)$/i.test(e.target.tagName)) return;
+      // Tab switching (1-4) works from any tab; "?" help too.
+      if (e.key === "1") return switchTab("review");
+      if (e.key === "2") return switchTab("status");
+      if (e.key === "3") return switchTab("issues");
+      if (e.key === "4") return switchTab("history");
+      if (e.key === "?") return openHelp();
+      // The card actions (verify/reject/defer/deps/open) only fire on the
+      // Review tab — they act on the card stage, which is hidden otherwise.
+      if (state.activeTab !== "review") return;
       switch (e.key) {
         case "ArrowRight": e.preventDefault(); actVerify(); break;
         case "ArrowLeft": e.preventDefault(); actReject(); break;
         case " ": case "Spacebar": case "ArrowDown": e.preventDefault(); actDefer(); break;
         case "d": case "D": openDeps(); break;
         case "o": case "O": openDeepDive(); break;
-        case "?": openHelp(); break;
         default: break;
       }
     });
@@ -1983,6 +2152,219 @@
     openModal(panel);
   }
 
+  // === dashboard tabs (Status / Issues / History) =========================
+  // Read-only views over the conductor + review state. Each fetches its
+  // endpoint on activation (Status also auto-refreshes) and renders into its
+  // pane. The Review tab is the existing card flow, untouched. Tab switching
+  // and every dashboard fetch are PURE READS — they never POST.
+
+  var DASH_POLL_MS = 5000;
+  var dashTimer = null;
+
+  function dashHost(id) { return document.getElementById(id); }
+
+  // Compact, locale-free "MM-DD HH:MM" from an ISO-ish timestamp.
+  function fmtTs(ts) {
+    if (!ts) return "";
+    var m = String(ts).match(/(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
+    return m ? (m[2] + "-" + m[3] + " " + m[4] + ":" + m[5]) : String(ts).slice(0, 16);
+  }
+
+  // A status pill. The class keys off the FIRST word so "running (pid dead)"
+  // still maps to .sb-running.
+  function statusBadge(status) {
+    var key = String(status || "pending").split(" ")[0];
+    return el("span", { class: "sb sb-" + key, text: status || "pending" });
+  }
+
+  function statChip(num, label) {
+    return el("div", { class: "stat-chip" }, [
+      el("div", { class: "stat-num", text: String(num) }),
+      el("div", { class: "stat-label", text: label }),
+    ]);
+  }
+
+  function dashError(hostId, err) {
+    var host = dashHost(hostId);
+    if (!host) return;
+    host.innerHTML = "";
+    host.appendChild(el("div", { class: "dash-empty",
+      text: "could not load: " + ((err && err.message) || err) }));
+  }
+
+  function switchTab(name) {
+    if (!name) return;
+    state.activeTab = name;
+    var btns = document.querySelectorAll(".tab-btn");
+    for (var i = 0; i < btns.length; i++) {
+      var on = btns[i].getAttribute("data-tab") === name;
+      btns[i].classList.toggle("active", on);
+      btns[i].setAttribute("aria-selected", on ? "true" : "false");
+    }
+    ["review", "status", "issues", "history"].forEach(function (t) {
+      var pane = document.getElementById("tab-" + t);
+      if (!pane) return;
+      if (t === name) pane.removeAttribute("hidden");
+      else pane.setAttribute("hidden", "hidden");
+    });
+    // Stop any prior tab's auto-refresh.
+    if (dashTimer) { clearInterval(dashTimer); dashTimer = null; }
+    if (name === "status") {
+      renderStatusTab();
+      dashTimer = setInterval(renderStatusTab, DASH_POLL_MS);
+    } else if (name === "issues") {
+      renderIssuesTab();
+    } else if (name === "history") {
+      renderHistoryTab();
+    }
+    // Review tab renders on its own (event-driven); nothing to do here.
+  }
+
+  // --- Status tab: the conductor (global orchestrator) + jobs + landings ---
+  function renderStatusTab() {
+    if (state.activeTab !== "status") return; // a stale poll after a switch
+    getJSON("/api/conductor-status").then(function (d) {
+      if (state.activeTab !== "status") return;
+      var host = dashHost("dash-status");
+      if (!host) return;
+      host.innerHTML = "";
+      var up = !!d.alive;
+      host.appendChild(el("div", { class: "cond-banner" }, [
+        el("span", { class: "cond-dot " + (up ? "up" : "down") }),
+        el("div", {}, [
+          el("div", { class: "cond-title",
+            text: up ? "conductor running" : "conductor stopped" }),
+          el("div", { class: "dash-empty",
+            text: up ? "dispatches refines + auto-merges PRs across all chapters"
+                     : "no live orchestrator — rejecting an issue starts one" }),
+        ]),
+        el("div", { class: "cond-meta" }, [
+          el("div", {}, ["pid ", el("span", { class: "mono",
+            text: d.pid == null ? "—" : String(d.pid) })]),
+          el("div", { text: "concurrency " + (d.concurrency == null ? "—" : d.concurrency) }),
+          el("div", { text: d.updated_ts ? ("updated " + fmtTs(d.updated_ts)) : "" }),
+        ]),
+      ]));
+      host.appendChild(el("div", { class: "stat-row dash-section" }, [
+        statChip(d.running || 0, "running"),
+        statChip((d.jobs || []).length, "jobs tracked"),
+        statChip((d.landings || []).length, "recent landings"),
+      ]));
+      var jobsSec = el("section", { class: "dash-section" },
+        [el("div", { class: "dash-h", text: "Aristotle jobs" })]);
+      if (!(d.jobs || []).length)
+        jobsSec.appendChild(el("div", { class: "dash-empty", text: "no jobs — the queue is drained" }));
+      (d.jobs || []).forEach(function (j) {
+        var ar = j.project_id
+          ? (j.project_id + (j.aristotle_status ? " (" + j.aristotle_status + ")" : "")) : "";
+        var kids = [
+          el("span", { class: "job-issue", text: "#" + (j.issue_num == null ? "?" : j.issue_num) }),
+          el("span", { class: "job-chip", text: "c" + (j.chapter == null ? "?" : j.chapter) }),
+          statusBadge(j.status),
+        ];
+        if (ar) kids.push(el("span", { class: "job-aristotle", text: ar }));
+        jobsSec.appendChild(el("div", { class: "job-row" }, kids));
+      });
+      host.appendChild(jobsSec);
+      var landSec = el("section", { class: "dash-section" },
+        [el("div", { class: "dash-h", text: "Recent landings" })]);
+      if (!(d.landings || []).length)
+        landSec.appendChild(el("div", { class: "dash-empty", text: "none yet" }));
+      (d.landings || []).slice().reverse().forEach(function (l) {
+        landSec.appendChild(el("div", { class: "land-row" }, [
+          el("span", { class: "job-issue", text: "#" + (l.issue == null ? "?" : l.issue) }),
+          el("span", { class: "job-when", text: fmtTs(l.ts) }),
+          el("span", { class: "job-aristotle mono", text: (l.sha_landed || "").slice(0, 7) }),
+        ]));
+      });
+      host.appendChild(landSec);
+    }).catch(function (e) { dashError("dash-status", e); });
+  }
+
+  // --- Issues tab: every registered issue grouped by chapter ---
+  function renderIssuesTab() {
+    var host = dashHost("dash-issues");
+    if (!host) return;
+    host.innerHTML = "";
+    host.appendChild(el("div", { class: "dash-loading", text: "loading issues…" }));
+    getJSON("/api/issues-overview").then(function (d) {
+      if (state.activeTab !== "issues") return;
+      host.innerHTML = "";
+      var counts = d.counts || {};
+      var order = ["building", "ready", "verified", "rejected", "stalled", "blocked", "pending"];
+      var chips = order.filter(function (s) { return counts[s]; })
+        .map(function (s) { return statChip(counts[s], s); });
+      if (chips.length) host.appendChild(el("div", { class: "stat-row dash-section" }, chips));
+      var any = false;
+      (d.chapters || []).forEach(function (ch) {
+        if (!(ch.issues || []).length) return;
+        any = true;
+        var block = el("section", { class: "chap-block" }, [
+          el("div", { class: "chap-title" }, [
+            "Chapter " + ch.chapter,
+            el("span", { class: "chap-count", text: ch.issues.length + " issues" }),
+          ]),
+        ]);
+        ch.issues.forEach(function (it) {
+          var kids = [
+            el("span", { class: "issue-id", text: "#" + it.id }),
+            statusBadge(it.status),
+            el("span", { class: "issue-title", title: it.title || "", text: it.title || "(untitled)" }),
+          ];
+          if (it.tier) kids.push(el("span", { class: "issue-tier", text: it.tier }));
+          var row = el("div", { class: "issue-row" + (it.ready ? " is-ready" : "") }, kids);
+          if (it.ready) row.addEventListener("click", function () {
+            switchTab("review"); openIssue(it.id);
+          });
+          block.appendChild(row);
+        });
+        host.appendChild(block);
+      });
+      if (!any) host.appendChild(el("div", { class: "dash-empty", text: "no registered issues" }));
+    }).catch(function (e) { dashError("dash-issues", e); });
+  }
+
+  // --- History tab: issue-status changes + merged PRs ---
+  function renderHistoryTab() {
+    var host = dashHost("dash-history");
+    if (!host) return;
+    host.innerHTML = "";
+    host.appendChild(el("div", { class: "dash-loading", text: "loading history…" }));
+    getJSON("/api/history").then(function (d) {
+      if (state.activeTab !== "history") return;
+      host.innerHTML = "";
+      var vSec = el("section", { class: "dash-section" },
+        [el("div", { class: "dash-h", text: "Issue status changes" })]);
+      if (!(d.verdict_events || []).length)
+        vSec.appendChild(el("div", { class: "dash-empty", text: "no recorded verdicts yet" }));
+      (d.verdict_events || []).forEach(function (e) {
+        vSec.appendChild(el("div", { class: "hist-row" }, [
+          el("span", { class: "hist-ts", text: fmtTs(e.ts) }),
+          el("div", { class: "hist-body" }, [
+            el("span", { class: "job-issue", text: "#" + e.issue_num }), " ",
+            statusBadge(e.verdict),
+            e.notes ? el("div", { class: "dash-empty", text: e.notes }) : null,
+          ]),
+        ]));
+      });
+      host.appendChild(vSec);
+      var pSec = el("section", { class: "dash-section" },
+        [el("div", { class: "dash-h", text: "Merged PRs" })]);
+      if (!(d.merged_prs || []).length)
+        pSec.appendChild(el("div", { class: "dash-empty", text: "none" }));
+      (d.merged_prs || []).forEach(function (p) {
+        pSec.appendChild(el("div", { class: "hist-row" }, [
+          el("span", { class: "hist-ts", text: fmtTs(p.merged_at) }),
+          el("div", { class: "hist-body" }, [
+            el("span", { class: "hist-pr", text: "#" + p.number }), " ",
+            el("span", { text: p.title || "" }),
+          ]),
+        ]));
+      });
+      host.appendChild(pSec);
+    }).catch(function (e) { dashError("dash-history", e); });
+  }
+
   // === wiring ==============================================================
   function attachButtons() {
     document.getElementById("btn-verify").addEventListener("click", actVerify);
@@ -1995,6 +2377,13 @@
       sel.addEventListener("change", function () {
         state.chapter = sel.value;
         refreshQueue();
+      });
+    }
+    // Dashboard tab bar — switching is a pure read (no POST).
+    var tabs = document.querySelectorAll(".tab-btn");
+    for (var i = 0; i < tabs.length; i++) {
+      tabs[i].addEventListener("click", function (e) {
+        switchTab(e.currentTarget.getAttribute("data-tab"));
       });
     }
   }
@@ -2029,6 +2418,7 @@
     hasReconcileDrift: hasReconcileDrift,
     staleCitations: staleCitations,
     reconcileSummary: reconcileSummary,
+    switchTab: switchTab,   // dashboard tab navigation (pure read)
     _state: state,
   };
 })();

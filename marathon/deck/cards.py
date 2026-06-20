@@ -46,6 +46,7 @@ carries its issue title/body, so the deck works on an unaudited chapter.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -880,6 +881,59 @@ _REPO_SCAN_MAX_FILE_BYTES = 2 * 1024 * 1024
 # order, so the cap is stable.
 _MAX_SURFACED_DECLS = 12
 
+# Cap on how many "this may already be formalized" suggestions the flag-missing
+# modal surfaces. Advisory + read-only; keep the list short and high-signal.
+_MAX_MISSING_SUGGESTIONS = 8
+
+
+def _doc_block(source_block: "Optional[str]") -> str:
+    """The text of a decl's LEADING ``/-- … -/`` docstring (the part of its
+    source block ABOVE the keyword), or ``""`` when it has none.
+
+    The result-key gate tests against THIS — the decl's OWN docstring — not its
+    proof body and not a neighbouring decl's docstring that a loose source slice
+    (:func:`_slice_decl_block`) may have bled in past the keyword. Pure."""
+    if not source_block:
+        return ""
+    s = source_block.lstrip()
+    if not s.startswith("/--"):
+        return ""
+    end = s.find("-/")
+    return (s[3:end] if end != -1 else s[3:]).strip()
+
+
+def _doc_summary(source_block: "Optional[str]", limit: int = 200) -> str:
+    """A one-line human snippet for a decl's source block: the first line of its
+    ``/-- … -/`` docstring when present, else the first source line (the
+    signature). Trimmed to ``limit`` chars. Pure; ``""`` for empty input."""
+    doc = _doc_block(source_block)
+    base = doc if doc else (source_block or "").strip()
+    first = next((ln.strip() for ln in base.splitlines() if ln.strip()), "")
+    return first[:limit]
+
+
+def _result_key_pattern(key: str) -> "re.Pattern":
+    """A boundary-anchored matcher for a textbook result key, so a key cannot
+    collide with a LONGER number: ``12.2`` must not match ``12.22``/``12.20`` and
+    ``1.1`` must not match ``1.10``/``21.1``/``v1.1.3``. The key may not be
+    flanked by a digit (either side) or a dot (left side)."""
+    return re.compile(r"(?<![\d.])" + re.escape(key) + r"(?![\d])")
+
+
+def _docstring_result_key(
+    source_block: "Optional[str]", patterns: "dict[str, re.Pattern]"
+) -> "Optional[str]":
+    """The first (sorted) result key whose boundary-anchored pattern appears in
+    the decl's OWN docstring, or ``None``. Deterministic — ``patterns`` is
+    iterated in sorted-key order by the caller's dict construction."""
+    doc = _doc_block(source_block)
+    if not doc:
+        return None
+    for key in patterns:  # insertion order = sorted (built by the caller)
+        if patterns[key].search(doc):
+            return key
+    return None
+
 
 def _locate_decl_site(text: str, decl_name: str):
     """``(sites, target_i)`` — the :func:`scan_lean_source` sites and the
@@ -1041,6 +1095,23 @@ def _tracked_lean_files(repo_dir: Path) -> list[Path]:
     return paths[:_REPO_SCAN_MAX_FILES]
 
 
+def _scan_dir_has_lean(scan_dir: Optional[Path]) -> bool:
+    """True iff ``scan_dir`` contains at least one ``.lean`` file — i.e. there is
+    a real Lean repo we could have found a decl in. Used to decide whether a
+    snapshot-resolved decl with no current source is a STALE CITATION (a by-name
+    miss IS evidence of absence when there are Lean files) or merely unscannable
+    (trust the snapshot). Returns on the first hit, so it is cheap for a Lean
+    repo; ``False`` on any error or an empty/sourceless dir."""
+    if scan_dir is None:
+        return False
+    try:
+        for _ in Path(scan_dir).rglob("*.lean"):
+            return True
+    except OSError:
+        return False
+    return False
+
+
 def _find_decl_source_in_repo(
     repo_dir: Path, decl_name: str
 ) -> tuple[Optional[str], Optional[str]]:
@@ -1070,6 +1141,51 @@ def _find_decl_source_in_repo(
             rel = str(path)
         return _slice_decl_block(text, sites, target_i), rel
     return None, None
+
+
+def _code_decls_in_namespaces(
+    repo_dir: Path, namespaces: "list[str]"
+) -> "dict[str, tuple[str, Optional[str]]]":
+    """Index ``{qualified_name: (source_block, repo_relative_file)}`` of decls in
+    the CURRENT code that are DIRECT members (``<ns>.<leaf>``, no further dot) of
+    one of ``namespaces``.
+
+    A SINGLE pass over the (substring-pre-filtered) tracked ``.lean`` files — the
+    source block is sliced INLINE, so a caller never re-scans the repo per
+    candidate. Recovers decls ADDED or RENAMED after the audit snapshot — present
+    in the code but in NEITHER the snapshot NOR any issue body (the #94 case: the
+    code has the renamed ``…IsSmooth.smul_of_contMDiff`` while the snapshot AND
+    the issue bodies still say the old ``…IsSmooth.smul_smoothFunction``).
+    Deterministic (sorted files; first definition wins); pure read-only; capped
+    on file count + per-file size."""
+    from marathon.formalization import scan_lean_source
+
+    nss = sorted(set(namespaces))
+    if not nss:
+        return {}
+    prefixes = [ns + "." for ns in nss]
+    out: "dict[str, tuple[str, Optional[str]]]" = {}
+    for path in _tracked_lean_files(repo_dir):
+        try:
+            if path.stat().st_size > _REPO_SCAN_MAX_FILE_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not any(ns in text for ns in nss):  # cheap pre-filter
+            continue
+        sites, _ = scan_lean_source(text)
+        try:
+            rel: Optional[str] = str(path.relative_to(repo_dir))
+        except ValueError:
+            rel = str(path)
+        for i, s in enumerate(sites):
+            q = s.qualified or ""
+            for p in prefixes:
+                if q.startswith(p) and "." not in q[len(p):]:
+                    out.setdefault(q, (_slice_decl_block(text, sites, i), rel))
+                    break
+    return out
 
 
 def _build_decl_view(
@@ -1176,12 +1292,21 @@ def _build_decl_view(
     scan_dir = repo_dir
     if scan_dir is None and ctx.snapshot is not None and ctx.snapshot.repo_dir:
         scan_dir = Path(ctx.snapshot.repo_dir)
-    in_code = resolved is not None or source_block is not None
     if source_block is None and scan_dir is not None:
         scanned_block, scanned_file = _find_decl_source_in_repo(scan_dir, name)
         if scanned_block is not None:
             source_block, source_file = scanned_block, scanned_file
-            in_code = True
+    # A decl is IN THE CURRENT CODE iff we have its source — from the snapshot's
+    # (name-checked, current-file) location OR a repo-wide by-name scan.
+    in_code = source_block is not None
+    if not in_code and resolved is not None:
+        # It resolved in the snapshot but we found NO source in the current code.
+        # Treat it as a STALE CITATION (renamed/removed since the audit) ONLY when
+        # there is a scannable Lean repo we could have found it in — there, a
+        # by-name miss is real evidence of absence. With no scannable repo (e.g.
+        # tests, or a snapshot whose repo is gone), the snapshot is the only
+        # source of truth, so trust its resolution.
+        in_code = not _scan_dir_has_lean(scan_dir)
 
     view = DeclView(
         name=name, kind=kind, tier=tier, qualifiers=qualifiers,
@@ -1276,18 +1401,20 @@ def _surface_namespace_decls(
                 seen.add(name)
                 break
 
-    # Keep only candidates whose SOURCE DOCSTRING references the issue's
-    # textbook result (e.g. "Proposition 12.19(b)") — the precise signal that a
-    # decl is ANOTHER PART of the same result (the missing (b)/(d)
-    # characterizations), vs unrelated plumbing (algebra instances, pullback
-    # helpers) that merely shares the namespace.
+    # Keep only candidates whose OWN DOCSTRING references the issue's textbook
+    # result (e.g. "Proposition 12.19(b)") — the signal that a decl is ANOTHER
+    # PART of the same result (the missing (b)/(d) characterizations), vs
+    # unrelated plumbing (algebra instances, pullback helpers) that merely shares
+    # the namespace. Matched with a boundary-anchored pattern against the decl's
+    # leading docstring (so "12.19" never matches "12.190" and a number in the
+    # proof body / a bled-in neighbour docstring can't trigger it).
+    key_patterns = {k: _result_key_pattern(k) for k in sorted(result_keys)}
     out: list[DeclView] = []
     for name in candidates:
         if len(out) >= _MAX_SURFACED_DECLS:
             break
         view = _build_decl_view(ctx, ledger, name, repo_dir)
-        src = view.source_block or ""
-        match = next((k for k in result_keys if k in src), None)
+        match = _docstring_result_key(view.source_block, key_patterns)
         if match is None:
             continue
         out.append(replace(
@@ -1339,6 +1466,96 @@ def surfaced_decls_for_issue(
         ctx, cited_names, ledger, Path(cfg.repo_dir),
         exclude_names=exclude, result_keys=result_keys,
     )
+
+
+def missing_suggestions_for_issue(
+    cfg: "ReviewConfig", issue_num: int
+) -> list[dict]:
+    """PURE read: declarations that the issue's title-promised result may
+    ALREADY be formalized as — surfaced when the reviewer opens "flag a missing
+    declaration", so a false "missing" doesn't dispatch a REDUNDANT Aristotle
+    ADD (the #94 incident: the "function multiplication" case the reviewer
+    flagged missing already existed as ``…IsSmooth.smul_of_contMDiff``, owned by
+    sibling issue #92).
+
+    The candidate pool is the CURRENT CODE (built from a SINGLE repo scan): the
+    decls that are direct members of one of the issue's cited namespaces and that
+    the issue does NOT itself cite. A candidate is kept only when its OWN leading
+    docstring references the issue's textbook result-key — matched with a
+    boundary-anchored pattern (so ``12.2`` never matches ``12.22``) against the
+    docstring alone (so a number in the proof body, or a neighbouring decl's
+    docstring bled in by a loose source slice, can't trigger it).
+
+    Scanning the code — not the snapshot or the issue bodies — is load-bearing:
+    the #94 case is a POST-snapshot RENAME (``smul_smoothFunction`` →
+    ``smul_of_contMDiff`` in PR #107), so the renamed decl exists ONLY in the
+    code; neither the snapshot nor any body knows the new name. Only an IN-CODE
+    decl can be "already formalized", so the code is also the authoritative pool.
+
+    Writes nothing; fires no verdict. Returns advisory dicts (``decl``,
+    ``matched_key``, ``cited_by`` — possibly empty for an uncited duplicate,
+    ``in_code``, ``source_file``, ``snippet``), ranked sibling-owned-first then
+    by name, capped at :data:`_MAX_MISSING_SUGGESTIONS`. ``[]`` when the title is
+    un-numbered or there is no scannable code."""
+    chapter = cfg.chapter_of_issue(issue_num)
+    chapter_nums = _chapter_issue_nums(cfg, chapter)
+    if issue_num not in chapter_nums:
+        chapter_nums = [issue_num, *chapter_nums]
+    ctx = _load_context(cfg, chapter_nums)
+    repo_dir = Path(cfg.repo_dir)
+
+    # Un-numbered ("def") issues have no result to be "missing a part of" — the
+    # body's citations are authoritative (parity with surfacing).
+    meta = ctx.issue_meta.get(issue_num) or {}
+    result_keys = _textbook_result_keys(meta.get("title") or "")
+    if not result_keys:
+        return []
+    # "Already formalized" means present in the CODE — need a scannable Lean repo.
+    if not _scan_dir_has_lean(repo_dir):
+        return []
+
+    # The issue's OWN citations (resolved) + their namespaces — the search scope.
+    cited_self = _decls_for_issue(ctx, issue_num)
+    cited_resolved = {
+        _resolve_to_snapshot(ctx, raw) or raw for raw in cited_self
+    }
+    namespaces = _namespace_prefixes(sorted(cited_resolved))
+    if not namespaces:
+        return []
+
+    # Which chapter issue(s) cite each decl (resolved-or-raw name → issues) — for
+    # the cited_by annotation (a sibling owning the decl is a stronger signal).
+    decl_to_issues = _decl_to_issues(ctx, chapter_nums)
+    # Boundary-anchored key patterns, built ONCE in sorted-key order (so the
+    # reported matched_key is deterministic for a multi-key title).
+    key_patterns = {k: _result_key_pattern(k) for k in sorted(result_keys)}
+
+    # The candidate pool IS the current code: direct namespace members with their
+    # source, from a single indexed scan (no per-candidate repo rescan).
+    code_index = _code_decls_in_namespaces(repo_dir, namespaces)
+
+    matches: list[dict] = []
+    for name in sorted(code_index):
+        if name in cited_resolved:
+            continue
+        source_block, source_file = code_index[name]
+        match = _docstring_result_key(source_block, key_patterns)
+        if match is None:
+            continue
+        cited_by = sorted(decl_to_issues.get(name, set()) - {issue_num})
+        matches.append({
+            "decl": name,
+            "matched_key": match,
+            "cited_by": cited_by,
+            "in_code": True,
+            "source_file": source_file,
+            "snippet": _doc_summary(source_block),
+        })
+    # Rank sibling-OWNED first (a decl another issue explicitly cites is a
+    # stronger "already exists" signal than a same-namespace uncited match),
+    # then by name. Then cap.
+    matches.sort(key=lambda m: (not m["cited_by"], m["decl"]))
+    return matches[:_MAX_MISSING_SUGGESTIONS]
 
 
 def _textbook_result_keys(title: str) -> "set[str]":

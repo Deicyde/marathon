@@ -292,6 +292,43 @@ def test_card_labels_absent_decl_as_stale_citation(tmp_path, monkeypatch):
     assert ghost.api is False
 
 
+def test_snapshot_decl_renamed_in_repo_is_stale(tmp_path, monkeypatch):
+    """The reported bug: a decl present in a STALE snapshot but renamed/removed
+    in the CURRENT code (no source found by extraction OR by-name scan) must read
+    in_code=false — a stale citation, not a phantom card with no source.
+    Snapshot resolution ALONE is not 'in the current code'."""
+    cfg = make_cfg(tmp_path)
+    _write_source(cfg)   # Demo/Chapter14.lean has Foo + Bar — NOT 'Renamed'
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo"),
+        _decl("Demo.Chapter14.Renamed"),   # in the (stale) snapshot, absent from code
+    ], cfg.repo_dir))
+    patch_bulk(monkeypatch, {
+        22: {"title": "#22", "state": "OPEN",
+             "body": _bundle_body("Foo", "Renamed"), "labels": set()},
+    })
+    detail = cards.build_card_detail(cfg, 22)
+    renamed = {d.name: d for d in detail.decls}["Demo.Chapter14.Renamed"]
+    assert renamed.in_code is False        # resolved in snapshot, but gone from code
+    assert renamed.source_block is None
+
+
+def test_snapshot_decl_in_code_when_no_lean_repo(tmp_path, monkeypatch):
+    """Safety valve: with NO scannable Lean repo (no .lean files), a
+    snapshot-resolved decl whose source can't be extracted stays in_code=true —
+    the snapshot is then the only source of truth (e.g. unit-test fixtures)."""
+    cfg = make_cfg(tmp_path)
+    # NO _write_source: the repo has no .lean files to scan.
+    install_snapshot(cfg, make_snapshot([_decl("Demo.Chapter14.Foo")], cfg.repo_dir))
+    patch_bulk(monkeypatch, {
+        22: {"title": "#22", "state": "OPEN",
+             "body": _bundle_body("Foo"), "labels": set()},
+    })
+    detail = cards.build_card_detail(cfg, 22)
+    foo = {d.name: d for d in detail.decls}["Demo.Chapter14.Foo"]
+    assert foo.in_code is True             # no .lean repo → trust the snapshot
+
+
 def test_card_decl_view_serializes_new_fields(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path)
     _write_source(cfg)

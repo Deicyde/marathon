@@ -19,7 +19,7 @@ from typing import Optional
 # Reserved store key for the subdeck's ONE informal-text approval verdict (the
 # leading approval card). Mirrors the live contract: never a real decl name, so
 # it stays out of the reviewable set / progress / summary / ship.
-from marathon.deck.subdeck import INFORMAL_KEY
+from marathon.deck.subdeck import INFORMAL_KEY, MISSING_KEY
 
 # --- demo content -----------------------------------------------------------
 # Each issue is a "subdeck" of declarations. Tiers/evidence are fixed (in live
@@ -407,10 +407,43 @@ def demo_subdeck(issue_id: int, *, skip_api: bool = False) -> dict:
             # The leading informal-approval slot (None when no decl is
             # LLM-rendered) — mirrors the live subdeck shape; OUTSIDE the cards.
             "informal": _informal_slot(issue_id, reviewable),
+            # The issue-level "something is MISSING" note (or None).
+            "missing": (_VERDICTS.get(issue_id, {}).get(MISSING_KEY) or {}).get("note"),
             # Reconciliation outputs (PURE — mirror the live subdeck shape).
             "stale_citations": stale_citations,
             "reconcile": reconcile,
         }
+
+
+def demo_missing_suggestions(issue_id: int) -> list:
+    """SIMULATED "this may already exist" candidates for the flag-missing modal
+    (mirrors cards.missing_suggestions_for_issue's shape). Canned for the demo's
+    tensor-product / function-multiplication issue; [] otherwise."""
+    iss = _BY_ID.get(issue_id) or {}
+    title = (iss.get("title") or "").lower()
+    if "function multiplication" in title or "12.22" in title:
+        return [{
+            "decl": "MixedTensorField.IsSmooth.smul_of_contMDiff",
+            "matched_key": "12.22",
+            "cited_by": [],
+            "in_code": True,
+            "source_file": "GeometricAnalysis/LeeSM/Chapter12/TensorField.lean",
+            "snippet": "Multiplication by a smooth function preserves smoothness "
+                       "of mixed tensor fields.",
+        }]
+    return []
+
+
+def demo_record_missing(issue_id: int, note=None) -> dict:
+    """SIMULATED missing-note record/clear (mirrors subdeck.record_missing)."""
+    with _LOCK:
+        text = (note or "").strip()
+        decls = _VERDICTS.setdefault(issue_id, {})
+        if text:
+            decls[MISSING_KEY] = {"verdict": "missing", "note": text}
+        else:
+            decls.pop(MISSING_KEY, None)
+        return {"ok": True, "missing": (decls.get(MISSING_KEY) or {}).get("note")}
 
 
 def demo_record_verdict(issue_id: int, decl: str, verdict: str, note=None) -> dict:
@@ -440,7 +473,7 @@ def demo_record_verdict(issue_id: int, decl: str, verdict: str, note=None) -> di
         }
 
 
-def _compose_ship_note(issue_id: int, summary: dict) -> str:
+def _compose_ship_note(issue_id: int, summary: dict, missing=None) -> str:
     keep = summary["kept"]
     fix = summary["rejected"]
     lines = [f"Per-declaration review of issue #{issue_id}.", ""]
@@ -454,6 +487,13 @@ def _compose_ship_note(issue_id: int, summary: dict) -> str:
     if fix:
         lines.append("FIX these declarations (rejected):")
         lines += [f"- {r['name']}: {r['note']}" for r in fix]
+        lines.append("")
+    if (missing or "").strip():
+        lines.append("ADD the missing declaration(s):")
+        lines += [
+            (ln if ln.lstrip().startswith("-") else f"- {ln.rstrip()}")
+            for ln in missing.strip().splitlines()
+        ]
         lines.append("")
     lines.append("Leave all other code untouched.")
     return "\n".join(lines)
@@ -518,8 +558,9 @@ def demo_ship(issue_id: int, *, skip_api: bool = False) -> dict:
             "\n\nMarked the issue's informal statement verified (LLM-rendered "
             "marker flipped)." if informal_verified else ""
         )
-        if summary["rejected"]:
-            note = _compose_ship_note(issue_id, composed)
+        missing = (_VERDICTS.get(issue_id, {}).get(MISSING_KEY) or {}).get("note")
+        if summary["rejected"] or missing:
+            note = _compose_ship_note(issue_id, composed, missing)
             outcome = "shipped"
             message = (
                 "DEMO — not actually sent. In live mode this composed "

@@ -74,6 +74,14 @@ REVIEWED_DECL_VERDICTS = frozenset({"verify", "reject"})
 #: LLM-rendered warning and, at ship, flips the issue body's informal marker.
 INFORMAL_KEY = "__informal__"
 
+#: Reserved store key for the issue's "something is MISSING" note — a per-issue
+#: free-text instruction that a result the title promises has NO declaration yet
+#: (e.g. Prop 12.22 cites the tensor-product case but not the function-
+#: multiplication case). It is NOT a decl name, so (like INFORMAL_KEY) it never
+#: becomes a card or enters progress/summary. At ship it makes the outcome route
+#: to Aristotle with an ADD section even when every existing decl is verified.
+MISSING_KEY = "__missing__"
+
 #: The STORED per-decl verdict (``verify``/``reject``/``defer``) → the
 #: PAST-TENSE verdict the deck FRONTEND consumes on a serialized card
 #: (``app.js`` renders ``card.verdict`` as the tag text + the ``dv-<verdict>``
@@ -176,13 +184,80 @@ def record_decl_verdict(
     return decls[decl]
 
 
+def record_missing(
+    cfg: "ReviewConfig", issue_num: int, note: Optional[str]
+) -> Optional[dict]:
+    """Record (or CLEAR) the issue's "something is MISSING" note — a per-issue
+    instruction that the issue is incomplete (a result the title promises has no
+    declaration). A non-empty ``note`` stores it under :data:`MISSING_KEY`; an
+    empty/None ``note`` clears the flag. Returns the stored record (or None when
+    cleared). LOCAL ONLY — writes the sidecar; the irreversible step is
+    :func:`ship_issue`, where a present note routes the outcome to Aristotle."""
+    store = _load_store(cfg)
+    decls = store.setdefault(str(issue_num), {})
+    text = (note or "").strip()
+    if not text:
+        decls.pop(MISSING_KEY, None)
+        if not decls:
+            store.pop(str(issue_num), None)
+        _save_store(cfg, store)
+        return None
+    decls[MISSING_KEY] = {
+        "verdict": "missing",
+        "note": text,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_store(cfg, store)
+    return decls[MISSING_KEY]
+
+
 def clear_issue(cfg: "ReviewConfig", issue_num: int) -> None:
-    """Drop an issue's whole subdeck store (called after a successful ship so
-    a shipped issue's local review state never lingers). No-op when absent."""
+    """Drop an issue's whole subdeck store (called after a successful VERIFY
+    ship so a finished issue's local review state never lingers). No-op when
+    absent."""
     store = _load_store(cfg)
     if str(issue_num) in store:
         store.pop(str(issue_num))
         _save_store(cfg, store)
+
+
+def _persist_kept_verdicts(
+    cfg: "ReviewConfig", issue_num: int, subdeck: dict, kept_names: list
+) -> list[str]:
+    """After a REJECT ship, REWRITE the issue's store to keep ONLY the human
+    KEPT (verified) decls — each pinned to its CURRENT source
+    :func:`_decl_fingerprint` — plus the informal approval; everything else
+    (the rejected decls Aristotle will fix) is dropped. So when the refined
+    issue returns, the kept decls are already verified (no re-review) UNLESS
+    their source changed (then the fingerprint mismatch re-opens them). Returns
+    the decl names carried over. The store is wiped if nothing is kept."""
+    store = _load_store(cfg)
+    old = store.get(str(issue_num), {})
+    card_by_name = {c.get("name"): c for c in subdeck.get("cards", [])}
+    new_entry: dict = {}
+    carried: list[str] = []
+    for name in kept_names:
+        rec = old.get(name)
+        if not rec or rec.get("verdict") != "verify":
+            continue
+        card = card_by_name.get(name)
+        new_entry[name] = {
+            "verdict": "verify",
+            "note": rec.get("note"),
+            "ts": rec.get("ts"),
+            "fingerprint": _decl_fingerprint(card) if card else None,
+        }
+        carried.append(name)
+    # The informal approval is issue-level (the body marker was flipped at ship)
+    # — keep it so the human is not re-asked to approve the same statement.
+    if INFORMAL_KEY in old:
+        new_entry[INFORMAL_KEY] = old[INFORMAL_KEY]
+    if new_entry:
+        store[str(issue_num)] = new_entry
+    else:
+        store.pop(str(issue_num), None)
+    _save_store(cfg, store)
+    return carried
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +265,27 @@ def clear_issue(cfg: "ReviewConfig", issue_num: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _decl_card(view, record: Optional[dict]) -> dict:
+def _decl_fingerprint(view_or_card) -> str:
+    """A stable content hash of a declaration — its ``.lean`` source if we have
+    it, else the elaborated type, else the name. Used to PIN a carried-over
+    verdict: an approved decl stays approved across a reject→refine→re-review
+    cycle ONLY while this hash is unchanged (i.e. Aristotle did not alter it).
+    Accepts a DeclView (object) or a serialized card (dict) — same basis either
+    way, so a fingerprint taken at ship matches the one taken at re-review."""
+    import hashlib
+
+    if isinstance(view_or_card, dict):
+        basis = (view_or_card.get("source_block")
+                 or view_or_card.get("statement_pp")
+                 or view_or_card.get("name") or "")
+    else:
+        basis = (getattr(view_or_card, "source_block", None)
+                 or getattr(view_or_card, "statement_pp", None)
+                 or getattr(view_or_card, "name", None) or "")
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def _decl_card(view, record: Optional[dict], carry: Optional[str] = None) -> dict:
     """One subdeck card: a :class:`marathon.deck.cards.DeclView`'s JSON face
     plus the overlaid LOCAL verdict/note from the store (``None`` when the
     declaration has not been reviewed yet).
@@ -198,11 +293,18 @@ def _decl_card(view, record: Optional[dict]) -> dict:
     The verdict is mapped to the PAST-TENSE wire form (:data:`_VERDICT_WIRE`)
     the frontend renders/styles — the stored sidecar stays present-tense (the
     ship composition keys off it); only this serialized face is mapped so the
-    GET /api/subdeck seam matches what ``app.js`` consumes."""
+    GET /api/subdeck seam matches what ``app.js`` consumes.
+
+    ``carry`` flags a verdict CARRIED OVER from a prior ship: ``"carried_over"``
+    (the decl was approved before and is unchanged — pre-verified, no re-review)
+    or ``"changed"`` (approved before but its source changed — the verdict was
+    dropped by the caller, so this is shown unreviewed with a re-review flag)."""
     card = view.to_json()
     stored = (record or {}).get("verdict")
     card["verdict"] = _VERDICT_WIRE.get(stored, stored)
     card["note"] = (record or {}).get("note")
+    card["carried_over"] = carry == "carried_over"
+    card["changed_since_review"] = carry == "changed"
     return card
 
 
@@ -326,13 +428,35 @@ def build_subdeck(
     # decls (stale dropped). This is what the partition below operates on.
     reconciled_views = list(cited_in_code) + list(surfaced_views)
 
+    # CARRIED-OVER verdicts: a verdict persisted from a prior ship carries a
+    # ``fingerprint`` and only STANDS while the decl is unchanged. Compute the
+    # effective record + a carry-status per decl ONCE, and read it everywhere
+    # the store is consulted (partition / cards / progress / summary) — so a
+    # 'kept' decl Aristotle actually altered is re-reviewed, while an untouched
+    # one is not. An ordinary current-session verdict (no fingerprint) is
+    # unaffected.
+    view_by_name = {v.name: v for v in reconciled_views}
+
+    def _effective(name):
+        rec = records.get(name)
+        if not rec:
+            return None, None
+        if rec.get("fingerprint") is None:
+            return rec, None
+        view = view_by_name.get(name)
+        if view is not None and _decl_fingerprint(view) != rec["fingerprint"]:
+            return None, "changed"
+        return rec, "carried_over"
+
+    eff = {v.name: _effective(v.name) for v in reconciled_views}
+
     # Partition the views into MAIN vs API. An explicit human reject of an API
     # decl pulls it back to MAIN (the human chose to review it), so it always
     # shows in ``cards`` and never silently auto-approves.
     main_views = []
     api_views = []
     for view in reconciled_views:
-        rec = records.get(view.name)
+        rec = eff[view.name][0]
         rejected_by_human = (rec or {}).get("verdict") == "reject"
         if skip_api and view.api and not rejected_by_human:
             api_views.append(view)
@@ -340,7 +464,7 @@ def build_subdeck(
             main_views.append(view)
 
     def _build_cards(views: list) -> list[dict]:
-        return [_decl_card(v, records.get(v.name)) for v in views]
+        return [_decl_card(v, *eff[v.name]) for v in views]
 
     cards = _build_cards(main_views)
     auto_approved = _build_cards(api_views) if skip_api else []
@@ -348,7 +472,7 @@ def build_subdeck(
     # Order: UNREVIEWED first (so the next decl to review leads), then by
     # worst tier (the gating decl), then by name — a total, deterministic key.
     def _sort_key(card: dict) -> tuple:
-        reviewed = _is_reviewed(records.get(card["name"]))
+        reviewed = _is_reviewed(eff.get(card["name"], (None, None))[0])
         tier = card.get("tier")
         tier_rank = TIER_ORDER.index(tier) if tier in TIER_ORDER else 0
         return (1 if reviewed else 0, tier_rank, card["name"])
@@ -360,7 +484,7 @@ def build_subdeck(
     # skip_api, the API decls are not the human's to review (ship approves
     # them), so they are excluded from the denominator.
     total = len(cards)
-    reviewed = sum(1 for c in cards if _is_reviewed(records.get(c["name"])))
+    reviewed = sum(1 for c in cards if _is_reviewed(eff.get(c["name"], (None, None))[0]))
     complete = total > 0 and reviewed == total
 
     kept: list[str] = []
@@ -370,7 +494,7 @@ def build_subdeck(
     # not the raw citations — a stale-cited decl is dropped (it is never a
     # reviewable card) and a surfaced decl is included.
     for view in reconciled_views:
-        rec = records.get(view.name)
+        rec = eff[view.name][0]
         verdict = (rec or {}).get("verdict")
         if verdict == "verify":
             kept.append(view.name)
@@ -395,6 +519,11 @@ def build_subdeck(
         # at the issue level covers the whole result (NOT decl-by-decl). Lives
         # OUTSIDE cards — never counted in progress/completeness/summary.
         "informal": _informal_slot(detail, records),
+        # The issue-level "something is MISSING" note (or None) — a per-issue
+        # flag that the issue is incomplete; at ship it routes to Aristotle with
+        # an ADD instruction even when every existing decl is verified. OUTSIDE
+        # cards (keyed by MISSING_KEY) — never counted in progress/summary.
+        "missing": (records.get(MISSING_KEY) or {}).get("note"),
         # Reconciliation outputs (PURE — computed, written nowhere):
         "stale_citations": stale_citations,
         "reconcile": reconcile,
@@ -420,18 +549,22 @@ def next_unreviewed_card(subdeck: dict) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 
-def compose_ship_note(issue_num: int, summary: dict) -> str:
+def compose_ship_note(
+    issue_num: int, summary: dict, missing: Optional[str] = None
+) -> str:
     """The composite reject note (the shared contract's exact format).
 
     Human-authored composite — NO Claude — listing the KEPT declarations
-    (verified exactly as written, never to be changed) and the FIXED
-    declarations (rejected, each with the human's verbatim note). This is the
+    (verified exactly as written, never to be changed), the FIXED declarations
+    (rejected, each with the human's verbatim note), and — when the human flagged
+    the issue incomplete — an ADD section carrying the verbatim "what is missing"
+    note (a result the title promises but no declaration covers). This is the
     note :func:`ship_issue` carries VERBATIM to ``cmd_reject`` (the committed
     Claude-bypass), so Aristotle sees precisely what the human wrote.
 
-    Pure: derives entirely from ``summary`` (the ``build_subdeck`` shape).
-    A KEEP/FIX section with no members still renders its header so the note's
-    structure is stable."""
+    Pure: derives entirely from ``summary`` + ``missing``. A KEEP/FIX section
+    with no members still renders its header so the note's structure is stable;
+    the ADD section is omitted entirely when nothing is missing."""
     kept = summary.get("kept", [])
     rejected = summary.get("rejected", [])
 
@@ -447,6 +580,16 @@ def compose_ship_note(issue_num: int, summary: dict) -> str:
     for item in rejected:
         lines.append(f"- {item.get('name')}: {item.get('note')}")
     lines.append("")
+    missing_text = (missing or "").strip()
+    if missing_text:
+        lines.append(
+            "ADD the missing declaration(s) — a result this issue's title "
+            "promises is not yet formalized; add it (and keep everything above):"
+        )
+        for ln in missing_text.splitlines():
+            ln = ln.rstrip()
+            lines.append(ln if ln.lstrip().startswith("-") else f"- {ln}")
+        lines.append("")
     lines.append("Leave all other code untouched.")
     return "\n".join(lines)
 
@@ -540,14 +683,24 @@ def ship_issue(
             + ", ".join(auto_names)
         )
 
-    if summary["rejected"]:
-        note = compose_ship_note(issue_num, composed_summary)
+    # The issue's "something is MISSING" note (a result the title promises but no
+    # decl covers). When present it routes to Aristotle with an ADD section EVEN
+    # IF every existing decl was verified — the issue is incomplete, not done.
+    missing = subdeck.get("missing")
+
+    if summary["rejected"] or missing:
+        note = compose_ship_note(issue_num, composed_summary, missing)
         apply_verdict(cfg, issue_num, "reject", note=note)
         outcome = "shipped"
+        n_fix = len(summary["rejected"])
+        bits = []
+        if n_fix:
+            bits.append(f"{n_fix} sent back to Aristotle to fix")
+        if missing:
+            bits.append("a missing declaration to add")
         message = (
             f"#{issue_num} shipped: {len(kept)} kept, "
-            f"{len(summary['rejected'])} sent back to Aristotle "
-            f"(note verbatim){auto_clause}"
+            + " + ".join(bits) + f" (note verbatim){auto_clause}"
         )
     else:
         apply_verdict(cfg, issue_num, "verify")
@@ -607,7 +760,17 @@ def ship_issue(
                 f"#{issue_num}: {exc}"
             )
 
-    clear_issue(cfg, issue_num)
+    # Local store cleanup. A VERIFY ship finishes the issue → wipe everything.
+    # A REJECT ship sends only the rejected decls to Aristotle (the KEPT ones are
+    # told to stay unchanged), so PERSIST the human-verified verdicts — pinned to
+    # their current source — and drop the rest. When the refined issue comes back
+    # the human re-reviews only the FIXED decls; an untouched 'kept' decl stays
+    # approved (and is re-reviewed automatically if Aristotle altered it anyway).
+    carried_over: list[str] = []
+    if outcome == "shipped":
+        carried_over = _persist_kept_verdicts(cfg, issue_num, subdeck, summary["kept"])
+    else:
+        clear_issue(cfg, issue_num)
     return {
         "ok": True,
         "outcome": outcome,
@@ -615,5 +778,6 @@ def ship_issue(
         "auto_approved": auto_names,
         "added_to_issue": added_to_issue,
         "informal_verified": informal_verified,
+        "carried_over": carried_over,
         "advanced_to_issue": _next_ready_issue(cfg, issue_num),
     }

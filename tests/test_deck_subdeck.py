@@ -424,8 +424,16 @@ def test_ship_any_rejected_routes_cmd_reject_verbatim(tmp_path, monkeypatch):
         "deferred": [],
     })
     assert note == expected_note
-    # The store is cleared on a successful ship.
-    assert subdeck.issue_verdicts(cfg, 22) == {}
+    # A REJECT ship PERSISTS the KEPT (verified) decls — pinned to their current
+    # source — so the human does not re-review unchanged 'kept' decls when the
+    # refined issue returns; the REJECTED decl (Aristotle will fix it) is dropped.
+    assert out["carried_over"] == ["Demo.Chapter14.Baz", "Demo.Chapter14.Foo"]
+    persisted = subdeck.issue_verdicts(cfg, 22)
+    assert set(persisted) == {"Demo.Chapter14.Foo", "Demo.Chapter14.Baz"}
+    assert "Demo.Chapter14.Bar" not in persisted          # rejected → dropped
+    for name in ("Demo.Chapter14.Foo", "Demo.Chapter14.Baz"):
+        assert persisted[name]["verdict"] == "verify"
+        assert persisted[name].get("fingerprint")          # pinned to source
 
 
 def test_ship_advances_to_next_ready_issue(tmp_path, monkeypatch):
@@ -556,6 +564,50 @@ def test_decl_verdict_endpoint_records_locally(running_server, monkeypatch):
         == "verify"
 
 
+def test_missing_suggestions_is_pure_get(running_server, monkeypatch):
+    server, base, _token, _cfg = running_server
+    from marathon.review import review as review_mod
+    monkeypatch.setattr(review_mod, "cmd_verify",
+                        lambda args: pytest.fail("suggestions GET must not verify"))
+    monkeypatch.setattr(review_mod, "cmd_reject",
+                        lambda args: pytest.fail("suggestions GET must not reject"))
+    # Pure read: 200 with the {issue, candidates:[...]} shape, NO token needed.
+    status, body = _get(base + "/api/missing-suggestions/22")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["issue"] == 22
+    assert isinstance(payload["candidates"], list)
+    # Not a side-effecting POST route.
+    assert "/api/missing-suggestions/22" not in deck_server.DeckHandler._POST_ROUTES
+    # Malformed id → 400.
+    assert _get(base + "/api/missing-suggestions/notanint")[0] == 400
+
+
+def test_missing_endpoint_records_locally_and_needs_token(running_server, monkeypatch):
+    server, base, token, cfg = running_server
+    from marathon.review import review as review_mod
+    monkeypatch.setattr(review_mod, "cmd_verify",
+                        lambda args: pytest.fail("missing-note must not verify"))
+    monkeypatch.setattr(review_mod, "cmd_reject",
+                        lambda args: pytest.fail("missing-note must not reject"))
+
+    # no token → 403, nothing written
+    status, _ = _post(base + "/api/missing",
+                      {"issue": 22, "note": "function-multiplication lemma"})
+    assert status == 403
+    assert subdeck.issue_verdicts(cfg, 22) == {}
+
+    # with token → recorded LOCALLY, surfaced in the response
+    status, body = _post(
+        base + "/api/missing",
+        {"issue": 22, "note": "function-multiplication lemma"},
+        headers={deck_server.TOKEN_HEADER: token},
+    )
+    assert status == 200
+    assert json.loads(body)["missing"] == "function-multiplication lemma"
+    assert subdeck.build_subdeck(cfg, 22)["missing"] == "function-multiplication lemma"
+
+
 def test_decl_verdict_reject_without_note_is_400(running_server):
     _server, base, token, _cfg = running_server
     status, _ = _post(
@@ -619,3 +671,116 @@ def test_ship_endpoint_incomplete_returns_ok_false(running_server, monkeypatch):
     assert payload["ok"] is False
     assert "reason" in payload
     assert calls == {}  # NO irreversible action fired
+
+
+# --- carried-over verdicts (reject -> refine -> re-review remembers approvals) -
+
+def test_decl_fingerprint_tracks_source():
+    a = {"name": "N.A", "source_block": "def A := 0"}
+    a2 = {"name": "N.A", "source_block": "def A := 0"}      # identical source
+    a3 = {"name": "N.A", "source_block": "def A := 1"}      # changed source
+    assert subdeck._decl_fingerprint(a) == subdeck._decl_fingerprint(a2)
+    assert subdeck._decl_fingerprint(a) != subdeck._decl_fingerprint(a3)
+
+
+def test_persist_kept_verdicts_keeps_verified_drops_rejected(tmp_path, monkeypatch):
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    subdeck._save_store(cfg, {"22": {
+        "Demo.Chapter14.Foo": {"verdict": "verify", "note": None, "ts": "t"},
+        "Demo.Chapter14.Bar": {"verdict": "reject", "note": "fix", "ts": "t"},
+        subdeck.INFORMAL_KEY: {"verdict": "verify", "note": None, "ts": "t"},
+    }})
+    sd = {"cards": [
+        {"name": "Demo.Chapter14.Foo", "source_block": "def Foo := 0"},
+        {"name": "Demo.Chapter14.Bar", "source_block": "def Bar := 1"},
+    ]}
+    carried = subdeck._persist_kept_verdicts(cfg, 22, sd, ["Demo.Chapter14.Foo"])
+
+    assert carried == ["Demo.Chapter14.Foo"]
+    store = subdeck.issue_verdicts(cfg, 22)
+    assert "Demo.Chapter14.Bar" not in store               # rejected dropped
+    assert store["Demo.Chapter14.Foo"]["verdict"] == "verify"
+    assert store["Demo.Chapter14.Foo"]["fingerprint"] == subdeck._decl_fingerprint(
+        {"source_block": "def Foo := 0"})
+    assert subdeck.INFORMAL_KEY in store                   # informal kept
+
+
+def test_carried_over_verdict_stands_when_source_unchanged(tmp_path, monkeypatch):
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    sd = subdeck.build_subdeck(cfg, 22)
+    foo = next(c for c in sd["cards"] if c["name"] == "Demo.Chapter14.Foo")
+    # craft a persisted verdict pinned to Foo's CURRENT source → unchanged
+    subdeck._save_store(cfg, {"22": {"Demo.Chapter14.Foo": {
+        "verdict": "verify", "note": None, "ts": "t",
+        "fingerprint": subdeck._decl_fingerprint(foo),
+    }}})
+
+    sd2 = subdeck.build_subdeck(cfg, 22)
+    foo2 = next(c for c in sd2["cards"] if c["name"] == "Demo.Chapter14.Foo")
+    assert foo2["verdict"] == "verified" and foo2["carried_over"] is True
+    assert foo2["changed_since_review"] is False
+    # it counts as REVIEWED (no re-review needed)
+    assert any(c["name"] == "Demo.Chapter14.Foo" for c in sd2["cards"])
+    assert "Demo.Chapter14.Foo" in sd2["summary"]["kept"]
+
+
+def test_carried_over_verdict_reopens_when_source_changed(tmp_path, monkeypatch):
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    # a persisted verdict pinned to a STALE fingerprint (Aristotle altered it)
+    subdeck._save_store(cfg, {"22": {"Demo.Chapter14.Foo": {
+        "verdict": "verify", "note": None, "ts": "t",
+        "fingerprint": "STALE_DIFFERENT_HASH",
+    }}})
+
+    sd = subdeck.build_subdeck(cfg, 22)
+    foo = next(c for c in sd["cards"] if c["name"] == "Demo.Chapter14.Foo")
+    assert foo["verdict"] is None and foo["changed_since_review"] is True
+    assert foo["carried_over"] is False
+    # it is NOT counted kept (must be re-reviewed)
+    assert "Demo.Chapter14.Foo" not in sd["summary"]["kept"]
+
+
+# --- "something is MISSING": ADD-to-Aristotle for an incomplete issue --------
+
+def test_record_missing_round_trip_and_clear(tmp_path, monkeypatch):
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    assert subdeck.build_subdeck(cfg, 22)["missing"] is None
+    subdeck.record_missing(cfg, 22, "  function-multiplication lemma  ")
+    assert subdeck.build_subdeck(cfg, 22)["missing"] == "function-multiplication lemma"
+    # the missing note is NOT a card / not in progress / not in summary
+    sd = subdeck.build_subdeck(cfg, 22)
+    assert subdeck.MISSING_KEY not in {c["name"] for c in sd["cards"]}
+    # clearing drops it
+    subdeck.record_missing(cfg, 22, "")
+    assert subdeck.build_subdeck(cfg, 22)["missing"] is None
+
+
+def test_compose_ship_note_add_section():
+    summary = {"kept": ["N.A"], "rejected": [], "deferred": []}
+    note = subdeck.compose_ship_note(22, summary, "function multiplication case")
+    assert "ADD the missing declaration(s)" in note
+    assert "- function multiplication case" in note
+    assert "KEEP these declarations" in note
+    # no missing → no ADD section at all
+    assert "ADD" not in subdeck.compose_ship_note(22, summary)
+
+
+def test_ship_with_missing_only_routes_to_aristotle(tmp_path, monkeypatch):
+    """Every decl verified BUT a missing-declaration flagged → ships to Aristotle
+    (cmd_reject) with an ADD section, NOT marked verified."""
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    calls = patch_no_verdict_handlers(monkeypatch)
+    for d in ("Foo", "Bar", "Baz"):
+        subdeck.record_decl_verdict(cfg, 22, f"Demo.Chapter14.{d}", "verify")
+    subdeck.record_missing(cfg, 22, "function-multiplication case: f • A is smooth")
+
+    out = subdeck.ship_issue(cfg, 22)
+
+    assert out["ok"] is True and out["outcome"] == "shipped"   # NOT "verified"
+    assert "reject" in calls and "verify" not in calls
+    note = calls["reject"].notes
+    assert "KEEP these declarations" in note
+    assert "ADD the missing declaration(s)" in note
+    assert "function-multiplication case: f • A is smooth" in note
+    # the missing note is consumed at ship (the kept verdicts persist; missing not)
+    assert subdeck.build_subdeck(cfg, 22)["missing"] is None

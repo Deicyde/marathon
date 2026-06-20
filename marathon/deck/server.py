@@ -191,10 +191,20 @@ class DeckHandler(BaseHTTPRequestHandler):
                 return self._api_card(path[len("/api/card/"):])
             if path.startswith("/api/subdeck/"):
                 return self._api_subdeck(path[len("/api/subdeck/"):], query)
+            if path.startswith("/api/missing-suggestions/"):
+                return self._api_missing_suggestions(
+                    path[len("/api/missing-suggestions/"):]
+                )
             if path == "/api/status":
                 return self._api_status()
             if path == "/api/events":
                 return self._api_events()
+            if path == "/api/conductor-status":
+                return self._api_conductor_status()
+            if path == "/api/issues-overview":
+                return self._api_issues_overview()
+            if path == "/api/history":
+                return self._api_history(query)
             self._send_error_json(HTTPStatus.NOT_FOUND, f"no route {path!r}")
         except BrokenPipeError:  # client navigated away mid-stream
             return
@@ -298,6 +308,28 @@ class DeckHandler(BaseHTTPRequestHandler):
 
         self._send_json(build_subdeck(self.cfg, issue_num, skip_api=skip_api))
 
+    def _api_missing_suggestions(self, raw_id: str) -> None:
+        """GET /api/missing-suggestions/{issue} — PURE read. The declarations
+        the issue's title-promised result may ALREADY be formalized as, shown
+        when the reviewer opens "flag a missing declaration" so a false-missing
+        doesn't dispatch a redundant Aristotle ADD. Records nothing, fires no
+        verdict; advisory-only (a network/parse failure must never block Save)."""
+        try:
+            issue_num = int(raw_id)
+        except ValueError:
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad issue id {raw_id!r}"
+            )
+        if self._demo:
+            from marathon.deck.demo import demo_missing_suggestions
+            return self._send_json(
+                {"issue": issue_num, "candidates": demo_missing_suggestions(issue_num)}
+            )
+        from marathon.deck.cards import missing_suggestions_for_issue
+
+        candidates = missing_suggestions_for_issue(self.cfg, issue_num)
+        self._send_json({"issue": issue_num, "candidates": candidates})
+
     def _api_status(self) -> None:
         """Poll endpoint: the live conductor/landing events as one JSON
         blob. Pure read from jobs.json + landings.jsonl + bounce reports."""
@@ -319,6 +351,30 @@ class DeckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # --- dashboard tabs (read-only; pure reads, never a side effect) -------
+
+    def _api_conductor_status(self) -> None:
+        """The Status tab: is the global conductor alive, its concurrency +
+        per-job table + recent landings. Pure read (jobs.json + lock + log)."""
+        from marathon.deck.dashboard import conductor_status
+        self._send_json(conductor_status(self.cfg))
+
+    def _api_issues_overview(self) -> None:
+        """The Issues tab: every registered issue grouped by chapter, each with
+        a combined status + tier. One ``gh`` bulk read (degrades local-only)."""
+        from marathon.deck.dashboard import issues_overview
+        self._send_json(issues_overview(self.cfg))
+
+    def _api_history(self, query: dict) -> None:
+        """The History tab: recent issue-status changes (verdicts log) + merged
+        PRs (one ``gh`` read). ``?limit=N`` caps each feed (default 30)."""
+        from marathon.deck.dashboard import history
+        try:
+            limit = int((query.get("limit") or ["30"])[0])
+        except (ValueError, TypeError):
+            limit = 30
+        self._send_json(history(self.cfg, limit=max(1, min(limit, 200))))
+
     # --- POST (the single irreversible route — token-guarded) -------------
 
     # The POST routes. Every one is token-guarded (see ``_read_guarded_body``);
@@ -327,7 +383,8 @@ class DeckHandler(BaseHTTPRequestHandler):
     # feature), ``/api/decl-verdict`` is LOCAL-only. A path not here is a 404
     # with no side effect.
     _POST_ROUTES = (
-        "/api/verdict", "/api/decl-verdict", "/api/ship", "/api/refresh-issue",
+        "/api/verdict", "/api/decl-verdict", "/api/missing", "/api/ship",
+        "/api/refresh-issue",
     )
 
     def do_POST(self) -> None:  # noqa: N802 (stdlib handler name)
@@ -341,6 +398,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                 self._api_verdict()
             elif parsed.path == "/api/decl-verdict":
                 self._api_decl_verdict()
+            elif parsed.path == "/api/missing":
+                self._api_missing()
             elif parsed.path == "/api/refresh-issue":
                 self._api_refresh_issue()
             else:  # /api/ship
@@ -500,6 +559,37 @@ class DeckHandler(BaseHTTPRequestHandler):
             "informal": subdeck.get("informal"),
             "next_decl": next_unreviewed_card(subdeck),
         })
+
+    def _api_missing(self) -> None:
+        """Record (or CLEAR) the issue's "something is MISSING" note — LOCAL
+        ONLY (POST /api/missing). Token-guarded like every POST, but fires NO
+        irreversible action: it writes only the local sidecar. The note routes
+        the issue to Aristotle with an ADD section at the explicit ship, never
+        here. An empty note clears the flag."""
+        data = self._read_guarded_body()
+        if data is None:
+            return  # the guard already sent the 4xx (origin / body / token)
+        issue_raw = data.get("issue")
+        note = data.get("note")
+        try:
+            issue_num = int(issue_raw)
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad or missing issue {issue_raw!r}"
+            )
+        if self._demo:
+            from marathon.deck.demo import demo_record_missing
+            return self._send_json(demo_record_missing(issue_num, note))
+        from marathon.deck.subdeck import build_subdeck, record_missing
+
+        try:
+            record_missing(self.cfg, issue_num, note)
+        except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
+            return self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, f"missing-note failed: {exc}"
+            )
+        subdeck = build_subdeck(self.cfg, issue_num)
+        self._send_json({"ok": True, "missing": subdeck.get("missing")})
 
     def _api_ship(self) -> None:
         """Ship a subdeck's issue (the contract's POST /api/ship) — the ONLY

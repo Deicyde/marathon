@@ -1150,3 +1150,131 @@ def test_refresh_does_not_break_ship_single_call_site(app_js: str):
 
 def test_style_has_refresh_button_styling(style_css: str):
     assert ".refresh-issue-btn" in style_css, "the push-refresh button must be styled"
+
+
+# --- dashboard: tabbed shell (Status / Issues / History + Review) -----------
+
+def test_index_has_tab_shell(index_html: str):
+    assert 'class="tab-nav"' in index_html
+    for t in ("review", "status", "issues", "history"):
+        assert 'data-tab="' + t + '"' in index_html
+        assert 'id="tab-' + t + '"' in index_html
+    for h in ("dash-status", "dash-issues", "dash-history"):
+        assert 'id="' + h + '"' in index_html
+
+
+def test_action_bar_lives_inside_the_review_pane(index_html: str):
+    # The action bar + card stage must be INSIDE #tab-review so they hide with
+    # the tab on the dashboard views (display:none on the pane hides them).
+    i_open = index_html.find('id="tab-review"')
+    i_action = index_html.find('class="action-bar"')
+    i_close = index_html.find('/#tab-review')
+    assert -1 < i_open < i_action < i_close
+
+
+def test_app_has_tab_render_functions(app_js: str):
+    code = _strip_block_comments(app_js)
+    for fn in ("function switchTab", "function renderStatusTab",
+               "function renderIssuesTab", "function renderHistoryTab"):
+        assert fn in code
+
+
+def test_dashboard_views_are_pure_reads(app_js: str):
+    # The dashboard fetches/render and tab switching must NEVER POST.
+    code = _strip_block_comments(app_js)
+    for fn in ("function renderStatusTab", "function renderIssuesTab",
+               "function renderHistoryTab", "function switchTab"):
+        body = _fn_body(code, fn)
+        assert "postJSON" not in body and "postShip" not in body
+    for fn in ("function renderStatusTab", "function renderIssuesTab",
+               "function renderHistoryTab"):
+        assert "getJSON(" in _fn_body(code, fn)
+
+
+def test_card_actions_gated_to_review_tab(app_js: str):
+    code = _strip_block_comments(app_js)
+    keys = _fn_body(code, "function attachKeys")
+    assert 'state.activeTab !== "review"' in keys
+    assert 'switchTab("status")' in keys           # 1-4 tab shortcuts
+    swipe = _fn_body(code, "function attachSwipe")
+    assert 'state.activeTab !== "review"' in swipe  # swipe is Review-only
+
+
+def test_dashboard_endpoints_referenced(app_js: str):
+    code = _strip_block_comments(app_js)
+    assert "/api/conductor-status" in code
+    assert "/api/issues-overview" in code
+    assert "/api/history" in code
+
+
+def test_style_has_tab_and_dashboard_classes(style_css: str):
+    for cls in (".tab-nav", ".tab-btn", ".cond-banner", ".issue-row",
+                ".hist-row", ".sb-verified"):
+        assert cls in style_css
+
+
+# --- "flag missing declaration" (ADD-to-Aristotle for an incomplete issue) ---
+
+def test_summary_has_flag_missing_section(app_js: str):
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function renderSummaryCard")
+    assert "summary-add" in body
+    assert "openMissingNote" in body
+    # a flagged-missing issue routes the ship to Aristotle even with no rejects
+    assert "anyAristotle" in body
+    assert "sd.missing" in body or "state.subdeck.missing" in body
+
+
+def test_missing_note_is_a_local_post(app_js: str):
+    code = _strip_block_comments(app_js)
+    assert "/api/missing" in code
+    # postMissing flows through postJSON (token-bearing) like every POST
+    pm = _fn_body(code, "function postMissing")
+    assert "postJSON(" in pm
+    # saving the note never ships
+    save = _fn_body(code, "function saveMissing")
+    assert "postMissing(" in save and "postShip" not in save
+
+
+def test_missing_endpoint_is_a_post_route(index_html: str, app_js: str):
+    # the flag-missing modal exists and is reachable from the summary
+    code = _strip_block_comments(app_js)
+    assert "function openMissingNote" in code
+    assert "Flag a missing declaration" in app_js
+
+
+# --- flag-missing "already exists" suggestions (advisory, async) -------------
+
+def test_missing_suggestions_fetch_defined(app_js: str):
+    code = _strip_block_comments(app_js)
+    assert "function fetchMissingSuggestions" in code
+    assert "/api/missing-suggestions/" in code
+    # flows through getJSON (a pure GET), never postJSON
+    body = _fn_body(code, "function fetchMissingSuggestions")
+    assert "getJSON(" in body and "postJSON" not in body
+
+
+def test_openMissingNote_async_fill_is_advisory(app_js: str):
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function openMissingNote")
+    # a container is inserted synchronously, then filled after the fetch
+    assert "missing-suggest" in body
+    assert "fetchMissingSuggestions(" in body
+    # advisory-only: a fetch failure must NOT block the modal (.catch present)
+    assert ".catch(" in body
+    # Save still records the note locally (never disabled by suggestions)
+    assert "saveMissing(" in body
+    # ORDERING: the modal is built + shown SYNCHRONOUSLY before the GET fires,
+    # so a slow/failed suggestions fetch can never block opening the modal.
+    assert body.index("openModal(") < body.index("fetchMissingSuggestions(")
+    # the .catch guard is chained off the suggestions fetch (after it).
+    assert ".catch(" in body[body.index("fetchMissingSuggestions("):]
+
+
+def test_dismiss_suggestion_does_not_save(app_js: str):
+    """The 'not missing — one of these is it' path closes the modal WITHOUT
+    saving a missing note (so no Aristotle ADD is later dispatched)."""
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function renderMissingSuggestions")
+    assert "closeModal()" in body
+    assert "saveMissing" not in body and "postMissing" not in body

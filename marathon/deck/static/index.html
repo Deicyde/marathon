@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>marathon deck — Code Tinder</title>
+  <title>marathon deck</title>
 
   <!--
     Session token injection hook. The backend (marathon/deck/server.py) renders
@@ -58,6 +58,20 @@
     </div>
   </header>
 
+  <!--
+    Dashboard tab bar. "Review" hosts the existing swipe card flow
+    (unchanged); Status / Issues / History are read-only dashboard views
+    rendered by app.js. The fixed action bar + card keyboard shortcuts are
+    scoped to the Review pane (hidden with it when another tab is active).
+  -->
+  <nav class="tab-nav" role="tablist" aria-label="Dashboard views">
+    <button class="tab-btn active" data-tab="review" role="tab" aria-selected="true">Review</button>
+    <button class="tab-btn" data-tab="status" role="tab" aria-selected="false">Status</button>
+    <button class="tab-btn" data-tab="issues" role="tab" aria-selected="false">Issues</button>
+    <button class="tab-btn" data-tab="history" role="tab" aria-selected="false">History</button>
+  </nav>
+
+  <div id="tab-review" class="tab-pane active" role="tabpanel">
   <main id="deck" class="deck">
     <!-- The card stack and overlays are rendered by app.js into here. -->
     <section id="card-stage" class="card-stage" aria-live="polite"></section>
@@ -91,6 +105,18 @@
       </button>
     </nav>
   </main>
+  </div><!-- /#tab-review -->
+
+  <!-- Dashboard panes (rendered by app.js on first activation, then polled). -->
+  <div id="tab-status" class="tab-pane" role="tabpanel" hidden>
+    <div class="dash" id="dash-status"></div>
+  </div>
+  <div id="tab-issues" class="tab-pane" role="tabpanel" hidden>
+    <div class="dash" id="dash-issues"></div>
+  </div>
+  <div id="tab-history" class="tab-pane" role="tabpanel" hidden>
+    <div class="dash" id="dash-history"></div>
+  </div>
 
   <!-- Modal host for reject-note / verify-confirm / deps / errors. -->
   <div id="modal-root" class="modal-root" hidden></div>
