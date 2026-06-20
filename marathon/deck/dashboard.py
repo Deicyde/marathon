@@ -75,6 +75,45 @@ def _refine_iteration(workdir: Optional[str]) -> Optional[dict]:
     }
 
 
+#: Post-prover pipeline phases, recognised in the refine's conductor-refine.log.
+#: Checked LATEST-line-first, so the most recent phase a running job reached wins.
+_PHASE_MARKERS = [
+    (re.compile(r"pull request|gh pr (create|edit|ready)|PR #|opening.*pr", re.I), "opening PR"),
+    (re.compile(r"\bpush(ing|ed)?\b|git push", re.I), "pushing"),
+    (re.compile(r"\bcommit(ted|ting)?\b|commit:", re.I), "committing"),
+    (re.compile(r"auto-rate|rating:", re.I), "rating"),
+    (re.compile(r"lake build|compiling|% complete|auto-build|building", re.I), "building"),
+]
+
+
+def _job_phase(
+    workdir: Optional[str], status: Optional[str],
+    aristotle_status: Optional[str], progress_pct: Optional[int],
+) -> str:
+    """A GRANULAR phase for a job — so a job whose Aristotle prover is done but
+    is still building/PR-ing reads "building", not the misleading "Complete".
+
+    Running jobs: ``proving NN%`` while the prover runs; once Aristotle is
+    COMPLETE, the latest post-prover phase from the conductor-refine.log
+    (building → rating → committing → pushing → opening PR). Finished jobs: their
+    status (succeeded / failed / stalled). Pure read; degrades to the status."""
+    st = status or ""
+    if not st.startswith("running"):
+        return st or "—"
+    a = (aristotle_status or "").upper()
+    if a == "QUEUED":
+        return "queued (Aristotle)"
+    if a in ("", "IN_PROGRESS", "RUNNING"):
+        return "proving" + (f" {progress_pct}%" if progress_pct is not None else "")
+    # Aristotle COMPLETE → the job is in its post-prover pipeline.
+    text = _read_tail(Path(workdir) / "conductor-refine.log", 32768) if workdir else ""
+    for line in reversed(text.splitlines()):
+        for rx, label in _PHASE_MARKERS:
+            if rx.search(line):
+                return label
+    return "building"  # prover done, in the build/finish pipeline
+
+
 # ---------------------------------------------------------------------------
 # Conductor / daemon status
 # ---------------------------------------------------------------------------
@@ -136,6 +175,12 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
         if status and status.startswith("running"):
             job["progress_pct"] = _refine_progress_pct(workdir)
             job["iteration"] = _refine_iteration(workdir)
+        # The granular phase (proving NN% / building / committing / pushing /
+        # opening PR) — so an Aristotle-COMPLETE-but-still-building job reads
+        # "building", not a misleading "Complete".
+        job["phase"] = _job_phase(
+            workdir, status, raw.get("aristotle_status"), job.get("progress_pct")
+        )
         jobs.append(job)
 
     return {

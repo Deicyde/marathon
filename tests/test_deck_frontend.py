@@ -1251,3 +1251,9 @@ def test_legend_hidden_attr_actually_hides(style_css: str):
     """The legend has display:flex (a fixed footer), so the `hidden` attribute
     set off the review tab needs an explicit rule to take effect."""
     assert ".legend[hidden]" in style_css
+
+
+def test_status_job_shows_granular_phase(app_js: str):
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function renderStatusTab")
+    assert "phase-chip" in body and "j.phase" in body

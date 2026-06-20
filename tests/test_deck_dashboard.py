@@ -314,3 +314,35 @@ def test_pending_queue_concurrency_and_cycle_reasons(tmp_path, monkeypatch):
     # no running jobs → dispatches next cycle
     q2 = dash._pending_queue(cfg, [], 1)
     assert "next cycle" in q2[0]["reason"]
+
+
+def test_job_phase_granularity(tmp_path):
+    wd = tmp_path / "wd"; wd.mkdir()
+    log = wd / "conductor-refine.log"
+    log.write_text("starting\n    status: IN_PROGRESS (40% complete)\n")
+    # Aristotle still proving → "proving NN%"
+    assert "proving 40%" in dash._job_phase(str(wd), "running", "IN_PROGRESS", 40)
+    # Aristotle COMPLETE but the log shows a build in flight → "building"
+    log.write_text("post-extraction: auto-build\n    lake build\n")
+    assert dash._job_phase(str(wd), "running", "COMPLETE", None) == "building"
+    # later phase wins: a PR line after the build → "opening PR"
+    log.write_text("lake build\n  push: ok\n  gh pr create ...\n")
+    assert dash._job_phase(str(wd), "running", "COMPLETE", None) == "opening PR"
+    # a finished job's phase is just its status (no "Complete" confusion)
+    assert dash._job_phase(str(wd), "succeeded", "COMPLETE", None) == "succeeded"
+    # COMPLETE with no readable log → default "building", not "complete"
+    assert dash._job_phase(None, "running", "COMPLETE", None) == "building"
+
+
+def test_conductor_status_job_carries_phase(tmp_path, monkeypatch):
+    wd = _make_run_workdir(tmp_path)   # log has "42% complete", no aristotle COMPLETE
+    lock = tmp_path / "conductor.lock"; lock.write_text("4242")
+    monkeypatch.setattr("marathon.conductor.conductor_lock_path", lambda cfg: lock)
+    monkeypatch.setattr("marathon.conductor.load_jobs_snapshot",
+        lambda repo_dir: {"jobs": [
+            {"issue_num": 95, "chapter": 12, "status": "running", "pid": 4242,
+             "aristotle_status": "COMPLETE", "workdir": str(wd)}]})
+    monkeypatch.setattr("marathon.review.daemon.process_alive", lambda pid: True)
+    j = dash.conductor_status(_cfg(tmp_path))["jobs"][0]
+    # aristotle COMPLETE + the workdir log has no post-prover marker → "building"
+    assert j["phase"] == "building"

@@ -2111,13 +2111,21 @@
       if (!(d.jobs || []).length)
         jobsSec.appendChild(el("div", { class: "dash-empty", text: "no jobs — the queue is drained" }));
       (d.jobs || []).forEach(function (j) {
-        var ar = j.project_id
-          ? (j.project_id + (j.aristotle_status ? " (" + j.aristotle_status + ")" : "")) : "";
+        // The project id only (the granular PHASE replaces the misleading
+        // raw aristotle_status like "(COMPLETE)").
+        var ar = j.project_id ? String(j.project_id).slice(0, 8) : "";
+        var running = (j.status || "").indexOf("running") === 0;
         var kids = [
           el("span", { class: "job-issue", text: "#" + (j.issue_num == null ? "?" : j.issue_num) }),
           el("span", { class: "job-chip", text: "c" + (j.chapter == null ? "?" : j.chapter) }),
           statusBadge(j.status),
         ];
+        // The granular phase (proving NN% / building / committing / pushing /
+        // opening PR) for a running job — the key "it's still building, not done".
+        if (running && j.phase) {
+          var pslug = String(j.phase).split(" ")[0].toLowerCase().replace(/[^a-z]/g, "");
+          kids.push(el("span", { class: "phase-chip phase-" + pslug, text: j.phase }));
+        }
         // Live iteration + Aristotle progress for a running job.
         var it = j.iteration;
         if (it && (it.current != null || it.completed != null)) {
