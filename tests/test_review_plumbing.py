@@ -378,3 +378,44 @@ def test_requeue_for_rereview_clears_local_verdict(tmp_path):
     assert requeue_for_rereview(cfg, 14) is True     # an entry was removed
     assert 14 not in load_state(cfg).issues          # now reads as unreviewed
     assert requeue_for_rereview(cfg, 14) is False    # idempotent — already gone
+
+
+# --- sync_tracker_to_verified (the tracker safety-net) -----------------------
+
+def test_sync_tracker_flips_verified_but_stale(tmp_path, monkeypatch):
+    """Every issue carrying review:verified whose tracker line is still 🟠 is
+    flipped to 🟡 in one write; an unverified issue's line is left 🟠."""
+    from marathon.review import tracker as tr
+    import marathon.review.github as gh_mod
+
+    cfg = make_cfg(tmp_path)  # chapter 14: #14 'Lemma 14.7', #15 'Proposition 14.8'
+    body = ("### Chapter 14:\n"
+            "1. Lemma 14.7 — foo 🟠\n"
+            "2. Proposition 14.8 — bar 🟠\n")
+    monkeypatch.setattr(tr, "issue_body", lambda n, repo: body)
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_bulk",
+        lambda nums, repo: {14: {"labels": ["review:verified"]},
+                            15: {"labels": ["review"]}},
+    )
+    fake = FakeGh()
+    monkeypatch.setattr(tr, "gh", fake)
+
+    ok, msg = tr.sync_tracker_to_verified(cfg, tmp_dir=tmp_path)
+    assert ok is True
+    written = (tmp_path / "review-tracker-body-batch.md").read_text()
+    assert "Lemma 14.7 — foo 🟡" in written        # verified → flipped
+    assert "Proposition 14.8 — bar 🟠" in written   # unverified → left alone
+
+
+def test_sync_tracker_noop_when_all_synced(tmp_path, monkeypatch):
+    from marathon.review import tracker as tr
+    import marathon.review.github as gh_mod
+    cfg = make_cfg(tmp_path)
+    body = "### Chapter 14:\n1. Lemma 14.7 — foo 🟡\n"  # already 🟡
+    monkeypatch.setattr(tr, "issue_body", lambda n, repo: body)
+    monkeypatch.setattr(gh_mod, "fetch_issues_bulk",
+                        lambda nums, repo: {14: {"labels": ["review:verified"]}})
+    monkeypatch.setattr(tr, "gh", FakeGh())
+    ok, _msg = tr.sync_tracker_to_verified(cfg, tmp_dir=tmp_path)
+    assert ok is False  # nothing to flip (already in sync)

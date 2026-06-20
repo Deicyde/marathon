@@ -117,6 +117,48 @@ def update_tracker_emoji(
     return True, msg
 
 
+def sync_tracker_to_verified(
+    cfg: ReviewConfig,
+    *,
+    chapter: Optional[int] = None,
+    tmp_dir: Path = Path("/tmp"),
+) -> tuple[bool, str]:
+    """Safety-net: flip every issue that IS verified (carries the
+    ``review:verified`` label) but whose tracker line is still 🟠 → 🟡, so the
+    parent tracker can't drift out of sync with the verified state.
+
+    The verify/ship path already flips the tracker per issue; this catches
+    stragglers — an issue verified out-of-band (a hand-added label), or a flip
+    that silently no-op'd. ONE bulk label read + ONE tracker write (only the
+    still-🟠 lines flip; an already-🟡 line is a no-op). Scoped to ``chapter``
+    when given, else all registered chapters. Returns ``(ok, message)``; ``ok``
+    is True iff at least one line was flipped."""
+    from marathon.review.github import fetch_issues_bulk
+
+    if chapter is not None:
+        registry = cfg.chapter_registry(chapter)
+        regs = [registry] if registry is not None else []
+    else:
+        regs = list(cfg.chapters.values())
+    nums = sorted({n for r in regs for (n, _t) in r.entries})
+    if not nums:
+        return False, "no registered issues to sync"
+
+    meta = fetch_issues_bulk(nums, cfg.github_repo) or {}
+    verified = [
+        n for n in nums
+        if "review:verified" in ((meta.get(n) or {}).get("labels") or [])
+    ]
+    if not verified:
+        return False, "no verified issues found"
+    # Only the lines still carrying 🟠 actually flip (update_tracker_emojis
+    # no-ops a line that isn't in old_emoji), so passing every verified issue is
+    # safe and idempotent.
+    return update_tracker_emojis(
+        cfg, [(n, "🟡") for n in verified], old_emoji="🟠", tmp_dir=tmp_dir
+    )
+
+
 def update_tracker_emojis(
     cfg: ReviewConfig,
     flips: list[tuple[int, str]],

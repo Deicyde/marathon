@@ -195,6 +195,12 @@ def e2e(cfg, clock, subprocess_calls, popen_factory, monkeypatch, tmp_path):
     # own `lake exe cache get`, which the fake Popen would otherwise record);
     # _prime_mathlib_cache is exercised directly in test_conductor_cache.py.
     monkeypatch.setenv("MARATHON_SKIP_CACHE_GET", "1")
+    # …and from the tracker safety-net (its own gh read), tested in
+    # test_review_plumbing.py — so gh-call-count assertions stay exact.
+    monkeypatch.setattr(
+        "marathon.review.tracker.sync_tracker_to_verified",
+        lambda cfg, **kw: (False, "skipped in tests"),
+    )
     return SimpleNamespace(
         cfg=cfg,
         clock=clock,

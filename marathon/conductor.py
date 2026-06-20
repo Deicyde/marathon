@@ -1309,6 +1309,7 @@ def run_conductor(
     ticks = 0
     last_automerge = float("-inf")  # run the merge orchestrator on tick 1, then ~once/min
     last_reconcile_sha: Optional[str] = None  # reconcile only when HEAD changes
+    last_tracker_sync = float("-inf")  # tracker safety-net cadence (~once/2min)
 
     try:
         if prune:
@@ -1356,6 +1357,19 @@ def run_conductor(
                         j.issue_num for j in jobs if j.status == "running"
                     ),
                 )
+            # Tracker safety-net: keep the parent tracker's emojis in sync with
+            # the review:verified labels (a verify normally flips its own line;
+            # this heals a straggler — an out-of-band label or a no-op'd flip).
+            # Throttled; best-effort (a failure warns, never crashes the tick).
+            if reconcile and not _STOP_REQUESTED and _now() - last_tracker_sync > 120:
+                last_tracker_sync = _now()
+                try:
+                    from marathon.review.tracker import sync_tracker_to_verified
+                    ok, msg = sync_tracker_to_verified(cfg)
+                    if ok:
+                        print(f"--- tracker sync: {msg} ---", flush=True)
+                except Exception as e:  # noqa: BLE001 — never crash the tick
+                    print(f"  warning: tracker sync failed: {e}", flush=True)
             # Referee-cadence: fire the referee --emit-tasks pass once the
             # landings-count crosses a multiple of referee_every. Best-effort
             # and OFF by default (referee_every == 0): a referee failure
