@@ -964,7 +964,8 @@ def _locate_decl_site(text: str, decl_name: str):
 def _slice_decl_block(text: str, sites, target_i: int) -> str:
     """The verbatim source block for ``sites[target_i]``: the full
     ``def``/``theorem``/… body plus the docstring + attribute/modifier lines
-    immediately above it, with trailing blanks / next-decl comments trimmed.
+    immediately above it, with trailing blanks, next-decl comments, and trailing
+    ``section`` / ``variable`` / module-docstring (``/-! … -/``) blocks trimmed.
 
     The single extraction slice shared by the snapshot path
     (:func:`_read_decl_source`) and the repo-wide fallback
@@ -980,6 +981,29 @@ def _slice_decl_block(text: str, sites, target_i: int) -> str:
         s = lines[idx - 1].strip()
         return s in {"noncomputable", "private", "protected", "scoped", "@[simp]"} \
             or s.startswith("@[")
+
+    def is_command(idx: int) -> bool:  # 1-based: a top-level command line that
+        # opens the NEXT region (`section`/`namespace`/`variable`/…) — never
+        # part of a decl's proof body, so a trailing one belongs to what follows.
+        kw = lines[idx - 1].strip().split(maxsplit=1)
+        return bool(kw) and kw[0] in {
+            "section", "namespace", "end", "variable",
+            "open", "attribute", "universe", "set_option",
+        }
+
+    def in_variable_block(idx: int) -> bool:  # 1-based: line idx is a binder
+        # continuation of a trailing `variable` block (walk up over `[…]/{…}/(…)`
+        # continuation lines to a `variable` keyword).
+        i = idx
+        while i > kw_line:
+            s = lines[i - 1].strip()
+            if s.startswith("variable"):
+                return True
+            if s[:1] in "[{(⦃⦅":
+                i -= 1
+            else:
+                return False
+        return False
 
     # START: include attributes/modifiers directly above, then the full
     # docstring block (walk up to its `/-…` opener) if one sits directly
@@ -1023,6 +1047,15 @@ def _slice_decl_block(text: str, sites, target_i: int) -> str:
             # An attribute/modifier line (@[simp], noncomputable, …) directly
             # above the NEXT decl's keyword belongs to that next decl — drop it,
             # which lets the loop go on to drop the next decl's docstring too.
+            end -= 1
+        elif is_command(end):
+            # A top-level command after the proof (`section`, `namespace`,
+            # `end`, `variable`, `open`, …) opens the NEXT region — never part
+            # of this decl. Dropping it lets the loop reach a module docstring
+            # (`/-! … -/`) above it and drop that too.
+            end -= 1
+        elif s[:1] in "[{(⦃⦅" and in_variable_block(end):
+            # A continuation line of a trailing `variable` binder block.
             end -= 1
         else:
             break

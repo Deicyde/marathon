@@ -430,3 +430,43 @@ def test_slice_does_not_bleed_next_decls_attribute_and_docstring(tmp_path):
     assert "First decl doc" in block and "theorem first" in block
     assert "Second decl doc" not in block   # the next decl's docstring …
     assert "@[simp]" not in block            # … and its attribute don't bleed in
+
+
+def test_slice_trims_trailing_module_docstring_section_and_variable(tmp_path):
+    """A decl's card must not bleed in the NEXT region's setup — a trailing
+    module docstring (`/-! … -/`), a `section` command, and a `variable` binder
+    block (the #98 `exists_of_tensorial` report)."""
+    cfg = make_cfg(tmp_path)
+    path = cfg.repo_dir / "Demo" / "Chapter14.lean"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "import Mathlib\n\n"
+        "namespace Demo.Chapter14\n\n"
+        "/-- Existence from tensoriality. -/\n"
+        "theorem exists_of_tensorial : True := by\n"
+        "  trivial\n\n"
+        "/-!\n"
+        "## Covariant tensor field bridge\n\n"
+        "`CovariantTensorField I M k` is connected to `MixedTensorField I M 0 k`\n"
+        "via `CovariantTensorField.bridgeEquiv` in `TensorBundle.lean`.\n"
+        "-/\n\n"
+        "section CovariantBridge\n\n"
+        "variable {𝕜 : Type*} [NontriviallyNormedField 𝕜] {E : Type*} [NormedAddCommGroup E]\n"
+        "  [NormedSpace 𝕜 E] {H : Type*} [TopologicalSpace H] {I : ModelWithCorners 𝕜 E H}\n"
+        "  [TopologicalSpace M] [ChartedSpace H M] [IsManifold I (↑(⊤ : ℕ∞)) M]\n\n"
+        "/-- The bridge equivalence. -/\n"
+        "def bridgeEquiv : True := trivial\n\n"
+        "end CovariantBridge\n\n"
+        "end Demo.Chapter14\n"
+    )
+    block, _rel = _find_decl_source_in_repo(
+        cfg.repo_dir, "Demo.Chapter14.exists_of_tensorial"
+    )
+    assert block is not None
+    assert "theorem exists_of_tensorial" in block and "trivial" in block
+    # None of the next region's setup may bleed into the card:
+    assert "Covariant tensor field bridge" not in block   # trailing module docstring
+    assert "section CovariantBridge" not in block          # section command
+    assert "variable {𝕜" not in block                      # variable keyword line
+    assert "TopologicalSpace M" not in block               # variable continuation line
+    assert "bridgeEquiv" not in block                      # the next decl itself
