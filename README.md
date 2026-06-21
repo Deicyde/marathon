@@ -88,9 +88,14 @@ it survives the deck restarting.
 
 ## Sharing the deck (multi-user)
 
-Host the deck behind GitHub auth so trusted collaborators sign in with their own
-GitHub account, act under **their own** identity, and refine under **their own**
-compute key — see **[docs/shared-deck.md](docs/shared-deck.md)**. The relevant
+Collaborators can just run their own local deck — clone, install, `gh auth`, go;
+see **[SETUP.md](SETUP.md)**. GitHub is the shared bus, so everyone's local deck
+sees the same queue.
+
+Or host one deck behind GitHub auth that collaborators reach by URL (for people
+who won't install anything) — they sign in with their own GitHub account, act
+under **their own** identity, and refine under **their own** compute key — see
+**[docs/shared-deck.md](docs/shared-deck.md)**. The relevant
 flags: `marathon deck --trusted-origin <origin> --no-host-conductor` (shared
 deck) and `marathon conductor run --queue-from-github` (a collaborator's own
 conductor, discovering the queue from GitHub).
