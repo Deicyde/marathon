@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -309,50 +311,81 @@ def _refine_prompts(workdir: Optional[str], max_bytes: int = 200000) -> str:
 _REFINE_LAND_RE = re.compile(r"^marathon/refine-c\d+-i(\d+)$")
 #: Per-repo cache of the (gh-derived) landings so the Status poll doesn't call
 #: gh every tick. {repo_dir: (epoch, landings)}.
-_LANDINGS_CACHE: dict = {}
+# Stale-while-revalidate cache for the deck's gh-backed reads. A slow `gh` call
+# (e.g. when the laptop is busy compiling a refine alongside the hosted deck)
+# must never block a request long enough to time out into a proxy 502: serve the
+# last value immediately and refresh in the BACKGROUND. Only the first call for a
+# key blocks (to seed it); a failed refresh keeps the last good value.
+_SWR: dict = {}
+_SWR_LOCK = threading.Lock()
+
+
+def _swr(key: str, ttl: float, fetch):
+    """Return the cached value for ``key`` immediately; if older than ``ttl``,
+    kick a one-shot background refresh via ``fetch``. Seeds synchronously on the
+    first call. Never raises (a failed refresh keeps the last good value)."""
+    now = time.time()
+    with _SWR_LOCK:
+        ent = _SWR.get(key)
+    if ent is None:
+        try:
+            val = fetch()
+        except Exception:  # noqa: BLE001
+            val = None
+        with _SWR_LOCK:
+            _SWR[key] = {"ts": time.time(), "data": val, "busy": False}
+        return val
+    if now - ent["ts"] > ttl and not ent["busy"]:
+        with _SWR_LOCK:
+            ent["busy"] = True
+
+        def _refresh() -> None:
+            try:
+                v = fetch()
+                with _SWR_LOCK:
+                    _SWR[key] = {"ts": time.time(), "data": v, "busy": False}
+            except Exception:  # noqa: BLE001 — keep the last good value, back off
+                with _SWR_LOCK:
+                    ent["ts"] = time.time()
+                    ent["busy"] = False
+
+        threading.Thread(target=_refresh, name="marathon-deck-swr",
+                         daemon=True).start()
+    return ent["data"]
 
 
 def _recent_landings(cfg: "ReviewConfig", limit: int = 8) -> list[dict]:
-    """Recently LANDED issues — an issue's Aristotle fix MERGED onto main. The
-    default flow merges via the conductor's automerge (``gh pr merge``), so a
-    landing IS a merged ``marathon/refine-c*-i*`` PR; the opt-in ``--land next``
-    queue (``landings.jsonl``) is folded in when present. Newest-first, capped.
+    """Recently LANDED issues — an issue's Aristotle fix MERGED onto main (a
+    merged ``marathon/refine-c*-i*`` PR; the opt-in ``--land next`` queue folded
+    in). Newest-first, capped. Stale-while-revalidate cached ~60s per repo, so a
+    slow ``gh`` never blocks the Status poll into a 502. Pure read; ``[]`` on
+    failure."""
+    def _compute() -> list[dict]:
+        out: list[dict] = []
+        for pr in _merged_prs(cfg, max(limit * 3, 20)):
+            m = _REFINE_LAND_RE.match(pr.get("head") or "")
+            if m:
+                out.append({"issue": int(m.group(1)), "pr": pr.get("number"),
+                            "ts": pr.get("merged_at")})
+        try:
+            from marathon.landing import LANDINGS_RELPATH
 
-    Cached ~60s per repo so the Status-tab poll doesn't hit ``gh`` every tick.
-    Pure read; ``[]`` on any failure."""
-    import time
+            path = Path(cfg.repo_dir) / LANDINGS_RELPATH
+            if path.is_file():
+                for line in path.read_text().splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except (ValueError, TypeError):
+                        continue
+        except Exception:  # noqa: BLE001
+            pass
+        out.sort(key=lambda r: r.get("ts") or "", reverse=True)
+        return out
 
-    key = str(getattr(cfg, "repo_dir", ""))
-    now = time.time()
-    ent = _LANDINGS_CACHE.get(key)
-    if ent is not None and now - ent[0] < 60:
-        return ent[1][:limit]
-
-    out: list[dict] = []
-    # Default flow: merged marathon/refine PRs (the issue's fix landed).
-    for pr in _merged_prs(cfg, max(limit * 3, 20)):
-        m = _REFINE_LAND_RE.match(pr.get("head") or "")
-        if m:
-            out.append({"issue": int(m.group(1)), "pr": pr.get("number"),
-                        "ts": pr.get("merged_at")})
-    # Opt-in --land next queue (landings.jsonl), folded in when present.
-    try:
-        from marathon.landing import LANDINGS_RELPATH
-
-        path = Path(cfg.repo_dir) / LANDINGS_RELPATH
-        if path.is_file():
-            for line in path.read_text().splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out.append(json.loads(line))
-                except (ValueError, TypeError):
-                    continue
-    except Exception:  # noqa: BLE001
-        pass
-    out.sort(key=lambda r: r.get("ts") or "", reverse=True)
-    _LANDINGS_CACHE[key] = (now, out)
+    out = _swr("landings:" + str(getattr(cfg, "repo_dir", "")), 60, _compute) or []
     return out[:limit]
 
 
@@ -392,8 +425,26 @@ def _issue_status(
 
 def issues_overview(cfg: "ReviewConfig") -> dict:
     """All registered issues grouped by chapter, each with a combined status,
-    tier, and (when available) readiness/blocked-reason + title. ONE ``gh`` bulk
-    read for titles/labels (degrades to local-only on failure)."""
+    tier, and (when available) readiness/blocked-reason + title.
+
+    The whole result is stale-while-revalidate cached ~45s per repo: it runs
+    several ``gh`` reads (bulk titles/labels + the queue build), so under heavy
+    local load it must not block a request into a proxy 502 — it serves the last
+    value and refreshes in the background."""
+    repo = str(getattr(cfg, "github_repo", ""))
+    cached = _swr("issues_overview:" + repo, 45,
+                  lambda: _issues_overview_compute(cfg))
+    if cached is not None:
+        return cached
+    return {  # cold-call failure: degrade to an empty overview, never raise
+        "repo": getattr(cfg, "github_repo", None),
+        "chapters": [], "counts": {s: 0 for s in _STATUS_ORDER}, "total": 0,
+    }
+
+
+def _issues_overview_compute(cfg: "ReviewConfig") -> dict:
+    """The actual assembly behind :func:`issues_overview` (ONE ``gh`` bulk read
+    for titles/labels; degrades to local-only on failure)."""
     chapters = getattr(cfg, "chapters", {}) or {}
     registry = []  # (chapter, issue, substring)
     for ch in sorted(chapters):

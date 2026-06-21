@@ -28,7 +28,7 @@ def _no_real_gh(monkeypatch):
     landings from merged PRs. Default every gh call to a failed/empty result
     (the history test overrides this with its own fake run), and clear the
     per-repo landings cache so tests never see each other's data."""
-    dash._LANDINGS_CACHE.clear()
+    dash._SWR.clear()
     monkeypatch.setattr(
         dash.subprocess, "run",
         lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr=""),
@@ -396,3 +396,37 @@ def test_recent_landings_cached_per_repo(tmp_path, monkeypatch):
     dash._recent_landings(cfg)
     dash._recent_landings(cfg)            # second call within 60s → cache hit
     assert calls["n"] == 1
+
+
+# --- stale-while-revalidate cache ------------------------------------------
+
+def test_swr_serves_stale_and_refreshes_in_background(monkeypatch):
+    import time as _t
+    calls = {"n": 0}
+
+    def _fetch():
+        calls["n"] += 1
+        return f"v{calls['n']}"
+
+    dash._SWR.clear()
+    assert dash._swr("k", 0.0, _fetch) == "v1"      # cold: seeds synchronously
+    # ttl=0 → next call is stale → returns the CACHED value immediately (v1),
+    # and kicks a background refresh (does not block on _fetch).
+    assert dash._swr("k", 0.0, _fetch) == "v1"
+    for _ in range(50):                              # let the bg refresh land
+        if calls["n"] >= 2:
+            break
+        _t.sleep(0.02)
+    assert calls["n"] == 2                           # refreshed in the background
+    assert dash._swr("k", 9999, _fetch) == "v2"     # now serves the refreshed value
+
+
+def test_swr_failed_refresh_keeps_last_good(monkeypatch):
+    dash._SWR.clear()
+    assert dash._swr("k2", 9999, lambda: "good") == "good"
+    # force staleness + a failing fetch → must keep "good", never raise
+    dash._SWR["k2"]["ts"] = 0
+    def _boom():
+        raise RuntimeError("gh down")
+    out = dash._swr("k2", 0.0, _boom)
+    assert out == "good"                             # stale value served, no raise
