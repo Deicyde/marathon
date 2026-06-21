@@ -57,6 +57,13 @@ class PipelineConfig:
     # Workdir path for the iteration; used to emit the audit JSONL log.
     # Set by refine; skeleton doesn't currently audit.
     audit_workdir: Optional[Path] = None
+    # When True (default), BEFORE the build/commit the statement-immutability
+    # guard reverts any change this iteration made to a human-verified
+    # declaration's signature (restoring it from the approved-statements
+    # manifest). HARD enforcement — unlike ``audit_verified`` (soft, post-commit
+    # warning), this can never let a frozen statement change land. No-op when the
+    # manifest is empty, so it is safe to leave on for skeleton runs too.
+    enforce_frozen_statements: bool = True
     # When True (default), refresh ``formalization.yaml`` (mathlib-
     # initiative v0.2 schema) at the repo root with auto-derived
     # fields (sorry_count, models, etc.) before each auto-commit.
@@ -1077,6 +1084,18 @@ def append_rating(
         f.write(json.dumps(entry) + "\n")
 
 
+def _modified_lean_files(repo_dir: Path) -> list[str]:
+    """Repo-relative ``.lean`` paths changed in the working tree vs HEAD — the
+    just-extracted, not-yet-committed iteration changes the guard inspects."""
+    cp = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD", "--", "*.lean"],
+        cwd=str(repo_dir), capture_output=True, text=True, check=False,
+    )
+    if cp.returncode != 0:
+        return []
+    return [ln.strip() for ln in cp.stdout.splitlines() if ln.strip()]
+
+
 def run_post_pipeline(
     config: PipelineConfig,
     repo_dir: Path,
@@ -1102,7 +1121,46 @@ def run_post_pipeline(
         "gate": None,
         "gate_posture": None,
         "jury": None,
+        "frozen_reverts": [],
     }
+
+    # --- statement-immutability guard (HARD) ---------------------------
+    # Runs BEFORE the build (so the build validates the reverted source) and
+    # before commit (so a frozen-signature change can never land). For every
+    # human-verified declaration whose signature this iteration changed, the
+    # offending decl is surgically restored from HEAD — signature back to the
+    # approved statement, body back to `sorry` — while honest body fills on
+    # sibling decls are kept. No-op when nothing is frozen.
+    if config.enforce_frozen_statements:
+        try:
+            from marathon.review.approved_statements import (
+                guard_touched_files,
+                load_manifest,
+            )
+
+            manifest = load_manifest(repo_dir)
+            if manifest:
+                reverts = guard_touched_files(
+                    repo_dir, "HEAD", _modified_lean_files(repo_dir),
+                    manifest=manifest,
+                )
+                if reverts:
+                    out["frozen_reverts"] = [
+                        {"decl": r.decl_name, "issue": r.issue, "file": r.file}
+                        for r in reverts
+                    ]
+                    print(
+                        f"  ⚠ statement-guard: reverted {len(reverts)} change(s) "
+                        f"to approved statement(s) before commit "
+                        f"(a fill must not alter a verified statement):"
+                    )
+                    for r in reverts:
+                        print(
+                            f"      • {r.decl_name} (verified #{r.issue}) in "
+                            f"{r.file} — restored to the approved statement"
+                        )
+        except Exception as exc:  # noqa: BLE001 — the guard must never crash a run
+            print(f"  statement-guard: skipped ({exc})")
 
     if config.auto_build:
         b = run_lake_build(repo_dir, config.build_timeout)

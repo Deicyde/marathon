@@ -153,14 +153,14 @@ class ApprovedStatement:
     verified_ts: Optional[str] = None
 
 
-def manifest_path(cfg: ReviewConfig) -> Path:
-    return cfg.repo_dir / ".marathon" / "review" / "approved_statements.json"
+def manifest_path(repo_dir: Path) -> Path:
+    return Path(repo_dir) / ".marathon" / "review" / "approved_statements.json"
 
 
-def load_manifest(cfg: ReviewConfig) -> dict[str, ApprovedStatement]:
+def load_manifest(repo_dir: Path) -> dict[str, ApprovedStatement]:
     """``{decl_name: ApprovedStatement}``; empty dict if the manifest is absent
     or unreadable (never raises — a missing manifest just means nothing frozen)."""
-    p = manifest_path(cfg)
+    p = manifest_path(repo_dir)
     try:
         data = json.loads(p.read_text())
     except (OSError, ValueError):
@@ -180,8 +180,8 @@ def load_manifest(cfg: ReviewConfig) -> dict[str, ApprovedStatement]:
     return out
 
 
-def save_manifest(cfg: ReviewConfig, statements: dict[str, ApprovedStatement]) -> Path:
-    p = manifest_path(cfg)
+def save_manifest(repo_dir: Path, statements: dict[str, ApprovedStatement]) -> Path:
+    p = manifest_path(repo_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": MANIFEST_VERSION,
@@ -249,7 +249,7 @@ def capture_on_verify(cfg: ReviewConfig, issue_num: int) -> list[str]:
     src = _chapter_source_text(cfg, chapter) if chapter is not None else ""
     ts = datetime.now().astimezone().isoformat(timespec="seconds")
 
-    manifest = load_manifest(cfg)
+    manifest = load_manifest(cfg.repo_dir)
     frozen: list[str] = []
     for name in sorted(decls):
         sig = extract_signature(src, name) if src else None
@@ -263,7 +263,7 @@ def capture_on_verify(cfg: ReviewConfig, issue_num: int) -> list[str]:
         )
         frozen.append(name)
     if frozen:
-        save_manifest(cfg, manifest)
+        save_manifest(cfg.repo_dir, manifest)
     return frozen
 
 
@@ -312,7 +312,6 @@ def _splice_decl_from_baseline(
 
 
 def guard_touched_files(
-    cfg: ReviewConfig,
     repo_dir: Path,
     baseline_ref: str,
     files: Iterable,
@@ -331,7 +330,7 @@ def guard_touched_files(
     list of reverted declarations (empty ⇒ nothing was violated). Call this AFTER
     extraction and BEFORE commit so a signature change can never land.
     """
-    manifest = manifest if manifest is not None else load_manifest(cfg)
+    manifest = manifest if manifest is not None else load_manifest(repo_dir)
     if not manifest:
         return []
     reverted: list[RevertedDecl] = []

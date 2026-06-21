@@ -94,8 +94,8 @@ def test_find_decl_block_spans_to_next_decl_and_end():
 
 def test_manifest_roundtrip(tmp_path):
     cfg = _cfg(tmp_path)
-    save_manifest(cfg, {"foo": ApprovedStatement("foo", "theorem foo : True", 5, 12, "t")})
-    back = load_manifest(cfg)
+    save_manifest(cfg.repo_dir, {"foo": ApprovedStatement("foo", "theorem foo : True", 5, 12, "t")})
+    back = load_manifest(cfg.repo_dir)
     assert back["foo"].signature == "theorem foo : True"
     assert back["foo"].issue == 5 and back["foo"].chapter == 12
 
@@ -112,7 +112,7 @@ def test_capture_on_verify_prefers_source_signature(tmp_path, monkeypatch):
     )
     frozen = capture_on_verify(cfg, 42)
     assert frozen == ["foo"]
-    man = load_manifest(cfg)
+    man = load_manifest(cfg.repo_dir)
     assert man["foo"].signature == "theorem foo {k : ℕ} : P k"
     assert man["foo"].issue == 42 and man["foo"].chapter == 12
 
@@ -122,14 +122,14 @@ def test_capture_on_verify_falls_back_to_issue_block(tmp_path, monkeypatch):
     monkeypatch.setattr(ReviewConfig, "chapter_of_issue", lambda self, n: 12)
     monkeypatch.setattr(ghmod, "issue_body", lambda num, repo: "```lean\ntheorem bar : True\n```")
     assert capture_on_verify(cfg, 7) == ["bar"]
-    assert load_manifest(cfg)["bar"].signature == "theorem bar : True"
+    assert load_manifest(cfg.repo_dir)["bar"].signature == "theorem bar : True"
 
 
 def test_capture_on_verify_no_body_is_noop(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     monkeypatch.setattr(ghmod, "issue_body", lambda num, repo: None)
     assert capture_on_verify(cfg, 9) == []
-    assert not manifest_path(cfg).exists()
+    assert not manifest_path(cfg.repo_dir).exists()
 
 
 # --- the hard guard (A2): adversarial ---------------------------------------
@@ -161,13 +161,13 @@ def test_guard_reverts_signature_change_but_keeps_body_fill(tmp_path):
     f, rel = _chapter_file(cfg)
     f.write_text("theorem a : P := by sorry\ntheorem b {k : ℕ} : Q k := by sorry\n")
     _commit(repo, "skeleton")
-    save_manifest(cfg, {
+    save_manifest(cfg.repo_dir, {
         "a": ApprovedStatement("a", "theorem a : P", 1, 12, "t"),
         "b": ApprovedStatement("b", "theorem b {k : ℕ} : Q k", 2, 12, "t"),
     })
     # a: honest body fill (sig unchanged) ; b: signature CHANGED + body filled
     f.write_text("theorem a : P := by exact hP\ntheorem b {k : ℕ} : QChanged k := by exact hQ\n")
-    reverted = guard_touched_files(cfg, repo, "HEAD", [rel])
+    reverted = guard_touched_files(repo, "HEAD", [rel])
 
     assert [r.decl_name for r in reverted] == ["b"]
     assert reverted[0].issue == 2 and reverted[0].file == rel
@@ -186,9 +186,9 @@ def test_guard_reverts_multiline_type_change_opening_line_identical(tmp_path):
     f, rel = _chapter_file(cfg)
     f.write_text("theorem a {k : ℕ} :\n    P k := by sorry\n")
     _commit(repo, "skeleton")
-    save_manifest(cfg, {"a": ApprovedStatement("a", "theorem a {k : ℕ} : P k", 1, 12, "t")})
+    save_manifest(cfg.repo_dir, {"a": ApprovedStatement("a", "theorem a {k : ℕ} : P k", 1, 12, "t")})
     f.write_text("theorem a {k : ℕ} :\n    Q k := by exact h\n")  # type changed
-    reverted = guard_touched_files(cfg, repo, "HEAD", [rel])
+    reverted = guard_touched_files(repo, "HEAD", [rel])
 
     assert [r.decl_name for r in reverted] == ["a"]
     text = f.read_text()
@@ -202,12 +202,12 @@ def test_guard_body_only_fill_is_not_reverted(tmp_path):
     f, rel = _chapter_file(cfg)
     f.write_text("theorem a : P := by sorry\n")
     _commit(repo, "skeleton")
-    save_manifest(cfg, {"a": ApprovedStatement("a", "theorem a : P", 1, 12, "t")})
+    save_manifest(cfg.repo_dir, {"a": ApprovedStatement("a", "theorem a : P", 1, 12, "t")})
     f.write_text("theorem a : P := by exact hP\n")  # body only
-    assert guard_touched_files(cfg, repo, "HEAD", [rel]) == []
+    assert guard_touched_files(repo, "HEAD", [rel]) == []
     assert "by exact hP" in f.read_text()  # fill kept untouched
 
 
 def test_guard_empty_manifest_is_noop(tmp_path):
     cfg = _cfg(tmp_path)
-    assert guard_touched_files(cfg, cfg.repo_dir, "HEAD", ["x.lean"]) == []
+    assert guard_touched_files(cfg.repo_dir, "HEAD", ["x.lean"]) == []
