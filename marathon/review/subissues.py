@@ -31,6 +31,29 @@ def _chapter_label(chapter: int) -> str:
     return f"chapter-{chapter}"
 
 
+def _ensure_chapter_label(cfg: ReviewConfig, chapter: int) -> None:
+    """Create the ``chapter-N`` GitHub label if it doesn't already exist.
+
+    For a BRAND-NEW chapter the label never exists, so create_subissue's
+    ``--label chapter-N`` would fail on every draft — the whole batch is silently
+    skipped (0 issues, chapter left unregistered). Creating it up front makes the
+    Add Chapter flow self-contained. Idempotent + best-effort (label-create
+    failures are non-fatal; the worst case is the pre-existing behaviour)."""
+    label = _chapter_label(chapter)
+    cp = gh(
+        "label", "list", "--repo", cfg.github_repo, "--limit", "200",
+        "--json", "name", "--jq", ".[].name", check=False,
+    )
+    existing = set((cp.stdout or "").splitlines()) if cp.returncode == 0 else set()
+    if label in existing:
+        return
+    print(f"  creating missing label {label}")
+    gh(
+        "label", "create", label, "--repo", cfg.github_repo,
+        "--color", "0e8a16", "--description", f"Chapter {chapter}", check=False,
+    )
+
+
 def create_subissue(
     cfg: ReviewConfig,
     title: str,
@@ -77,6 +100,7 @@ def create_subissues_from_drafts(
     """
     skip = skip or set()
     chapter = detect_chapter(drafts_path)
+    _ensure_chapter_label(cfg, chapter)  # a new chapter has no label yet → create it
     text = drafts_path.read_text()
     drafts = parse_drafts(text)
     print(f"Found {len(drafts)} draft sections in {drafts_path}")
