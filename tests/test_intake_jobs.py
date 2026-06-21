@@ -20,18 +20,18 @@ def _wait(reg, chapter, want, timeout=3.0):
     raise AssertionError(f"#{chapter} never reached {want!r}: {reg.status(chapter)}")
 
 
-def _good(cfg, chapter, *, informal_path=None):
+def _good(cfg, chapter, *, informal_path=None, use_tracker=False):
     return IntakeResult(
         chapter, Path(f"/d/Chapter{chapter}.md"),
         [ProposedSubIssue(1, "T1", "body1")], "raw", "m",
     )
 
 
-def _err(cfg, chapter, *, informal_path=None):
+def _err(cfg, chapter, *, informal_path=None, use_tracker=False):
     return IntakeResult(chapter, Path("x"), [], "", "m", error="boom")
 
 
-def _crash(cfg, chapter, *, informal_path=None):
+def _crash(cfg, chapter, *, informal_path=None, use_tracker=False):
     raise RuntimeError("kaboom")
 
 
@@ -67,7 +67,7 @@ def test_registry_status_none_when_unstarted():
 def test_registry_result_none_while_running():
     ev = threading.Event()
 
-    def slow(cfg, chapter, *, informal_path=None):
+    def slow(cfg, chapter, *, informal_path=None, use_tracker=False):
         ev.wait(2.0)
         return IntakeResult(chapter, Path("x"), [ProposedSubIssue(1, "t", "b")], "", "m")
 
@@ -83,7 +83,7 @@ def test_registry_no_double_spawn_while_running():
     started: list[int] = []
     ev = threading.Event()
 
-    def slow(cfg, chapter, *, informal_path=None):
+    def slow(cfg, chapter, *, informal_path=None, use_tracker=False):
         started.append(chapter)
         ev.wait(2.0)
         return IntakeResult(chapter, Path("x"), [ProposedSubIssue(1, "t", "b")], "", "m")

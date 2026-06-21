@@ -55,7 +55,7 @@ def _serve(server):
 def test_add_chapter_http_flow(tmp_path):
     cfg = _cfg(tmp_path)
 
-    def fake_runner(_cfg, chapter, *, informal_path=None):
+    def fake_runner(_cfg, chapter, *, informal_path=None, use_tracker=False):
         return IntakeResult(
             chapter, Path("/d.md"),
             [ProposedSubIssue(1, "T1", "b1"), ProposedSubIssue(2, "T2", "b2")],
@@ -84,11 +84,62 @@ def test_add_chapter_http_flow(tmp_path):
         server.shutdown(); server.server_close(); thread.join(timeout=5)
 
 
+def test_add_chapter_routes_informal_source(tmp_path):
+    """The endpoint maps informal_source → the runner's (use_tracker, informal_path):
+    default & explicit 'tracker' → use_tracker; 'file'+path → informal_path; legacy
+    path-only → file; 'none' → neither; 'file' without a path → 400 (runner unused)."""
+    cfg = _cfg(tmp_path)
+    seen = []
+
+    def fake_runner(_cfg, chapter, *, informal_path=None, use_tracker=False):
+        seen.append({"informal_path": informal_path, "use_tracker": use_tracker})
+        return IntakeResult(chapter, Path("/d.md"),
+                            [ProposedSubIssue(1, "T", "b")], "raw", "m")
+
+    server = deck_server.make_server(cfg, port=0)
+    server.intake = IntakeRegistry(runner=fake_runner)
+    thread, base = _serve(server)
+
+    def start(chapter, payload):
+        seen.clear()
+        body = {"chapter": chapter}
+        body.update(payload)
+        code, _ = _post(base, "/api/add-chapter", body, server.token)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not seen:
+            time.sleep(0.01)
+        return code
+
+    try:
+        # distinct chapters so each start is independent (no running-job no-op)
+        start(15, {})  # default → tracker
+        assert seen[-1] == {"informal_path": None, "use_tracker": True}
+        start(16, {"informal_source": "tracker"})
+        assert seen[-1] == {"informal_path": None, "use_tracker": True}
+        start(17, {"informal_source": "file", "informal_statements": "informal/C17.md"})
+        assert seen[-1]["use_tracker"] is False
+        assert str(seen[-1]["informal_path"]).endswith("informal/C17.md")
+        start(18, {"informal_statements": "informal/C18.md"})  # legacy path-only → file
+        assert seen[-1]["use_tracker"] is False and seen[-1]["informal_path"] is not None
+        start(19, {"informal_source": "none"})
+        assert seen[-1] == {"informal_path": None, "use_tracker": False}
+
+        # 'file' with no path → 400, runner never invoked
+        seen.clear()
+        code, _ = _post(base, "/api/add-chapter",
+                        {"chapter": 20, "informal_source": "file"}, server.token)
+        assert code == 400
+        time.sleep(0.05)
+        assert seen == []
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=5)
+
+
 def test_add_chapter_refused_without_valid_token(tmp_path):
     cfg = _cfg(tmp_path)
     started = []
 
-    def fake_runner(_cfg, chapter, *, informal_path=None):
+    def fake_runner(_cfg, chapter, *, informal_path=None, use_tracker=False):
         started.append(chapter)
         return IntakeResult(chapter, Path("x"), [ProposedSubIssue(1, "t", "b")], "", "m")
 

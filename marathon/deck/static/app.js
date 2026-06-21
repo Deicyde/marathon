@@ -2084,14 +2084,37 @@
       'register the chapter.</p>' +
       '<div class="addchap-form">' +
       '<label>Chapter <input id="ac-chapter" type="number" min="1" step="1" placeholder="15"></label>' +
-      '<label>Informal-statements file <span class="muted">(optional, repo-relative)</span>' +
+      '<fieldset class="ac-source"><legend>Informal statements</legend>' +
+      '<label><input type="radio" name="ac-source" value="tracker" checked> ' +
+      'Tracker roadmap <span class="muted">— quote this chapter\'s curated page/name ' +
+      'lines from the project tracker issue (recommended)</span></label>' +
+      '<label><input type="radio" name="ac-source" value="file"> ' +
+      'File <span class="muted">— a repo-relative markdown file of statements</span></label>' +
+      '<label><input type="radio" name="ac-source" value="none"> ' +
+      'None <span class="muted">— let Claude draft them; you verify each on review</span></label>' +
+      '</fieldset>' +
+      '<label id="ac-file-row" hidden>Informal-statements file <span class="muted">(repo-relative)</span>' +
       '<input id="ac-informal" type="text" placeholder=".marathon/review/informal/Chapter15.md"></label>' +
       '<button id="ac-start" class="ac-btn">Start intake</button>' +
       '</div>' +
       '<div id="ac-status" class="addchap-status" aria-live="polite"></div>' +
       '<div id="ac-drafts" class="addchap-drafts"></div>' +
       '</div>';
+    root.querySelectorAll('input[name="ac-source"]').forEach(function (r) {
+      r.addEventListener("change", function () {
+        var fileRow = acEl("ac-file-row");
+        if (!fileRow) return;
+        if (acSource() === "file") fileRow.removeAttribute("hidden");
+        else fileRow.setAttribute("hidden", "");
+      });
+    });
     acEl("ac-start").addEventListener("click", acStart);
+  }
+
+  // Which informal source the radio group has selected (defaults to tracker).
+  function acSource() {
+    var checked = document.querySelector('input[name="ac-source"]:checked');
+    return checked ? checked.value : "tracker";
   }
 
   function acStart() {
@@ -2100,10 +2123,17 @@
       acEl("ac-status").innerHTML = '<span class="err">Enter a chapter number first.</span>';
       return;
     }
+    var source = acSource();
     var informal = ((acEl("ac-informal") || {}).value || "").trim();
+    if (source === "file" && !informal) {
+      acEl("ac-status").innerHTML =
+        '<span class="err">Enter the informal-statements file path, or pick a different source.</span>';
+      return;
+    }
     acEl("ac-drafts").innerHTML = "";
     acEl("ac-status").innerHTML = "Starting intake for Chapter " + chapter + "…";
-    postJSON("/api/add-chapter", { chapter: chapter, informal_statements: informal })
+    postJSON("/api/add-chapter",
+             { chapter: chapter, informal_source: source, informal_statements: informal })
       .then(function () { acPollOnce(chapter); })
       .catch(function (e) {
         acEl("ac-status").innerHTML = '<span class="err">' + acEsc(e.message) + "</span>";

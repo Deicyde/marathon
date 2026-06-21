@@ -138,3 +138,63 @@ def test_intake_informal_file_embedded_with_verbatim_directive(tmp_path):
     assert res.ok
     assert "foo is genuinely true" in cap["prompt"]  # informal embedded
     assert "VERBATIM" in cap["prompt"]                # verbatim directive active
+
+
+# --- tracker roadmap as the informal source ----------------------------------
+
+def _tracker_body() -> str:
+    return (
+        "# LeeSM Tracker\n\nSome preamble about the project.\n\n"
+        "### Chapter 14: Forms\n"
+        "1. (p. 400) Define differential forms🟡\n\n"
+        "### Chapter 15: Orientations\n"
+        "1. (p. 379) Proposition 15.4: Pointwise orientations🟡\n"
+        "2. (p. 385) Define the orientation of a manifold🟡\n\n"
+        "### Chapter 16: Integration\n"
+        "1. (p. 401) Define integration of forms🟡\n"
+    )
+
+
+def test_tracker_chapter_section_extracts_only_that_chapter(tmp_path, monkeypatch):
+    import marathon.review.github as ghmod
+    from marathon.review.chapter_intake import tracker_chapter_section
+
+    monkeypatch.setattr(ghmod, "issue_body", lambda num, repo: _tracker_body())
+    sec = tracker_chapter_section(_cfg(tmp_path), 15)
+    assert sec is not None
+    assert "### Chapter 15: Orientations" in sec
+    assert "Pointwise orientations" in sec and "orientation of a manifold" in sec
+    assert "differential forms" not in sec      # bounded below (Ch14 excluded)
+    assert "integration of forms" not in sec    # bounded above (Ch16 excluded)
+
+
+def test_intake_from_tracker_embeds_section_with_anchor_directive(tmp_path, monkeypatch):
+    import marathon.review.github as ghmod
+
+    monkeypatch.setattr(ghmod, "issue_body", lambda num, repo: _tracker_body())
+    cfg = _cfg(tmp_path)
+    _write_chapter(cfg, 15)
+    cap: dict = {}
+    res = run_chapter_intake(
+        cfg, 15, use_tracker=True, _runner=_runner(_GOOD_DRAFTS, capture=cap)
+    )
+    assert res.ok
+    assert "Pointwise orientations" in cap["prompt"]            # Ch15 section embedded
+    assert "orientation of a manifold" in cap["prompt"]
+    assert "integration of forms" not in cap["prompt"]          # bounded (no Ch16)
+    assert "Anchored to the project tracker roadmap" in cap["prompt"]  # anchor directive
+    assert "tracker roadmap" in cap["prompt"]
+
+
+def test_intake_tracker_missing_section_is_error_not_raise(tmp_path, monkeypatch):
+    import marathon.review.github as ghmod
+
+    monkeypatch.setattr(  # tracker has no Chapter 15 section
+        ghmod, "issue_body", lambda num, repo: "### Chapter 14: Forms\n1. x🟡\n"
+    )
+    cfg = _cfg(tmp_path)
+    _write_chapter(cfg, 15)
+    res = run_chapter_intake(cfg, 15, use_tracker=True, _runner=_runner(_GOOD_DRAFTS))
+    assert not res.ok
+    assert "tracker roadmap" in (res.error or "") and "Chapter 15" in (res.error or "")
+    assert not drafts_path_for(cfg, 15).is_file()  # nothing written

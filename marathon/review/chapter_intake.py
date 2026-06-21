@@ -111,16 +111,61 @@ def _audit_inventory(cfg: ReviewConfig, chapter: int) -> list[str]:
     return rows
 
 
+def tracker_chapter_section(cfg: ReviewConfig, chapter: int) -> Optional[str]:
+    """The Chapter-``chapter`` slice of the parent tracker issue body — the
+    project's human-curated roadmap of textbook results (one line per result:
+    page citation + name + short description). ``None`` when the tracker can't be
+    read or has no section for this chapter. Mirrors the section bounds used by
+    :mod:`marathon.review.tracker` (``### Chapter N`` up to the next ``### Chapter``)."""
+    try:
+        from marathon.review.github import issue_body
+
+        body = issue_body(cfg.parent_issue, cfg.github_repo)
+    except Exception:  # noqa: BLE001 — a gh/network failure is non-fatal here
+        return None
+    if not body:
+        return None
+    marker = cfg.tracker_section(chapter)
+    start = body.find(marker)
+    if start == -1:
+        return None
+    end = body.find("\n### Chapter", start + 1)
+    if end == -1:
+        end = len(body)
+    section = body[start:end].strip()
+    return section or None
+
+
 def _build_intake_prompt(
     chapter: int,
     sources: list[tuple[str, str]],
     inventory: list[str],
     informal_text: Optional[str],
+    informal_kind: Optional[str] = None,
 ) -> str:
     rubric = _common_decision_rubric_section()
     output = _common_output_format_section("bootstrap")
 
-    if informal_text is not None:
+    if informal_text is not None and informal_kind == "tracker":
+        informal_directive = (
+            "A section of the project's **tracker roadmap** for this chapter is "
+            "included below — a human-curated list where each numbered line is one "
+            "textbook result: a page citation, the result's name, and a short "
+            "description (any trailing status emoji like 🟡/🔵/🟢 is a progress "
+            "marker — ignore it). Pair each roadmap line with the matching Lean "
+            "declaration(s); one line may map to several declarations — put them in "
+            "ONE sub-issue. Quote the roadmap line VERBATIM (minus the status emoji) "
+            "in each Informal Statement section and open it with `*📋 Anchored to the "
+            "project tracker roadmap (user-curated); confirm the full statement "
+            "against the cited page on review.*`. The roadmap gives the citation and "
+            "name, NOT the full formal statement — do NOT fabricate the full "
+            "statement; the citation lets the human reviewer confirm faithfulness "
+            "against the page."
+        )
+        informal_block = (
+            f"\n## Project tracker roadmap — Chapter {chapter}\n\n{informal_text}\n"
+        )
+    elif informal_text is not None:
         informal_directive = (
             "A human-provided **informal-statements file** is included below. "
             "Pair each of its sections with the matching Lean declaration(s); a "
@@ -183,6 +228,7 @@ def run_chapter_intake(
     chapter: int,
     *,
     informal_path: Optional[Path] = None,
+    use_tracker: bool = False,
     model: Optional[str] = None,
     timeout: Optional[float] = INTAKE_TIMEOUT_SECONDS,
     _runner=run_claude,
@@ -204,17 +250,31 @@ def run_chapter_intake(
         )
 
     informal_text: Optional[str] = None
+    informal_kind: Optional[str] = None
     if informal_path is not None:
         try:
             informal_text = Path(informal_path).read_text()
+            informal_kind = "file"
         except OSError as e:
             return IntakeResult(
                 chapter, dpath, [], "", model_label,
                 error=f"could not read informal-statements file {informal_path}: {e}",
             )
+    elif use_tracker:
+        informal_text = tracker_chapter_section(cfg, chapter)
+        informal_kind = "tracker"
+        if not informal_text:
+            return IntakeResult(
+                chapter, dpath, [], "", model_label,
+                error=(
+                    f"no '{cfg.tracker_section(chapter)}' section found in the "
+                    f"tracker roadmap (issue #{cfg.parent_issue}) — add that chapter "
+                    f"to the roadmap, or choose a file / 'none' informal source"
+                ),
+            )
 
     prompt = _build_intake_prompt(
-        chapter, sources, _audit_inventory(cfg, chapter), informal_text
+        chapter, sources, _audit_inventory(cfg, chapter), informal_text, informal_kind
     )
     try:
         cp = _runner(prompt, model=model, timeout=timeout)

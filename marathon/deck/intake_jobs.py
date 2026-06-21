@@ -47,7 +47,8 @@ class IntakeRegistry:
         self._lock = threading.Lock()
         self._runner = runner
 
-    def start(self, cfg, chapter: int, informal_path: Optional[Path] = None) -> dict:
+    def start(self, cfg, chapter: int, informal_path: Optional[Path] = None,
+              use_tracker: bool = False) -> dict:
         """Start (or return the already-running) intake for ``chapter``.
 
         Returns the job snapshot. A second call while one is running is a no-op
@@ -63,7 +64,7 @@ class IntakeRegistry:
         def _work() -> None:
             try:
                 res: IntakeResult = self._runner(
-                    cfg, chapter, informal_path=informal_path
+                    cfg, chapter, informal_path=informal_path, use_tracker=use_tracker
                 )
                 status = "ready" if res.ok else "error"
             except Exception as exc:  # noqa: BLE001 — registry must never die

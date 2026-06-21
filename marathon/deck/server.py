@@ -587,13 +587,33 @@ class DeckHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST,
                 f"bad or missing chapter {data.get('chapter')!r}",
             )
-        informal_path = None
+        source = str(data.get("informal_source") or "").strip().lower()
         raw = str(data.get("informal_statements") or "").strip()
-        if raw:
+        # Back-compat: a legacy client that sends only a path (no informal_source)
+        # means "file"; an otherwise-empty request defaults to the tracker roadmap.
+        if not source:
+            source = "file" if raw else "tracker"
+        informal_path = None
+        use_tracker = False
+        if source == "tracker":
+            use_tracker = True
+        elif source == "none":
+            pass
+        elif source == "file":
+            if not raw:
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    "informal source 'file' selected but no path was given",
+                )
             p = Path(raw)
             informal_path = p if p.is_absolute() else self.cfg.repo_dir / p
+        else:
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                f"unknown informal_source {source!r} (want tracker|file|none)",
+            )
         snap = self.server.intake.start(
-            self.cfg, chapter, informal_path=informal_path
+            self.cfg, chapter, informal_path=informal_path, use_tracker=use_tracker
         )
         self._send_json(snap)
 
