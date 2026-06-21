@@ -578,3 +578,36 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .phase-pushing { color: #88c0d0; }
 .phase-opening { color: #a3be8c; }
 .phase-queued { color: var(--muted); }
+
+/* --- Add Chapter tab (F1): headless chapter-intake → review → approve --- */
+.addchap { max-width: 56rem; }
+.addchap h2 { margin: 0 0 0.4rem; font-size: 1.1rem; }
+.addchap-help { color: var(--muted); margin: 0 0 1.2rem; line-height: 1.5; font-size: 0.9rem; }
+.addchap-form { display: flex; flex-direction: column; gap: 0.8rem; margin-bottom: 1.2rem; }
+.addchap-form label { display: flex; flex-direction: column; gap: 0.3rem; font-weight: 600; font-size: 0.88rem; }
+.addchap-form input {
+  font: inherit; padding: 0.5rem 0.6rem; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--ink);
+}
+.addchap-form input:focus { outline: none; border-color: var(--accent); }
+.ac-btn {
+  align-self: flex-start; font: inherit; font-weight: 600; cursor: pointer;
+  padding: 0.55rem 1.1rem; border-radius: 8px; border: 1px solid var(--accent);
+  background: var(--accent); color: #07101f;
+}
+.ac-btn:hover:not(:disabled) { filter: brightness(1.08); }
+.ac-btn:disabled { opacity: 0.55; cursor: default; }
+.ac-approve { margin-top: 1rem; }
+.addchap-status { min-height: 1.4rem; margin: 0.4rem 0; line-height: 1.5; font-size: 0.9rem; }
+.addchap-drafts { margin-top: 0.8rem; }
+.drafts-list { display: flex; flex-direction: column; gap: 0.4rem; }
+.draft { border: 1px solid var(--line); border-radius: 8px; padding: 0.45rem 0.7rem; background: var(--panel); }
+.draft summary { cursor: pointer; font-size: 0.9rem; }
+.draft-body {
+  white-space: pre-wrap; word-break: break-word; margin: 0.6rem 0 0;
+  font-size: 0.8rem; line-height: 1.45; color: var(--muted); font-family: var(--mono);
+}
+.ac-created { line-height: 1.8; }
+.muted { color: var(--muted); }
+.err { color: var(--bad); font-weight: 600; }
+.warn { color: var(--warn); }

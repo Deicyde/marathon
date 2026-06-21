@@ -2052,7 +2052,7 @@
       btns[i].classList.toggle("active", on);
       btns[i].setAttribute("aria-selected", on ? "true" : "false");
     }
-    ["review", "status", "issues", "history"].forEach(function (t) {
+    ["review", "status", "issues", "history", "add-chapter"].forEach(function (t) {
       var pane = document.getElementById("tab-" + t);
       if (!pane) return;
       if (t === name) pane.removeAttribute("hidden");
@@ -2071,8 +2071,131 @@
       renderIssuesTab();
     } else if (name === "history") {
       renderHistoryTab();
+    } else if (name === "add-chapter") {
+      renderAddChapterTab();
     }
     // Review tab renders on its own (event-driven); nothing to do here.
+  }
+
+  // --- Add Chapter tab (F1): headless chapter-intake → review → approve -----
+  // POST /api/add-chapter starts a headless intake (Claude drafts one review
+  // sub-issue per chapter result); we poll /api/chapter-intake-status until it
+  // is ready, render the drafts for human review, then POST /api/approve-chapter
+  // to open the GitHub issues + register the chapter. Build the form ONCE so a
+  // tab switch away+back keeps any in-flight state.
+  var acPoll = null;
+  function acEsc(s) {
+    var d = document.createElement("div");
+    d.textContent = s == null ? "" : String(s);
+    return d.innerHTML;
+  }
+  function acEl(id) { return document.getElementById(id); }
+
+  function renderAddChapterTab() {
+    var root = acEl("dash-add-chapter");
+    if (!root || root.getAttribute("data-init") === "1") return;
+    root.setAttribute("data-init", "1");
+    root.innerHTML =
+      '<div class="addchap">' +
+      '<h2>Add a chapter</h2>' +
+      '<p class="addchap-help">Run a headless review of a <em>formalized</em> chapter: ' +
+      'Claude reads the whole chapter and drafts one review sub-issue per first-class ' +
+      'result. You review the drafts below, then approve to open the GitHub issues and ' +
+      'register the chapter.</p>' +
+      '<div class="addchap-form">' +
+      '<label>Chapter <input id="ac-chapter" type="number" min="1" step="1" placeholder="15"></label>' +
+      '<label>Informal-statements file <span class="muted">(optional, repo-relative)</span>' +
+      '<input id="ac-informal" type="text" placeholder=".marathon/review/informal/Chapter15.md"></label>' +
+      '<button id="ac-start" class="ac-btn">Start intake</button>' +
+      '</div>' +
+      '<div id="ac-status" class="addchap-status" aria-live="polite"></div>' +
+      '<div id="ac-drafts" class="addchap-drafts"></div>' +
+      '</div>';
+    acEl("ac-start").addEventListener("click", acStart);
+  }
+
+  function acStart() {
+    var chapter = parseInt((acEl("ac-chapter") || {}).value, 10);
+    if (!chapter || chapter < 1) {
+      acEl("ac-status").innerHTML = '<span class="err">Enter a chapter number first.</span>';
+      return;
+    }
+    var informal = ((acEl("ac-informal") || {}).value || "").trim();
+    acEl("ac-drafts").innerHTML = "";
+    acEl("ac-status").innerHTML = "Starting intake for Chapter " + chapter + "…";
+    postJSON("/api/add-chapter", { chapter: chapter, informal_statements: informal })
+      .then(function () { acPollOnce(chapter); })
+      .catch(function (e) {
+        acEl("ac-status").innerHTML = '<span class="err">' + acEsc(e.message) + "</span>";
+      });
+  }
+
+  function acPollOnce(chapter) {
+    if (acPoll) { clearTimeout(acPoll); acPoll = null; }
+    postJSON("/api/chapter-intake-status", { chapter: chapter })
+      .then(function (s) {
+        var st = acEl("ac-status");
+        if (!st) return; // tab torn down
+        if (s.status === "running") {
+          st.innerHTML = "⏳ Reviewing Chapter " + chapter +
+            " — headless Claude is reading the whole chapter. This takes a few minutes.";
+          acPoll = setTimeout(function () { acPollOnce(chapter); }, 4000);
+        } else if (s.status === "ready") {
+          st.innerHTML = "✅ Drafted " + (s.subissues || []).length +
+            " sub-issues for Chapter " + chapter + ". Review them, then approve.";
+          acRenderDrafts(chapter, s.subissues || []);
+        } else if (s.status === "error") {
+          st.innerHTML = '<span class="err">Intake failed: ' + acEsc(s.error || "unknown") + "</span>";
+        } else {
+          st.innerHTML = '<span class="err">No intake job found — start one.</span>';
+        }
+      })
+      .catch(function (e) {
+        var st = acEl("ac-status");
+        if (st) st.innerHTML = '<span class="err">' + acEsc(e.message) + "</span>";
+      });
+  }
+
+  function acRenderDrafts(chapter, subs) {
+    var html = '<div class="drafts-list">';
+    subs.forEach(function (s) {
+      html += '<details class="draft"><summary><b>#' + s.index + "</b> · " +
+        acEsc(s.title) + '</summary><pre class="draft-body">' + acEsc(s.body) + "</pre></details>";
+    });
+    html += "</div>";
+    html += '<button id="ac-approve" class="ac-btn ac-approve">Approve &amp; open ' +
+      subs.length + " issue" + (subs.length === 1 ? "" : "s") + "</button>";
+    acEl("ac-drafts").innerHTML = html;
+    acEl("ac-approve").addEventListener("click", function () { acApprove(chapter); });
+  }
+
+  function acApprove(chapter) {
+    var btn = acEl("ac-approve");
+    if (btn) { btn.disabled = true; btn.textContent = "Opening issues…"; }
+    postJSON("/api/approve-chapter", { chapter: chapter })
+      .then(function (r) {
+        var created = r.created || [];
+        var html = "<p>✅ Opened " + created.length + " issue" +
+          (created.length === 1 ? "" : "s") + " for Chapter " + chapter + ":</p>" +
+          '<ul class="ac-created">';
+        created.forEach(function (c) {
+          html += '<li><a href="' + acEsc(c.url) + '" target="_blank" rel="noopener">#' +
+            c.issue + "</a></li>";
+        });
+        html += "</ul>";
+        if (r.registry_error) {
+          html += '<p class="warn">⚠️ Registry note: ' + acEsc(r.registry_error) +
+            " — register the chapter in config.toml by hand.</p>";
+        } else {
+          html += '<p class="muted">Chapter ' + chapter + " registered in config.toml.</p>";
+        }
+        acEl("ac-drafts").innerHTML = html;
+        acEl("ac-status").innerHTML = "";
+      })
+      .catch(function (e) {
+        if (btn) { btn.disabled = false; btn.textContent = "Approve & open issues"; }
+        acEl("ac-status").innerHTML = '<span class="err">Approve failed: ' + acEsc(e.message) + "</span>";
+      });
   }
 
   // --- Status tab: the conductor (global orchestrator) + jobs + landings ---

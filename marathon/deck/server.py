@@ -136,6 +136,11 @@ class DeckServer(ThreadingHTTPServer):
         # in-memory verdicts, a SIMULATED ship that fires nothing). No cfg /
         # repo / GitHub / Aristotle is touched.
         self.demo = demo
+        # Per-deck registry of in-flight headless chapter-intake jobs (the
+        # "Add Chapter" feature). Lazily exercised; harmless when unused.
+        from marathon.deck.intake_jobs import IntakeRegistry
+
+        self.intake = IntakeRegistry()
         super().__init__(server_address, DeckHandler)
 
 
@@ -409,6 +414,7 @@ class DeckHandler(BaseHTTPRequestHandler):
     _POST_ROUTES = (
         "/api/verdict", "/api/decl-verdict", "/api/missing", "/api/ship",
         "/api/refresh-issue",
+        "/api/add-chapter", "/api/chapter-intake-status", "/api/approve-chapter",
     )
 
     def do_POST(self) -> None:  # noqa: N802 (stdlib handler name)
@@ -433,6 +439,12 @@ class DeckHandler(BaseHTTPRequestHandler):
                     self._api_missing()
                 elif parsed.path == "/api/refresh-issue":
                     self._api_refresh_issue()
+                elif parsed.path == "/api/add-chapter":
+                    self._api_add_chapter()
+                elif parsed.path == "/api/chapter-intake-status":
+                    self._api_chapter_intake_status()
+                elif parsed.path == "/api/approve-chapter":
+                    self._api_approve_chapter()
                 else:  # /api/ship
                     self._api_ship()
         except BrokenPipeError:
@@ -527,6 +539,134 @@ class DeckHandler(BaseHTTPRequestHandler):
                 f"verdict routing failed: {exc}",
             )
         self._send_json(result.to_json())
+
+    # --- "Add Chapter" intake (F1): start a headless intake, poll it, approve --
+
+    def _api_add_chapter(self) -> None:
+        """Start a headless chapter-intake on a daemon thread. Returns the job
+        snapshot immediately; the UI polls /api/chapter-intake-status until the
+        job is ``ready`` (drafted sub-issues) or ``error``."""
+        data = self._read_guarded_body()
+        if data is None:
+            return
+        if self.server.demo:
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "add-chapter is not available in demo mode"
+            )
+        try:
+            chapter = int(data.get("chapter"))
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                f"bad or missing chapter {data.get('chapter')!r}",
+            )
+        informal_path = None
+        raw = str(data.get("informal_statements") or "").strip()
+        if raw:
+            p = Path(raw)
+            informal_path = p if p.is_absolute() else self.cfg.repo_dir / p
+        snap = self.server.intake.start(
+            self.cfg, chapter, informal_path=informal_path
+        )
+        self._send_json(snap)
+
+    def _api_chapter_intake_status(self) -> None:
+        """Poll one chapter's intake job (LOCAL read — no side effect)."""
+        data = self._read_guarded_body()
+        if data is None:
+            return
+        try:
+            chapter = int(data.get("chapter"))
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                f"bad or missing chapter {data.get('chapter')!r}",
+            )
+        snap = self.server.intake.status(chapter) or {
+            "chapter": chapter, "status": "none",
+        }
+        self._send_json(snap)
+
+    def _api_approve_chapter(self) -> None:
+        """Apply a READY intake: open the GitHub sub-issues + register the
+        chapter in ``config.toml``. Guarded against a double-approve creating
+        duplicate issues (an already-registered chapter is refused)."""
+        data = self._read_guarded_body()
+        if data is None:
+            return
+        if self.server.demo:
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "approve-chapter is not available in demo mode"
+            )
+        try:
+            chapter = int(data.get("chapter"))
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                f"bad or missing chapter {data.get('chapter')!r}",
+            )
+        res = self.server.intake.result(chapter)
+        if res is None or not res.ok:
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                f"no ready intake for chapter {chapter} to approve — start one "
+                "and wait for it to finish",
+            )
+
+        from marathon.review.config import (
+            RegistryEditError,
+            load_config,
+            register_chapter,
+        )
+        from marathon.review.subissues import create_subissues_from_drafts
+
+        # Persistent double-approve guard: an already-registered chapter was
+        # already applied, so opening its issues again would duplicate them.
+        try:
+            already = chapter in getattr(
+                load_config(repo_dir=self.cfg.repo_dir), "chapters", {}
+            )
+        except SystemExit:
+            already = False
+        if already:
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                f"chapter {chapter} is already registered — it was already "
+                "approved (skipping to avoid duplicate issues)",
+            )
+
+        try:
+            created = create_subissues_from_drafts(self.cfg, res.drafts_path)
+        except Exception as e:  # noqa: BLE001 — surface, never crash the loop
+            return self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"creating sub-issues failed: {e}",
+            )
+
+        # entries: [issue_num, tracker_substring] in draft order — use the draft
+        # titles the human just reviewed as the substrings.
+        titles = {s.index: s.title for s in res.subissues}
+        entries = [[num, titles.get(idx, f"entry {idx}")] for idx, num, _u in created]
+        target = self.cfg.target_path(chapter)
+        try:
+            target = target.relative_to(self.cfg.repo_dir)
+        except ValueError:
+            pass
+        registry_error = None
+        if entries:
+            try:
+                register_chapter(self.cfg.repo_dir, chapter, target, entries)
+            except RegistryEditError as e:
+                registry_error = str(e)
+        # The issues were created, so this is a success even if the registry
+        # write warned (the human can fix config.toml by hand); ok=True keeps
+        # the created list visible in the UI instead of throwing it away.
+        self._send_json({
+            "ok": True,
+            "chapter": chapter,
+            "created": [{"index": i, "issue": n, "url": u} for i, n, u in created],
+            "registry_error": registry_error,
+        })
 
     def _api_decl_verdict(self) -> None:
         """Record one per-(issue,decl) verdict — LOCAL ONLY (the contract's
