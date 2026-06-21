@@ -250,8 +250,15 @@ def _load_pending_rejections_md(
     try:
         from marathon.review.github import fetch_reject_note
 
-        note = fetch_reject_note(cfg, focus_issue)
-    except Exception:  # noqa: BLE001 — a recovery failure must never crash refine
+        # fetch_reject_note(issue_num, repo) -> (note, reject_ts)
+        note, _reject_ts = fetch_reject_note(focus_issue, cfg.github_repo)
+    except Exception as e:  # noqa: BLE001 — a recovery failure must never crash refine
+        # LOG it: a silent swallow here is what let a wrong-signature call to
+        # fetch_reject_note hide (the note never arrived, the iteration fell to
+        # Claude-in-loop, and #96 failed identically twice). A visible failure
+        # beats a silent fall-through to the structure-scanning draft.
+        print(f"  reject-note GitHub fallback for #{focus_issue} failed: {e}",
+              flush=True)
         note = None
     if note and note.strip():
         body = note.strip()

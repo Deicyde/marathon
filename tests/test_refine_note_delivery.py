@@ -13,6 +13,7 @@ import marathon.review.state as statemod
 
 class _FakeCfg:
     chapters: dict = {}
+    github_repo = "owner/repo"
 
     def target_path(self, chapter):  # never matched (chapters empty) → chapter=None
         return None
@@ -31,9 +32,10 @@ def _patch(monkeypatch, *, local, github):
                         lambda *a, **k: local)
     calls = []
 
-    def fake_fetch(cfg, n):
-        calls.append(n)
-        return github
+    def fake_fetch(issue_num, repo):  # REAL sig: (issue_num, repo) -> (note, ts)
+        assert isinstance(issue_num, int) and isinstance(repo, str)  # guard the sig
+        calls.append(issue_num)
+        return (github, "2026-06-21T00:00:00Z")
 
     monkeypatch.setattr(ghmod, "fetch_reject_note", fake_fetch)
     return calls
