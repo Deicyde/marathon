@@ -920,6 +920,39 @@ def _enqueue_landing_after_success(cfg: ReviewConfig, job: ConductorJob) -> None
         )
 
 
+def _requeue_if_no_pr_landed(cfg: ReviewConfig, job: ConductorJob) -> None:
+    """A per-issue refine that exits clean but opened NO PR (typically because
+    Aristotle produced no diff) leaves its issue stuck 'rejected' — iterated, but
+    with nothing to merge, so no requeue ever fires and the deck blocks it from
+    review (the #98 symptom class). If the branch has no PR and the issue is still
+    rejected, requeue it for re-review. No-op when a PR exists (open → automerge →
+    requeue; merged → the merged-rejection reconcile handles it)."""
+    branch = getattr(job, "branch", None)
+    if not branch:
+        return
+    from marathon.review.automerge import _REFINE_BRANCH_RE, _requeue_refined_issue
+    from marathon.review.github import gh
+
+    if not _REFINE_BRANCH_RE.match(branch):
+        return
+    try:
+        cp = gh("pr", "list", "--repo", cfg.github_repo, "--head", branch,
+                "--state", "all", "--json", "number", "--limit", "1", check=False)
+        if cp.returncode != 0:
+            return
+        if json.loads(cp.stdout or "[]"):
+            return  # a PR exists — let the normal merge → requeue path handle it
+    except Exception as exc:  # noqa: BLE001 — a check failure must not crash a reap
+        print(f"  no-PR check for {branch} failed ({exc}); skipping", flush=True)
+        return
+    st = load_state(cfg).issues.get(job.issue_num)
+    if st is not None and getattr(st, "status", None) == "rejected":
+        n = _requeue_refined_issue(cfg, branch)
+        if n is not None:
+            print(f"--- #{n} refine exited clean but landed no PR — requeued for "
+                  f"re-review (was stuck 'rejected') ---", flush=True)
+
+
 def _reap_finished(
     cfg: ReviewConfig,
     jobs: list[ConductorJob],
@@ -928,6 +961,7 @@ def _reap_finished(
     max_attempts: int,
     *,
     land: Optional[str] = None,
+    reconcile: bool = True,
 ) -> int:
     """Poll running jobs; apply the Phase-0 state machine to each exit.
 
@@ -970,6 +1004,16 @@ def _reap_finished(
             print(f"    worktree kept (interrupted): {job.worktree}", flush=True)
         elif rc == 0:
             job.status = "succeeded"
+            # B0c: a refine that exits clean but opened NO PR (typically no diff →
+            # nothing to commit/PR) would leave the issue stuck 'rejected' forever
+            # — iterated, but nothing to merge, so no requeue fires and the deck
+            # blocks it from review (the #98 symptom). Requeue it so it returns to
+            # the review feed instead of vanishing.
+            if reconcile:
+                try:
+                    _requeue_if_no_pr_landed(cfg, job)
+                except Exception as exc:  # noqa: BLE001 — never crash a reap
+                    print(f"  no-PR requeue check failed: {exc}", flush=True)
             _remove_worktree(cfg.repo_dir, Path(job.worktree))
             # Phase-4 opt-in: enqueue onto the landing queue ONLY under
             # --land next (default off — the per-issue PR flow is
@@ -1284,7 +1328,8 @@ def run_conductor(
         while True:
             ticks += 1
             _reap_finished(
-                cfg, jobs, not_before, kept_worktrees, max_attempts, land=land
+                cfg, jobs, not_before, kept_worktrees, max_attempts,
+                land=land, reconcile=reconcile,
             )
             # Land eligible PRs (the merge orchestrator) so infra/registration
             # stays on main across all chapters. Throttled to ~once/min so the

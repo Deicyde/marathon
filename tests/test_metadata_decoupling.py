@@ -490,10 +490,12 @@ def test_reap_fires_hook_on_success_not_on_failure(tmp_path, monkeypatch):
             proc=SimpleNamespace(poll=lambda: rc),
         )
 
-    assert conductor._reap_finished(cfg, [job(0)], {}, {}, max_attempts=3) == 1
+    # reconcile=False isolates this from the no-PR requeue (B0c), which would
+    # otherwise requeue #22 on the success reap (the test's job has no PR).
+    assert conductor._reap_finished(cfg, [job(0)], {}, {}, max_attempts=3, reconcile=False) == 1
     assert fired == [cfg.repo_dir]
 
-    assert conductor._reap_finished(cfg, [job(1)], {}, {}, max_attempts=3) == 1
+    assert conductor._reap_finished(cfg, [job(1)], {}, {}, max_attempts=3, reconcile=False) == 1
     assert fired == [cfg.repo_dir]  # failure: no second firing
     assert load_state(cfg).issues[22].attempts == 1  # state machine still ran
 

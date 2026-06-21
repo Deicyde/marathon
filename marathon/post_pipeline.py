@@ -470,9 +470,15 @@ def run_git_commit(
 
 
 def run_git_push(repo_dir: Path) -> tuple[bool, str]:
-    """Run ``git push`` from ``repo_dir``. Returns ``(ok, message)``."""
+    """Push the current HEAD from ``repo_dir`` to its same-named origin branch.
+    Returns ``(ok, message)``.
+
+    Uses an explicit ``origin HEAD`` rather than a bare ``git push`` so it never
+    fails with "the upstream branch of your current branch does not match the
+    name of your current branch" (push.default=simple) when the worktree's branch
+    has no/mismatched upstream — the failure mode that silently stranded #98."""
     proc = subprocess.run(
-        ["git", "push"],
+        ["git", "push", "origin", "HEAD"],
         cwd=str(repo_dir),
         capture_output=True,
         text=True,
@@ -894,13 +900,16 @@ def open_or_update_pr(
 ) -> tuple[bool, str]:
     """Push ``branch`` (force) and open-or-update its PR. Returns
     ``(ok, url_or_error)``."""
-    # Force-push (with lease) so each iteration's commits land on the
-    # branch cleanly. The per-issue persistent-branch model means the
-    # branch's history only ever reflects the latest iteration, so a
-    # force-push is safe — no shared collaborators are tracking this
-    # branch besides the daemon itself.
+    # Force-push to an EXPLICIT refspec so the push is robust to two failure
+    # modes that silently stranded #98: (1) a branch upstream that doesn't match
+    # the branch name (push.default=simple → "upstream does not match"), and
+    # (2) a STALE remote-tracking ref left after the branch was deleted on a prior
+    # merge, which makes --force-with-lease reject the push as "stale info". The
+    # per-issue persistent-branch model has a single writer (this daemon), so a
+    # plain --force with an explicit ``HEAD:refs/heads/<branch>`` is safe and
+    # avoids relying on the (possibly stale) lease.
     push = subprocess.run(
-        ["git", "push", "--force-with-lease", "-u", "origin", branch],
+        ["git", "push", "--force", "origin", f"HEAD:refs/heads/{branch}"],
         cwd=str(repo_dir), capture_output=True, text=True, check=False,
     )
     if push.returncode != 0:
@@ -1122,6 +1131,11 @@ def run_post_pipeline(
         "gate_posture": None,
         "jury": None,
         "frozen_reverts": [],
+        # None = not attempted; True/False = a REQUESTED push/PR succeeded/failed.
+        # The caller (refine) fails the iteration on a False so the conductor
+        # keeps the worktree and retries instead of reaping the only copy.
+        "push_ok": None,
+        "pr_ok": None,
     }
 
     # --- statement-immutability guard (HARD) ---------------------------
@@ -1334,12 +1348,13 @@ def run_post_pipeline(
         else:
             print(f"  commit: skipped — {c.skipped_reason}")
 
-        if config.auto_push and c.sha:
+        # Skip the bare push when --auto-pr is on: the PR step below pushes the
+        # marathon branch explicitly. Running both made the bare push fail on the
+        # branch upstream mismatch — and that failure used to be silent.
+        if config.auto_push and c.sha and not config.auto_pr:
             ok, push_msg = run_git_push(repo_dir)
-            if ok:
-                print(f"  push: ok ({push_msg})")
-            else:
-                print(f"  push: failed — {push_msg}")
+            out["push_ok"] = ok
+            print(f"  push: {('ok (' + push_msg + ')') if ok else ('failed — ' + push_msg)}")
 
 
         # Post-commit audit: did this iteration touch any verified
@@ -1550,12 +1565,14 @@ def run_post_pipeline(
                         title=pr_title,
                         body=pr_body,
                     )
+                    out["pr_ok"] = pr_ok
                     if pr_ok:
                         print(f"  pr: {pr_msg}")
                     else:
                         print(f"  pr: failed — {pr_msg}")
-        except Exception as e:  # noqa: BLE001 — soft-warning
-            print(f"  pr: skipped — {type(e).__name__}: {e}")
+        except Exception as e:  # noqa: BLE001 — surface as a PR failure, not silent
+            out["pr_ok"] = False
+            print(f"  pr: failed — {type(e).__name__}: {e}")
 
     return out
 

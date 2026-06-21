@@ -838,7 +838,7 @@ async def _run_refine_attempt(
         and task.status == TaskStatus.COMPLETE
         and pipeline_config.has_any()
     ):
-        run_post_pipeline(
+        pipeline_result = run_post_pipeline(
             config=pipeline_config,
             repo_dir=repo_dir,
             target_path=Path(state.output_path),
@@ -848,6 +848,23 @@ async def _run_refine_attempt(
             extra_paths_to_stage=cross_writes_for_pipeline or None,
             iteration_duration_seconds=state.duration_seconds,
         )
+        # A REQUESTED push/PR that FAILED must fail the whole run (non-zero exit)
+        # so the conductor marks the job failed, KEEPS the worktree, and retries —
+        # never reaps the only copy of committed-but-unlanded work (the #98 trap).
+        # push_ok/pr_ok are None when not attempted, True on success, False on a
+        # genuine failure.
+        failed = [
+            label
+            for label, ok in (("push", pipeline_result.get("push_ok")),
+                              ("PR", pipeline_result.get("pr_ok")))
+            if ok is False
+        ]
+        if failed:
+            sys.exit(
+                f"refine iteration {iteration_idx}: {' + '.join(failed)} FAILED "
+                "after a clean build/commit — the work is committed in this "
+                "worktree but did not land. Preserving the worktree for retry."
+            )
 
     return task.status
 
