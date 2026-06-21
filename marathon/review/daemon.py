@@ -96,7 +96,12 @@ MAX_LOOPS_ONCE = 5
 # (not currently wired — left as a hook for future tuning).
 DEFAULT_REFINE_ARGS: list[str] = [
     "--skeleton", "--max-iterations", "1", "--max-retries", "3",
-    "--auto-build", "--build-timeout", "1800",
+    # 2400s = 40 min: a heavy chapter (e.g. Ch12's tensor-field files) takes
+    # ~20 min to `lake build` even WITH the Mathlib cache primed, so give it
+    # generous headroom. NOTE: a build running far past this is almost always
+    # compiling Mathlib FROM SCRATCH (the per-worktree cache prime didn't fire) —
+    # the real fix for that is the cache prime, not a bigger timeout.
+    "--auto-build", "--build-timeout", "2400",
     "--auto-commit", "--auto-push", "--auto-rate",
     # ``--auto-referee-every`` deliberately omitted: Claude no longer
     # auto-refreshes referee.md from daemon iterations. Standing items
