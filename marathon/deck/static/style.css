@@ -30,6 +30,13 @@ html, body {
 }
 
 /* --- top bar --- */
+/* topbar + tab-nav share one sticky context so the two bars can never drift
+   apart on scroll (no per-element top offset to mismatch). */
+.appbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
 .topbar {
   display: flex;
   align-items: center;
@@ -37,9 +44,6 @@ html, body {
   padding: 0.6rem 1rem;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
-  position: sticky;
-  top: 0;
-  z-index: 5;
 }
 .brand { font-size: 1.05rem; margin: 0; font-weight: 700; letter-spacing: 0.02em; }
 .brand-accent { color: var(--accent); }
@@ -429,7 +433,7 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 /* ===================================================================== */
 
 /* --- tab bar --- */
-.tab-nav { display: flex; gap: 0.3rem; padding: 0 1rem; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 56px; z-index: 4; overflow-x: auto; }
+.tab-nav { display: flex; gap: 0.3rem; padding: 0 1rem; background: var(--panel); border-bottom: 1px solid var(--line); overflow-x: auto; }
 .tab-btn { background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted); cursor: pointer; padding: 0.7rem 0.9rem; font: inherit; font-weight: 600; font-size: 0.92rem; white-space: nowrap; transition: color .15s, border-color .15s; }
 .tab-btn:hover { color: var(--ink); }
 .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
