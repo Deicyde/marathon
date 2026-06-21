@@ -234,7 +234,31 @@ def _load_pending_rejections_md(
             break
     # If we can't identify the chapter, fall back to project-wide pending
     # rejections rather than dropping them entirely.
-    return render_pending_rejections_md(cfg, chapter, focus_issue=focus_issue)
+    md = render_pending_rejections_md(cfg, chapter, focus_issue=focus_issue)
+    if md or focus_issue is None:
+        return md
+    # GitHub fallback for a focused single-issue rejection. The refine runs in a
+    # worktree checked out from origin/main, whose state.json frequently LACKS
+    # the just-written reject note (it lives in the main repo's local state and
+    # on the GitHub issue, but is not committed to origin/main before dispatch).
+    # Without it, refine's "send the human's reject note to Aristotle verbatim"
+    # bypass silently fails and the iteration falls back to Claude-in-loop, which
+    # refactors the target from its visible structure — the #96 failure, where it
+    # deleted the approved IsSmooth.* lemmas instead of adding the requested
+    # SmoothPullback, twice. Recover the note from GitHub (the durable source) so
+    # the bypass fires and the note actually steers Aristotle.
+    try:
+        from marathon.review.github import fetch_reject_note
+
+        note = fetch_reject_note(cfg, focus_issue)
+    except Exception:  # noqa: BLE001 — a recovery failure must never crash refine
+        note = None
+    if note and note.strip():
+        body = note.strip()
+        if body.lstrip().startswith("- **"):
+            return body
+        return f"- **Review #{focus_issue} REJECTED**\n\n{body}"
+    return md
 
 
 def _read_latest_rating_note(workdir: Path) -> Optional[str]:
