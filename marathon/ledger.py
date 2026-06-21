@@ -115,7 +115,12 @@ if TYPE_CHECKING:  # pragma: no cover — type-only; avoids review-package dep
     from marathon.review.config import ReviewConfig
 
 
-SCHEMA_VERSION = 3
+# v4 added a referee_tasks table. The referee feature was since removed, so v4 no
+# longer CREATES that table — but the version stays 4 (NOT reverted to 3): schema
+# versions only ever move forward, and already-deployed v4 ledgers must not be
+# refused as "newer than this marathon" (_ensure_schema's forward-compat guard). An
+# orphaned referee_tasks table in an old db simply sits unused.
+SCHEMA_VERSION = 4
 LEDGER_RELPATH = Path(".marathon") / "marathon.db"
 
 #: Allowed ``targets.kind`` values (the planner's intake taxonomy):
