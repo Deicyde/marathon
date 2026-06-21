@@ -379,6 +379,15 @@ def record_verification(cfg: ReviewConfig, issue_num: int) -> IssueState:
     save_state(cfg, state)
     _append_verdict_jsonl(cfg, issue_num, "verified", None, entry.verdict_ts)
     _ledger_upsert(cfg, issue_num, entry, verdict_event="verified")
+    # Freeze the verified statements into the approved-statements manifest so a
+    # later fill/refine iteration can never change them (the fill guard reverts
+    # any signature change). Best-effort — capture must never block a verify.
+    try:
+        from marathon.review.approved_statements import capture_on_verify
+
+        capture_on_verify(cfg, issue_num)
+    except Exception:  # noqa: BLE001
+        pass
     return entry
 
 
