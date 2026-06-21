@@ -225,7 +225,6 @@ class HermesWatcher:
         workdir: Path,
         target_folder: Path,
         repo_dir: Path,
-        referee_path: Optional[Path],
         skeleton_mode: bool,
         iteration_idx: int,
         poll_interval: int = EVENT_POLL_INTERVAL,
@@ -233,7 +232,6 @@ class HermesWatcher:
         self.workdir = workdir
         self.target_folder = target_folder
         self.repo_dir = repo_dir
-        self.referee_path = referee_path
         self.skeleton_mode = skeleton_mode
         self.iteration_idx = iteration_idx
         self.poll_interval = poll_interval
@@ -398,14 +396,6 @@ class HermesWatcher:
         ctx_md_list = [_event_to_md(e) for e in ctx_events[-RECENT_EVENTS_CONTEXT:]]
         ctx_block = "\n".join(ctx_md_list) if ctx_md_list else "(none)"
 
-        # Referee notes; trim to keep total prompt size bounded.
-        referee_md = "(no referee.md available)"
-        if self.referee_path and self.referee_path.is_file():
-            try:
-                referee_md = _truncate(self.referee_path.read_text(), 8_000)
-            except OSError:
-                referee_md = "(could not read referee.md)"
-
         # Persistent memory tail: notes from prior Hermes calls in this
         # workdir, possibly including prior iterations.
         memory_block = self._read_memory_tail()
@@ -424,7 +414,6 @@ class HermesWatcher:
             f"## Task goal\n\n{task_desc}\n\n"
             f"## Target folder\n\n`{target_rel}/`\n\n"
             f"## Skeleton mode\n\n{self.skeleton_mode}\n\n"
-            f"## Referee notes (project-level reviewer guidance)\n\n{referee_md}\n\n"
             f"## Persistent memory (your own notes from prior Hermes calls in "
             f"this refine target)\n\n{memory_block}\n\n"
             f"## Recent events (most recent last)\n\n{ctx_block}\n\n"
@@ -561,7 +550,6 @@ def build_watcher_factory(
     workdir: Path,
     target_folder: Path,
     repo_dir: Path,
-    referee_path: Optional[Path],
     skeleton_mode: bool,
 ):
     """Return a factory matching the ``watcher_factory`` signature expected
@@ -576,7 +564,6 @@ def build_watcher_factory(
             workdir=workdir,
             target_folder=target_folder,
             repo_dir=repo_dir,
-            referee_path=referee_path,
             skeleton_mode=skeleton_mode,
             iteration_idx=iteration_idx,
         )

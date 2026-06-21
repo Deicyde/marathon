@@ -1,9 +1,9 @@
 """Shared ``claude`` CLI subprocess helper + cross-process concurrency limiter.
 
-WHY this module exists: five call sites (the refine reviewer in
+WHY this module exists: four call sites (the refine reviewer in
 ``claude_review``, the auto-rater in ``post_pipeline``, the Hermes steerer
-in ``hermes_watcher``, the advisory jury in ``jury``, and the referee in
-``referee``) each grew their own copy of the same subprocess conventions —
+in ``hermes_watcher``, and the advisory jury in ``jury``) each grew their
+own copy of the same subprocess conventions —
 prompt via stdin, ``ANTHROPIC_API_KEY`` scrubbed, ``--tools ""``,
 ``--output-format text``. Phase 3's Conductor fans N refine jobs out in
 parallel, and every one of them drafts/steers/rates/juries through this
@@ -25,7 +25,7 @@ The conventions, and why each exists:
   ``claude-opus-4-7``.** Computed per call (the jury convention, not
   ``claude_review``'s historical import-time read) so long-lived processes
   and tests see env changes. Call sites that must stay pinned (the rater,
-  Hermes, the referee) pass their model explicitly.
+  Hermes) pass their model explicitly.
 
 The slot limiter: K lock files under ``~/.marathon/claude-slots/``
 (K = ``MARATHON_CLAUDE_MAX_CONCURRENT``, default 2). A caller acquires any

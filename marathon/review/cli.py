@@ -28,7 +28,8 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
             "Review is the human-in-the-loop mathematical-accuracy check "
             "before proofs land on a skeleton chapter. Each declaration has "
             "a sub-issue; this command lets you list/show/verify/reject them "
-            "in textbook order, with rejections queued via referee.md."
+            "in textbook order, with rejections queued in the per-issue "
+            "review state."
         ),
     )
     cv_sub = p_cv.add_subparsers(dest="review_cmd", required=True)
@@ -304,15 +305,15 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
         "--notes",
         required=True,
         help=(
-            "Rejection notes (file path or inline) — go into referee.md, "
-            "NOT the comment."
+            "Rejection notes (file path or inline) — go into the per-issue "
+            "review state, NOT the comment."
         ),
     )
     p_r.add_argument("--comment", default=None, help="Override default verdict comment.")
     p_r.add_argument(
         "--no-refine",
         action="store_true",
-        help="Don't auto-launch refine daemon (just queue via referee.md).",
+        help="Don't auto-launch refine daemon (just queue the rejection).",
     )
     p_r.set_defaults(func=r.cmd_reject)
 

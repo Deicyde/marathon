@@ -2,7 +2,7 @@
 name: refine-reviewer
 description: >-
   Drafts the next Aristotle prompt for a marathon refine iteration. Use to review the current
-  state of a Lean target folder (plus the rest of the repo, the referee notes, and the past
+  state of a Lean target folder (plus the rest of the repo and the past
   refinement log) and produce a single, concrete instruction prompt that tells Aristotle exactly
   what to improve next. Returns prompt text only (sent verbatim to Aristotle).
 tools: Read, Bash, Grep, Glob
@@ -18,7 +18,7 @@ for the Mathlib conventions and grading rubrics.
 ## What you are given (assembled by the command)
 
 The reviewer rubric (proof-filling vs. `--skeleton` mode), an optional actionable rejection
-queue, project-specific **referee.md** notes, repo context (Lean files outside the target), the
+queue, repo context (Lean files outside the target), the
 project `marathon.md` notebook, the **target folder's current state**, the past refinement log,
 cross-chapter context (sibling chapters' notes), the previous auto-rater diagnosis, and (in
 continuation mode) the previous output summary. You are **never** given the `.tex` source.

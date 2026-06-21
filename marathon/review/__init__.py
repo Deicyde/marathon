@@ -5,8 +5,9 @@ declaration in a skeleton chapter gets a sub-issue paired with a
 plaintext rendering, mechanical-accuracy notes, and a verification
 checklist. The reviewer compares each entry against its textbook source
 (e.g. Lee's *Introduction to Smooth Manifolds*) and marks it VERIFIED or
-REJECTED. Rejections are queued via referee.md and picked up by the
-auto-refine daemon.
+REJECTED. Rejections are queued in the per-issue review state
+(``.marathon/review/state.json``) and picked up by the auto-refine
+daemon.
 
 This subpackage absorbs the previously-standalone scripts under
 ``<repo>/.marathon/review/*.py`` into the Marathon framework so they

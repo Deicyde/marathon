@@ -45,10 +45,6 @@ class PipelineConfig:
     # Aristotle). Set by refine, not by skeleton — refine drafts each Aristotle
     # prompt via Claude, skeleton uses a static template.
     claude_in_loop: bool = False
-    # Optional path to a referee notes file (e.g. referee.md). When set and
-    # auto_rate is on, the rater also receives these notes as
-    # project-specific priorities to weight scoring against.
-    referee_path: Optional[Path] = None
     # When True (and auto_commit also True), after the auto-commit lands,
     # run a post-iteration audit that diffs HEAD~1..HEAD against the set
     # of verified declarations extracted from currently-verified
@@ -972,7 +968,6 @@ def call_claude_rater(
     build_result: Optional[BuildResult],
     repo_dir: Optional[Path] = None,
     iteration_commit_sha: Optional[str] = None,
-    referee_path: Optional[Path] = None,
 ) -> RatingResult:
     claude_path = shutil.which("claude")
     if not claude_path:
@@ -991,23 +986,7 @@ def call_claude_rater(
     if repo_dir is not None and iteration_commit_sha:
         diff = _compute_iteration_diff(repo_dir, target_path, iteration_commit_sha)
 
-    referee_md: Optional[str] = None
-    if referee_path is not None and referee_path.is_file():
-        referee_md = referee_path.read_text()
-
     parts = [rubric]
-    if referee_md:
-        parts.append(
-            "## Project-specific reviewer priorities (referee.md)\n\n"
-            "These notes describe project-specific failure modes the reviewer "
-            "agent (separate from you) is asked to push back on. Treat them as "
-            "context for what counts as a structural fix on this project — a "
-            "diff that closes a referee item is unambiguously structural, "
-            "regardless of how small the textual change. Do not score against "
-            "items absent from the diff; the rubric above is still the primary "
-            "scoring guide.\n\n"
-            + referee_md
-        )
     if build_result is not None and build_result.ok is not None:
         status = "PASS" if build_result.ok else ("TIMED OUT" if build_result.timed_out else "FAIL")
         build_section = f"## Build status\n\n{status}"
@@ -1327,7 +1306,6 @@ def run_post_pipeline(
             out["build"],
             repo_dir=repo_dir,
             iteration_commit_sha=commit_sha,
-            referee_path=config.referee_path,
         )
         out["rating"] = r
         if r.parse_error:

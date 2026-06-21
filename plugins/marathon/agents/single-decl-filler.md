@@ -19,7 +19,7 @@ conventions and grading rubrics.
 ## What you are given (assembled by `marathon fill` / `marathon fill-file`)
 
 The reviewer rubric (proof-filling mode, never skeleton), the focus directive (enumerates the
-target decl(s) and the forbidden-edit scope), project-specific **referee.md** notes, repo
+target decl(s) and the forbidden-edit scope), repo
 context (Lean files outside the target — read-only), the project `marathon.md` notebook, the
 **target file's current state**, the past refinement log if any, cross-chapter context, and
 any rejection notes from a linked GitHub sub-issue.

@@ -2,7 +2,7 @@
 
 A Claude Code plugin that drives **Marathon** — this repo's driver for the Aristotle (Harmonic)
 automated theorem-proving API — as slash commands. Each command wraps the `marathon` CLI; the
-Claude roles Marathon already shells out to (refine review, referee, Hermes steering, auto-rater)
+Claude roles Marathon already shells out to (refine review, Hermes steering, auto-rater)
 are re-homed here as agents.
 
 ## Install
@@ -22,7 +22,6 @@ are re-homed here as agents.
 | `/marathon:refine` | `marathon refine` — iterate a Lean folder (Claude drafts, Aristotle proves) |
 | `/marathon:fill` | `marathon fill` — fill one declaration's `sorry` body in a single iteration |
 | `/marathon:fill-file` | `marathon fill-file` — fill every `sorry` in a single file in one iteration |
-| `/marathon:referee` | `marathon referee` — refresh project reviewer notes (`referee.md`) |
 | `/marathon:review` | `marathon review …` — human-in-the-loop per-declaration verify/reject |
 | `/marathon:review:bootstrap-chapter` | `marathon review bootstrap-chapter` — first-time chapter setup: open one GitHub sub-issue per named result |
 | `/marathon:review:audit-chapter` | `marathon review audit-chapter` — refresh an already-bootstrapped chapter's sub-issues against current Lean |
@@ -32,7 +31,7 @@ are re-homed here as agents.
 
 ## Agents
 
-`refine-reviewer`, `single-decl-filler`, `referee`, `hermes-steer`, `rater` — sourced from
+`refine-reviewer`, `single-decl-filler`, `hermes-steer`, `rater` — sourced from
 `marathon/prompts/*.md` and the plugin's `agents/` directory.
 
 ## Daemon (`marathon review daemon`)

@@ -12,7 +12,6 @@ Example::
 
     github_repo = "pitmonticone/GeometricAnalysis"
     parent_issue = 1
-    referee_path = ".marathon/referee.md"
     target_path_template = "GeometricAnalysis/LeeSM/Chapter{chapter}"
     tracker_section_pattern = "### Chapter {chapter}:"
 
@@ -111,7 +110,6 @@ class ReviewConfig:
 
     github_repo: str
     parent_issue: int
-    referee_path: Path
     target_path_template: str
     tracker_section_pattern: str
     labels: ReviewLabels
@@ -208,9 +206,6 @@ def load_config(repo_dir: Optional[Path] = None) -> ReviewConfig:
     except KeyError as e:
         sys.exit(f"missing required field in {config_path}: {e}")
 
-    referee_rel = data.get("referee_path", ".marathon/referee.md")
-    referee_path = repo_dir / referee_rel
-
     tracker_section_pattern = data.get(
         "tracker_section_pattern", "### Chapter {chapter}:"
     )
@@ -249,7 +244,6 @@ def load_config(repo_dir: Optional[Path] = None) -> ReviewConfig:
         config_path=config_path,
         github_repo=github_repo,
         parent_issue=parent_issue,
-        referee_path=referee_path,
         target_path_template=target_path_template,
         tracker_section_pattern=tracker_section_pattern,
         labels=labels,

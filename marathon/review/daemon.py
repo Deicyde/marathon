@@ -103,12 +103,6 @@ DEFAULT_REFINE_ARGS: list[str] = [
     # the real fix for that is the cache prime, not a bigger timeout.
     "--auto-build", "--build-timeout", "2400",
     "--auto-commit", "--auto-push", "--auto-rate",
-    # ``--auto-referee-every`` deliberately omitted: Claude no longer
-    # auto-refreshes referee.md from daemon iterations. Standing items
-    # are tracked in standing-items.md instead (run ``marathon referee``
-    # manually if you want a refresh). Removing the auto-refresh prevents
-    # the machine-managed priority tail from competing with explicit
-    # human reject notes for Aristotle's marquee move.
     "--audit-verified",
     # Daemon iterations always go through a marathon-owned branch +
     # PR. Solves the stranded-commit failure mode where the daemon
@@ -141,9 +135,7 @@ def hash_user_header(cfg: ReviewConfig, chapter: Optional[int] = None) -> str:
     chapters when None). Returns '' when there are no pending rejections.
 
     Name retained for callsite compatibility; the underlying source is
-    now ``.marathon/review/state.json`` (per-issue queue) instead of
-    ``referee.md``'s user-managed header. ``referee.md`` is back to
-    being purely the project rubric layer."""
+    ``.marathon/review/state.json`` (the per-issue rejection queue)."""
     return hash_pending(cfg, chapter)
 
 

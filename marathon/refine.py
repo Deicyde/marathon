@@ -463,23 +463,14 @@ def _build_refine_submission_dir(
     tex_path: Optional[Path],
     workdir_log: Optional[Path],
     work_dir: Path,
-    referee_path: Optional[Path] = None,
 ) -> Path:
-    """Stage the Aristotle submission tree.
-
-    ``referee_path``, if given, is excluded from the bundle: those notes
-    are reviewer-only direction for Claude and should not reach Aristotle.
-    """
+    """Stage the Aristotle submission tree."""
     staged = work_dir / "submission"
     staged.mkdir()
-
-    referee_resolved = referee_path.resolve() if referee_path else None
 
     for rel in _list_repo_files(repo_dir):
         src = repo_dir / rel
         if not src.is_file():
-            continue
-        if referee_resolved is not None and src.resolve() == referee_resolved:
             continue
         dst = staged / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -570,7 +561,6 @@ async def _submit_fresh_refine(
     state_path: Path,
     attempt_idx: int,
     max_retries: int,
-    referee_path: Optional[Path] = None,
 ) -> Optional[tuple[Project, AgentTask]]:
     state.attempts += 1
     state.output_path = None
@@ -585,7 +575,6 @@ async def _submit_fresh_refine(
             tex_path=tex_path,
             workdir_log=workdir_log,
             work_dir=Path(stage_tmp),
-            referee_path=referee_path,
         )
         try:
             project, task = await submit_from_directory(prompt=prompt, project_dir=staged)
@@ -667,7 +656,6 @@ async def _run_refine_attempt(
     existing_project: Optional[Project] = None,
     existing_task: Optional[AgentTask] = None,
     existing_mode: Optional[str] = None,
-    referee_path: Optional[Path] = None,
     review_rejection: Optional[int] = None,
     watcher_factory=None,
 ) -> Optional[TaskStatus]:
@@ -727,7 +715,6 @@ async def _run_refine_attempt(
             state_path=state_path,
             attempt_idx=attempt_idx,
             max_retries=max_retries,
-            referee_path=referee_path,
         )
         if submitted is None:
             return None
@@ -880,7 +867,6 @@ async def _run_iteration(
     existing_task: Optional[AgentTask],
     existing_mode: Optional[str],
     workdir: Path,
-    referee_path: Optional[Path] = None,
     cross_chapter: bool = True,
     watcher_factory=None,
     continue_on_review: bool = True,
@@ -970,11 +956,6 @@ async def _run_iteration(
 
             marathon_md = workdir_log.read_text() if workdir_log and workdir_log.is_file() else None
             refine_log_text = log_path.read_text() if log_path.is_file() else ""
-            referee_md = (
-                referee_path.read_text()
-                if referee_path and referee_path.is_file()
-                else None
-            )
             # Per-iteration rejection queue. Prefer the prefetched value
             # passed in from the caller (necessary under ``--auto-pr``,
             # where the branch switch wipes ``state.json`` before this
@@ -986,16 +967,6 @@ async def _run_iteration(
                 pending_rejections_md = _load_pending_rejections_md(
                     repo_dir, target_folder, focus_issue=review_rejection,
                 )
-            # When the daemon is dispatching a focused single-issue
-            # rejection, suppress referee.md ENTIRELY so Claude-in-loop
-            # can't second-guess the human's specific reject ask by
-            # scanning the failure-mode catalog in the user header.
-            # The rubric (system prompt) still carries style/idiom
-            # guidance; the project-specific priorities are not
-            # load-bearing for a one-rejection iteration.
-            referee_md_for_prompt = (
-                None if review_rejection is not None else referee_md
-            )
             # Re-read the latest rater note on every attempt (including
             # retries) so a fresh Claude review sees the latest available
             # diagnosis even if a retry follows a partial pipeline run.
@@ -1008,7 +979,7 @@ async def _run_iteration(
             # the human's reject notes ARE the Aristotle prompt. Past
             # iterations under Claude-in-loop have repeatedly overridden
             # the explicit reject ask with project-wide structural picks
-            # — even after muting referee.md and tightening the
+            # — even after tightening the
             # rejection-queue preamble. The target file's visible content
             # alone is enough to nudge Claude toward "while we're at it"
             # refactors. For focused rejections, the simplest fix is to
@@ -1035,7 +1006,6 @@ async def _run_iteration(
                     attempt_idx=attempt_idx,
                     max_retries=max_retries,
                     previous_status=last_status,
-                    referee_md=referee_md_for_prompt,
                     pending_rejections_md=pending_rejections_md,
                     previous_rating_note=previous_rating_note,
                     cross_chapter_md=cross_chapter_md,
@@ -1076,7 +1046,6 @@ async def _run_iteration(
             existing_project=attempt_project,
             existing_task=attempt_task,
             existing_mode=attempt_mode,
-            referee_path=referee_path,
             review_rejection=review_rejection,
             watcher_factory=watcher_factory,
         )
@@ -1160,16 +1129,6 @@ async def refine_command(args) -> None:
         if not tex_path.is_file():
             sys.exit(f"--tex file not found: {tex_path}")
 
-    referee_path: Optional[Path] = None
-    if args.referee is not None:
-        referee_path = args.referee.resolve()
-        if not referee_path.is_file():
-            sys.exit(f"--referee file not found: {referee_path}")
-    else:
-        candidate = repo_dir / ".marathon" / "referee.md"
-        if candidate.is_file():
-            referee_path = candidate.resolve()
-
     try:
         rel_to_repo = target_folder.relative_to(repo_dir)
     except ValueError:
@@ -1200,8 +1159,6 @@ async def refine_command(args) -> None:
     print(f"output path:      {output_path_str}")
     if tex_path is not None:
         print(f"tex file:         {tex_path}")
-    if referee_path is not None:
-        print(f"referee notes:    {referee_path}")
     print(f"workdir:          {workdir}")
     if not args.no_cross_chapter:
         sibling_count = sum(
@@ -1240,7 +1197,6 @@ async def refine_command(args) -> None:
         build_timeout=args.build_timeout,
         ratings_path=workdir / "marathon-ratings.jsonl",
         claude_in_loop=True,  # refine drafts each prompt via Claude
-        referee_path=referee_path,
         audit_verified=getattr(args, "audit_verified", False),
         audit_workdir=workdir,
         update_formalization=getattr(args, "update_formalization", True),
@@ -1328,7 +1284,6 @@ async def refine_command(args) -> None:
             workdir=workdir,
             target_folder=target_folder,
             repo_dir=repo_dir,
-            referee_path=referee_path,
             skeleton_mode=args.skeleton,
         )
         print("live-steering:   on (Hermes will inspect each EDITING_FILE event)")
@@ -1395,7 +1350,6 @@ async def refine_command(args) -> None:
             existing_task=existing_task,
             existing_mode=existing_mode,
             workdir=workdir,
-            referee_path=referee_path,
             cross_chapter=not args.no_cross_chapter,
             watcher_factory=watcher_factory,
             continue_on_review=continue_on_review,
@@ -1420,50 +1374,6 @@ async def refine_command(args) -> None:
         )
         if state.note:
             print(f"  note: {state.note}")
-
-        # Auto-referee trigger: after every Nth iteration of this refine
-        # invocation, run the referee agent to refresh referee.md.
-        if (
-            args.auto_referee_every > 0
-            and iteration_idx % args.auto_referee_every == 0
-        ):
-            from marathon.referee import update_referee
-            ref_path = (
-                referee_path
-                if referee_path is not None
-                else (repo_dir / ".marathon" / "referee.md")
-            )
-            print(
-                f"\n  auto-referee: triggered after iteration "
-                f"{iteration_idx} (every {args.auto_referee_every}); "
-                "scanning repo + sibling workdirs..."
-            )
-            ref_result = update_referee(
-                repo_dir=repo_dir,
-                referee_path=ref_path,
-                workdirs_parent=workdir.parent if workdir.parent.is_dir() else None,
-                auto_commit=True,
-                # Mirror --auto-push: when the user has it on for chapter
-                # commits, push the auto-referee commits too so the next
-                # chapter's bundle sees the refreshed referee.md remotely.
-                auto_push=bool(args.auto_push),
-                write_to_proposed_only=False,
-            )
-            if ref_result.error:
-                print(f"  auto-referee: ERROR — {ref_result.error}")
-            elif ref_result.ok:
-                tail_info = (
-                    f"  auto-referee: wrote {ref_result.output_path.name}"
-                )
-                if ref_result.diff_summary:
-                    tail_info += f"  ({ref_result.diff_summary})"
-                if ref_result.commit_sha:
-                    tail_info += f"  commit={ref_result.commit_sha}"
-                if ref_result.pushed is True:
-                    tail_info += "  push=ok"
-                elif ref_result.pushed is False:
-                    tail_info += f"  push=FAIL({ref_result.push_message})"
-                print(tail_info)
 
     print(
         f"\nrefine batch finished. {state.iterations_completed} "

@@ -42,8 +42,7 @@ from marathon.review.config import (
 BASE_CONFIG = """\
 # GeometricAnalysis review config — hand comments must survive rewrites.
 github_repo = "someone/SomeProject"
-parent_issue = 1
-referee_path = ".marathon/referee.md"  # inline comment, also load-bearing
+parent_issue = 1  # inline comment, also load-bearing
 target_path_template = "SomeProject/Chapter{chapter}"
 tracker_section_pattern = "### Chapter {chapter}:"
 

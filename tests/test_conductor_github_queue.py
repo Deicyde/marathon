@@ -22,7 +22,6 @@ def make_cfg(tmp_path: Path) -> ReviewConfig:
         config_path=tmp_path / ".marathon" / "review" / "config.toml",
         github_repo="someone/SomeProject",
         parent_issue=1,
-        referee_path=tmp_path / ".marathon" / "referee.md",
         target_path_template="SomeProject/Chapter{chapter}",
         tracker_section_pattern="### Chapter {chapter}:",
         labels=ReviewLabels(),

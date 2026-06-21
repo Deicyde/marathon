@@ -1,6 +1,6 @@
 """Tests for ``marathon.claude_proc`` — the shared ``claude`` CLI helper
 and its cross-process concurrency limiter — plus one representative test
-per migrated call site (reviewer / rater / Hermes / jury / referee).
+per migrated call site (reviewer / rater / Hermes / jury).
 
 Boundaries are monkeypatched throughout: ``subprocess.run`` is replaced
 with an in-process fake (nothing ever execs the real ``claude``), and the
@@ -372,7 +372,6 @@ def test_hermes_call_site_round_trips_decision_and_raises_on_failure(
         workdir=tmp_path,
         target_folder=tmp_path / "repo" / "Chapter1",
         repo_dir=tmp_path / "repo",
-        referee_path=None,
         skeleton_mode=False,
         iteration_idx=0,
     )
@@ -421,39 +420,3 @@ def test_jury_call_site_parses_verdict_through_run_claude(monkeypatch, tmp_path)
     [call] = record
     assert call["model"] == "pinned-model"  # pre-resolved model passed through
     assert "jury_marker" in call["prompt"]
-
-
-def test_referee_call_site_sends_prompt_via_stdin_not_argv(monkeypatch):
-    """The referee was the last argv call site; after migration the prompt
-    must arrive as run_claude's stdin argument and the response contract
-    ((ok, stripped_text)) is unchanged."""
-    from marathon import referee
-
-    record: list = []
-    monkeypatch.setattr(referee.shutil, "which", lambda name: "/fake/bin/claude")
-    monkeypatch.setattr(
-        referee, "run_claude",
-        _fake_run_claude(record, stdout="### Top-leverage open items\n- item\n"),
-    )
-
-    ok, response = referee._invoke_claude_referee("REFEREE PROMPT " * 10)
-
-    assert ok is True
-    assert response == "### Top-leverage open items\n- item"
-    [call] = record
-    assert call["prompt"].startswith("REFEREE PROMPT ")  # stdin, not argv
-    assert call["model"] == referee.REFEREE_MODEL == "claude-opus-4-7"
-
-
-def test_referee_call_site_reports_failure_tuple(monkeypatch):
-    from marathon import referee
-
-    monkeypatch.setattr(referee.shutil, "which", lambda name: "/fake/bin/claude")
-    monkeypatch.setattr(
-        referee, "run_claude", _fake_run_claude([], stdout="err", returncode=2)
-    )
-
-    ok, message = referee._invoke_claude_referee("p")
-
-    assert ok is False
-    assert "claude exited 2" in message

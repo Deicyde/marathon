@@ -54,7 +54,7 @@ Dimension describing **this iteration's changes** (only meaningful when a
   - 4 = mostly structural with some cosmetic spillover.
   - 3 = a roughly even mix of structural and cosmetic, OR one clean
     structural move (e.g. a single new bridging declaration that closes a
-    referee item) accompanied by light prose/attribute polish. **A new
+    structural gap) accompanied by light prose/attribute polish. **A new
     `def` or `theorem` that adds previously-missing API surface counts as
     structural and lands the iteration here at minimum, even if its body
     is `sorry`.**
@@ -97,12 +97,6 @@ build is FAIL or TIMED OUT and a build-log tail is included, identify
 the actual error class (missing import, type mismatch, elaboration
 timeout, deterministic timeout) in your `notes` paragraph instead of
 just citing "build failed."
-
-If a "Project-specific reviewer priorities" section is included
-(referee.md), use it as context for what counts as a structural fix on
-this project. A diff that closes a referee item is unambiguously
-structural regardless of textual size; absence of referee items in the
-diff is not itself a deduction — the main rubric still drives scoring.
 
 Return **ONLY a single-line JSON object**, no preamble, no markdown fences,
 no commentary outside the JSON. Schema:

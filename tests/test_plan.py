@@ -124,7 +124,7 @@ def test_v2_to_v3_migration_is_additive_and_idempotent(tmp_path):
 
     # First open upgrades in place to the CURRENT version (the additive
     # migration brings a v2 db all the way up — the targets and
-    # referee_tasks tables appear together).
+    # target_deps tables appear together).
     ledger.init()
     info = ledger.status()
     assert info["schema_version"] == SCHEMA_VERSION

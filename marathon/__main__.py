@@ -8,7 +8,6 @@ from pathlib import Path
 from marathon.review.cli import add_subparser as _add_review_subparser
 from marathon.review.cli import review_command
 from marathon.refine import refine_command
-from marathon.referee import referee_command
 from marathon.skeleton import skeleton_command
 from marathon.fill import add_fill_subparsers
 from marathon.audit.probes import ProbeKind
@@ -131,19 +130,6 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_refine.add_argument(
-        "--referee",
-        type=Path,
-        default=None,
-        metavar="FILE",
-        help=(
-            "Path to a markdown file with project-specific reviewer notes "
-            "that Claude should layer on top of its rubric. If this flag "
-            "is omitted, Marathon auto-detects <repo-dir>/.marathon/referee.md. The "
-            "file is given only to Claude (the reviewer); it is excluded "
-            "from the Aristotle bundle."
-        ),
-    )
-    p_refine.add_argument(
         "--workdir",
         type=Path,
         default=None,
@@ -192,23 +178,6 @@ def _build_parser() -> argparse.ArgumentParser:
             "correctness, future-proofness, and idiomatic Mathlib style. "
             "Use this to iterate on the scaffold quality before filling in "
             "any proofs."
-        ),
-    )
-    p_refine.add_argument(
-        "--auto-referee-every",
-        type=int,
-        default=0,
-        metavar="N",
-        help=(
-            "After every N successfully-completed iterations of this refine "
-            "invocation, automatically run the referee agent to refresh the "
-            "machine-managed tail of referee.md (and commit it). 0 (default) "
-            "disables. Typical: 1 to run after every iteration, 3 to run "
-            "once per chapter at the end. The referee scans the repo, "
-            "per-chapter workdirs (siblings of --workdir), and the current "
-            "referee.md; the agent's output replaces the section between "
-            "the `BEGIN: Marathon-managed referee tail` sentinels. The "
-            "user-managed header above the sentinel is preserved untouched."
         ),
     )
     p_refine.add_argument(
@@ -291,124 +260,6 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_pipeline_flags(p_refine)
-
-    p_ref = subparsers.add_parser(
-        "referee",
-        help=(
-            "Run the referee agent: scan the repo + per-chapter workdirs and "
-            "refresh the machine-managed tail of referee.md."
-        ),
-        description=(
-            "One-shot pass of the referee agent. Reads the current "
-            "referee.md (split into user-managed header above the BEGIN "
-            "sentinel and machine-managed tail below), the reviewer rubrics "
-            "(to deduplicate), the repo's Lean files, all per-chapter "
-            "marathon.md / ratings.jsonl / refine-log.md under "
-            "--workdirs-parent, and the recent git log. The agent emits a "
-            "fresh machine-managed tail; Marathon reassembles the file with "
-            "the user header preserved verbatim and either overwrites "
-            "referee.md (default, with an auto-commit) or writes "
-            "referee.md.proposed (with --review)."
-        ),
-    )
-    p_ref.add_argument(
-        "--repo-dir",
-        type=Path,
-        default=None,
-        metavar="PATH",
-        help=(
-            "Lean repo containing referee.md (must be a git repo). Required "
-            "for the default prose pass; the `tasks` subcommand takes its "
-            "own --repo-dir."
-        ),
-    )
-    p_ref.add_argument(
-        "--referee",
-        type=Path,
-        default=None,
-        metavar="FILE",
-        help=(
-            "Path to the referee.md file to update. Defaults to "
-            "<repo-dir>/.marathon/referee.md."
-        ),
-    )
-    p_ref.add_argument(
-        "--workdirs-parent",
-        type=Path,
-        default=None,
-        metavar="DIR",
-        help=(
-            "Parent directory containing per-chapter marathon refine workdirs "
-            "(subdirs with marathon-refine-state.json). The referee aggregates "
-            "their marathon.md, ratings, and refine-log files for context. "
-            "Without this flag the agent only sees the repo state."
-        ),
-    )
-    p_ref.add_argument(
-        "--review",
-        action="store_true",
-        help=(
-            "Don't overwrite referee.md. Write the new content to "
-            "referee.md.proposed for manual review. Implies --no-commit."
-        ),
-    )
-    p_ref.add_argument(
-        "--no-commit",
-        action="store_true",
-        help=(
-            "Write referee.md but don't auto-commit. Useful when you want "
-            "to inspect the change before committing manually."
-        ),
-    )
-    p_ref.add_argument(
-        "--push",
-        action="store_true",
-        help=(
-            "After auto-committing, also `git push` the current branch. "
-            "Default: off. Ignored under --review or --no-commit."
-        ),
-    )
-    p_ref.add_argument(
-        "--emit-tasks",
-        action="store_true",
-        help=(
-            "After the prose pass, persist STRUCTURED referee fix-tasks to "
-            "the ledger (the 'teeth'): mechanical cross-chapter dedup tasks "
-            "from audit fingerprints, plus Claude-proposed "
-            "deception/naming/doc/structural tasks, plus a self-"
-            "accountability pass that closes resolved prior tasks and "
-            "escalates overdue ones. Default OFF — without this flag the "
-            "referee is the unchanged prose-only standing-items.md rewriter. "
-            "List the persisted tasks with `marathon referee tasks`."
-        ),
-    )
-
-    # `marathon referee tasks` — list referee-origin fix-tasks (read-only).
-    p_ref_sub = p_ref.add_subparsers(dest="referee_command")
-    p_ref_tasks = p_ref_sub.add_parser(
-        "tasks",
-        help="List referee-origin fix-tasks (status + overdue counts).",
-        description=(
-            "Read-only listing of the structured fix-tasks the referee has "
-            "emitted into the ledger (via `marathon referee --emit-tasks`), "
-            "with each task's status, severity, kind, the decls it spans, "
-            "the planner target it blocks, and how many referee passes it is "
-            "overdue. No Claude call, no git mutation."
-        ),
-    )
-    p_ref_tasks.add_argument(
-        "--repo-dir",
-        type=Path,
-        required=True,
-        metavar="PATH",
-        help="Lean repo whose ledger holds the referee tasks.",
-    )
-    p_ref_tasks.add_argument(
-        "--open",
-        dest="open_only",
-        action="store_true",
-        help="Show only open (unresolved) tasks.",
-    )
 
     # Review tree: `marathon review list/next/show/verify/reject/...`
     # Project-specific settings come from <repo>/.marathon/review/config.toml.
@@ -752,8 +603,7 @@ def _add_ledger_subparser(subparsers) -> None:
         help=(
             "Parent directory containing per-chapter marathon workdirs "
             "(subdirs with marathon-state.json / "
-            "marathon-refine-state.json) — same convention as "
-            "`marathon referee --workdirs-parent`. Omit to import only "
+            "marathon-refine-state.json). Omit to import only "
             "the in-repo surfaces."
         ),
     )
@@ -860,24 +710,6 @@ def _add_conductor_subparser(subparsers) -> None:
         ),
     )
     p_run.add_argument(
-        "--referee-every", type=int, default=0, metavar="N",
-        help=(
-            "Phase-8 opt-in: after every N successful landings (counted "
-            "from .marathon/landing/landings.jsonl) fire `marathon referee "
-            "--emit-tasks` to refresh the standing items AND persist "
-            "structured fix-tasks. Those referee fix-tasks then GATE "
-            "SCHEDULING: a target/rejection whose chapter is named by an "
-            "unresolved BLOCKING referee task (one carrying a blocks_target) "
-            "is deferred — never dispatched around — until the task "
-            "resolves (the Ch.11 coordinateCoframe item survived twelve "
-            "advisory iterations; this gives the referee teeth). The "
-            "trigger is best-effort and idempotent (a referee failure warns "
-            "and never fails a landing/dispatch). Default: 0 = OFF "
-            "(manual-only referee, today's behavior — the scheduler is "
-            "byte-identical when no referee tasks exist)."
-        ),
-    )
-    p_run.add_argument(
         "--no-automerge",
         dest="automerge",
         action="store_false",
@@ -954,7 +786,6 @@ def _run_conductor_run(args) -> None:
         ),
         worktree_parent=args.worktree_parent,
         land=args.land,
-        referee_every=args.referee_every,
         automerge=getattr(args, "automerge", True),
         merge_scope=getattr(args, "merge_scope", "any"),
         reconcile=getattr(args, "reconcile", True),
@@ -1589,7 +1420,7 @@ def _add_audit_subparser(subparsers) -> None:
             "UNFOLDING probe (a def's wellformedness / total-ness, degrading "
             "honestly to a typecheck when no expected value is supplied — it "
             "does NOT emit rfl-trivial probes that prove nothing) and a "
-            "SANITY probe (the PUnit-collapse catcher, referee.md #1, for "
+            "SANITY probe (the PUnit-collapse catcher, for "
             "structures/classes — emitted as 'needs witness' when the "
             "snapshot can't supply a non-collapsing model, never a vacuous "
             "pass). Prints the generated probe source. With --run (and lake "
@@ -2937,12 +2768,6 @@ def main() -> None:
                 "Aristotle project).",
                 file=sys.stderr,
             )
-            sys.exit(130)
-    elif args.command == "referee":
-        try:
-            referee_command(args)
-        except KeyboardInterrupt:
-            print("\ninterrupted", file=sys.stderr)
             sys.exit(130)
     elif args.command == "review":
         try:

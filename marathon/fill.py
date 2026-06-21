@@ -256,11 +256,9 @@ async def _run_fill(args) -> None:
     args.update_formalization = getattr(args, "update_formalization", True)
     # refine.py expects these even when None.
     args.tex = getattr(args, "tex", None)
-    args.referee = getattr(args, "referee", None)
     args.max_prompt_words = getattr(args, "max_prompt_words", None)
     args.no_cross_chapter = getattr(args, "no_cross_chapter", True)
     args.dry_run = getattr(args, "dry_run", False)
-    args.auto_referee_every = getattr(args, "auto_referee_every", 0)
     await refine_command(args)
 
 
@@ -290,11 +288,9 @@ async def _run_fill_file(args) -> None:
     args.review_rejection = getattr(args, "review_rejection", None)
     args.update_formalization = getattr(args, "update_formalization", True)
     args.tex = getattr(args, "tex", None)
-    args.referee = getattr(args, "referee", None)
     args.max_prompt_words = getattr(args, "max_prompt_words", None)
     args.no_cross_chapter = getattr(args, "no_cross_chapter", True)
     args.dry_run = getattr(args, "dry_run", False)
-    args.auto_referee_every = getattr(args, "auto_referee_every", 0)
     await refine_command(args)
 
 

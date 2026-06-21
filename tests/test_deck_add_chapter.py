@@ -24,7 +24,6 @@ def _cfg(tmp_path) -> ReviewConfig:
         config_path=repo / ".marathon/review/config.toml",
         github_repo="example/Demo",
         parent_issue=1,
-        referee_path=repo / ".marathon/referee.md",
         target_path_template="Demo/Chapter{chapter}",
         tracker_section_pattern="### Chapter {chapter}:",
         labels=ReviewLabels(),

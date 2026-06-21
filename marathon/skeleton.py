@@ -243,8 +243,7 @@ def _extract_solution(
     member set are kept. This supports cross-chapter refactors
     (where Aristotle's reject-notes told it to also edit a sibling
     chapter, e.g. moving a block of declarations) and vendor-file
-    backports — both workflows are project-supported per
-    ``.marathon/referee.md``'s rubric items, but previously broke
+    backports — both project-supported workflows, but previously broke
     silently because the extractor scope was hard-coded to one
     chapter. See ``/tmp/marathon-refine-chapter-scope-bug.md`` for
     the failure mode this addresses.

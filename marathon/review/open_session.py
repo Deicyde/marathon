@@ -134,7 +134,7 @@ def _file_mentions_for_chapter(cfg: ReviewConfig, chapter: int) -> list[str]:
     mentions.append(f"@{rel_target}/")  # whole folder as a single chip
     # Also list the standard review context files so the user can attach
     # them in one go.
-    for relpath in (".marathon/referee.md", ".marathon/review/state.json"):
+    for relpath in (".marathon/review/state.json",):
         if (cfg.repo_dir / relpath).is_file():
             mentions.append(f"@{relpath}")
     return mentions

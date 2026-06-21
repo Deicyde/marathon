@@ -12,7 +12,7 @@
     {
       "name": "marathon",
       "source": "./plugins/marathon",
-      "description": "Drive the Aristotle (Harmonic) theorem-proving API through the marathon CLI: skeleton, refine, referee, review, rate, steer."
+      "description": "Drive the Aristotle (Harmonic) theorem-proving API through the marathon CLI: skeleton, refine, review, rate, steer."
     }
   ]
 }

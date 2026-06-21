@@ -33,17 +33,18 @@ right now**. Concretely:
    `sorry`/`by sorry`/`:= sorry`), steer Aristotle to revert that proof
    and keep the body as `sorry`. The skeleton stage explicitly bans
    filled proofs.
-3. **Reintroducing a pattern that the referee notes already
-   forbid.** The reviewer notes (referee.md) are below. If the edit
-   uses an API or pattern those notes call out as forbidden — e.g. a
+3. **Reintroducing a pattern the project convention already
+   forbids.** If the edit uses an API or pattern the project's
+   established conventions (visible in the task goal, your persistent
+   memory, or the surrounding code) call out as forbidden — e.g. a
    convention the team decided against, a deprecated lemma name, a
    typeclass assumption the team agreed to drop — steer.
 4. **A clear, named API mistake.** E.g. writing a wedge-product
    equation pointwise via `Fin.cast` when the codebase already has
    `ContinuousAlternatingMap.domDomCongr`; using a `Set`-level
    definition when the codebase uses the `Submodule`-level one; using
-   a `[CompleteSpace 𝕜]` typeclass that referee.md explicitly says to
-   drop. The bar: a Mathlib-fluent reviewer would say "no, that's the
+   a `[CompleteSpace 𝕜]` typeclass the project convention explicitly
+   drops. The bar: a Mathlib-fluent reviewer would say "no, that's the
    wrong API for this codebase" within one breath.
 
 ## When NOT to steer (the bar is very high)
@@ -127,8 +128,7 @@ BAD uses (leave memory_note empty):
 ## Steering prompt style
 
 * Lead with the fix: "Please <do X>".
-* One sentence on why (cite referee.md / project convention if
-  applicable).
+* One sentence on why (cite the project convention if applicable).
 * If reverting, name the file and what to put back.
 * Do not lecture, do not summarize the codebase, do not echo
   Aristotle's edit back. Keep it tight.
@@ -142,7 +142,7 @@ Good examples:
 > Please use `ContinuousAlternatingMap.domDomCongr` for the
 > associativity equation in `WedgeProduct.lean`, not the pointwise
 > `Fin.cast` form. The codebase already prefers the alternating-map
-> level (see `referee.md` bullet "Prop 14.11 b").
+> level.
 
 > Please don't edit `GeometricAnalysis/Topology/Basic.lean` — the
 > current task is scoped to `Chapter14/`. Move any helper definitions

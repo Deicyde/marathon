@@ -109,7 +109,6 @@ conductor, discovering the queue from GitHub).
 | `fill` / `fill-file` | Fill the `sorry` body of one declaration / every `sorry` in one file. |
 | `plan` | Build the target ledger from an axiom, a repo's `sorry`s, or a textbook. |
 | `review` | CLI verdicts — `verify` / `reject` / `sync` — the deck's non-UI equivalent. |
-| `referee` | Refresh the project-specific reviewer rubric (`referee.md`). |
 | `audit` | Elaborator-grade declaration audit → `.marathon/audit/latest.json`. |
 | `landing` | Serial landing queue onto a `marathon/next` integration branch. |
 | `ledger` | Inspect the runtime ledger (`.marathon/marathon.db`, SQLite). |

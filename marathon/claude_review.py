@@ -127,7 +127,6 @@ def review_and_draft_prompt(
     attempt_idx: int = 0,
     max_retries: int = 0,
     previous_status: Optional[str] = None,
-    referee_md: Optional[str] = None,
     pending_rejections_md: Optional[str] = None,
     previous_rating_note: Optional[str] = None,
     cross_chapter_md: Optional[str] = None,
@@ -209,21 +208,6 @@ def review_and_draft_prompt(
             "them verbatim.\n\n"
             + pending_rejections_md
         )
-    if referee_md:
-        sections.append(
-            "# Project-specific reviewer notes (referee.md)\n\n"
-            "These notes are the project's *rubric layer* — long-lived "
-            "directives written by an outside reviewer (human or AI) to "
-            "course-correct your reviews on this project. They are NOT a "
-            "queue; per-iteration rejection tasks come from the "
-            "*Actionable review queue* section above (if any). Treat these "
-            "notes as a layer of project-specific priorities **on top of** "
-            "the rubric. If the rubric and these notes conflict, the rubric "
-            "wins on output style (second person, no preamble, specific "
-            "replacements); these notes win on what to look at and how hard "
-            "to push.\n\n"
-            + referee_md
-        )
     sections.append(
         "# Repo context (Lean files outside the target folder)\n\n"
         + (repo_context or "(none)")
@@ -259,9 +243,9 @@ def review_and_draft_prompt(
             "An independent reviewer scored the previous iteration's diff "
             "across quality / math correctness / generality / api coverage / "
             "modern Lean 4 / structural focus. Its note enumerates the "
-            "structural and cosmetic moves it observed, plus the referee "
-            "items it judged still on the table. Use this to: (a) avoid "
-            "regressions the rater flagged, (b) re-flag referee items the "
+            "structural and cosmetic moves it observed, plus the items it "
+            "judged still on the table. Use this to: (a) avoid "
+            "regressions the rater flagged, (b) re-flag items the "
             "rater says weren't addressed, (c) calibrate whether your prior "
             "drafted prompt actually translated into structural change "
             "(low `structural_focus` means your last prompt didn't land "
@@ -344,7 +328,7 @@ def review_and_draft_prompt(
     # Subprocess conventions (prompt via stdin against E2BIG, API-key
     # scrub for Max OAuth, cross-process slot limiter) live in
     # marathon.claude_proc.run_claude — shared with the rater/jury/
-    # referee/Hermes call sites.
+    # Hermes call sites.
     print(
         f"  invoking Claude Code via subprocess (prompt size: "
         f"{len(combined):,} chars)"
