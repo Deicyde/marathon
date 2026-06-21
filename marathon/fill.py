@@ -101,6 +101,11 @@ def _find_sorries_in_file(file_path: Path) -> list[str]:
         m = _DECL_RE.match(line)
         if m:
             current_decl = m.group("name")
+            # single-line `... := by sorry`: the sorry rides the decl line itself,
+            # so check it here too (the old code `continue`d past it and missed it)
+            if sorry_re.search(line) and current_decl not in seen:
+                seen.add(current_decl)
+                out.append(current_decl)
             continue
         if current_decl is not None and sorry_re.search(line):
             if current_decl not in seen:
