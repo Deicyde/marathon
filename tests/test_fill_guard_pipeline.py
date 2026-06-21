@@ -49,3 +49,20 @@ def test_pipeline_guard_disabled_leaves_change(tmp_path):
     )
     assert out["frozen_reverts"] == []
     assert "PChanged" in f.read_text()  # untouched when enforcement is off
+
+
+def test_frozen_binding_quotes_approved_signatures(tmp_path):
+    """A3: the fill directive binds the frozen signature of any target decl so
+    Aristotle is told to reproduce it verbatim; empty when no target is frozen."""
+    from marathon.fill import _frozen_binding
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    save_manifest(repo, {
+        "Foo.bar": ApprovedStatement("Foo.bar", "theorem Foo.bar {k : ℕ} : P k", 5, 12, "t"),
+    })
+    out = _frozen_binding(repo, ["Foo.bar", "Foo.unfrozen"])
+    assert "FROZEN STATEMENTS" in out
+    assert "theorem Foo.bar {k : ℕ} : P k" in out
+    assert _frozen_binding(repo, ["Foo.unfrozen"]) == ""   # no frozen target → empty
+    assert _frozen_binding(tmp_path / "nope", ["x"]) == ""  # no manifest → empty

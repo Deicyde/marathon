@@ -237,7 +237,7 @@ async def _run_fill(args) -> None:
         print(f"  fill: targeting {len(decls)} declaration(s) cited in "
               f"#{args.issue}: {', '.join(decls)}")
 
-    args.focus_directive = _build_fill_directive(decls)
+    args.focus_directive = _build_fill_directive(decls) + _frozen_binding(args.repo_dir, decls)
     # Fill is one-shot: a single iteration that either lands or doesn't.
     # The human re-runs `marathon fill` with sharper context if it
     # didn't land.
@@ -282,7 +282,9 @@ async def _run_fill_file(args) -> None:
     print(f"  fill-file: targeting {len(decls)} sorry-bodied decl(s) in "
           f"{rel}: {', '.join(decls)}")
 
-    args.focus_directive = _build_fill_file_directive(rel, decls)
+    args.focus_directive = (
+        _build_fill_file_directive(rel, decls) + _frozen_binding(args.repo_dir, decls)
+    )
     args.max_iterations = 1
     args.skeleton = False
     args.review_rejection = getattr(args, "review_rejection", None)
@@ -327,6 +329,29 @@ def _build_fill_file_directive(rel_path: Path, decls: list[str]) -> str:
         "declaration's signature. Do NOT add, remove, or rename any "
         "declaration. Do NOT touch any OTHER file in the chapter — "
         f"every change must be inside `{rel_path}`."
+    )
+
+
+def _frozen_binding(repo_dir: Path, decls: list[str]) -> str:
+    """A directive suffix that quotes the human-approved (frozen) signatures of
+    any target declaration, telling Aristotle to reproduce them verbatim. Empty
+    when none of ``decls`` are frozen. The hard guard reverts a violation anyway;
+    this just reduces wasted iterations by binding the constraint up front."""
+    try:
+        from marathon.review.approved_statements import load_manifest
+
+        manifest = load_manifest(repo_dir)
+    except Exception:  # noqa: BLE001
+        return ""
+    frozen = [manifest[d].signature for d in decls if d in manifest]
+    if not frozen:
+        return ""
+    quoted = "\n".join(f"  • `{sig}`" for sig in frozen)
+    return (
+        "\n\nFROZEN STATEMENTS — these signatures are human-approved. Reproduce "
+        "each one EXACTLY as written and fill ONLY the proof body after `:=`. Do "
+        "not change binders, hypotheses, or the stated type; any such change is "
+        "automatically reverted before the iteration lands:\n" + quoted
     )
 
 
