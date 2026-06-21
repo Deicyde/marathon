@@ -127,6 +127,31 @@ def _load_additional_writable_paths(
     return out
 
 
+def _writable_paths_for_attempt(
+    repo_dir: Path,
+    expected_path: PurePosixPath,
+    review_rejection: Optional[int],
+) -> list[PurePosixPath]:
+    """The cross-chapter / vendor writable whitelist for one refine attempt.
+
+    For a FOCUSED single-issue rejection (``review_rejection`` set) the writable
+    scope is FENCED to the target chapter: the whitelist is dropped to ``[]`` so
+    a "fix issue N in chapter C" refine cannot sprawl across chapters. This is
+    the mechanical guard against the #114 failure mode — a Chapter-12-only ask
+    that returned edits to 34 files across six chapters plus vendored Mathlib,
+    none of which the reject note requested. The target folder itself is always
+    writable; any out-of-chapter edits Aristotle returns are discarded at
+    staging (and surface as a failed build if the in-chapter edits genuinely
+    depended on them — itself a useful "went off-ask" signal).
+
+    For a general / autonomous iteration (``review_rejection is None``) the full
+    cross-chapter whitelist applies, preserving deliberate cross-chapter work.
+    """
+    if review_rejection is not None:
+        return []
+    return _load_additional_writable_paths(repo_dir, expected_path)
+
+
 def _format_reject_as_aristotle_prompt(
     pending_rejections_md: str,
     focus_issue: int,
@@ -619,6 +644,7 @@ async def _run_refine_attempt(
     existing_task: Optional[AgentTask] = None,
     existing_mode: Optional[str] = None,
     referee_path: Optional[Path] = None,
+    review_rejection: Optional[int] = None,
     watcher_factory=None,
 ) -> Optional[TaskStatus]:
     """Run one Aristotle attempt for the current iteration. Returns the
@@ -730,9 +756,16 @@ async def _run_refine_attempt(
             # chapter folder other than the primary one, plus any
             # `extra_writable_paths` entries). Gracefully no-ops when
             # the project isn't using the review workflow.
-            additional_writable = _load_additional_writable_paths(
-                repo_dir, expected_path,
+            additional_writable = _writable_paths_for_attempt(
+                repo_dir, expected_path, review_rejection,
             )
+            if review_rejection is not None:
+                print(
+                    f"  scope fence: focused rejection (#{review_rejection}) — "
+                    f"writes restricted to {expected_path}; cross-chapter / "
+                    "vendor edits will be discarded at staging.",
+                    flush=True,
+                )
             found, log_updated, unexpected, cross_writes = _extract_solution(
                 Path(result_path), expected_path, repo_dir, log_dest,
                 additional_writable_paths=additional_writable,
@@ -1020,6 +1053,7 @@ async def _run_iteration(
             existing_task=attempt_task,
             existing_mode=attempt_mode,
             referee_path=referee_path,
+            review_rejection=review_rejection,
             watcher_factory=watcher_factory,
         )
 
