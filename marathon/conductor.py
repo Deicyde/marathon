@@ -339,6 +339,64 @@ def _github_discovered_rejections(cfg: ReviewConfig):
     return pending_rejections_needing_iteration(cfg, None)
 
 
+def _reconcile_merged_rejections(cfg: ReviewConfig) -> list[int]:
+    """Heal issues left stuck in 'rejected' after their refine PR was MERGED
+    OUTSIDE the conductor's automerge — e.g. a human merged it by hand. Automerge
+    does the post-merge requeue itself (``_requeue_refined_issue``); a hand-merge
+    bypasses it, so the issue reads 'rejected' forever and never re-enters the
+    review feed (the recurring #98 trap). Each tick (throttled by the caller) we
+    requeue any locally-'rejected' issue whose refine branch has a MERGED PR that
+    landed STRICTLY AFTER the current rejection — so a fresh re-reject whose OLD PR
+    merged is left alone (it is genuinely awaiting a new refine, not a stuck
+    re-review). Fail-soft: a gh failure logs and the tick continues. Returns the
+    issue numbers reconciled."""
+    from marathon.review.automerge import _REFINE_BRANCH_RE, _requeue_refined_issue
+    from marathon.review.github import gh
+    from marathon.review.state import load_state
+    from marathon.review.sync import _ts_strictly_newer
+
+    try:
+        state = load_state(cfg)
+    except Exception:  # noqa: BLE001 — never crash a tick
+        return []
+    rejected = {
+        n: st for n, st in state.issues.items()
+        if getattr(st, "status", None) == "rejected"
+    }
+    if not rejected:
+        return []
+    # One gh read: recent MERGED refine PRs -> {issue_num: (branch, mergedAt)}.
+    merged: dict[int, tuple[str, Optional[str]]] = {}
+    try:
+        cp = gh("pr", "list", "--repo", cfg.github_repo, "--state", "merged",
+                "--json", "headRefName,mergedAt", "--limit", "100", check=False)
+        if cp.returncode != 0:
+            return []
+        for pr in json.loads(cp.stdout or "[]"):
+            m = _REFINE_BRANCH_RE.match(pr.get("headRefName", "") or "")
+            if m:
+                merged[int(m.group(1))] = (pr["headRefName"], pr.get("mergedAt"))
+    except Exception as exc:  # noqa: BLE001 — never crash a tick
+        print(f"  merged-rejection reconcile: gh failed ({exc}); skipping",
+              flush=True)
+        return []
+    reconciled: list[int] = []
+    for issue_num, st in rejected.items():
+        if issue_num not in merged:
+            continue
+        branch, merged_at = merged[issue_num]
+        if not _ts_strictly_newer(merged_at, getattr(st, "verdict_ts", None)):
+            continue  # merge predates this rejection — a fresh reject, not a stuck one
+        n = _requeue_refined_issue(cfg, branch)
+        if n is not None:
+            reconciled.append(n)
+    if reconciled:
+        print(f"--- reconciled {len(reconciled)} merged-but-rejected issue(s) into "
+              f"re-review (refine PR merged out-of-band): {sorted(reconciled)} ---",
+              flush=True)
+    return reconciled
+
+
 def _eligible_issues(
     cfg: ReviewConfig, warned_unknown: set[int],
     queue_from_github: bool = False,
@@ -1207,6 +1265,7 @@ def run_conductor(
     last_automerge = float("-inf")  # run the merge orchestrator on tick 1, then ~once/min
     last_reconcile_sha: Optional[str] = None  # reconcile only when HEAD changes
     last_tracker_sync = float("-inf")  # tracker safety-net cadence (~once/2min)
+    last_merge_reconcile = float("-inf")  # merged-but-rejected re-review heal (~once/min)
 
     try:
         if prune:
@@ -1267,6 +1326,17 @@ def run_conductor(
                         print(f"--- tracker sync: {msg} ---", flush=True)
                 except Exception as e:  # noqa: BLE001 — never crash the tick
                     print(f"  warning: tracker sync failed: {e}", flush=True)
+            # Heal issues stuck in 'rejected' after their refine PR was merged
+            # out-of-band (a hand-merge skips automerge's post-merge requeue), so
+            # they re-enter the review feed instead of sitting stuck. Throttled;
+            # best-effort (never crashes the tick).
+            if reconcile and not _STOP_REQUESTED and _now() - last_merge_reconcile > 60:
+                last_merge_reconcile = _now()
+                try:
+                    _reconcile_merged_rejections(cfg)
+                except Exception as e:  # noqa: BLE001 — never crash the tick
+                    print(f"  warning: merged-rejection reconcile failed: {e}",
+                          flush=True)
             running = [j for j in jobs if j.status == "running"]
 
             picks: list[tuple[int, int]] = []

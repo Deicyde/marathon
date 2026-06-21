@@ -209,10 +209,11 @@ def e2e(cfg, clock, subprocess_calls, popen_factory, monkeypatch, tmp_path):
     )
 
 
-def run_once(e2e, concurrency=1, max_attempts=3, prune=False, automerge=False):
-    # automerge defaults OFF here so the scheduling/dispatch tests are isolated
-    # from the merge orchestrator's `gh pr list` calls; the dedicated automerge
-    # tests opt in explicitly.
+def run_once(e2e, concurrency=1, max_attempts=3, prune=False, automerge=False,
+             reconcile=False):
+    # automerge AND reconcile default OFF here so the scheduling/dispatch tests
+    # are isolated from the gh-pr-list features (the merge orchestrator and the
+    # merged-but-rejected re-review reconcile); their dedicated tests opt in.
     return conductor.run_conductor(
         repo_dir=e2e.cfg.repo_dir,
         concurrency=concurrency,
@@ -221,6 +222,7 @@ def run_once(e2e, concurrency=1, max_attempts=3, prune=False, automerge=False):
         max_attempts=max_attempts,
         worktree_parent=e2e.runs_parent,
         automerge=automerge,
+        reconcile=reconcile,
     )
 
 
