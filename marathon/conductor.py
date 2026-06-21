@@ -664,12 +664,72 @@ def _prime_mathlib_cache(
     return True
 
 
+def _has_open_pr_for_issue(cfg: ReviewConfig, issue_num: int, chapter: int) -> bool:
+    """True when the issue's per-issue branch already has an OPEN PR — a fill is
+    pending merge, so don't dispatch another. Best-effort: a check failure returns
+    False (better a rare duplicate than a wedged queue)."""
+    from marathon.review.github import gh
+
+    branch = _branch_name_for_issue(f"Chapter{chapter}", issue_num)
+    try:
+        cp = gh("pr", "list", "--repo", cfg.github_repo, "--head", branch,
+                "--state", "open", "--json", "number", "--limit", "1", check=False)
+        if cp.returncode != 0:
+            return False
+        return bool(json.loads(cp.stdout or "[]"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _pick_fill_dispatchable(
+    cfg: ReviewConfig,
+    fill_chapters: set[int],
+    running_issues: set[int],
+    not_before: dict[int, float],
+    fill_attempts: dict[int, int],
+    max_fill_attempts: int,
+    *,
+    _now_fn=_now,
+    _discover=None,
+    _open_pr=None,
+) -> list[tuple[int, int]]:
+    """``[(issue, chapter), …]`` fills to dispatch this tick: verified-but-``sorry``
+    issues in ``fill_chapters``, excluding those already running, backed off,
+    attempt-capped, or with an open PR (a fill already pending merge). Sorted by
+    issue number. Discovery is naturally idempotent — once a fill's PR merges the
+    decl is no longer ``sorry`` and drops out — so the only loop risk is a fill
+    that lands nothing, which ``max_fill_attempts`` bounds."""
+    if not fill_chapters:
+        return []
+    from marathon.review.fill_discovery import discover_fill_targets
+
+    discover = _discover or discover_fill_targets
+    open_pr = _open_pr or _has_open_pr_for_issue
+    now = _now_fn()
+    out: list[tuple[int, int]] = []
+    for chapter in sorted(fill_chapters):
+        for t in discover(cfg, chapter):
+            n = t.issue
+            if n in running_issues:
+                continue
+            if n in not_before and not_before[n] > now:
+                continue
+            if fill_attempts.get(n, 0) >= max_fill_attempts:
+                continue
+            if open_pr(cfg, n, chapter):
+                continue
+            out.append((n, chapter))
+    return out
+
+
 def _dispatch_job(
     cfg: ReviewConfig,
     issue_num: int,
     chapter: int,
     runs_parent: Path,
     kept_worktrees: dict[int, str],
+    *,
+    fill: bool = False,
 ) -> Optional[ConductorJob]:
     """Create the job worktree (or reuse the one a failed attempt kept —
     it still holds the per-issue branch, so a fresh add would trip the
@@ -738,16 +798,35 @@ def _dispatch_job(
     # formalization.yaml is the generalized form of the wall_time merge
     # race, so jobs never commit the yaml; the conductor regenerates it
     # centrally after each success (_regenerate_metadata_after_success).
-    cmd = [
-        sys.executable, "-m", "marathon", "refine",
-        str(target),
-        "--repo-dir", str(worktree),
-        "--workdir", str(workdir),
-        "--review-rejection", str(issue_num),
-        "--no-metadata-commit",
-        *daemon.DEFAULT_REFINE_ARGS,
-    ]
-    log_path = workdir / "conductor-refine.log"
+    if fill:
+        # Prove the verified-but-`sorry` declarations cited in this issue. The
+        # statement-immutability guard (enforce_frozen_statements, default on)
+        # reverts any change to an approved signature, so a fill can only fill
+        # bodies + add sub-lemmas. Reuses the per-issue branch so the existing
+        # automerge path lands the proof PR. `marathon fill` defaults
+        # auto-build/commit/push/pr/rate ON, so only the conductor-specific
+        # flags are passed.
+        cmd = [
+            sys.executable, "-m", "marathon", "fill",
+            str(target),
+            "--repo-dir", str(worktree),
+            "--workdir", str(workdir),
+            "--issue", str(issue_num),
+            "--no-metadata-commit",
+            "--build-timeout", "2400",
+        ]
+        log_path = workdir / "conductor-fill.log"
+    else:
+        cmd = [
+            sys.executable, "-m", "marathon", "refine",
+            str(target),
+            "--repo-dir", str(worktree),
+            "--workdir", str(workdir),
+            "--review-rejection", str(issue_num),
+            "--no-metadata-commit",
+            *daemon.DEFAULT_REFINE_ARGS,
+        ]
+        log_path = workdir / "conductor-refine.log"
     log_handle = log_path.open("ab")
     try:
         popen = subprocess.Popen(cmd, stdout=log_handle, stderr=subprocess.STDOUT)
@@ -1250,6 +1329,8 @@ def run_conductor(
     merge_scope: str = "any",
     reconcile: bool = True,
     queue_from_github: bool = False,
+    fill_chapters: Optional[set[int]] = None,
+    max_fill_attempts: int = 3,
 ) -> int:
     """Run the conductor loop. Returns the final exit code.
 
@@ -1305,6 +1386,11 @@ def run_conductor(
     kept_worktrees: dict[int, str] = {}
     warned_unknown: set[int] = set()
     dispatch_count = 0
+    fill_attempts: dict[int, int] = {}         # per-issue fill dispatch counter (capped)
+    fill_chapters = set(fill_chapters or ())   # opt-in proving scope (empty ⇒ no fills)
+    if fill_chapters:
+        print(f"  fill (proving) enabled for chapter(s): {sorted(fill_chapters)} "
+              f"(max {max_fill_attempts} attempts/issue)", flush=True)
     ticks = 0
     last_automerge = float("-inf")  # run the merge orchestrator on tick 1, then ~once/min
     last_reconcile_sha: Optional[str] = None  # reconcile only when HEAD changes
@@ -1403,6 +1489,35 @@ def run_conductor(
                     jobs.append(job)
                     dispatch_count += 1
                 running = [j for j in jobs if j.status == "running"]
+
+                # Fill-dispatch (opt-in): prove verified-but-`sorry` decls in the
+                # requested chapters with whatever concurrency the refines left.
+                # The statement-immutability guard makes each fill body-only.
+                if fill_chapters:
+                    slots = n - len(running)
+                    fill_picks = (
+                        _pick_fill_dispatchable(
+                            cfg, fill_chapters,
+                            running_issues={j.issue_num for j in running},
+                            not_before=not_before,
+                            fill_attempts=fill_attempts,
+                            max_fill_attempts=max_fill_attempts,
+                        )[:slots] if slots > 0 else []
+                    )
+                    for issue_num, chapter in fill_picks:
+                        job = _dispatch_job(
+                            cfg, issue_num, chapter, runs_parent,
+                            kept_worktrees, fill=True,
+                        )
+                        if job is None:
+                            not_before[issue_num] = _now() + WORKTREE_DEFER_SECONDS
+                            continue
+                        fill_attempts[issue_num] = fill_attempts.get(issue_num, 0) + 1
+                        print(f"--- dispatched FILL #{issue_num} (chapter {chapter}, "
+                              f"attempt {fill_attempts[issue_num]}) ---", flush=True)
+                        jobs.append(job)
+                        dispatch_count += 1
+                    running = [j for j in jobs if j.status == "running"]
 
             write_jobs_snapshot(cfg.repo_dir, jobs, n)
 

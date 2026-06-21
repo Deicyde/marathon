@@ -195,6 +195,13 @@ def _add_passthrough_refine_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-auto-pr", dest="auto_pr", action="store_false")
     p.add_argument("--auto-pr-repo", default=None, metavar="OWNER/NAME")
     p.add_argument("--auto-pr-base", default="main", metavar="BRANCH")
+    # Conductor-dispatched fills pass --no-metadata-commit (formalization.yaml is
+    # regenerated centrally after each job); mirror refine's flag so it is accepted
+    # and forwarded to the pipeline.
+    p.add_argument("--metadata-commit", dest="commit_metadata",
+                   action="store_true", default=True)
+    p.add_argument("--no-metadata-commit", dest="commit_metadata",
+                   action="store_false")
     p.add_argument("--audit-verified", action="store_true", default=True)
     p.add_argument("--no-audit-verified", dest="audit_verified", action="store_false")
     # Machine gate (phase-2). Fill's defaults-on philosophy does NOT

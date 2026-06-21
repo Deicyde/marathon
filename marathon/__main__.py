@@ -755,6 +755,17 @@ def _add_conductor_subparser(subparsers) -> None:
             "via MARATHON_QUEUE_FROM_GITHUB=1."
         ),
     )
+    p_run.add_argument(
+        "--fill-chapter",
+        type=int, action="append", default=None, metavar="N", dest="fill_chapters",
+        help=(
+            "Enable hands-off PROVING for chapter N (repeatable): the conductor "
+            "dispatches `marathon fill` for every verified declaration that still "
+            "has a `sorry` body, landing proof PRs. The statement-immutability "
+            "guard ensures a fill can only fill bodies + add sub-lemmas, never "
+            "change an approved statement. Omit to disable proving (the default)."
+        ),
+    )
     p_run.set_defaults(func=_run_conductor_run)
 
     p_stat = sub.add_parser(
@@ -790,6 +801,7 @@ def _run_conductor_run(args) -> None:
         merge_scope=getattr(args, "merge_scope", "any"),
         reconcile=getattr(args, "reconcile", True),
         queue_from_github=getattr(args, "queue_from_github", False),
+        fill_chapters=set(getattr(args, "fill_chapters", None) or ()),
     )
     if rc:
         raise SystemExit(rc)
