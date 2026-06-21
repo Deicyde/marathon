@@ -605,6 +605,33 @@ def _remove_worktree(repo_dir: Path, worktree: Path) -> None:
         )
 
 
+def _reap_orphan_worktree(repo_dir: Path, branch: str) -> bool:
+    """Reap a worktree left holding ``branch`` by a FAILED refine of a PREVIOUS
+    conductor run. ``kept_worktrees`` (the reuse map) is in-memory, so a conductor
+    restart loses track of such a worktree; a fresh ``git worktree add -B`` then
+    trips git's branch guard and the issue wedges in a defer loop forever. Safe to
+    reap: same-issue dispatch is single-flight, so no LIVE job is using it.
+    Returns True if a worktree (or stale metadata) was cleaned."""
+    cp = _git(repo_dir, "worktree", "list", "--porcelain")
+    if cp.returncode != 0:
+        return False
+    path: Optional[str] = None
+    cur: Optional[str] = None
+    for line in cp.stdout.splitlines():
+        if line.startswith("worktree "):
+            cur = line[len("worktree "):].strip()
+        elif line.strip() == f"branch refs/heads/{branch}":
+            path = cur
+            break
+    if path is None:
+        _git(repo_dir, "worktree", "prune")  # only stale metadata held the branch
+        return True
+    print(f"  reaping orphan worktree for {branch}: {path}", flush=True)
+    _remove_worktree(repo_dir, Path(path))
+    _git(repo_dir, "worktree", "prune")
+    return True
+
+
 def prune_worktrees(repo_dir: Path, runs_parent: Path) -> None:
     """Remove leftover ``wt-*`` worktrees under ``runs_parent`` (failed /
     interrupted jobs from prior runs keep theirs by design), then ``git
@@ -783,18 +810,26 @@ def _dispatch_job(
             msg = ((proc.stderr or proc.stdout) or "").strip()
             lower = msg.lower()
             if "already checked out" in lower or "already used by worktree" in lower:
+                # A leftover worktree from a previous run still holds this issue's
+                # branch (kept_worktrees is in-memory, so a conductor restart
+                # orphans it). No LIVE job uses it (same-issue dispatch is
+                # single-flight), so reap it and retry the add ONCE — otherwise
+                # the issue wedges in a defer loop forever (the #96 failure mode).
                 print(
-                    f"--- deferring #{issue_num}: branch {branch} is checked "
-                    "out in another worktree (double-dispatch guard). If it "
-                    "is a leftover, run `marathon conductor run --prune`. ---",
-                    flush=True,
+                    f"--- #{issue_num}: branch {branch} held by a leftover "
+                    "worktree; reaping it and retrying the add ---", flush=True,
                 )
-            else:
-                print(
-                    f"--- deferring #{issue_num}: `git worktree add` failed: "
-                    f"{msg} ---",
-                    flush=True,
+                _reap_orphan_worktree(cfg.repo_dir, branch)
+                proc = _git(
+                    cfg.repo_dir, "worktree", "add", "-B", branch,
+                    str(worktree), WORKTREE_START_POINT,
                 )
+        if proc.returncode != 0:
+            msg = ((proc.stderr or proc.stdout) or "").strip()
+            print(
+                f"--- deferring #{issue_num}: `git worktree add` failed: "
+                f"{msg} ---", flush=True,
+            )
             return None
         # Seed the fresh worktree's Mathlib oleans so the refine's `lake build`
         # skips the from-scratch Mathlib compile. Best-effort — a failure just

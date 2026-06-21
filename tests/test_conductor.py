@@ -475,8 +475,9 @@ def test_interrupted_job_records_nothing(cfg, subprocess_calls, monkeypatch):
 
 
 def test_branch_conflict_defers_not_crash(cfg, monkeypatch, tmp_path, capsys):
-    """git's refusal to check out the per-issue branch in a second
-    worktree (double-dispatch guard) must defer the job, never raise."""
+    """git's refusal to check out the per-issue branch in a second worktree: the
+    conductor first reaps the (possibly orphaned) holder + retries; when that
+    still fails (this mock fails every git call), it DEFERS — never raises."""
     def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(
             args=cmd, returncode=128, stdout="",
@@ -493,8 +494,8 @@ def test_branch_conflict_defers_not_crash(cfg, monkeypatch, tmp_path, capsys):
     job = conductor._dispatch_job(cfg, 22, 14, tmp_path / "runs", {})
     assert job is None
     out = capsys.readouterr().out
-    assert "deferring #22" in out
-    assert "double-dispatch guard" in out
+    assert "reaping it and retrying" in out      # tries to clear the leftover first
+    assert "deferring #22" in out                # then defers when it still can't
 
 
 def test_worktree_parent_inside_repo_refused(cfg, monkeypatch):
