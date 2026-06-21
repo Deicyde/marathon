@@ -102,3 +102,20 @@ def test_add_chapter_refused_without_valid_token(tmp_path):
         assert started == []  # the guard fired BEFORE any intake started
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=5)
+
+
+def test_index_no_cache_and_asset_version_stamped(tmp_path):
+    """The index is served no-cache and its asset refs are version-stamped, so a
+    redeployed bundle reaches the browser instead of a stale cached copy."""
+    cfg = _cfg(tmp_path)
+    server = deck_server.make_server(cfg, port=0)
+    thread, base = _serve(server)
+    try:
+        with urllib.request.urlopen(base + "/", timeout=5) as r:
+            cache_control = r.headers.get("Cache-Control")
+            body = r.read().decode()
+        assert cache_control == "no-cache"
+        assert "__ASSET_VERSION__" not in body      # placeholder substituted
+        assert "/static/app.js?v=" in body          # versioned ref present
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=5)

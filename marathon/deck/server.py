@@ -78,6 +78,25 @@ ACCESS_TOKEN_HEADER = "X-Forwarded-Access-Token"
 # absent (tests run without it; an early launch may pre-date app.js/style.css).
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+# index.html references its cacheable assets as `app.js?v=__ASSET_VERSION__`;
+# _serve_index substitutes the current value (newest asset mtime). A redeploy of
+# app.js/style.css bumps it, so the browser fetches the new bundle instead of a
+# stale cached copy — the index itself is served `no-cache`, so it always carries
+# the current value. (Without this, a redeploy left the browser running the OLD
+# app.js: new index.html, cached old JS — e.g. a new tab that did nothing.)
+ASSET_VERSION_PLACEHOLDER = "__ASSET_VERSION__"
+
+
+def _asset_version() -> str:
+    newest = 0.0
+    for _name in ("app.js", "style.css"):
+        try:
+            newest = max(newest, (STATIC_DIR / _name).stat().st_mtime)
+        except OSError:
+            pass
+    return str(int(newest)) if newest else "0"
+
+
 # A small static-asset content-type table (stdlib mimetypes is fine too,
 # but this keeps the common deck assets explicit + dependency-free).
 _CONTENT_TYPES = {
@@ -179,12 +198,15 @@ class DeckHandler(BaseHTTPRequestHandler):
         self._send_json({"ok": False, "error": message}, status=status)
 
     def _send_bytes(
-        self, body: bytes, content_type: str, status: int = HTTPStatus.OK
+        self, body: bytes, content_type: str, status: int = HTTPStatus.OK,
+        cache_control: Optional[str] = None,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        if cache_control is not None:
+            self.send_header("Cache-Control", cache_control)
         self.end_headers()
         self.wfile.write(body)
 
@@ -250,7 +272,12 @@ class DeckHandler(BaseHTTPRequestHandler):
             )
         token = self.server.token  # type: ignore[attr-defined]
         html = html.replace(TOKEN_PLACEHOLDER, token)
-        self._send_bytes(html.encode("utf-8"), _CONTENT_TYPES[".html"])
+        html = html.replace(ASSET_VERSION_PLACEHOLDER, _asset_version())
+        # no-cache: the index is tiny + dynamic (token + asset version); always
+        # revalidate so a redeployed bundle's new ?v= reaches the browser.
+        self._send_bytes(
+            html.encode("utf-8"), _CONTENT_TYPES[".html"], cache_control="no-cache"
+        )
 
     def _serve_static(self, path: str) -> None:
         """Serve a file under STATIC_DIR. Path-traversal-safe (the resolved
