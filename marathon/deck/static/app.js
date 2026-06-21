@@ -221,7 +221,6 @@
 
   // --- app state -----------------------------------------------------------
   var state = {
-    chapter: "",
     queue: [],          // [CardSummary] — ready ISSUES (the picker)
     building: 0,
     landedToday: 0,
@@ -1837,13 +1836,12 @@
     setActionsEnabled(false);
     stage().innerHTML = "";
     stage().appendChild(el("div", { class: "card card-loading", text: "loading queue…" }));
-    return fetchQueue(state.chapter)
+    return fetchQueue()
       .then(function (data) {
         state.queue = (data.cards || []).slice();
         state.building = data.building || 0;
         state.landedToday = data.landed_today || 0;
         applyStatus({ building: state.building, landed_today: state.landedToday });
-        populateChapters();
         // The queue is the issue PICKER: drop straight into the first ready
         // issue's subdeck (auto-pick). No verdict/ship here — pure reads only.
         openFirstReadyIssue();
@@ -1851,24 +1849,6 @@
       .catch(function (err) {
         showErrorCard("Could not load the queue", err, refreshQueue);
       });
-  }
-
-  function populateChapters() {
-    var sel = document.getElementById("chapter-select");
-    if (!sel) return;
-    var seen = {};
-    state.queue.forEach(function (c) {
-      if (c.chapter != null) seen[c.chapter] = true;
-    });
-    var chapters = Object.keys(seen).sort(function (a, b) { return Number(a) - Number(b); });
-    var current = sel.value;
-    // Keep "all" + observed chapters; preserve selection.
-    sel.innerHTML = "";
-    sel.appendChild(el("option", { value: "", text: "all" }));
-    chapters.forEach(function (ch) {
-      sel.appendChild(el("option", { value: ch, text: "ch " + ch }));
-    });
-    sel.value = current;
   }
 
   // === action bar enable/disable ==========================================
@@ -2499,13 +2479,6 @@
     document.getElementById("btn-defer").addEventListener("click", actDefer);
     document.getElementById("btn-deps").addEventListener("click", openDeps);
     document.getElementById("btn-deepdive").addEventListener("click", openDeepDive);
-    var sel = document.getElementById("chapter-select");
-    if (sel) {
-      sel.addEventListener("change", function () {
-        state.chapter = sel.value;
-        refreshQueue();
-      });
-    }
     // Dashboard tab bar — switching is a pure read (no POST).
     var tabs = document.querySelectorAll(".tab-btn");
     for (var i = 0; i < tabs.length; i++) {

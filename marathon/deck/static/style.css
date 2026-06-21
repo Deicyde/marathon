@@ -43,11 +43,6 @@ html, body {
 }
 .brand { font-size: 1.05rem; margin: 0; font-weight: 700; letter-spacing: 0.02em; }
 .brand-accent { color: var(--accent); }
-.chapter-picker { display: flex; align-items: center; gap: 0.4rem; color: var(--muted); font-size: 0.85rem; }
-.chapter-picker select {
-  background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
-  border-radius: 6px; padding: 0.25rem 0.5rem; font: inherit;
-}
 .status-strip { margin-left: auto; color: var(--muted); font-size: 0.85rem; display: flex; align-items: center; gap: 0.4rem; }
 .status-sep { opacity: 0.5; }
 .status-conn { font-variant-numeric: tabular-nums; }
