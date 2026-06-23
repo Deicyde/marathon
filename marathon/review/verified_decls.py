@@ -110,20 +110,40 @@ def extract_declarations_from_lean_block(lean_code: str) -> set[str]:
 
 _LEAN_BLOCK_RE = re.compile(r"```lean\n(.*?)\n```", re.DOTALL)
 
+# Sub-issues opened by the headless chapter-intake cite their declaration in a
+# ``### Lean declarations`` bullet list — a source link + the name in backticks
+# (e.g. ``- [Orientation.lean:82-90](…) — `PointwiseOrientation` ``) — NOT a
+# ``` ```lean ``` `` signature block. Parse those names too, else the deck /
+# audit / verified-set can't resolve such issues and every card blocks with
+# "no audit evidence". Scoped to the ``### Lean declarations`` section so prose
+# backticks elsewhere in the body are not mistaken for declarations.
+_DECL_SECTION_RE = re.compile(
+    r"^###[ \t]+Lean declarations[ \t]*$(.*?)(?=^###[ \t]|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+_BACKTICK_NAME_RE = re.compile(r"`([A-Za-z_][\w'.]*)`")
+
+
+def extract_declarations_from_declaration_sections(body: str) -> set[str]:
+    """Declaration names cited in a ``### Lean declarations`` section (the
+    chapter-intake issue format: backtick'd names + source links)."""
+    out: set[str] = set()
+    for sec in _DECL_SECTION_RE.finditer(body):
+        out.update(m.group(1) for m in _BACKTICK_NAME_RE.finditer(sec.group(1)))
+    return out
+
 
 def extract_declarations_from_issue_body(body: str) -> set[str]:
-    """Parse ` ```lean ... ``` ` code blocks in an issue body and return
-    the union of Lean declarations they contain.
-
-    A typical sub-issue body has a ``### Lean signatures`` section with
-    one or more ` ```lean ``` ` blocks; this function scans every
-    ``` ```lean ``` ``` block in the body, not just the signatures
-    section, so declarations cited elsewhere (e.g. in mechanical-
-    accuracy bullets) are also counted as verified.
+    """The union of Lean declarations an issue body cites, across BOTH formats:
+    ` ```lean ... ``` ` signature blocks (the original review-issue shape) AND a
+    ``### Lean declarations`` bullet list (the chapter-intake shape). Scanning
+    both means intake-bootstrapped chapters resolve in the deck/audit just like
+    hand-authored ones.
     """
     out: set[str] = set()
     for m in _LEAN_BLOCK_RE.finditer(body):
         out.update(extract_declarations_from_lean_block(m.group(1)))
+    out.update(extract_declarations_from_declaration_sections(body))
     return out
 
 

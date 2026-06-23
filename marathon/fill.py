@@ -50,8 +50,13 @@ def _extract_decls_from_text(text: str) -> list[str]:
 
 
 def _extract_decls_from_issue_body(body: str) -> list[str]:
-    """Return declaration names cited in ``` ```lean ``` `` code blocks
-    inside an issue body. Dedup preserving first-occurrence order."""
+    """Return declaration names cited in an issue body across both shapes —
+    ``` ```lean ``` `` blocks AND a ``### Lean declarations`` bullet list (the
+    chapter-intake format) — dedup preserving first-occurrence order."""
+    from marathon.review.verified_decls import (
+        extract_declarations_from_declaration_sections,
+    )
+
     seen: set[str] = set()
     out: list[str] = []
     for block in _LEAN_BLOCK_RE.finditer(body):
@@ -60,6 +65,10 @@ def _extract_decls_from_issue_body(body: str) -> list[str]:
             if name not in seen:
                 seen.add(name)
                 out.append(name)
+    for name in sorted(extract_declarations_from_declaration_sections(body)):
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
     return out
 
 
