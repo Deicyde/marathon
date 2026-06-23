@@ -529,14 +529,40 @@ def audit_state_dir(repo_dir: str | Path) -> Path:
 
 
 def save_snapshot(
-    snapshot: AuditSnapshot, repo_dir: str | Path | None = None
+    snapshot: AuditSnapshot,
+    repo_dir: str | Path | None = None,
+    *,
+    merge: bool = True,
 ) -> Path:
     """Write ``latest.json`` (rotating any existing one to
     ``previous.json``) under the repo's ``.marathon/audit/``.  The dir
     self-gitignores on first write — same convention as the conductor's
     ``jobs.json``: this is droppable derived cache living inside the
-    consumer repo."""
+    consumer repo.
+
+    With ``merge=True`` (default) the new audit's declarations are MERGED into
+    the existing snapshot PER TARGET MODULE: auditing one chapter updates that
+    chapter's decls and keeps every other chapter's, so a multi-chapter review
+    holds evidence for all chapters at once instead of the snapshot being one
+    target's wholesale replacement. An audit that captured nothing (e.g. a
+    ``lake env lean`` failure → 0 decls) keeps the existing snapshot rather than
+    wiping it. Pass ``merge=False`` for a clean from-scratch overwrite."""
+    from dataclasses import replace as _dc_replace
+
     repo = Path(repo_dir) if repo_dir is not None else Path(snapshot.repo_dir)
+    if merge:
+        existing = load_snapshot(repo)
+        if existing is not None:
+            new_modules = {d.module for d in snapshot.decls}
+            if not new_modules:
+                snapshot = existing  # nothing new audited → don't wipe what's there
+            else:
+                kept = [d for d in existing.decls if d.module not in new_modules]
+                merged = kept + list(snapshot.decls)
+                snapshot = _dc_replace(
+                    snapshot, decls=merged,
+                    modules=sorted({d.module for d in merged}),
+                )
     state_dir = audit_state_dir(repo)
     state_dir.mkdir(parents=True, exist_ok=True)
     gitignore = state_dir / ".gitignore"
