@@ -17,11 +17,20 @@ fresh audit to a hosted box is a separate, optional compute-side step.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
+
+# Subjects of commits the co-located conductor makes onto the deck's checkout
+# (it regenerates formalization.yaml centrally after each job). These are the
+# ONLY local-ahead commits the deck-sync is allowed to discard when recovering a
+# diverged checkout — operator commits are never touched.
+_MARATHON_METADATA_RE = re.compile(
+    r"chore\(marathon\)|regenerate formalization\.yaml", re.IGNORECASE
+)
 
 
 def _git(repo_dir: Path, *args: str, timeout: int = 90) -> subprocess.CompletedProcess:
@@ -39,20 +48,60 @@ def _head(repo_dir: Path) -> str:
         return ""
 
 
+def _recover_from_marathon_divergence(repo_dir: Path, before: str) -> str:
+    """Recover a deck checkout that ``git pull --ff-only`` can no longer advance.
+
+    The deck's tree is a read-only MIRROR of its upstream, but the co-located
+    ``marathon conductor`` commits a ``formalization.yaml`` regen onto it; if that
+    commit doesn't push (e.g. origin advanced via automerge first) the checkout
+    diverges and the ff-only pull wedges FOREVER — the silent staleness that made
+    a reviewer re-reject an already-fixed decl. Reset to the upstream, but ONLY
+    when every local-ahead commit is a marathon metadata commit (never clobber
+    operator commits), preserving tracked review-state edits across the reset
+    (untracked files survive ``reset --hard``)."""
+    _git(repo_dir, "fetch", "origin", "--quiet")
+    up = _git(repo_dir, "rev-parse", "--abbrev-ref", "@{u}")
+    if up.returncode != 0:
+        return "pull failed (ff-only); no upstream to recover to"
+    upstream = up.stdout.strip()
+    log = _git(repo_dir, "log", "--format=%s", f"{upstream}..HEAD")
+    subjects = [s for s in (log.stdout or "").splitlines() if s.strip()]
+    if not subjects:
+        return f"pull failed (ff-only) but not ahead of {upstream}; manual check"
+    if not all(_MARATHON_METADATA_RE.search(s) for s in subjects):
+        return (f"diverged from {upstream} by {len(subjects)} non-marathon "
+                "commit(s); NOT resetting — resolve manually")
+    stash = _git(repo_dir, "stash", "push", "-m", "deck-sync-autostash")
+    stashed = stash.returncode == 0 and "No local changes" not in (stash.stdout or "")
+    reset = _git(repo_dir, "reset", "--hard", upstream)
+    if reset.returncode != 0:
+        if stashed:
+            _git(repo_dir, "stash", "pop")
+        return f"diverged; reset to {upstream} failed: {(reset.stderr or '')[:80]}"
+    if stashed:
+        pop = _git(repo_dir, "stash", "pop")
+        if pop.returncode != 0:
+            return (f"recovered to {upstream} but review-state stash pop "
+                    "conflicted — restore manually (`git stash list`)")
+    after = _head(repo_dir)
+    return (f"recovered diverged checkout {before[:7]} → {after[:7]} "
+            f"(dropped {len(subjects)} marathon metadata commit(s))")
+
+
 def pull_once(repo_dir: Path) -> str:
     """Fast-forward the deck's checkout to its upstream; return a human status.
 
-    Uses ``git pull --ff-only`` so it NEVER clobbers local work — a hosted deck
-    never commits to the tree (merges happen on GitHub via gh, local review state
-    is untracked), so it always fast-forwards cleanly. A non-ff state (someone
-    left local commits) is reported, not forced. Fail-soft: never raises."""
+    Uses ``git pull --ff-only`` so it NEVER clobbers operator work. The deck's
+    tree is a read-only mirror, but the co-located conductor commits a
+    ``formalization.yaml`` regen onto it that can diverge the checkout; on an
+    ff-failure we hand off to :func:`_recover_from_marathon_divergence`, which
+    resets to upstream ONLY when the divergence is marathon metadata commits (and
+    preserves tracked review state). Fail-soft: never raises."""
     try:
         before = _head(repo_dir)
         cp = _git(repo_dir, "pull", "--ff-only", "--quiet")
         if cp.returncode != 0:
-            msg = (cp.stderr or cp.stdout or "").strip().splitlines()
-            tail = msg[-1] if msg else "unknown error"
-            return f"pull failed (ff-only): {tail[:120]}"
+            return _recover_from_marathon_divergence(repo_dir, before)
         after = _head(repo_dir)
         if not after:
             return "pull ok (HEAD unreadable)"
