@@ -121,15 +121,26 @@ _DECL_SECTION_RE = re.compile(
     r"^###[ \t]+Lean declarations[ \t]*$(.*?)(?=^###[ \t]|\Z)",
     re.MULTILINE | re.DOTALL,
 )
-_BACKTICK_NAME_RE = re.compile(r"`([A-Za-z_][\w'.]*)`")
+# A backtick'd token in `### Lean declarations` is either the bare name
+# (`PointwiseOrientation`) or the name with its decl keyword
+# (`def DifferentialForm.IsNonvanishing`) — the intake emits both shapes.
+_BACKTICK_TOKEN_RE = re.compile(r"`([^`\n]+)`")
+_BARE_NAME_RE = re.compile(r"[A-Za-z_][\w'.]*\Z")
 
 
 def extract_declarations_from_declaration_sections(body: str) -> set[str]:
     """Declaration names cited in a ``### Lean declarations`` section (the
-    chapter-intake issue format: backtick'd names + source links)."""
+    chapter-intake issue format: backtick'd names + source links). Handles a
+    bare name (`Foo.bar`) AND a name carrying its keyword (`def Foo.bar`)."""
     out: set[str] = set()
     for sec in _DECL_SECTION_RE.finditer(body):
-        out.update(m.group(1) for m in _BACKTICK_NAME_RE.finditer(sec.group(1)))
+        for m in _BACKTICK_TOKEN_RE.finditer(sec.group(1)):
+            content = m.group(1).strip()
+            dm = _DECL_RE.match(content)
+            if dm:
+                out.add(dm.group("name"))         # `def Foo.bar` → Foo.bar
+            elif _BARE_NAME_RE.match(content):
+                out.add(content)                  # `Foo.bar` → Foo.bar
     return out
 
 

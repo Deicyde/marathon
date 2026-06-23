@@ -44,6 +44,23 @@ def test_declaration_sections_scoped_to_lean_declarations_only():
     assert extract_declarations_from_declaration_sections(INTAKE_BODY) == {"PointwiseOrientation"}
 
 
+# the roadmap-granularity intake emits the keyword INSIDE the backticks
+INTAKE_BODY_KEYWORD = """### Lean declarations
+- `def DifferentialForm.IsNonvanishing` — [OrientationForms.lean](GeometricAnalysis/LeeSM/Chapter15/OrientationForms.lean#L67-L72)
+- `theorem Prop_15_5_forward` — [OrientationForms.lean](GeometricAnalysis/LeeSM/Chapter15/OrientationForms.lean#L121-L128)
+
+### Scaffolding folded
+- `instFooBar` — a helper instance, not first-class.
+"""
+
+
+def test_intake_format_with_keyword_in_backticks_strips_keyword():
+    got = extract_declarations_from_issue_body(INTAKE_BODY_KEYWORD)
+    assert got == {"DifferentialForm.IsNonvanishing", "Prop_15_5_forward"}
+    # the scaffolding helper is not a card
+    assert "instFooBar" not in got
+
+
 def test_lean_block_format_still_works():
     got = extract_declarations_from_issue_body(LEAN_BLOCK_BODY)
     assert {"MixedTensorField.exists_of_tensorial", "Foo.bar"} <= got
