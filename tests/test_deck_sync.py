@@ -37,13 +37,17 @@ def test_pull_once_updated(monkeypatch, tmp_path):
     assert sync.pull_once(tmp_path) == "updated aaaaaaa → bbbbbbb"
 
 
-def test_pull_once_non_ff_is_reported_not_forced(monkeypatch, tmp_path):
+def test_pull_once_non_ff_operator_commit_is_not_reset(monkeypatch, tmp_path):
+    # a non-ff divergence whose local-ahead commit is NOT a marathon metadata
+    # commit is reported and left ALONE — operator work is never reset away.
     monkeypatch.setattr(sync, "_git", _fake_git([
-        (0, "aaaaaaa\n", ""),                          # before
-        (1, "", "fatal: Not possible to fast-forward"),  # pull fails
+        (0, "aaaaaaa\n", ""),                            # before (rev-parse HEAD)
+        (1, "", "fatal: Not possible to fast-forward"),  # pull --ff-only fails
+        (0, "", ""),                                     # recovery: fetch origin
+        (0, "origin/main\n", ""),                        # recovery: rev-parse @{u}
+        (0, "operator: hand-written work\n", ""),        # recovery: log @{u}..HEAD
     ]))
-    out = sync.pull_once(tmp_path)
-    assert out.startswith("pull failed (ff-only):") and "fast-forward" in out
+    assert "NOT resetting" in sync.pull_once(tmp_path)
 
 
 def test_pull_once_failsoft_on_exception(monkeypatch, tmp_path):
