@@ -68,6 +68,16 @@ REFINE_STATE_FILENAME = "marathon-refine-state.json"
 REFINE_LOG_FILENAME = "marathon-refine-log.md"
 RATINGS_FILENAME = "marathon-ratings.jsonl"
 
+# Distinguished exit code for "the --auto-pr branch prep aborted before the
+# iteration could run" (e.g. ``git fetch origin <base>`` failed, including a
+# git-AUTH failure). A NON-ZERO exit makes the conductor mark the job FAILED
+# (record_failed_attempt + backoff retry) instead of recording a phantom
+# iteration and marking it succeeded — see the conductor reap path and
+# marathon.review.daemon._handle_refine_exit. The conductor also keys its
+# distinct top-level git-auth warning off this exact code (see conductor.py
+# _reap_finished), so do not reuse it for unrelated failures.
+EXIT_AUTO_PR_BRANCH_ABORT = 12
+
 
 def _load_additional_writable_paths(
     repo_dir: Path, expected_path: PurePosixPath
@@ -1280,8 +1290,18 @@ async def refine_command(args) -> None:
         )
         if not ok:
             print(f"  auto-pr: {branch_msg}", flush=True)
-            print("  refusing to run iteration on the wrong branch.")
-            return
+            print("  refusing to run iteration on the wrong branch.", flush=True)
+            # CRITICAL: exit NON-ZERO, not a bare ``return``. A bare return
+            # exits the process 0, which the conductor reads as success — it
+            # records a phantom iteration (last_iteration_ts), flips
+            # needs_iteration to False, and NEVER retries, silently stranding
+            # the rejection (the #156 git-AUTH symptom). A non-zero exit
+            # routes through _handle_refine_exit's failure branch
+            # (record_failed_attempt + backoff retry); last_iteration_ts is
+            # left untouched so needs_iteration stays True and the conductor
+            # auto-retries with backoff. Use the distinguished code so the
+            # conductor can surface a git-auth-specific warning.
+            sys.exit(EXIT_AUTO_PR_BRANCH_ABORT)
         print(f"  auto-pr: {branch_msg}")
     if pipeline_config.has_any():
         flags = [

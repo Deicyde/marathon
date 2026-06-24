@@ -84,7 +84,7 @@ from typing import Optional
 
 import marathon.review.daemon as daemon
 from marathon.post_pipeline import _branch_name_for_issue
-from marathon.refine import REFINE_STATE_FILENAME
+from marathon.refine import EXIT_AUTO_PR_BRANCH_ABORT, REFINE_STATE_FILENAME
 from marathon.review.config import ReviewConfig, load_config
 from marathon.review.state import (
     load_state,
@@ -1114,6 +1114,21 @@ def _reap_finished(
                 f"{job.status}, exit {rc}): {job.worktree}",
                 flush=True,
             )
+            # Distinct, top-level git-AUTH warning. The refine exits with the
+            # distinguished EXIT_AUTO_PR_BRANCH_ABORT code when --auto-pr
+            # branch prep aborted (e.g. ``git fetch origin <base>`` failed,
+            # including a credential failure). We surface it here — NOT buried
+            # in the per-job log — because retries will keep failing until a
+            # human fixes the credentials. Keying off the exit code (rather
+            # than tailing the job log) avoids a log-file/closed-handle race
+            # and is robust regardless of log content.
+            if rc == EXIT_AUTO_PR_BRANCH_ABORT:
+                print(
+                    f"⚠️  refine #{job.issue_num} aborted on a GIT AUTH "
+                    f"failure — run `gh auth setup-git`; retries will keep "
+                    f"failing until this is fixed.",
+                    flush=True,
+                )
     return reaped
 
 

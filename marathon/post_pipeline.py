@@ -575,6 +575,39 @@ def _infer_repo(repo_dir: Path) -> Optional[str]:
     return proc.stdout.strip() or None
 
 
+# Signatures git / gh / the credential helper emit when a remote operation
+# fails to authenticate. Matched case-insensitively against captured stderr so
+# we can flag an abort as a (human-fixable) AUTH failure rather than a
+# transient network error. Sources observed in the wild include
+# "could not read Username for 'https://github.com': Device not configured"
+# (the #156 symptom) and the SSH "Permission denied (publickey)".
+_GIT_AUTH_ERROR_SIGNATURES: tuple[str, ...] = (
+    "could not read username",
+    "authentication failed",
+    "device not configured",
+    "terminal prompts disabled",
+    "permission denied (publickey)",
+    "invalid username or password",
+    "fatal: could not read",
+    "remote: invalid",
+)
+
+
+def _is_git_auth_error(stderr: str) -> bool:
+    """True when ``stderr`` from a failed git/gh op looks like an
+    authentication failure (vs a transient network/ref error).
+
+    Used to flag an --auto-pr branch-prep abort as a human-fixable AUTH
+    problem (``gh auth setup-git`` / credential helper) so the conductor
+    can surface a distinct, actionable warning instead of silently
+    retrying forever on a credential failure that will never self-heal.
+    Matched case-insensitively."""
+    if not stderr:
+        return False
+    haystack = stderr.lower()
+    return any(sig in haystack for sig in _GIT_AUTH_ERROR_SIGNATURES)
+
+
 def prepare_auto_pr_branch(
     repo_dir: Path,
     chapter_label: str,
@@ -604,7 +637,14 @@ def prepare_auto_pr_branch(
         check=False,
     )
     if fetch.returncode != 0:
-        return False, branch, f"git fetch origin {base} failed: {fetch.stderr.strip()[:200]}"
+        stderr = fetch.stderr.strip()
+        if _is_git_auth_error(stderr):
+            return False, branch, (
+                f"git fetch origin {base} failed — GIT AUTH: cannot "
+                f"authenticate to origin; run `gh auth setup-git` or fix the "
+                f"git credential helper. [{stderr[:120]}]"
+            )
+        return False, branch, f"git fetch origin {base} failed: {stderr[:200]}"
 
     # If the working tree is dirty, refuse — we'd risk losing uncommitted
     # work by switching branches. EXCEPT: if the only dirty files are
@@ -657,7 +697,14 @@ def prepare_auto_pr_branch(
         cwd=str(repo_dir), capture_output=True, text=True, check=False,
     )
     if checkout.returncode != 0:
-        return False, branch, f"git checkout -B {branch} failed: {checkout.stderr.strip()[:200]}"
+        stderr = checkout.stderr.strip()
+        if _is_git_auth_error(stderr):
+            return False, branch, (
+                f"git checkout -B {branch} failed — GIT AUTH: cannot "
+                f"authenticate to origin; run `gh auth setup-git` or fix the "
+                f"git credential helper. [{stderr[:120]}]"
+            )
+        return False, branch, f"git checkout -B {branch} failed: {stderr[:200]}"
 
     return True, branch, f"on {branch} (reset to origin/{base})"
 
