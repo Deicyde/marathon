@@ -743,6 +743,22 @@ def _add_conductor_subparser(subparsers) -> None:
         ),
     )
     p_run.add_argument(
+        "--no-reverify",
+        dest="reverify",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable the auto-un-verify of a verified issue when its reviewable "
+            "content changes (on by default; wall-clock throttled, NOT "
+            "HEAD-gated). When a verified issue's body adds a new card, or a "
+            "frozen statement is changed / renamed / removed in code, the "
+            "conductor drops the review:verified label, deletes the issue's "
+            "state entry (so the deck re-surfaces it), and posts ONE comment — "
+            "unchanged cards keep their verdicts. The approved-statements "
+            "manifest is left frozen so later changes still diff."
+        ),
+    )
+    p_run.add_argument(
         "--queue-from-github",
         action="store_true",
         help=(
@@ -800,6 +816,7 @@ def _run_conductor_run(args) -> None:
         automerge=getattr(args, "automerge", True),
         merge_scope=getattr(args, "merge_scope", "any"),
         reconcile=getattr(args, "reconcile", True),
+        reverify=getattr(args, "reverify", True),
         queue_from_github=getattr(args, "queue_from_github", False),
         fill_chapters=set(getattr(args, "fill_chapters", None) or ()),
     )

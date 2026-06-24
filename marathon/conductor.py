@@ -1317,6 +1317,54 @@ def _maybe_reconcile_signatures(
     return cur
 
 
+def _maybe_reopen_stale_verified(
+    cfg: ReviewConfig, *, exclude_issues: "frozenset[int]"
+) -> int:
+    """Re-open verified issues whose reviewable content has DRIFTED since the
+    verify froze it. Iterate every registered issue; for each whose
+    ``state.json`` status is ``'verified'`` and which has no running job
+    (a live refine may be editing that body), compute
+    :func:`marathon.review.reverify.verified_staleness`. If stale, call
+    :func:`unverify_for_rereview` (drops the verified label, deletes the
+    state.json entry, posts ONE comment). Returns the number of issues
+    re-opened.
+
+    NOT HEAD-gated (unlike the signature reconcile): a new card can arrive via
+    an issue-BODY edit that never moves HEAD, so this pass must run on its own
+    wall-clock cadence. NEVER raises — one issue's failure warns and the loop
+    continues."""
+    from marathon.review.reverify import unverify_for_rereview, verified_staleness
+
+    try:
+        state = load_state(cfg)
+    except Exception:  # noqa: BLE001 — never crash the tick
+        return 0
+    reopened = 0
+    for num, st in sorted(state.issues.items()):
+        if getattr(st, "status", None) != "verified":
+            continue
+        if num in exclude_issues:
+            continue
+        try:
+            stale, reasons = verified_staleness(cfg, num)
+        except Exception as e:  # noqa: BLE001 — one issue isn't fatal
+            print(f"  warning: staleness check #{num} failed: {e}", flush=True)
+            continue
+        if not stale:
+            continue
+        try:
+            if unverify_for_rereview(cfg, num, reasons):
+                reopened += 1
+                print(
+                    f"--- re-opened verified #{num} for re-review "
+                    f"({'; '.join(reasons)}) ---",
+                    flush=True,
+                )
+        except Exception as e:  # noqa: BLE001 — one issue isn't fatal
+            print(f"  warning: re-open #{num} failed: {e}", flush=True)
+    return reopened
+
+
 def run_conductor(
     repo_dir: Optional[Path] = None,
     concurrency: Optional[int] = None,
@@ -1328,6 +1376,7 @@ def run_conductor(
     automerge: bool = True,
     merge_scope: str = "any",
     reconcile: bool = True,
+    reverify: bool = True,
     queue_from_github: bool = False,
     fill_chapters: Optional[set[int]] = None,
     max_fill_attempts: int = 3,
@@ -1396,6 +1445,7 @@ def run_conductor(
     last_reconcile_sha: Optional[str] = None  # reconcile only when HEAD changes
     last_tracker_sync = float("-inf")  # tracker safety-net cadence (~once/2min)
     last_merge_reconcile = float("-inf")  # merged-but-rejected re-review heal (~once/min)
+    last_reopen_check = float("-inf")  # stale-verified re-open cadence (~once/2min)
 
     try:
         if prune:
@@ -1467,6 +1517,24 @@ def run_conductor(
                     _reconcile_merged_rejections(cfg)
                 except Exception as e:  # noqa: BLE001 — never crash the tick
                     print(f"  warning: merged-rejection reconcile failed: {e}",
+                          flush=True)
+            # Re-open verified issues whose reviewable content drifted since the
+            # verify froze it (a body edit added a new card, or a frozen
+            # statement changed / was renamed in code). Wall-clock throttled —
+            # NOT HEAD-gated: a new card can arrive via an issue-body edit that
+            # never moves HEAD. Skips issues with a running job (a live refine
+            # may be editing that body). Best-effort (never crashes the tick).
+            if reverify and not _STOP_REQUESTED and _now() - last_reopen_check > 120:
+                last_reopen_check = _now()
+                try:
+                    _maybe_reopen_stale_verified(
+                        cfg,
+                        exclude_issues=frozenset(
+                            j.issue_num for j in jobs if j.status == "running"
+                        ),
+                    )
+                except Exception as e:  # noqa: BLE001 — never crash the tick
+                    print(f"  warning: stale-verified re-open failed: {e}",
                           flush=True)
             running = [j for j in jobs if j.status == "running"]
 

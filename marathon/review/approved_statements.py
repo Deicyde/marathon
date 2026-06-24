@@ -199,20 +199,41 @@ def save_manifest(repo_dir: Path, statements: dict[str, ApprovedStatement]) -> P
 def _chapter_source_text(cfg: ReviewConfig, chapter: int) -> str:
     """Concatenation of every ``.lean`` file under the chapter's target folder
     (best-effort, empty if the folder is absent). Used to read the current
-    signature of a freshly-verified declaration."""
+    signature of a freshly-verified declaration.
+
+    Thin wrapper over :func:`_chapter_source_read` that drops the read-failure
+    flag — kept for callers (capture) that only need the text."""
+    text, _read_failed = _chapter_source_read(cfg, chapter)
+    return text
+
+
+def _chapter_source_read(cfg: ReviewConfig, chapter: int) -> tuple[str, bool]:
+    """``(text, read_failed)`` for the chapter's ``.lean`` source.
+
+    ``text`` is the concatenation of every readable ``.lean`` file under the
+    chapter's target folder (best-effort, empty if the folder is absent).
+    ``read_failed`` is True iff AT LEAST ONE ``.lean`` file existed but could
+    NOT be read (``OSError``) — i.e. ``text`` is a PARTIAL view of the source.
+
+    The flag matters for staleness: a partial read makes a frozen decl that
+    lives in the unread file look removed/changed even though the source is
+    fine, so the staleness diff must suppress its source-derived checks just as
+    it does for an all-empty source."""
     try:
         target = cfg.target_path(chapter)
     except Exception:  # noqa: BLE001
-        return ""
+        return ("", False)
     if not target.is_dir():
-        return ""
+        return ("", False)
     parts: list[str] = []
+    read_failed = False
     for p in sorted(target.rglob("*.lean")):
         try:
             parts.append(p.read_text())
         except OSError:
+            read_failed = True
             continue
-    return "\n\n".join(parts)
+    return ("\n\n".join(parts), read_failed)
 
 
 def capture_on_verify(cfg: ReviewConfig, issue_num: int) -> list[str]:

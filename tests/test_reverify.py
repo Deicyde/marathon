@@ -1,0 +1,416 @@
+"""Tests for auto-un-verify of a verified review issue whose reviewable
+content changes (marathon.review.reverify + the conductor pass).
+
+Contract under test:
+
+* ``verified_staleness`` diffs an issue's CURRENT carded/in-code reviewable
+  set against the manifest record frozen at verify time, CONSERVATIVELY:
+  detects a new card, a changed statement, and a removed/renamed decl; is
+  not-stale when current == manifest, when manifest-for-issue is empty, and
+  when the source can't be read (no false flag).
+* ``unverify_for_rereview`` removes the verified label, deletes the
+  state.json entry, and posts ONE comment (all via mocked gh).
+* the conductor's ``_maybe_reopen_stale_verified`` re-opens a stale verified
+  issue, skips a fresh verified one, and skips an excluded (running-job) one.
+
+Every gh / GitHub boundary is monkeypatched: no test invokes gh.
+"""
+
+from __future__ import annotations
+
+import marathon.conductor as conductor
+import marathon.review.reverify as reverify
+from marathon.review.approved_statements import ApprovedStatement, save_manifest
+from marathon.review.config import ChapterRegistry, ReviewConfig, ReviewLabels
+from marathon.review.state import IssueState, ReviewState, load_state, save_state
+
+
+# --- fixtures ---------------------------------------------------------------
+
+
+def make_cfg(tmp_path) -> ReviewConfig:
+    repo = tmp_path / "repo"
+    (repo / "Demo" / "Chapter14").mkdir(parents=True, exist_ok=True)
+    return ReviewConfig(
+        repo_dir=repo,
+        config_path=repo / ".marathon/review/config.toml",
+        github_repo="owner/Demo",
+        parent_issue=1,
+        target_path_template="Demo/Chapter{chapter}",
+        tracker_section_pattern="### Chapter {chapter}:",
+        labels=ReviewLabels(),
+        chapters={14: ChapterRegistry(chapter=14, entries=[(22, "Lemma A")])},
+    )
+
+
+def write_source(cfg: ReviewConfig, *, body: str) -> None:
+    (cfg.repo_dir / "Demo" / "Chapter14" / "X.lean").write_text(body)
+
+
+def issue_body_for(decls: list[str], bodies: dict[str, str]) -> str:
+    """An issue body whose ```lean block declares ``decls`` (signatures only)."""
+    lean = "\n".join(bodies[d] for d in decls)
+    return f"### Lean signatures\n\n```lean\n{lean}\n```\n"
+
+
+def issue_body_with_name_bullet(
+    lean_decls: list[str], bodies: dict[str, str], bullet_names: list[str]
+) -> str:
+    """A mixed issue body: a ```lean signature block for ``lean_decls`` PLUS a
+    ``### Lean declarations`` section citing ``bullet_names`` by NAME only (the
+    chapter-intake shape — backtick'd names, no ```lean block)."""
+    parts: list[str] = []
+    if lean_decls:
+        lean = "\n".join(bodies[d] for d in lean_decls)
+        parts.append(f"### Lean signatures\n\n```lean\n{lean}\n```")
+    if bullet_names:
+        bullets = "\n".join(
+            f"- [X.lean:1-2](http://x) — `{n}`" for n in bullet_names
+        )
+        parts.append(f"### Lean declarations\n\n{bullets}")
+    return "\n\n".join(parts) + "\n"
+
+
+def freeze(cfg: ReviewConfig, issue_num: int, sigs: dict[str, str]) -> None:
+    """Write the approved-statements manifest with ``sigs`` frozen for the
+    issue (each value is an ALREADY-normalized signature)."""
+    save_manifest(
+        cfg.repo_dir,
+        {
+            name: ApprovedStatement(
+                decl_name=name, signature=sig, issue=issue_num,
+                chapter=14, verified_ts="2026-06-20T00:00:00-04:00",
+            )
+            for name, sig in sigs.items()
+        },
+    )
+
+
+def seed_verified(cfg: ReviewConfig, issue_num: int) -> None:
+    save_state(
+        cfg,
+        ReviewState(issues={
+            issue_num: IssueState(
+                status="verified", verdict_ts="2026-06-20T00:00:00-04:00",
+            )
+        }),
+    )
+
+
+def patch_body(monkeypatch, body):
+    """Make reverify.verified_staleness see ``body`` as the issue body
+    (a callable taking issue_num, or a constant string/None)."""
+    def fake(issue_num, repo):
+        return body(issue_num) if callable(body) else body
+    monkeypatch.setattr("marathon.review.github.issue_body", fake)
+
+
+# --- verified_staleness -----------------------------------------------------
+
+
+def test_staleness_detects_new_card(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    foo = "theorem foo : True := by trivial"
+    bar = "theorem bar : True := by trivial"
+    write_source(cfg, body=f"{foo}\n{bar}\n")
+    # Only `foo` was frozen; the body now ALSO cites `bar` → new card.
+    freeze(cfg, 22, {"foo": "theorem foo : True"})
+    patch_body(monkeypatch, issue_body_for(["foo", "bar"], {"foo": foo, "bar": bar}))
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert stale
+    assert reasons == ["new card: bar"]
+
+
+def test_staleness_name_bullet_in_source_is_stale_new_card(tmp_path, monkeypatch):
+    """Positive control (FIX 1 must not over-suppress): a genuine IN-SOURCE
+    decl carded via a `### Lean declarations` name bullet but absent from the
+    manifest IS freezable (extract_signature finds it in source) → new card.
+    Mirrors #156's `ManifoldOrientation.toPointwiseOrientation`."""
+    cfg = make_cfg(tmp_path)
+    foo = "theorem foo : True := by trivial"
+    newdecl = "def ManifoldOrientation.toPointwiseOrientation : Nat := 0"
+    # Both decls live in source; only `foo` was frozen. The body cites the new
+    # decl by NAME ONLY in `### Lean declarations`, but it IS in source →
+    # capture WOULD have frozen it → genuine new card.
+    write_source(cfg, body=f"{foo}\n{newdecl}\n")
+    freeze(cfg, 22, {"foo": "theorem foo : True"})
+    patch_body(
+        monkeypatch,
+        issue_body_with_name_bullet(
+            ["foo"], {"foo": foo}, ["ManifoldOrientation.toPointwiseOrientation"]
+        ),
+    )
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert stale
+    assert reasons == ["new card: ManifoldOrientation.toPointwiseOrientation"]
+
+
+def test_staleness_name_only_bullet_not_freezable_is_not_stale(tmp_path, monkeypatch):
+    """FIX 1: a decl cited by NAME ONLY in `### Lean declarations` — NOT in
+    source and with NO ```lean block defining it — was never freezable, so
+    capture never put it in the manifest. It must NOT trigger a spurious
+    `new card`, else the issue can never stay verified."""
+    cfg = make_cfg(tmp_path)
+    foo = "theorem foo : True := by trivial"
+    # `foo` is in source and was frozen; `Ghost.bar` is cited by name only in
+    # the `### Lean declarations` section, is NOT in source, and has no ```lean
+    # block → capture could never freeze it.
+    write_source(cfg, body=f"{foo}\n")
+    freeze(cfg, 22, {"foo": "theorem foo : True"})
+    patch_body(
+        monkeypatch,
+        issue_body_with_name_bullet(["foo"], {"foo": foo}, ["Ghost.bar"]),
+    )
+
+    # Sanity: the carded set DOES include the non-freezable name (asymmetry).
+    from marathon.review.verified_decls import extract_declarations_from_issue_body
+    carded = extract_declarations_from_issue_body(
+        issue_body_with_name_bullet(["foo"], {"foo": foo}, ["Ghost.bar"])
+    )
+    assert "Ghost.bar" in carded
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert not stale
+    assert reasons == []
+
+
+def test_staleness_partial_source_read_failure_is_not_stale(tmp_path, monkeypatch):
+    """FIX 2: a multi-file chapter where ONE .lean file is unreadable while a
+    sibling reads fine. A frozen decl living in the unreadable file would look
+    removed/changed though the source is fine → must NOT be stale."""
+    cfg = make_cfg(tmp_path)
+    chap = cfg.repo_dir / "Demo" / "Chapter14"
+    # Two files: A.lean readable, B.lean holds `bar` but will fail to read.
+    (chap / "A.lean").write_text("theorem foo : True := by trivial\n")
+    b = chap / "B.lean"
+    b.write_text("theorem bar : True := by trivial\n")
+    # Freeze `bar` (lives in the file we will make unreadable).
+    freeze(cfg, 22, {"bar": "theorem bar : True"})
+    patch_body(
+        monkeypatch,
+        issue_body_for(["bar"], {"bar": "theorem bar : True := by sorry"}),
+    )
+
+    real_read_text = type(b).read_text
+
+    def flaky_read_text(self, *args, **kwargs):
+        if self.name == "B.lean":
+            raise OSError("simulated unreadable file")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr("pathlib.Path.read_text", flaky_read_text)
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert not stale
+    assert reasons == []
+
+
+def test_staleness_detects_changed_signature(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    # Frozen as `: True`; source now states `: False` → changed statement.
+    write_source(cfg, body="theorem foo : False := by sorry\n")
+    freeze(cfg, 22, {"foo": "theorem foo : True"})
+    patch_body(
+        monkeypatch,
+        issue_body_for(["foo"], {"foo": "theorem foo : False := by sorry"}),
+    )
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert stale
+    assert reasons == ["changed statement: foo"]
+
+
+def test_staleness_detects_removed_when_dropped_from_cards(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    # `foo` still in code, but the issue body no longer cites it → removed/renamed.
+    write_source(cfg, body="theorem foo : True := by trivial\n")
+    freeze(cfg, 22, {"foo": "theorem foo : True"})
+    patch_body(
+        monkeypatch,
+        issue_body_for(["baz"], {"baz": "theorem baz : True := by trivial"}),
+    )
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert stale
+    # `baz` is a new card AND `foo` was removed from the cards.
+    assert "removed/renamed: foo" in reasons
+    assert "new card: baz" in reasons
+
+
+def test_staleness_detects_removed_when_gone_from_code(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    # Still carded, but the decl no longer exists in the source → removed/renamed.
+    write_source(cfg, body="theorem unrelated : True := by trivial\n")
+    freeze(cfg, 22, {"foo": "theorem foo : True"})
+    patch_body(
+        monkeypatch,
+        issue_body_for(["foo"], {"foo": "theorem foo : True := by sorry"}),
+    )
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert stale
+    assert reasons == ["removed/renamed: foo"]
+
+
+def test_staleness_not_stale_when_current_equals_manifest(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    foo = "theorem foo : True := by trivial"
+    write_source(cfg, body=f"{foo}\n")
+    freeze(cfg, 22, {"foo": "theorem foo : True"})
+    patch_body(monkeypatch, issue_body_for(["foo"], {"foo": foo}))
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert not stale
+    assert reasons == []
+
+
+def test_staleness_empty_manifest_for_issue_is_not_stale(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    write_source(cfg, body="theorem foo : True := by trivial\n")
+    # Manifest exists but for a DIFFERENT issue → manifest-for-22 is empty.
+    freeze(cfg, 99, {"foo": "theorem foo : True"})
+    patch_body(
+        monkeypatch,
+        issue_body_for(["foo"], {"foo": "theorem foo : True := by trivial"}),
+    )
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert not stale
+    assert reasons == []
+
+
+def test_staleness_source_read_failure_is_not_stale(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    # Source is EMPTY (folder has no .lean / unreadable) but the decl is still
+    # carded — must NOT false-flag as removed/changed.
+    freeze(cfg, 22, {"foo": "theorem foo : True"})
+    patch_body(
+        monkeypatch,
+        issue_body_for(["foo"], {"foo": "theorem foo : True := by sorry"}),
+    )
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert not stale
+    assert reasons == []
+
+
+def test_staleness_body_unfetchable_is_not_stale(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    write_source(cfg, body="theorem foo : True := by trivial\n")
+    freeze(cfg, 22, {"foo": "theorem foo : True"})
+    patch_body(monkeypatch, None)  # body fetch failed
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert not stale
+    assert reasons == []
+
+
+# --- unverify_for_rereview --------------------------------------------------
+
+
+def test_unverify_removes_label_deletes_state_and_comments(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    seed_verified(cfg, 22)
+    assert load_state(cfg).get(22) is not None
+
+    calls: list[list[str]] = []
+
+    def fake_gh(*args, **kwargs):
+        calls.append(list(args))
+        class CP:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return CP()
+
+    monkeypatch.setattr("marathon.review.github.gh", fake_gh)
+
+    ok = reverify.unverify_for_rereview(cfg, 22, ["new card: bar"])
+    assert ok is True
+
+    # state entry deleted (deck re-surfaces the issue).
+    assert load_state(cfg).get(22) is None
+
+    # exactly one label-edit (remove verified) and one comment.
+    edits = [c for c in calls if c[:1] == ["issue"] and "edit" in c]
+    comments = [c for c in calls if c[:2] == ["issue", "comment"]]
+    assert len(edits) == 1
+    assert "--remove-label" in edits[0]
+    assert cfg.labels.verified in edits[0]
+    assert "--add-label" not in edits[0]
+    assert len(comments) == 1
+    # the comment summarizes the reason.
+    body = comments[0][comments[0].index("--body") + 1]
+    assert "new card(s): bar" in body
+    assert "♻️" in body
+
+
+def test_unverify_leaves_manifest_frozen(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    seed_verified(cfg, 22)
+    freeze(cfg, 22, {"foo": "theorem foo : True"})
+
+    monkeypatch.setattr(
+        "marathon.review.github.gh",
+        lambda *a, **k: type("CP", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+    )
+    reverify.unverify_for_rereview(cfg, 22, ["changed statement: foo"])
+
+    from marathon.review.approved_statements import load_manifest
+    # The manifest is deliberately NOT touched — a later change still diffs.
+    assert "foo" in load_manifest(cfg.repo_dir)
+
+
+# --- conductor pass ---------------------------------------------------------
+
+
+def test_conductor_reopens_stale_skips_fresh_and_excluded(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+
+    # Two verified issues: 22 is stale (new card), 23 is fresh, plus a third
+    # stale one (24) that is EXCLUDED because a job is running on it.
+    cfg.chapters[14] = ChapterRegistry(
+        chapter=14, entries=[(22, "A"), (23, "B"), (24, "C")]
+    )
+    save_state(cfg, ReviewState(issues={
+        22: IssueState(status="verified", verdict_ts="2026-06-20T00:00:00-04:00"),
+        23: IssueState(status="verified", verdict_ts="2026-06-20T00:00:00-04:00"),
+        24: IssueState(status="verified", verdict_ts="2026-06-20T00:00:00-04:00"),
+    }))
+
+    # 22 and 24 are stale; 23 is fresh.
+    def fake_staleness(_cfg, num):
+        if num in (22, 24):
+            return (True, [f"new card: card{num}"])
+        return (False, [])
+
+    reopened: list[int] = []
+
+    def fake_unverify(_cfg, num, reasons):
+        reopened.append(num)
+        return True
+
+    monkeypatch.setattr(reverify, "verified_staleness", fake_staleness)
+    monkeypatch.setattr(reverify, "unverify_for_rereview", fake_unverify)
+
+    n = conductor._maybe_reopen_stale_verified(cfg, exclude_issues=frozenset({24}))
+
+    assert n == 1
+    assert reopened == [22]  # 23 fresh (skipped), 24 excluded (running job)
+
+
+def test_conductor_pass_skips_non_verified(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    save_state(cfg, ReviewState(issues={
+        22: IssueState(status="rejected", verdict_ts="2026-06-20T00:00:00-04:00",
+                       notes="x"),
+    }))
+
+    def boom(*a, **k):
+        raise AssertionError("staleness must not be consulted for non-verified")
+
+    monkeypatch.setattr(reverify, "verified_staleness", boom)
+    n = conductor._maybe_reopen_stale_verified(cfg, exclude_issues=frozenset())
+    assert n == 0
