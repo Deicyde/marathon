@@ -584,3 +584,513 @@ def test_multi_section_declarations_all_spliced(tmp_path, monkeypatch):
     # The first section's unrelated token and the Notes prose survive verbatim.
     assert "`Demo.Chapter15.Tf.unrelated`" in nb
     assert "### Notes\n\nprose\n\n" in nb
+
+
+# ---------------------------------------------------------------------------
+# ### Lean declarations — the ADD path (back-fill uncited in-code decls)
+# ---------------------------------------------------------------------------
+#
+# The real Chapter-15 coverage gap: a refine ADDED `ManifoldOrientation.
+# toPointwiseOrientation` (docstring references the issue's result-key 15.5)
+# but it ended up cited by NO issue — so it never became a review card. The
+# `### Lean declarations` reconcile path must back-fill it as an intake bullet,
+# mirroring the signatures ADD path.
+#
+# `missing_suggestions_for_issue` surfaces an uncited candidate when: the title
+# is numbered (15.5), the issue cites a decl whose namespace the candidate is a
+# DIRECT member of, the candidate's OWN docstring references the key, and it is
+# cited by no chapter issue. The cited decl must resolve in the snapshot (so the
+# namespace is computed); the candidate lives ONLY in the code.
+
+# `Demo.Chapter15.Orient` namespace, current code:
+#   ofManifold            — Prop 15.5 (part 1), CITED by issue 98 (in snapshot)
+#   toPointwiseOrientation — Prop 15.5 (part 2), uncited refine-add (code-only)
+#   unrelated             — Prop 15.9, a different result (must NOT be added)
+#   helper                — no textbook result (must NOT be added)
+_ADD_SRC = """\
+import Mathlib
+
+namespace Demo.Chapter15.Orient
+
+/-- Proposition 15.5 (part 1): a manifold orientation. -/
+theorem ofManifold : True := trivial
+
+/-- Proposition 15.5 (part 2): the induced pointwise orientation. -/
+theorem toPointwiseOrientation : True := trivial
+
+/-- Proposition 15.9: an unrelated result in the same namespace. -/
+theorem unrelated : True := trivial
+
+/-- A plumbing helper — no textbook result. -/
+theorem helper : True := trivial
+
+end Demo.Chapter15.Orient
+"""
+
+_CITED_OFMANIFOLD = "Demo.Chapter15.Orient.ofManifold"
+_ADD_CANDIDATE = "Demo.Chapter15.Orient.toPointwiseOrientation"
+
+
+def _decl_add_body(cited: str = _CITED_OFMANIFOLD) -> str:
+    """A `### Lean declarations` (intake) body citing `cited`, wrapped in other
+    sections so the byte-identical-outside check has something to guard."""
+    return (
+        f"{_OTHER_SECTIONS}"
+        f"### Lean declarations\n\n"
+        f"- [Demo/Chapter15/Orient.lean:L6-L7]"
+        f"(https://github.com/x/y/blob/OLDSHA/Demo/Chapter15/Orient.lean#L6-L7)"
+        f" — `{cited}`\n\n"
+        f"### Informal Statement\n\ntext\n"
+    )
+
+
+def _setup_add(tmp_path, monkeypatch, *, body, title="Proposition 15.5 — orient",
+               extra_snapshot=(), sibling_body=None, state=None):
+    """A chapter-15 registry whose issue 98 body is `body`; the `_ADD_SRC`
+    namespace lives in the code; the cited `ofManifold` is in the snapshot so its
+    namespace resolves. An optional sibling issue 97 can CITE the ADD candidate
+    (to exercise the cited_by!=[] exclusion)."""
+    cfg = make_cfg(tmp_path)
+    entries = [(98, "Prop 15.5")]
+    bulk = {98: {"title": title, "state": "OPEN", "labels": set(), "body": body}}
+    if sibling_body is not None:
+        entries.insert(0, (97, "Prop 15.5 sibling"))
+        bulk[97] = {"title": title, "state": "OPEN", "labels": set(),
+                    "body": sibling_body}
+    cfg.chapters[15] = ChapterRegistry(chapter=15, entries=entries)
+    (cfg.repo_dir / "Demo" / "Chapter15").mkdir(parents=True, exist_ok=True)
+    (cfg.repo_dir / "Demo" / "Chapter15" / "Orient.lean").write_text(_ADD_SRC)
+    install_snapshot(cfg, make_snapshot([
+        _decl(_CITED_OFMANIFOLD, module="Demo.Chapter15.Orient"),
+        *extra_snapshot,
+    ], cfg.repo_dir))
+    patch_bulk(monkeypatch, bulk)
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda d: "NEWSHA")
+    import marathon.review.github as gh_mod
+    monkeypatch.setattr(gh_mod, "issue_body", lambda n, repo: bulk[n]["body"])
+    if state is not None:
+        from marathon.review.state import save_state
+        save_state(cfg, state)
+    return cfg
+
+
+def test_declarations_format_add_uncited_in_code_decl(tmp_path, monkeypatch):
+    """ADD (a): a `### Lean declarations` body with an uncited in-code candidate
+    matching the issue result-key (15.5) → it is APPENDED as an intake bullet at
+    the end of the declarations section. The bullet carries a real permalink at
+    the NEW sha; every other section is byte-identical."""
+    body = _decl_add_body()
+    cfg = _setup_add(tmp_path, monkeypatch, body=body)
+    r = auto_reconcile_issue(cfg, 98, dry_run=True)
+
+    assert r["added"] == [_ADD_CANDIDATE]
+    assert r["renamed"] == []
+    nb = r["new_body"]
+    # The new bullet is present, with a permalink pinned at the NEW sha, and the
+    # backtick'd decl name in the intake shape.
+    assert f"— `{_ADD_CANDIDATE}`" in nb
+    assert "blob/NEWSHA/Demo/Chapter15/Orient.lean#L" in nb
+    # It is appended INSIDE the declarations section (before Informal Statement),
+    # right after the existing bullet.
+    decl_sec = nb.split("### Lean declarations\n\n", 1)[1].split("### Informal")[0]
+    assert f"`{_CITED_OFMANIFOLD}`" in decl_sec
+    assert f"`{_ADD_CANDIDATE}`" in decl_sec
+    # The unrelated (15.9) and the un-numbered helper are NOT added.
+    assert "unrelated`" not in nb
+    assert "Orient.helper`" not in nb
+    # Everything before the declarations section is byte-identical, and the
+    # trailing Informal Statement section is untouched.
+    assert nb.startswith(_OTHER_SECTIONS + "### Lean declarations")
+    assert nb.endswith("### Informal Statement\n\ntext\n")
+    assert "unrelated `backtick` token" in nb
+
+
+def test_declarations_format_add_frozen_suppressed_no_write(tmp_path, monkeypatch):
+    """ADD (b): a FROZEN (verified) issue with an ADD candidate → the ADD is
+    suppressed and NOTHING is written. `_gh_edit_body` is monkeypatched to raise:
+    it must never be called. `updated` is False and `added` is empty."""
+    from marathon.review.state import ReviewState, IssueState
+
+    body = _decl_add_body()
+    cfg = _setup_add(
+        tmp_path, monkeypatch, body=body,
+        state=ReviewState(issues={
+            98: IssueState(status="verified",
+                           verdict_ts="2026-06-20T00:00:00-04:00"),
+        }),
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("a frozen issue body must NEVER be edited")
+
+    monkeypatch.setattr(refresh_mod, "_gh_edit_body", _boom)
+
+    # NOT dry_run — the freeze, not dry_run, blocks the write.
+    r = auto_reconcile_issue(cfg, 98)
+    assert r["updated"] is False
+    assert r["added"] == []
+    assert r["flagged_renames"] == []   # no rename here, only a suppressed ADD
+    assert "verified/frozen" in r["message"]
+    assert "add(s) suppressed" in r["message"]
+
+
+def test_declarations_format_add_skipped_when_cited_by_another_issue(
+    tmp_path, monkeypatch
+):
+    """ADD (c): the candidate is ALREADY cited by a SIBLING issue (97) → its
+    `cited_by` is non-empty, so it is NOT added (back-fill targets only decls
+    cited by NO issue). With no rename either, NOTHING is written."""
+    body = _decl_add_body()
+    # Sibling 97 cites the ADD candidate in ITS declarations body → cited_by!=[].
+    sibling = (
+        "### Lean declarations\n\n"
+        f"- src — `{_ADD_CANDIDATE}`\n\n"
+        "### Informal Statement\n\ntext\n"
+    )
+    cfg = _setup_add(
+        tmp_path, monkeypatch, body=body, sibling_body=sibling,
+        # The candidate must resolve in the snapshot for the sibling's citation
+        # to register against it in `decl_to_issues`.
+        extra_snapshot=[_decl(_ADD_CANDIDATE, module="Demo.Chapter15.Orient")],
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("nothing to add or rename ⇒ no edit")
+
+    monkeypatch.setattr(refresh_mod, "_gh_edit_body", _boom)
+
+    r = auto_reconcile_issue(cfg, 98)
+    assert r["added"] == []
+    assert r["renamed"] == []
+    assert r["updated"] is False
+    assert "already reconciled" in r["message"]
+
+
+def test_declarations_format_add_when_section_is_last_eof(tmp_path, monkeypatch):
+    """ADD edge: the `### Lean declarations` section is the LAST in the body (no
+    trailing `### ` header). The bullet is appended before EOF, the body's
+    trailing newline run is preserved, and the prior section is byte-identical."""
+    head = "## Context\n\nprose\n\n"
+    body = (
+        f"{head}### Lean declarations\n\n"
+        f"- src — `{_CITED_OFMANIFOLD}`\n"
+    )
+    cfg = _setup_add(tmp_path, monkeypatch, body=body)
+    r = auto_reconcile_issue(cfg, 98, dry_run=True)
+    assert r["added"] == [_ADD_CANDIDATE]
+    nb = r["new_body"]
+    # The prefix (everything up to & including the existing bullet) is intact…
+    assert nb.startswith(head + "### Lean declarations\n\n- src — "
+                         f"`{_CITED_OFMANIFOLD}`\n")
+    # …and the new bullet trails it, with the result-key candidate.
+    assert f"— `{_ADD_CANDIDATE}`" in nb
+    assert nb.endswith("\n")
+
+
+def test_declarations_format_rename_and_add_combined(tmp_path, monkeypatch):
+    """RENAME + ADD together: the body cites a STALE
+    `Mixed.toPointwiseOrientation` (a namespace-rename of the orphaned
+    `Orient.toPointwiseOrientation` — SAME leaf) which ALSO is the ADD candidate
+    surfaced by the result-key. The rename CLAIMS it, so it is NOT also appended
+    as a duplicate ADD bullet — renames first, then ADD (mirrors the signatures
+    `renamed_targets` dedup)."""
+    stale = "Demo.Chapter15.Mixed.toPointwiseOrientation"  # same leaf, diff ns
+    body = (
+        f"{_OTHER_SECTIONS}### Lean declarations\n\n"
+        f"- [src](https://github.com/x/y/blob/OLDSHA/f.lean#L1-L1) — "
+        f"`{_CITED_OFMANIFOLD}`\n"
+        f"- [src](https://github.com/x/y/blob/OLDSHA/f.lean#L1-L1) — `{stale}`\n\n"
+        "### Informal Statement\n\ntext\n"
+    )
+    # The issue cites `Orient.ofManifold` (resolves → Orient namespace, so the ADD
+    # path surfaces the same-namespace `toPointwiseOrientation`) AND a stale
+    # `Mixed.toPointwiseOrientation` (same leaf). The orphaned live
+    # `Orient.toPointwiseOrientation` is BOTH the leaf-match target AND the ADD
+    # candidate; it must be in the snapshot as an orphan (cited by no issue).
+    cfg = _setup_add(
+        tmp_path, monkeypatch, body=body,
+        extra_snapshot=[_decl(_ADD_CANDIDATE, module="Demo.Chapter15.Orient")],
+    )
+    r = auto_reconcile_issue(cfg, 98, dry_run=True)
+    # The stale is RENAMED onto the orphan; the orphan is NOT also ADDed.
+    assert r["renamed"] == [{"old": stale, "new": _ADD_CANDIDATE}]
+    assert r["added"] == []
+    nb = r["new_body"]
+    # The renamed token appears exactly once — no duplicate ADD bullet.
+    assert nb.count(f"`{_ADD_CANDIDATE}`") == 1
+    assert stale not in nb
+
+
+# ---------------------------------------------------------------------------
+# ### Scaffolding folded — the ADD path must leave a folded decl folded
+# ---------------------------------------------------------------------------
+#
+# A session can DELIBERATELY fold a mechanical accessor under `### Scaffolding
+# folded` (Ch15 lists e.g. `ManifoldOrientation.ext`, `…isContinuous`). The ADD
+# path derives candidates from `missing_suggestions_for_issue` filtered to empty
+# `cited_by` — that filter only sees `### Lean declarations` / ```lean cards, NOT
+# the folded section, so a folded decl would otherwise be wrongly re-ADDED as a
+# card, undoing the fold. `_folded_decls(body)` must exclude it in BOTH the
+# signatures and declarations ADD paths.
+
+
+def test_folded_decls_extracts_all_shapes():
+    """`_folded_decls` reads ONLY the `### Scaffolding folded` section and handles
+    the bare shape, the `def Name` keyword shape, a comma-separated list inside
+    ONE backtick span, and a list across multiple spans/bullets — returning the
+    bare names. Decls in OTHER sections / prose are never read as folded."""
+    from marathon.deck.refresh import _folded_decls
+
+    body = (
+        "### Lean declarations\n\n"
+        "- src — `Demo.Chapter15.Orient.ofManifold`\n\n"
+        "### Scaffolding folded\n\n"
+        # comma-separated list across two backtick spans on one bullet
+        "- `instNegOrient`, `Demo.Chapter15.Orient.neg_apply` — the Neg instance.\n"
+        # keyword shape in a backtick span
+        "- `def Demo.Chapter15.Orient.helper` — plumbing.\n"
+        # comma-separated list INSIDE one backtick span
+        "- `Demo.Chapter15.Orient.ext, Demo.Chapter15.Orient.isContinuous` — accessors.\n\n"
+        "### Informal Statement\n\n"
+        # a prose backtick AFTER the folded section must NOT be read as folded
+        "uses `Demo.Chapter15.Orient.notFolded` here\n"
+    )
+    got = _folded_decls(body)
+    assert got == {
+        "instNegOrient",
+        "Demo.Chapter15.Orient.neg_apply",
+        "Demo.Chapter15.Orient.helper",
+        "Demo.Chapter15.Orient.ext",
+        "Demo.Chapter15.Orient.isContinuous",
+    }
+    assert "Demo.Chapter15.Orient.ofManifold" not in got  # ### Lean declarations
+    assert "Demo.Chapter15.Orient.notFolded" not in got   # prose elsewhere
+
+
+def test_folded_decls_no_section_is_empty():
+    from marathon.deck.refresh import _folded_decls
+    assert _folded_decls(_decl_add_body()) == set()  # no folded section at all
+
+
+def test_declarations_format_add_skips_folded_decl(tmp_path, monkeypatch):
+    """ADD (folded): a `### Lean declarations` body that ALSO folds the otherwise-
+    uncited in-code ADD candidate (`toPointwiseOrientation`) under `###
+    Scaffolding folded` → the candidate is NOT re-added (it is acknowledged as
+    folded). With no rename either, NOTHING is written."""
+    body = (
+        f"{_OTHER_SECTIONS}"
+        f"### Lean declarations\n\n"
+        f"- [Demo/Chapter15/Orient.lean:L6-L7]"
+        f"(https://github.com/x/y/blob/OLDSHA/Demo/Chapter15/Orient.lean#L6-L7)"
+        f" — `{_CITED_OFMANIFOLD}`\n\n"
+        f"### Scaffolding folded\n\n"
+        f"- `{_ADD_CANDIDATE}` — folded as a mechanical accessor.\n\n"
+        f"### Informal Statement\n\ntext\n"
+    )
+    cfg = _setup_add(tmp_path, monkeypatch, body=body)
+
+    def _boom(*a, **k):
+        raise AssertionError("a folded decl must NOT be re-added ⇒ no edit")
+
+    monkeypatch.setattr(refresh_mod, "_gh_edit_body", _boom)
+
+    r = auto_reconcile_issue(cfg, 98)
+    assert r["added"] == []        # the folded candidate is NOT re-added
+    assert r["renamed"] == []
+    assert r["updated"] is False
+    assert "already reconciled" in r["message"]
+
+
+def test_signatures_format_add_skips_folded_decl(tmp_path, monkeypatch):
+    """ADD (folded, signatures format): a `### Lean signatures` body that ALSO
+    folds the uncited in-code ADD candidate under `### Scaffolding folded` → the
+    signatures ADD path (`add_only`) excludes it, so nothing is added/written."""
+    body = (
+        f"{SIGNATURES_HEADER}\n\n"
+        f"```lean\ntheorem {_CITED_OFMANIFOLD} : True\n```\n"
+        f"[`{_CITED_OFMANIFOLD}` at Demo/Chapter15/Orient.lean:L6-L6]"
+        f"(https://github.com/x/y/blob/OLDSHA/Demo/Chapter15/Orient.lean#L6-L6)\n\n"
+        f"### Scaffolding folded\n\n"
+        f"- `{_ADD_CANDIDATE}` — folded as a mechanical accessor.\n\n"
+        f"### Informal Statement\n\ntext\n"
+    )
+    cfg = _setup_add(tmp_path, monkeypatch, body=body)
+
+    def _boom(*a, **k):
+        raise AssertionError("a folded decl must NOT be re-added ⇒ no edit")
+
+    monkeypatch.setattr(refresh_mod, "_gh_edit_body", _boom)
+
+    r = auto_reconcile_issue(cfg, 98)
+    assert r["added"] == []        # the folded candidate is NOT re-added
+    assert r["updated"] is False
+
+
+# ---------------------------------------------------------------------------
+# ### Scaffolding folded — HARDENING the guard against four adversarial defects
+# ---------------------------------------------------------------------------
+#
+# The folded note is free-form LLM prose and runs automatically in the
+# conductor, so any extraction defect silently undoes a fold or hides a real
+# gap. Each test below pins one defect and its fix; all use the SAME real
+# Chapter-15 ADD setup (`_setup_add` / `_decl_add_body`) and assert the folded
+# candidate is NOT re-added (added == []) — or, for the section-bleed test, that
+# a GENUINE downstream candidate IS still added (not hidden by a section that
+# bled past a shallower/deeper header).
+
+
+def test_folded_umbrella_colon_first_decl_extracted():
+    """DEFECT 2 (unit): the documented `<umbrella>: <decl₁>, <decl₂>, …` shape
+    inside ONE backtick span. The leading `<umbrella>: ` label is stripped, so
+    the FIRST decl is extracted (not silently dropped with the umbrella prefix
+    still attached). The umbrella itself is NOT a folded decl.
+
+    The FIRST decl is BARE (`extLeaf`, no dot) on purpose: the plain-prose
+    dotted-name harvest cannot reach a bare token, so this isolates the
+    umbrella-strip + comma-split + `_BARE_NAME_RE` path — without the strip the
+    first piece is `ManifoldOrientation: extLeaf`, matching neither token, and
+    `extLeaf` is silently dropped."""
+    from marathon.deck.refresh import _folded_decls
+
+    body = (
+        "### Scaffolding folded\n\n"
+        "- `ManifoldOrientation: extLeaf, "
+        "Demo.Chapter15.Orient.isContinuous` — accessors.\n\n"
+        "### Informal Statement\n\ntext\n"
+    )
+    got = _folded_decls(body)
+    # BOTH decls in the umbrella span are folded — including the bare FIRST one
+    # (only the umbrella-strip + comma-split path can recover `extLeaf`).
+    assert "extLeaf" in got
+    assert "Demo.Chapter15.Orient.isContinuous" in got
+    # The umbrella grouping-parent is not itself a folded decl.
+    assert "ManifoldOrientation" not in got
+
+
+def test_folded_umbrella_colon_first_decl_not_readded(tmp_path, monkeypatch):
+    """DEFECT 2 (consumer): the ADD candidate is the FIRST decl of an
+    umbrella-colon span. Pre-fix the umbrella prefix kept it from matching, so it
+    leaked through and was re-ADDed. With the strip it is folded → NOT re-added.
+    The `### Lean declarations` body cites `ofManifold`; the candidate
+    `toPointwiseOrientation` is folded as the FIRST decl under an umbrella."""
+    body = (
+        f"{_OTHER_SECTIONS}"
+        f"### Lean declarations\n\n"
+        f"- [Demo/Chapter15/Orient.lean:L6-L7]"
+        f"(https://github.com/x/y/blob/OLDSHA/Demo/Chapter15/Orient.lean#L6-L7)"
+        f" — `{_CITED_OFMANIFOLD}`\n\n"
+        f"### Scaffolding folded\n\n"
+        f"- `ManifoldOrientation: {_ADD_CANDIDATE}, Demo.Chapter15.Orient.ext`"
+        f" — folded accessors.\n\n"
+        f"### Informal Statement\n\ntext\n"
+    )
+    cfg = _setup_add(tmp_path, monkeypatch, body=body)
+
+    def _boom(*a, **k):
+        raise AssertionError("the FIRST folded decl must NOT be re-added")
+
+    monkeypatch.setattr(refresh_mod, "_gh_edit_body", _boom)
+
+    r = auto_reconcile_issue(cfg, 98)
+    assert r["added"] == []
+    assert r["updated"] is False
+    assert "already reconciled" in r["message"]
+
+
+def test_folded_bare_leaf_vs_qualified_candidate_not_readded(
+    tmp_path, monkeypatch
+):
+    """DEFECT 4: the folded note names the BARE LEAF (`toPointwiseOrientation`)
+    while the ADD candidate is fully-qualified
+    (`Demo.Chapter15.Orient.toPointwiseOrientation`). The consumer excludes a
+    candidate whose LEAF is in the folded leaf-set, so the qualified candidate is
+    NOT re-added."""
+    leaf = _ADD_CANDIDATE.rsplit(".", 1)[-1]  # toPointwiseOrientation
+    body = (
+        f"{_OTHER_SECTIONS}"
+        f"### Lean declarations\n\n"
+        f"- [Demo/Chapter15/Orient.lean:L6-L7]"
+        f"(https://github.com/x/y/blob/OLDSHA/Demo/Chapter15/Orient.lean#L6-L7)"
+        f" — `{_CITED_OFMANIFOLD}`\n\n"
+        f"### Scaffolding folded\n\n"
+        f"- `{leaf}` — folded by bare leaf name.\n\n"
+        f"### Informal Statement\n\ntext\n"
+    )
+    cfg = _setup_add(tmp_path, monkeypatch, body=body)
+
+    def _boom(*a, **k):
+        raise AssertionError("a bare-leaf folded decl must exclude the "
+                             "qualified candidate ⇒ no edit")
+
+    monkeypatch.setattr(refresh_mod, "_gh_edit_body", _boom)
+
+    r = auto_reconcile_issue(cfg, 98)
+    assert r["added"] == []
+    assert r["updated"] is False
+    assert "already reconciled" in r["message"]
+
+
+def test_folded_section_does_not_bleed_past_h2_h4_headers(
+    tmp_path, monkeypatch
+):
+    """DEFECT 1: a `### Scaffolding folded` section followed by a SHALLOWER `## `
+    (h2) and a DEEPER `#### ` (h4) header whose prose names the GENUINE uncited
+    ADD candidate. Pre-fix the section bled past those non-h3 headers and read
+    the candidate's dotted name as "folded", hiding it. With the any-header
+    terminator the section stops at the `## ` boundary, so the genuine candidate
+    IS still added.
+
+    The folded note itself folds an UNRELATED decl (`Orient.helper`); the real
+    ADD candidate `toPointwiseOrientation` is named only in the downstream h2/h4
+    prose and must survive as an ADD."""
+    body = (
+        f"### Lean declarations\n\n"
+        f"- [Demo/Chapter15/Orient.lean:L6-L7]"
+        f"(https://github.com/x/y/blob/OLDSHA/Demo/Chapter15/Orient.lean#L6-L7)"
+        f" — `{_CITED_OFMANIFOLD}`\n\n"
+        f"### Scaffolding folded\n\n"
+        f"- `Demo.Chapter15.Orient.helper` — a folded plumbing helper.\n\n"
+        f"## Downstream notes\n\n"
+        f"This h2 mentions `{_ADD_CANDIDATE}` in prose.\n\n"
+        f"#### A deeper note\n\n"
+        f"and the h4 references {_ADD_CANDIDATE} again.\n\n"
+        f"### Informal Statement\n\ntext\n"
+    )
+    cfg = _setup_add(tmp_path, monkeypatch, body=body)
+    r = auto_reconcile_issue(cfg, 98, dry_run=True)
+    # The downstream candidate is NOT hidden by section-bleed — it IS added.
+    assert r["added"] == [_ADD_CANDIDATE]
+    nb = r["new_body"]
+    assert f"— `{_ADD_CANDIDATE}`" in nb
+
+
+def test_folded_plain_prose_no_backtick_dotted_not_readded(
+    tmp_path, monkeypatch
+):
+    """DEFECT 3: a PLAIN-PROSE folded note — no backticks at all — naming the
+    dotted ADD candidate. The dotted-identifier harvest reads it from the raw
+    section text, so the candidate is folded → NOT re-added even without
+    backticks."""
+    body = (
+        f"{_OTHER_SECTIONS}"
+        f"### Lean declarations\n\n"
+        f"- [Demo/Chapter15/Orient.lean:L6-L7]"
+        f"(https://github.com/x/y/blob/OLDSHA/Demo/Chapter15/Orient.lean#L6-L7)"
+        f" — `{_CITED_OFMANIFOLD}`\n\n"
+        f"### Scaffolding folded\n\n"
+        f"We folded {_ADD_CANDIDATE} as a mechanical accessor under the "
+        f"orientation umbrella; no backticks here.\n\n"
+        f"### Informal Statement\n\ntext\n"
+    )
+    cfg = _setup_add(tmp_path, monkeypatch, body=body)
+
+    def _boom(*a, **k):
+        raise AssertionError("a plain-prose folded dotted decl must NOT be "
+                             "re-added ⇒ no edit")
+
+    monkeypatch.setattr(refresh_mod, "_gh_edit_body", _boom)
+
+    r = auto_reconcile_issue(cfg, 98)
+    assert r["added"] == []
+    assert r["updated"] is False
+    assert "already reconciled" in r["message"]

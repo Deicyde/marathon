@@ -450,6 +450,8 @@ _PERMALINK_LINE_RE = re.compile(r"^\[`([^`]+)` at .+?#L\d+-L\d+\)\s*$")
 from marathon.review.verified_decls import (  # noqa: E402
     _ATTR as _DECL_ATTR,
     _BACKTICK_TOKEN_RE,
+    _BARE_NAME_RE,
+    _DECL_RE,
     _DECL_SECTION_RE,
     _MOD as _DECL_MOD,
     DECL_KEYWORDS as _DECL_KEYWORDS,
@@ -470,6 +472,111 @@ _DECL_KW_PREFIX_RE = re.compile(
     + r"(?:" + "|".join(_DECL_KEYWORDS) + r")\s+)"
     r"(?P<name>[A-Za-z_][\w'.]*)\Z"
 )
+
+#: The ``### Scaffolding folded`` section bounds — the SAME shape
+#: ``_DECL_SECTION_RE`` uses for ``### Lean declarations`` (header line up to the
+#: next markdown header / EOF), retargeted to the folded header. The chapter
+#: session emits the folded decls under this header as ``<umbrella>: <decl₁>,
+#: <decl₂>, …`` lines (see :mod:`marathon.review.chapter_sessions`); group 1 is
+#: the section body. Scoped to THIS header alone so prose backticks / ``### Lean
+#: declarations`` cards elsewhere in the body are never read as folded.
+#:
+#: The terminator is ANY markdown header — ``(?=^#{1,6}[ \t]|\Z)`` — NOT just
+#: ``### `` (h3). The folded note can be followed by a SHALLOWER ``## `` (h2,
+#: e.g. a top-level ``## Context``) or a DEEPER ``#### `` (h4) header; an
+#: h3-only terminator would BLEED past those and read the downstream section's
+#: backtick'd / dotted names as "folded" — silently hiding genuine ADD
+#: candidates. Terminating on every header level bounds the section to exactly
+#: the folded note.
+_FOLDED_SECTION_RE = re.compile(
+    r"^###[ \t]+Scaffolding folded[ \t]*$(.*?)(?=^#{1,6}[ \t]|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+#: A fully-qualified DOTTED identifier (``A.B.foo``) anywhere in the folded
+#: section text — the PLAIN-PROSE fallback. The folded note is free-form LLM
+#: prose; nothing enforces backticks, so a note written WITHOUT backticks would
+#: otherwise harvest nothing and let the folded decls be re-ADDed. We harvest
+#: dotted names from the whole section text (backtick'd or not). REQUIRES at
+#: least one dot — bare single-word tokens are NOT harvested from non-backtick
+#: prose (those are a false-positive risk: any ordinary English word would
+#: match); bare names come ONLY from inside backtick spans.
+_FOLDED_DOTTED_RE = re.compile(r"[A-Za-z_][\w']*(?:\.[A-Za-z_][\w']*)+")
+
+#: A leading ``<umbrella>: `` label inside a folded backtick span — an
+#: identifier/dotted-name followed by ``:`` and whitespace. The documented
+#: folded format (``marathon.review.chapter_sessions``) is
+#: ``<umbrella>: <decl₁>, <decl₂>, …`` which can sit inside ONE backtick span
+#: (`` `ManifoldOrientation: Orient.ext, Orient.isContinuous` ``). The umbrella
+#: label is a grouping PARENT (often already its own card), so it is stripped
+#: before comma-splitting — keeping it would leave the FIRST comma piece as
+#: ``ManifoldOrientation: Orient.ext`` which matches neither ``_DECL_RE`` nor
+#: ``_BARE_NAME_RE``, silently dropping the first folded decl.
+_FOLDED_UMBRELLA_RE = re.compile(r"^[A-Za-z_][\w'.]*:\s+")
+
+
+def _folded_decls(body: str) -> set[str]:
+    """The bare declaration names listed under the body's ``### Scaffolding
+    folded`` section ONLY — the decls a session DELIBERATELY folded under an
+    umbrella (mechanical accessors like ``ManifoldOrientation.ext``) and which
+    the ADD path must therefore NEVER re-surface as a card.
+
+    Scoped to the ``### Scaffolding folded`` header (up to the next ``### ``
+    header / EOF) exactly as
+    :func:`marathon.review.verified_decls.extract_declarations_from_declaration_sections`
+    scopes to ``### Lean declarations`` — so backticks in prose or in OTHER
+    sections are never mistaken for folded decls.
+
+    Parses each backtick'd span with the SAME tokens the declarations extractor
+    uses (``_BACKTICK_TOKEN_RE`` + the keyword-shape ``_DECL_RE`` / bare-name
+    ``_BARE_NAME_RE``, imported — never forked). The folded section additionally
+    writes COMMA-SEPARATED lists (``<umbrella>: <decl₁>, <decl₂>, …``) that may
+    sit inside ONE backtick span (`` `instFoo`, `Foo.bar_apply` `` is two spans,
+    but `` `instFoo, Foo.bar_apply` `` is one) or across several spans/bullets.
+    Inside each span a leading ``<umbrella>: `` label is STRIPPED before
+    comma-splitting (the umbrella is a grouping parent, often its own card; left
+    in, the first comma piece would carry the ``<umbrella>: `` prefix and match
+    NEITHER token — silently dropping the first folded decl). Each comma piece is
+    then resolved via ``_DECL_RE`` (keyword shape) / ``_BARE_NAME_RE`` (bare).
+
+    A PLAIN-PROSE fallback (``_FOLDED_DOTTED_RE``) also harvests fully-qualified
+    DOTTED identifiers from the WHOLE folded-section text (backtick'd or not), so
+    a note written without backticks still excludes its folded decls. Bare
+    single-word tokens are harvested ONLY from inside backtick spans (a dotted
+    name in prose is unambiguous; a bare word is not). Returns the set of bare
+    decl names (empty when there is no folded section)."""
+    out: set[str] = set()
+    for sec in _FOLDED_SECTION_RE.finditer(body):
+        text = sec.group(1)
+        for m in _BACKTICK_TOKEN_RE.finditer(text):
+            # Strip a leading `<umbrella>: ` label so the first comma piece is a
+            # real decl, not the umbrella-prefixed `<umbrella>: <decl₁>`.
+            span = _FOLDED_UMBRELLA_RE.sub("", m.group(1).strip(), count=1)
+            for piece in span.split(","):
+                content = piece.strip()
+                if not content:
+                    continue
+                dm = _DECL_RE.match(content)
+                if dm:
+                    out.add(dm.group("name"))        # `def Foo.bar` → Foo.bar
+                elif _BARE_NAME_RE.match(content):
+                    out.add(content)                 # `Foo.bar` → Foo.bar
+        # Plain-prose fallback: harvest dotted identifiers from the whole section
+        # text (covers a no-backtick note). Dotted-only — never bare words.
+        out.update(_FOLDED_DOTTED_RE.findall(text))
+    return out
+
+
+def _folded_leaves(folded: "set[str]") -> set[str]:
+    """The leaf (last dotted component) of each name in ``folded`` — the set the
+    consumer ADD-exclusion matches a fully-qualified candidate's leaf against.
+
+    A folded note may name the BARE LEAF (``ext``) while
+    ``missing_suggestions_for_issue`` yields the fully-qualified candidate
+    (``…Orient.ext``); without leaf matching the qualified candidate would slip
+    past the ``name in folded`` test and be wrongly re-ADDed. ``A.B.foo`` →
+    ``foo``; a bare ``foo`` → ``foo`` (its own leaf)."""
+    return {f.rsplit(".", 1)[-1] for f in folded}
 
 
 def _proven_rename(
@@ -664,10 +771,21 @@ def auto_reconcile_issue(
 
     * ``### Lean declarations`` (and NO ``### Lean signatures``) — the
       chapter-intake bootstrapped shape (a bullet list of backtick'd names +
-      source links). Only the RENAME edit applies: a stale cited name is replaced
-      by its leaf-matched live name, swapping the backtick'd name token in place
-      within that section; the source link is left as-is (best-effort). ADD /
-      permalink-repin are signatures-only.
+      source links). BOTH the RENAME and ADD edits apply (mirroring the
+      signatures path):
+
+      - RENAME — a stale cited name is replaced by its leaf-matched live name,
+        swapping the backtick'd name token in place within that section; the
+        source link is left as-is (best-effort).
+      - ADD — uncited (``cited_by`` empty) in-code decls matching the issue's
+        result-key (``missing_suggestions_for_issue``) are rendered as
+        intake-style bullets (`` - [<File>.lean:L<a>-L<b>](<permalink>) — `<decl>` ``)
+        and APPENDED at the end of the ``### Lean declarations`` section. This
+        is what fixes the Chapter-15 coverage gap (an uncited refine-added decl
+        like ``ManifoldOrientation.toPointwiseOrientation`` never became a
+        card). A candidate consumed by a leaf-match rename is excluded.
+
+      Permalink-repin of existing bullets stays signatures-only.
 
     VERIFIED-ISSUE SAFETY: if the issue is human-verified/frozen (status
     ``verified`` in ``state.json``, or any cited decl present in the
@@ -734,8 +852,10 @@ def auto_reconcile_issue(
         if not v.in_code and v.name not in stale:
             stale.append(v.name)
 
-    # The ``### Lean declarations`` (intake) format: NO signatures section. Only
-    # the leaf-match rename applies, swapping the stale name token in place.
+    # The ``### Lean declarations`` (intake) format: NO signatures section. Two
+    # edits, mirroring the signatures path — a leaf-match RENAME (swapping the
+    # stale name token in place) AND an ADD (uncited in-code decls matching the
+    # result-key, appended as intake-style bullets).
     if not has_signatures:
         return _reconcile_declarations_format(
             cfg, issue_num, body, sha, stale, orphaned, cited_set,
@@ -743,9 +863,19 @@ def auto_reconcile_issue(
         )
 
     # ADD candidates: uncited (cited_by empty) in-code decls matching the
-    # result-key — the orphaned-but-present decls the issue should cite.
+    # result-key — the orphaned-but-present decls the issue should cite. A decl
+    # listed under the body's ``### Scaffolding folded`` section is DELIBERATELY
+    # folded (acknowledged, not first-class) — never re-ADD it as a card, else
+    # the auto-reconcile would silently undo a session's fold.
+    folded = _folded_decls(body)
+    folded_leaves = _folded_leaves(folded)
     suggestions = missing_suggestions_for_issue(cfg, issue_num)
-    add_names = [s["decl"] for s in suggestions if not s["cited_by"]]
+    add_names = [
+        s["decl"] for s in suggestions
+        if not s["cited_by"]
+        and s["decl"] not in folded
+        and s["decl"].rsplit(".", 1)[-1] not in folded_leaves
+    ]
 
     # Resolve renames first: a stale S maps to its rename target — proven by git
     # (:func:`_proven_rename` against the ADD candidates), else a UNIQUE leaf
@@ -962,14 +1092,30 @@ def _reconcile_declarations_format(
     empty: dict,
     dry_run: bool,
 ) -> dict:
-    """Reconcile a ``### Lean declarations`` (chapter-intake) body: the ONLY edit
-    is a leaf-match RENAME — replace each stale cited name token with its unique
-    ORPHANED live leaf-match, in place inside the declarations section(s). No ADD,
-    no permalink re-pin (those are signatures-only).
+    """Reconcile a ``### Lean declarations`` (chapter-intake) body: TWO edits,
+    mirroring the signatures path —
+
+    * RENAME — replace each stale cited name token with its unique ORPHANED live
+      leaf-match, in place inside the declarations section(s).
+    * ADD — uncited (``cited_by`` empty) in-code decls matching the issue's
+      result-key (``missing_suggestions_for_issue``, the SAME source the
+      signatures path uses) that no rename consumed are rendered as intake-style
+      bullets and APPENDED at the END of the LAST ``### Lean declarations``
+      section. The source link is a real permalink (file/line via
+      ``_locate_in_source`` + ``_permalink`` at ``sha``); a candidate whose
+      source can't be located is skipped (never emit a broken bullet).
+
+    No permalink re-pin of EXISTING bullets (that stays signatures-only).
 
     Verified/frozen issues are flagged, never rewritten (mirrors the signatures
-    path). Writes NOTHING when there is no stale rename to apply or on
-    ``dry_run`` (then ``new_body`` is returned for inspection)."""
+    path): the ADD is suppressed and the renames flagged, so NO write path
+    reaches ``_gh_edit_body``. Writes NOTHING when there is no rename to apply
+    AND nothing to add, or on ``dry_run`` (then ``new_body`` is returned for
+    inspection)."""
+    from marathon.deck.cards import (
+        _build_decl_view, _load_context, _ledger, missing_suggestions_for_issue,
+    )
+
     # Resolve renames against the ORPHANED pool, with many-to-one dedup: a second
     # stale sharing a leaf with an already-claimed target collapses to kept_stale.
     renamed: list[dict] = []
@@ -984,17 +1130,39 @@ def _reconcile_declarations_format(
         else:
             kept_stale.append(s)
 
-    if not renamed:
+    # ADD candidates: uncited (cited_by empty) in-code decls matching the
+    # result-key — the SAME source the signatures path uses. Exclude any
+    # candidate already consumed by a leaf-match rename (mirror ``renamed_targets``
+    # dedup so a renamed-onto decl isn't ALSO appended as a fresh bullet) AND any
+    # decl the body DELIBERATELY folded under ``### Scaffolding folded`` (a folded
+    # decl is acknowledged — never auto-add it, else the reconcile undoes a fold).
+    folded = _folded_decls(body)
+    folded_leaves = _folded_leaves(folded)
+    suggestions = missing_suggestions_for_issue(cfg, issue_num)
+    add_only = [
+        s["decl"] for s in suggestions
+        if not s["cited_by"]
+        and s["decl"] not in claimed
+        and s["decl"] not in folded
+        and s["decl"].rsplit(".", 1)[-1] not in folded_leaves
+    ]
+
+    if not renamed and not add_only:
         return {**empty, "sha": sha, "kept_stale": kept_stale,
                 "message": f"#{issue_num}: already reconciled ({len(kept_stale)} "
                            "stale declaration(s) kept — no leaf match)"}
 
+    # VERIFIED-ISSUE SAFETY: a human-verified/frozen statement is NEVER silently
+    # rewritten — not by a rename, not by an ADD. Flag the renames for a human
+    # and write NOTHING (the ADD is suppressed too — no write path reaches
+    # ``_gh_edit_body``).
     if _issue_is_frozen(cfg, issue_num, cited_set):
         return {**empty, "sha": sha, "kept_stale": kept_stale,
                 "flagged_renames": [dict(r) for r in renamed],
                 "message": (
                     f"#{issue_num} is verified/frozen — {len(renamed)} rename(s) "
-                    "flagged for human review, NOT auto-applied")}
+                    f"flagged for human review, {len(add_only)} add(s) suppressed, "
+                    "NOT auto-applied")}
 
     # Replace ONLY within ``### Lean declarations`` sections so prose backticks
     # elsewhere are never touched. The extractor reads ALL such sections
@@ -1018,17 +1186,40 @@ def _reconcile_declarations_format(
             new_body = new_body[:m.start(1)] + new_section + new_body[m.end(1):]
     applied = [r for r in renamed if r["old"] in applied_set]
     kept_stale.extend(r["old"] for r in renamed if r["old"] not in applied_set)
-    if not applied or new_body == body:
+
+    # ADD: render each candidate as an intake-style bullet and append at the END
+    # of the LAST ``### Lean declarations`` section (after the existing bullets,
+    # before the next ``### `` header). Re-find the sections in ``new_body`` so
+    # the splice offsets stay valid after the rename rewrites above. Skip any
+    # candidate whose source can't be located (never emit a broken bullet).
+    ctx = _load_context(cfg, [issue_num])
+    ledger = _ledger(cfg)
+    added_names: list[str] = []
+    if add_only:
+        bullets: list[str] = []
+        for name in sorted(add_only):
+            view = _build_decl_view(ctx, ledger, name, Path(cfg.repo_dir))
+            file_rel, a, b, _signature = _locate_in_source(Path(cfg.repo_dir), view)
+            if file_rel is None:
+                continue
+            url = _permalink(cfg.github_repo, sha, file_rel, a, b)
+            bullets.append(f"- [{file_rel}:L{a}-L{b}]({url}) — `{name}`")
+            added_names.append(name)
+        if bullets:
+            new_body = _append_declaration_bullets(new_body, bullets)
+
+    if (not applied and not added_names) or new_body == body:
         return {**empty, "sha": sha, "kept_stale": kept_stale,
                 "message": f"#{issue_num}: nothing to write (no token swapped)"}
 
     result = {
-        "ok": True, "updated": True, "added": [],
+        "ok": True, "updated": True, "added": added_names,
         "renamed": applied, "kept_stale": kept_stale,
         "flagged_renames": [], "sha": sha,
         "message": (
             f"#{issue_num} declarations reconciled to {sha[:7]}: "
-            f"{len(applied)} renamed, {len(kept_stale)} stale kept"),
+            f"{len(added_names)} added, {len(applied)} renamed, "
+            f"{len(kept_stale)} stale kept"),
     }
     if dry_run:
         result["new_body"] = new_body
@@ -1036,6 +1227,27 @@ def _reconcile_declarations_format(
         return result
     _gh_edit_body(cfg.github_repo, issue_num, new_body)
     return result
+
+
+def _append_declaration_bullets(body: str, bullets: "list[str]") -> str:
+    """Append ``bullets`` (rendered intake-style lines) at the END of the LAST
+    ``### Lean declarations`` section's body — after the existing bullets, before
+    the next ``### `` header (or EOF). Every byte OUTSIDE that section is
+    preserved verbatim. Returns ``body`` unchanged when no section is present
+    (the caller only enters with one)."""
+    matches = list(_DECL_SECTION_RE.finditer(body))
+    if not matches:  # pragma: no cover — caller guarantees a section
+        return body
+    m = matches[-1]
+    section = m.group(1)
+    block = "\n".join(bullets)
+    # Trim the section's trailing whitespace, append a blank line + the bullets,
+    # then restore exactly the run of trailing newlines the section had (so the
+    # gap to the next ``### `` header / EOF is byte-identical to before).
+    stripped = section.rstrip("\n")
+    trailing = section[len(stripped):]
+    new_section = stripped + "\n\n" + block + trailing
+    return body[:m.start(1)] + new_section + body[m.end(1):]
 
 
 def _issue_link_fallback(repo: str, issue_num: int) -> str:
