@@ -512,6 +512,86 @@ def test_migration_is_idempotent(tmp_path):
     assert ledger.status()["schema_version"] == SCHEMA_VERSION
 
 
+# The v4 decl_verdicts DDL verbatim, with the NARROW source CHECK (no
+# 'deck-verify') — what a pre-v5 ledger has on disk.
+_V4_DECL_VERDICTS_DDL = """
+CREATE TABLE IF NOT EXISTS decl_verdicts (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    decl_name        TEXT NOT NULL,
+    tier_claimed     TEXT NOT NULL CHECK (tier_claimed IN ('T2', 'T3')),
+    verdict          TEXT NOT NULL CHECK (verdict IN ('verified', 'revoked')),
+    fingerprint_type TEXT,
+    cone_json        TEXT NOT NULL DEFAULT '[]',
+    toolchain        TEXT,
+    issue_num        INTEGER,
+    ts               TEXT NOT NULL,
+    source           TEXT NOT NULL
+                     CHECK (source IN ('cli', 'backfill', 'repin', 'sync')),
+    notes            TEXT
+);
+CREATE INDEX IF NOT EXISTS decl_verdicts_by_decl
+    ON decl_verdicts (decl_name, id);
+CREATE TRIGGER IF NOT EXISTS decl_verdicts_no_update
+BEFORE UPDATE ON decl_verdicts
+BEGIN SELECT RAISE(ABORT, 'decl_verdicts is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS decl_verdicts_no_delete
+BEFORE DELETE ON decl_verdicts
+BEGIN SELECT RAISE(ABORT, 'decl_verdicts is append-only'); END;
+"""
+
+
+def test_v4_to_v5_widens_source_check_preserving_rows(tmp_path):
+    """A pre-v5 ledger (narrow decl_verdicts.source CHECK) rebuilds in
+    place: rows survive with ids intact, the old constraint no longer
+    rejects 'deck-verify', and the append-only trigger still fires."""
+    db_path = tmp_path / ".marathon" / "marathon.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(_V1_SCHEMA_SQL)
+        conn.executescript(_V4_DECL_VERDICTS_DDL)
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '4')"
+        )
+        # A pre-existing verdict row written under the narrow constraint.
+        conn.execute(
+            "INSERT INTO decl_verdicts (id, decl_name, tier_claimed, verdict, "
+            "fingerprint_type, cone_json, toolchain, issue_num, ts, source) "
+            "VALUES (7, 'Foo.old', 'T2', 'verified', 'fp', '[]', ?, 1, "
+            "'2026-01-01T00:00:00', 'backfill')",
+            (TOOLCHAIN,),
+        )
+        # The narrow CHECK is real: 'deck-verify' is rejected pre-migration.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO decl_verdicts (decl_name, tier_claimed, verdict, "
+                "ts, source) VALUES ('x', 'T2', 'verified', 't', 'deck-verify')"
+            )
+
+    ledger = Ledger.for_repo(tmp_path)
+    assert ledger.status()["schema_version"] == SCHEMA_VERSION  # 5
+
+    # The pre-existing row survived the rebuild, id and all.
+    (old,) = ledger.decl_verdict_events("Foo.old")
+    assert old.id == 7
+    assert old.source == "backfill" and old.tier_claimed == "T2"
+
+    # The widened CHECK now admits the live-verify source ...
+    new_id = ledger.append_decl_verdict(
+        "Foo.new", tier_claimed="T2", verdict="verified",
+        fingerprint_type="abc", cone=[], toolchain=TOOLCHAIN,
+        ts="2026-06-12T00:00:00+00:00", source="deck-verify",
+    )
+    assert new_id > 7  # AUTOINCREMENT continued past the carried-over rows
+    (new,) = ledger.decl_verdict_events("Foo.new")
+    assert new.source == "deck-verify"
+
+    # ... and the rebuilt table is still append-only (RAISE(ABORT) on the
+    # delete trigger surfaces as IntegrityError).
+    with sqlite3.connect(db_path) as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("DELETE FROM decl_verdicts WHERE id = 7")
+
+
 def test_future_schema_version_still_refused(tmp_path):
     ledger = Ledger.for_repo(tmp_path)
     ledger.init()

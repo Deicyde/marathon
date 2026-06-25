@@ -120,7 +120,16 @@ if TYPE_CHECKING:  # pragma: no cover — type-only; avoids review-package dep
 # versions only ever move forward, and already-deployed v4 ledgers must not be
 # refused as "newer than this marathon" (_ensure_schema's forward-compat guard). An
 # orphaned referee_tasks table in an old db simply sits unused.
-SCHEMA_VERSION = 4
+#
+# v5 WIDENS the decl_verdicts.source CHECK to admit 'deck-verify' — the live
+# verify flow (deck ship → cmd_verify) now appends a T2 spec-verdict per cited
+# decl, where before only the one-time --attest backfill / repin / sync wrote
+# verdict events. Unlike the additive v1→v4 migrations, relaxing a CHECK on an
+# EXISTING table cannot be done with `CREATE TABLE IF NOT EXISTS` (the table is
+# already there with the old constraint) — SQLite has no DROP CONSTRAINT, so
+# _ensure_schema runs a one-time table-rebuild for pre-v5 ledgers (see the v5
+# branch there). Fresh ledgers get the widened CHECK straight from the DDL.
+SCHEMA_VERSION = 5
 LEDGER_RELPATH = Path(".marathon") / "marathon.db"
 
 #: Allowed ``targets.kind`` values (the planner's intake taxonomy):
@@ -265,7 +274,8 @@ CREATE TABLE IF NOT EXISTS decl_verdicts (
     issue_num        INTEGER,
     ts               TEXT NOT NULL,
     source           TEXT NOT NULL
-                     CHECK (source IN ('cli', 'backfill', 'repin', 'sync')),
+                     CHECK (source IN ('cli', 'backfill', 'repin', 'sync',
+                                       'deck-verify')),
     notes            TEXT
 );
 
@@ -802,6 +812,79 @@ def _decl_verdict_from_row(row: tuple) -> DeclVerdictEvent:
     )
 
 
+def _migrate_decl_verdicts_source_check(conn: sqlite3.Connection) -> None:
+    """v4 -> v5: widen the ``decl_verdicts.source`` CHECK to admit
+    ``'deck-verify'``.
+
+    SQLite cannot ALTER/DROP a CHECK constraint, so this follows the
+    standard table-rebuild recipe: drop the append-only triggers,
+    rename the old table aside, recreate it with the widened constraint
+    (verbatim from ``_SCHEMA_SQL`` minus the rename), copy every row
+    over (column order preserved — including the AUTOINCREMENT ``id``,
+    so event order / "newest id wins" survives), drop the old table,
+    and recreate the index + append-only triggers.
+
+    Idempotent in effect: only ever reached from the pre-v5 migration
+    branch, and a fresh/already-v5 db gets the widened CHECK straight
+    from ``_SCHEMA_SQL`` and never enters here.
+    """
+    # The executescript above ran with the OLD table still present, so
+    # CREATE TABLE IF NOT EXISTS decl_verdicts was a no-op and the index
+    # + triggers already point at the old (narrow) table. Tear those down
+    # first; the rebuild recreates them against the new table.
+    conn.executescript(
+        """
+        DROP TRIGGER IF EXISTS decl_verdicts_no_update;
+        DROP TRIGGER IF EXISTS decl_verdicts_no_delete;
+        DROP INDEX   IF EXISTS decl_verdicts_by_decl;
+
+        ALTER TABLE decl_verdicts RENAME TO decl_verdicts__v4;
+
+        CREATE TABLE decl_verdicts (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            decl_name        TEXT NOT NULL,
+            tier_claimed     TEXT NOT NULL CHECK (tier_claimed IN ('T2', 'T3')),
+            verdict          TEXT NOT NULL
+                             CHECK (verdict IN ('verified', 'revoked')),
+            fingerprint_type TEXT,
+            cone_json        TEXT NOT NULL DEFAULT '[]',
+            toolchain        TEXT,
+            issue_num        INTEGER,
+            ts               TEXT NOT NULL,
+            source           TEXT NOT NULL
+                             CHECK (source IN ('cli', 'backfill', 'repin',
+                                               'sync', 'deck-verify')),
+            notes            TEXT
+        );
+
+        INSERT INTO decl_verdicts
+            (id, decl_name, tier_claimed, verdict, fingerprint_type,
+             cone_json, toolchain, issue_num, ts, source, notes)
+        SELECT
+             id, decl_name, tier_claimed, verdict, fingerprint_type,
+             cone_json, toolchain, issue_num, ts, source, notes
+        FROM decl_verdicts__v4;
+
+        DROP TABLE decl_verdicts__v4;
+
+        CREATE INDEX IF NOT EXISTS decl_verdicts_by_decl
+            ON decl_verdicts (decl_name, id);
+
+        CREATE TRIGGER IF NOT EXISTS decl_verdicts_no_update
+        BEFORE UPDATE ON decl_verdicts
+        BEGIN
+            SELECT RAISE(ABORT, 'decl_verdicts is append-only');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS decl_verdicts_no_delete
+        BEFORE DELETE ON decl_verdicts
+        BEGIN
+            SELECT RAISE(ABORT, 'decl_verdicts is append-only');
+        END;
+        """
+    )
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA_SQL)
     conn.execute(
@@ -820,6 +903,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         # already brought the db up to date — only the version stamp
         # remains, and a single bump covers any v<current gap. Idempotent:
         # a re-opened current-version db takes neither branch.
+        #
+        # EXCEPTION (v5): widening the decl_verdicts.source CHECK is NOT
+        # additive — the table already exists with the narrow constraint,
+        # and `CREATE TABLE IF NOT EXISTS` is a no-op against it. Rebuild
+        # it (SQLite's no-DROP-CONSTRAINT workaround) for any pre-v5 db
+        # BEFORE bumping the stamp.
+        if found < 5:
+            _migrate_decl_verdicts_source_check(conn)
         conn.execute(
             "UPDATE meta SET value = ? WHERE key = 'schema_version'",
             (str(SCHEMA_VERSION),),

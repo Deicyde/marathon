@@ -399,8 +399,20 @@ def cmd_verify(args) -> None:
         check=False,
     )
     # Clear any prior rejection queue entry for this issue. Idempotent
-    # if there was no prior rejection.
+    # if there was no prior rejection. This also fires capture_on_verify
+    # (freezes the verified statements into the approved-statements
+    # manifest), so by the time we reach the T2 step below the verify
+    # has already fully landed.
     record_verification(cfg, num)
+
+    # Promote the verified issue's cited declarations T1 → T2 in the
+    # trust ladder: a human spec-verdict pinned to the current type +
+    # cone fingerprints. Always-on (the intended default), but fully
+    # best-effort — a missing snapshot, a ledger error, or any other
+    # failure must NOT roll back or fail the verify (the label flip,
+    # state.json write, and capture_on_verify already succeeded). Mirrors
+    # capture_on_verify's never-block-a-verify contract.
+    _grant_t2_on_verify(cfg, num)
 
     # If --auto-pr was used, the iteration's commits sit in a
     # marathon-owned branch with an open PR. Verifying the issue
@@ -439,6 +451,125 @@ def cmd_verify(args) -> None:
             f"✅ #{num} verified (statements accepted; sorrys remain — "
             "issue kept OPEN), tracker → 🟡."
         )
+
+
+def _grant_t2_on_verify(cfg: ReviewConfig, issue_num: int) -> None:
+    """Best-effort: promote issue ``issue_num``'s cited declarations
+    T1 → T2 by appending a human spec-verdict pinned to the CURRENT
+    snapshot fingerprints.
+
+    Wires the LIVE verify flow into the trust ladder. Without this, only
+    the one-time ``--attest`` backfill ever wrote ``decl_verdicts``
+    events, so freshly-verified declarations stayed stuck at T1 forever.
+
+    Contract (mirrors ``capture_on_verify``): this NEVER fails or rolls
+    back the verify. The verify has already fully landed (label flip +
+    state.json + frozen-statements manifest) by the time we are called;
+    the entire body is wrapped in a broad ``try/except`` that downgrades
+    any failure — absent snapshot, ledger error, parser error — to a
+    printed warning and returns normally.
+
+    Per-decl, it reuses the SAME machinery as the backfill: the same
+    issue-body decl extractor ``capture_on_verify`` uses, the same
+    ``_resolve_decl`` (handles namespace-unqualified citations), the
+    same ``_cone_pins`` / ``_already_pinned`` idempotency check, and the
+    same ``record_spec_verdict`` writer. A decl that is absent / unknown
+    / unpinnable in the snapshot is skipped with a short reason
+    (``record_spec_verdict`` would raise ``TrustError`` for it); a decl
+    already pinned to the current fingerprints appends NO duplicate event
+    (re-verify is idempotent).
+
+    No reject-side revocation is needed: a reject leads to a refine that
+    changes the decl, and any type/cone-fingerprint change auto-degrades
+    the T2 on read (the pin no longer matches the live snapshot), so an
+    explicit revocation would be redundant.
+    """
+    try:
+        from marathon.audit.engine import load_snapshot
+        from marathon.audit.trust import (
+            TrustError,
+            _already_pinned,
+            _cone_pins,
+            _resolve_decl,
+            record_spec_verdict,
+        )
+        from marathon.review.github import issue_body
+        from marathon.review.verified_decls import (
+            extract_declarations_from_issue_body,
+        )
+
+        body = issue_body(issue_num, cfg.github_repo)
+        if not body:
+            return
+        cited = extract_declarations_from_issue_body(body)
+        if not cited:
+            return
+
+        snap = load_snapshot(cfg.repo_dir)
+        if snap is None:
+            print(
+                "  trust: skipped (no audit snapshot — run `marathon audit "
+                "run` to enable T2 promotion on verify)"
+            )
+            return
+
+        ledger = _ledger(cfg)
+        by_name = snap.by_name()
+
+        promoted = 0
+        already = 0
+        skipped: list[str] = []
+        for raw in sorted(cited):
+            decl, why = _resolve_decl(raw, by_name)
+            if decl is None or decl.is_unknown or decl.fingerprint_type is None:
+                skipped.append(raw)
+                continue
+            pins, unpinnable = _cone_pins(decl, by_name)
+            if unpinnable:
+                skipped.append(decl.name)
+                continue
+            if _already_pinned(
+                ledger.decl_verdict_events(decl.name),
+                decl,
+                pins,
+                snap.toolchain,
+            ):
+                already += 1
+                continue
+            try:
+                record_spec_verdict(
+                    ledger,
+                    decl.name,
+                    snap,
+                    tier="T2",
+                    issue_num=issue_num,
+                    source="deck-verify",
+                )
+            except TrustError:
+                skipped.append(decl.name)
+                continue
+            promoted += 1
+
+        summary = f"  trust: {promoted} decl(s) → T2"
+        if already:
+            summary += f", {already} already T2"
+        if skipped:
+            summary += (
+                f"; skipped {len(skipped)} (unaudited/unpinnable): "
+                + ", ".join(sorted(skipped))
+            )
+        print(summary)
+    except Exception as e:  # noqa: BLE001 — never fail/rollback a verify
+        print(f"  trust: WARN — T2 promotion step failed for #{issue_num}: {e}")
+
+
+def _ledger(cfg: ReviewConfig):
+    """Open the canonical ledger for ``cfg`` — the same path used by the
+    deck (``marathon.deck.cards._ledger``), the state.json dual-write
+    mirror, and ``Ledger.for_review_config`` everywhere else."""
+    from marathon.ledger import Ledger
+
+    return Ledger.for_review_config(cfg)
 
 
 def _maybe_merge_marathon_pr(cfg: ReviewConfig, issue_num: int) -> None:
