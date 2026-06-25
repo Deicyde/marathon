@@ -1011,6 +1011,276 @@ def _reconcile_body(
     return rebuilt
 
 
+def _cites_same_decl(token: str, decl_name: str) -> bool:
+    """Whether a body-written citation ``token`` names the same decl as the
+    resolved ``decl_name``. The body may write the citation BARE
+    (``exists_of_tensorial``) while the deck view resolved it QUALIFIED
+    (``…MixedTensorField.exists_of_tensorial``) — so an exact compare alone
+    would miss the bullet/block to delete. Matches when the two are equal, or
+    when EITHER is a whole trailing dotted segment of the other (the same
+    dotted-suffix rule the deck uses to resolve a cited name to a snapshot
+    decl). Bare-leaf-only matching is deliberately NOT done here (that would
+    over-match an unrelated sibling sharing a leaf); the suffix must be a whole
+    dotted run."""
+    if token == decl_name:
+        return True
+    return token.endswith("." + decl_name) or decl_name.endswith("." + token)
+
+
+def _drop_declaration_bullet(body: str, decl_name: str) -> tuple[str, bool]:
+    """Within EVERY ``### Lean declarations`` section, delete the whole bullet
+    LINE whose backtick'd token cites ``decl_name`` — leaving every byte outside
+    the matched line(s) (and outside the declarations sections) untouched.
+
+    Scoped to ``_DECL_SECTION_RE`` (the same section the extractor reads) so a
+    prose backtick elsewhere is never deleted. A bullet's token is parsed with
+    the SAME keyword-shape / bare-name rules the extractor uses (``_DECL_RE`` /
+    ``_BARE_NAME_RE``) and matched to ``decl_name`` via :func:`_cites_same_decl`
+    (handling a bare-vs-qualified citation). Returns ``(new_body, dropped)``;
+    splices right-to-left so each match offset stays valid as we rewrite."""
+    matches = list(_DECL_SECTION_RE.finditer(body))
+    if not matches:
+        return body, False
+    dropped = False
+    new_body = body
+    for m in reversed(matches):
+        section = m.group(1)
+        out_lines: list[str] = []
+        for line in section.splitlines(keepends=True):
+            citing = False
+            for tok in _BACKTICK_TOKEN_RE.finditer(line):
+                content = tok.group(1).strip()
+                dm = _DECL_RE.match(content)
+                name = dm.group("name") if dm else (
+                    content if _BARE_NAME_RE.match(content) else None
+                )
+                if name is not None and _cites_same_decl(name, decl_name):
+                    citing = True
+                    break
+            if citing:
+                dropped = True
+                continue  # drop this bullet line entirely
+            out_lines.append(line)
+        new_section = "".join(out_lines)
+        if new_section != section:
+            new_body = new_body[:m.start(1)] + new_section + new_body[m.end(1):]
+    return new_body, dropped
+
+
+def _drop_signature_block(body: str, decl_name: str) -> tuple[str, bool]:
+    """Within the ``### Lean signatures`` section, delete the whole ```` ```lean ````
+    block-RUN (the lines up to and including its trailing permalink line) whose
+    permalink cites ``decl_name`` — every other block byte-identical.
+
+    Reuses the block-run accumulation of :func:`_reconcile_body` (buffer lines
+    until a ``_PERMALINK_LINE_RE`` line, then decide on the whole run) and the
+    bare-vs-qualified match of :func:`_cites_same_decl`. Returns ``(new_body,
+    dropped)``; the body is returned unchanged when there is no signatures
+    section or no block cites ``decl_name``."""
+    lines = body.splitlines(keepends=True)
+    start = next(
+        (i for i, l in enumerate(lines)
+         if l.rstrip("\n").strip() == SIGNATURES_HEADER), None
+    )
+    if start is None:
+        return body, False
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("### "):
+            end = j
+            break
+    section = "".join(lines[start:end])
+
+    out_lines: list[str] = []
+    buf: list[str] = []
+    dropped = False
+    for line in section.splitlines(keepends=True):
+        buf.append(line)
+        m = _PERMALINK_LINE_RE.match(line.rstrip("\n"))
+        if m:
+            if _cites_same_decl(m.group(1), decl_name):
+                dropped = True  # drop the whole buffered block-run
+            else:
+                out_lines.extend(buf)
+            buf = []
+    out_lines.extend(buf)  # trailing non-block remainder (header, blanks)
+    if not dropped:
+        return body, False
+    new_section = "".join(out_lines)
+    # Collapse a blank-line run left where the block stood so the section keeps
+    # single-blank separators (sections are blank-separated). Drop runs of 3+
+    # newlines (a dropped middle block) down to the standard 2.
+    new_section = re.sub(r"\n{3,}", "\n\n", new_section)
+    rebuilt = "".join(lines[:start]) + new_section + "".join(lines[end:])
+    return rebuilt, True
+
+
+def _append_informal_drop_note(body: str, decl_name: str) -> tuple[str, bool]:
+    """Append a one-line PROSE note recording the drop to the issue's
+    ``### Informal Statement`` section (NEVER the declarations section — a note
+    written there would be re-extracted as a citation, undoing the drop).
+
+    The note is a blockquote:
+    ``> ♻️ Dropped stale citation `<decl>` — removed from the code (not a
+    rename).`` It is appended at the END of the Informal Statement section
+    (before the next ``### `` header / EOF). Returns ``(new_body, noted)``;
+    ``noted`` is False when there is no Informal Statement section (the body is
+    returned unchanged — the drop still stands, the note is best-effort)."""
+    note = (
+        f"> ♻️ Dropped stale citation `{decl_name}` — "
+        "removed from the code (not a rename)."
+    )
+    lines = body.splitlines(keepends=True)
+    start = next(
+        (i for i, l in enumerate(lines)
+         if l.rstrip("\n").strip() == INFORMAL_HEADER), None
+    )
+    if start is None:
+        return body, False
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("### "):
+            end = j
+            break
+    section = "".join(lines[start:end])
+    stripped = section.rstrip("\n")
+    trailing = section[len(stripped):]  # restore the original trailing newlines
+    new_section = stripped + "\n\n" + note + (trailing or "\n")
+    rebuilt = "".join(lines[:start]) + new_section + "".join(lines[end:])
+    return rebuilt, True
+
+
+def drop_stale_citation(
+    cfg: "ReviewConfig", issue_num: int, decl_name: str, *, dry_run: bool = False
+) -> dict:
+    """HUMAN-TRIGGERED drop of a confirmed DEAD citation — the one-click escape
+    the auto-reconciler can't safely make. When an issue cites a decl that was
+    DELIBERATELY removed from the code (folded/duplicated away — not renamed,
+    not genuinely-missing work), the deck shows a stale-citation warning and the
+    auto-reconciler conservatively KEEPS it (it can't distinguish a removal from
+    missing work). This drops that dead citation so the issue reviews cleanly —
+    but ONLY a human may invoke it (dropping can erase a real missing-work
+    signal), via the token-gated ``POST /api/drop-citation``.
+
+    SAFETY GATE — ``decl_name`` is droppable ONLY when ALL three hold (else this
+    returns ``{ok:False, dropped:False, message:…}`` and writes NOTHING):
+
+    * (a) it is CITED by the issue body (in ``extract_declarations_from_issue_body``,
+      via the per-decl card views the deck builds);
+    * (b) it is NOT in the current code (its card view has ``in_code=False`` — a
+      stale citation);
+    * (c) it has NO leaf-match rename target — the SAME orphaned-leaf-match path
+      the auto-reconciler uses (:func:`_leaf_match_rename` over
+      :func:`orphaned_chapter_decls` for the issue's chapter). A rename target
+      means RECONCILE, not drop, so we REFUSE and name the target.
+
+    Only a confirmed dead-end (cited + gone-from-code + no rename) is dropped.
+
+    The body edit removes the citation from BOTH formats — the matching
+    ``### Lean declarations`` bullet line AND the matching ``### Lean
+    signatures`` ```` ```lean ```` block — leaving every other section
+    byte-identical, then appends a PROSE drop-note to ``### Informal Statement``
+    (never the declarations section, so the dead name is not re-extracted). The
+    new body is written via a single ``gh issue edit``.
+
+    Returns ``{ok, dropped, message[, new_body]}``: ``dropped`` is True only when
+    the gate passed AND a citation was actually removed; ``new_body`` is included
+    on ``dry_run`` (no write) and omitted on a real write. NOTE: a VERIFIED issue
+    that loses a citation is re-opened by the conductor's reverify pass
+    (``verified_staleness`` sees "removed/renamed") — no special handling here."""
+    from marathon.deck.cards import (
+        _build_decl_view, _load_context, _decls_for_issue, _ledger,
+    )
+    from marathon.review.github import issue_body as _issue_body
+    from marathon.review.verified_decls import (
+        extract_declarations_from_issue_body,
+    )
+
+    repo = cfg.github_repo
+    repo_dir = Path(cfg.repo_dir)
+
+    body = _issue_body(issue_num, repo)
+    if body is None:
+        return {"ok": False, "dropped": False,
+                "message": f"could not fetch issue #{issue_num} body"}
+
+    # (a) CITED — the decl must appear in the body's citations. Resolve each
+    # cited raw name to a card view (the same machinery the deck/footnote use)
+    # and find the one whose resolved name is ``decl_name``. A name not cited at
+    # all is refused here.
+    if not any(
+        _cites_same_decl(c, decl_name)
+        for c in extract_declarations_from_issue_body(body)
+    ):
+        return {"ok": False, "dropped": False,
+                "message": (
+                    f"#{issue_num} does not cite `{decl_name}` — "
+                    "nothing to drop")}
+
+    ctx = _load_context(cfg, [issue_num])
+    ledger = _ledger(cfg)
+    cited_raw = _decls_for_issue(ctx, issue_num)
+    cited_set = set(cited_raw)
+
+    # Locate the cited view for ``decl_name`` (match the resolved view name OR
+    # the raw cited token bare-vs-qualified).
+    target_view = None
+    for raw in cited_raw:
+        v = _build_decl_view(ctx, ledger, raw, repo_dir)
+        if v.name == decl_name or _cites_same_decl(raw, decl_name):
+            target_view = v
+            break
+    if target_view is None:
+        # Cited by the body text but unresolved to a view (no snapshot match) —
+        # build a name-only view so the in_code check still runs.
+        target_view = _build_decl_view(ctx, ledger, decl_name, repo_dir)
+
+    # (b) GONE FROM CODE — a decl still present is not a stale citation; refuse.
+    if target_view.in_code:
+        return {"ok": False, "dropped": False,
+                "message": (
+                    f"`{decl_name}` is still in the code — not a stale "
+                    "citation; nothing to drop")}
+
+    # (c) NO RENAME — reuse the orphaned-leaf-match path. A rename target means
+    # the citation should be RECONCILED (renamed), not dropped, so refuse and
+    # name the target. ``decl_name`` is the resolved view name (qualified), the
+    # shape ``_leaf_match_rename`` expects.
+    chapter = cfg.chapter_of_issue(issue_num)
+    if chapter is not None:
+        live_names = live_chapter_decls(cfg, chapter)
+        orphaned = orphaned_chapter_decls(cfg, chapter, live_names)
+        rename = _leaf_match_rename(target_view.name, orphaned, cited_set)
+        if rename is not None:
+            return {"ok": False, "dropped": False,
+                    "message": (
+                        f"a rename is available (`{rename}`) — "
+                        "reconcile, don't drop")}
+
+    # Gate passed: a confirmed dead-end. Remove the citation from BOTH formats.
+    new_body, dropped_bullet = _drop_declaration_bullet(body, decl_name)
+    new_body, dropped_block = _drop_signature_block(new_body, decl_name)
+    if not (dropped_bullet or dropped_block):
+        return {"ok": False, "dropped": False,
+                "message": (
+                    f"`{decl_name}` passed the gate but no matching citation "
+                    "block/bullet was found in the body")}
+
+    new_body, _noted = _append_informal_drop_note(new_body, decl_name)
+
+    result = {
+        "ok": True, "dropped": True,
+        "message": (
+            f"#{issue_num}: dropped stale citation `{decl_name}` "
+            "(removed from the code, no rename)"),
+    }
+    if dry_run:
+        result["new_body"] = new_body
+        return result
+    _gh_edit_body(repo, issue_num, new_body)
+    return result
+
+
 def _issue_is_frozen(
     cfg: "ReviewConfig", issue_num: int, cited_names: "set[str]"
 ) -> bool:

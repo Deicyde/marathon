@@ -186,6 +186,16 @@
     return postJSON("/api/ship", { issue: issue, skip_api: !!skipApi });
   }
 
+  // postDropCitation — A GitHub WRITE (token-gated, HUMAN-TRIGGERED). Drops a
+  // confirmed-dead stale citation (cited + gone-from-code + no rename) from the
+  // issue body so the issue reviews cleanly. The backend re-validates the
+  // safety gate before any write — a live decl / a rename target / an uncited
+  // name is REFUSED ({ok:false}). Reached ONLY from the footnote's per-citation
+  // "Drop citation" button.
+  function postDropCitation(issue, decl) {
+    return postJSON("/api/drop-citation", { issue: issue, decl: decl });
+  }
+
   // The manual "refresh issue body from code" write was RETIRED: the conductor
   // now auto-reconciles signatures to the live code (ADD uncited in-code
   // result-key decls + replace git-proven renames; never drop a stale citation
@@ -631,6 +641,34 @@
   // rejected; they are advisory ("the issue is stale"). Building/appending the
   // footnote is a PURE READ (it reads subdeck.stale_citations and POSTs
   // nothing). The push-refresh button is the explicit way to fix the drift.
+  // HUMAN-TRIGGERED drop of one confirmed-dead stale citation. POSTs to the
+  // token-gated /api/drop-citation; the BACKEND re-validates the safety gate
+  // (cited + gone-from-code + no rename) before any write, so a refusal
+  // (rename available / live decl / uncited) surfaces here as a toast and
+  // writes nothing. On success the issue body lost the dead citation, so we
+  // reload the subdeck to re-read it. NOT automatic — dropping can erase a real
+  // missing-work signal, which is why it's a deliberate per-citation click.
+  function dropCitation(name, btn) {
+    var issue = state.issue;
+    if (issue == null) return;
+    if (btn) { btn.disabled = true; btn.textContent = "dropping…"; }
+    postDropCitation(issue, name)
+      .then(function (res) {
+        if (res && res.dropped) {
+          flashToast("Dropped stale citation " + name);
+          refetchSubdeck(); // re-read the body now that the citation is gone
+        } else {
+          // Gate refused (rename available / live decl / uncited) — no write.
+          flashToast((res && res.message) || "Not dropped");
+          if (btn) { btn.disabled = false; btn.textContent = "Drop citation"; }
+        }
+      })
+      .catch(function (err) {
+        flashToast(err && err.message ? err.message : "Drop failed");
+        if (btn) { btn.disabled = false; btn.textContent = "Drop citation"; }
+      });
+  }
+
   function staleFootnote() {
     var stale = staleCitations();
     var n = stale.length;
@@ -638,6 +676,24 @@
     var names = stale.map(function (s) {
       return (s && s.name) || String(s);
     });
+    // One row per stale citation: the name + a "Drop citation" button (the
+    // human-triggered escape for a citation whose decl was removed from the
+    // code — the auto-reconciler keeps it conservatively).
+    var rows = el("ul", { class: "stale-foot-list" }, names.map(function (name) {
+      return el("li", { class: "stale-foot-row" }, [
+        el("span", { class: "stale-foot-name mono", text: name }),
+        el("button", {
+          class: "btn btn-tiny stale-drop",
+          type: "button",
+          title: "Drop this citation from the issue body — only if the decl was "
+               + "removed from the code (not renamed). The backend re-checks "
+               + "before writing.",
+          onclick: (function (nm) {
+            return function (ev) { dropCitation(nm, ev.currentTarget); };
+          })(name),
+        }, ["Drop citation"]),
+      ]);
+    }));
     var foot = el("footer", {
       class: "stale-footnote",
       role: "note",
@@ -647,12 +703,13 @@
       el("div", { class: "stale-foot-text" }, [
         el("span", { class: "stale-foot-lead", text:
           n + " citation" + (n === 1 ? "" : "s") +
-          " in the issue body not found in the current code: " }),
-        el("span", { class: "stale-foot-names mono", text: names.join(", ") }),
+          " in the issue body not found in the current code:" }),
+        rows,
         el("span", { class: "stale-foot-tail", text:
-          " — the issue is stale. These are NOT review cards. The conductor " +
-          "reconciles renames automatically; a citation with no proven rename " +
-          "is kept (it may signal genuinely-missing work)." }),
+          "These are NOT review cards. The conductor reconciles renames " +
+          "automatically; a citation with no proven rename is kept (it may " +
+          "signal genuinely-missing work). If the decl was deliberately " +
+          "REMOVED from the code, drop its citation above." }),
       ]),
     ]);
     return foot;

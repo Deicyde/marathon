@@ -167,9 +167,16 @@ html, body {
   padding: 0.55rem 0.75rem; font-size: 0.78rem; line-height: 1.45;
 }
 .stale-foot-icon { color: var(--warn); font-size: 0.95rem; line-height: 1.3; }
-.stale-foot-lead { color: var(--warn); font-weight: 600; }
+.stale-foot-lead { color: var(--warn); font-weight: 600; display: block; }
 .stale-foot-names { color: var(--ink); }
-.stale-foot-tail { color: var(--muted); }
+.stale-foot-tail { color: var(--muted); display: block; margin-top: 0.3rem; }
+.stale-foot-list { list-style: none; margin: 0.3rem 0; padding: 0; }
+.stale-foot-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 0.6rem; padding: 0.18rem 0;
+}
+.stale-foot-name { color: var(--ink); word-break: break-all; }
+.btn.stale-drop { flex: none; }
 
 /* --- surfaced-from-code badge/banner (reconciliation: a reviewable card) --- */
 .surfaced-badge {

@@ -440,7 +440,7 @@ class DeckHandler(BaseHTTPRequestHandler):
     # with no side effect.
     _POST_ROUTES = (
         "/api/verdict", "/api/decl-verdict", "/api/missing", "/api/ship",
-        "/api/refresh-issue",
+        "/api/refresh-issue", "/api/drop-citation",
         "/api/add-chapter", "/api/chapter-intake-status", "/api/approve-chapter",
     )
 
@@ -466,6 +466,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                     self._api_missing()
                 elif parsed.path == "/api/refresh-issue":
                     self._api_refresh_issue()
+                elif parsed.path == "/api/drop-citation":
+                    self._api_drop_citation()
                 elif parsed.path == "/api/add-chapter":
                     self._api_add_chapter()
                 elif parsed.path == "/api/chapter-intake-status":
@@ -882,6 +884,53 @@ class DeckHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
             return self._send_error_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR, f"refresh failed: {exc}"
+            )
+        self._send_json(result)
+
+    def _api_drop_citation(self) -> None:
+        """HUMAN-TRIGGERED drop of a confirmed DEAD citation (the contract's
+        POST /api/drop-citation) — a GitHub WRITE, token-gated like every POST.
+
+        When an issue cites a decl that was deliberately REMOVED from the code
+        (folded/duplicated away — not renamed, not missing work), the
+        auto-reconciler conservatively KEEPS the stale citation (it can't tell a
+        removal from genuinely-missing work). This is the one-click human escape:
+        it routes through the MECHANICAL
+        :func:`marathon.deck.refresh.drop_stale_citation` (NO Claude), which
+        validates the citation is a confirmed dead-end (cited + gone-from-code +
+        no rename) BEFORE removing it from both body formats and writing the new
+        body via a SINGLE ``gh issue edit``. A citation with a rename target / a
+        live decl / an uncited name is REFUSED (``ok:False``) and NOT written."""
+        data = self._read_guarded_body()
+        if data is None:
+            return  # the guard already sent the 4xx (origin / body / token)
+
+        issue_raw = data.get("issue")
+        try:
+            issue_num = int(issue_raw)
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad or missing issue {issue_raw!r}"
+            )
+        decl = data.get("decl")
+        if not isinstance(decl, str) or not decl.strip():
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad or missing decl {decl!r}"
+            )
+
+        if self._demo:
+            return self._send_json(
+                {"ok": False, "dropped": False,
+                 "message": "drop-citation is not available in demo mode"}
+            )
+
+        from marathon.deck.refresh import drop_stale_citation
+
+        try:
+            result = drop_stale_citation(self.cfg, issue_num, decl.strip())
+        except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
+            return self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, f"drop-citation failed: {exc}"
             )
         self._send_json(result)
 
