@@ -375,7 +375,19 @@ def _reconcile_merged_rejections(cfg: ReviewConfig) -> list[int]:
         for pr in json.loads(cp.stdout or "[]"):
             m = _REFINE_BRANCH_RE.match(pr.get("headRefName", "") or "")
             if m:
-                merged[int(m.group(1))] = (pr["headRefName"], pr.get("mergedAt"))
+                n = int(m.group(1))
+                ma = pr.get("mergedAt")
+                # Keep the MOST RECENT merged PR per issue. gh's list order is
+                # not guaranteed newest-first, and an issue refined multiple
+                # times has several merged refine PRs; overwriting blindly could
+                # retain an OLD merge that predates the latest rejection, so the
+                # `_ts_strictly_newer` gate below wrongly skips it and the issue
+                # stays stuck 'rejected' forever (the bug that left #162/#164
+                # out of the review queue). mergedAt is ISO-UTC, so string
+                # comparison is chronological.
+                prev = merged.get(n)
+                if prev is None or (ma or "") > (prev[1] or ""):
+                    merged[n] = (pr["headRefName"], ma)
     except Exception as exc:  # noqa: BLE001 — never crash a tick
         print(f"  merged-rejection reconcile: gh failed ({exc}); skipping",
               flush=True)
