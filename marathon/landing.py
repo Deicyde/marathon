@@ -71,7 +71,7 @@ from typing import Optional
 
 import marathon.review.daemon as daemon
 from marathon.gate import MODE_SKELETON, MODES, run_gate
-from marathon.post_pipeline import run_lake_build
+from marathon.post_pipeline import lean_paths_to_targets, run_lake_build
 from marathon.review.config import ReviewConfig, find_repo_dir, load_config
 from marathon.state import now_iso
 
@@ -650,6 +650,10 @@ def _land_one(
         )
         return "dropped"
 
+    # Pre-cherry-pick HEAD, so we can diff the landed commits for the files
+    # they touched (the explicit build targets, below).
+    pre_pick = (_git(worktree, "rev-parse", "HEAD").stdout or "").strip()
+
     # Cherry-pick the job's commits (one per refine iteration; ranges
     # land oldest-first so multi-commit jobs apply in original order).
     pick = _git(worktree, "cherry-pick", *shas)
@@ -662,7 +666,20 @@ def _land_one(
 
     # Hard gate, part 1: lake build (same semantics as the daemon's
     # build step — timeout kills the build and the landing bounces).
-    build = run_lake_build(worktree, build_timeout)
+    # Build the landed .lean files as explicit lake targets, so the gate
+    # means "the cherry-picked files compile" — a bare `lake build` only
+    # compiles the default target's import closure and would pass-through a
+    # broken leaf module nothing in that closure imports.
+    landed_targets: list[str] = []
+    if pre_pick:
+        diff = _git(
+            worktree, "diff", "--name-only", pre_pick, "HEAD", "--", "*.lean"
+        )
+        if diff.returncode == 0:
+            landed_targets = lean_paths_to_targets(
+                worktree, diff.stdout.splitlines()
+            )
+    build = run_lake_build(worktree, build_timeout, targets=landed_targets or None)
     if build.skipped_reason:
         _rollback(worktree)
         return _bounce(

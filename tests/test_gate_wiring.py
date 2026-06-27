@@ -71,7 +71,7 @@ def _install_boundaries(
     record crossings into ``calls`` — the block-vs-not assertions read
     from here."""
 
-    def fake_build(repo_dir, timeout):
+    def fake_build(repo_dir, timeout, targets=None):
         calls.setdefault("build", []).append(repo_dir)
         return BuildResult(
             ok=build_ok,
@@ -476,3 +476,58 @@ def test_skeleton_threads_gate_flags_into_pipeline_config(tmp_path, monkeypatch)
     assert config.jury is True
     assert config.gate_state_path == folder / GATE_STATE_FILENAME
     assert config.jury_log_path == folder / JURY_LOG_FILENAME
+
+
+# --- build-gate target mapping ------------------------------------------------
+# The [build:OK] gate must build the files an iteration CHANGED as explicit
+# lake targets, not a bare `lake build` (which only compiles the default
+# target's import closure and would pass-through a broken leaf module).
+
+
+def test_lean_paths_to_targets_maps_lib_modules(tmp_path):
+    """A lib-source .lean path maps to its dotted module name; the
+    GeometricAnalysis leaf module from the bug report is preserved."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "lakefile.toml").write_text(
+        'name = "GeometricAnalysis"\n'
+        'defaultTargets = ["GeometricAnalysis"]\n'
+        '[[lean_lib]]\nname = "GeometricAnalysis"\n'
+    )
+    targets = pp.lean_paths_to_targets(
+        repo, ["GeometricAnalysis/LeeSM/Chapter15/OrientationForms.lean"]
+    )
+    assert targets == ["GeometricAnalysis.LeeSM.Chapter15.OrientationForms"]
+
+
+def test_lean_paths_to_targets_skips_non_lib_and_dedupes(tmp_path):
+    """Tests/scripts/.marathon paths are NOT buildable lake targets and are
+    dropped; duplicates collapse; a non-.lean path is ignored."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "lakefile.toml").write_text(
+        'name = "GeometricAnalysis"\n[[lean_lib]]\nname = "GeometricAnalysis"\n'
+    )
+    targets = pp.lean_paths_to_targets(
+        repo,
+        [
+            "GeometricAnalysis/A.lean",
+            "GeometricAnalysis/A.lean",  # dup
+            "scripts/Tool.lean",  # not a lib module
+            ".marathon/scratch.lean",  # dot-dir scratch
+            "tests/Foo.lean",  # not under the lib root
+            "README.md",  # not .lean
+        ],
+    )
+    assert targets == ["GeometricAnalysis.A"]
+
+
+def test_lean_paths_to_targets_heuristic_without_lakefile(tmp_path):
+    """No parseable lakefile → admit a capitalized-first-segment module
+    (the Mathlib/Lean convention) and still drop lowercase-rooted noise."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    targets = pp.lean_paths_to_targets(
+        repo, ["Demo/Chapter14/Basic.lean", "scripts/gen.lean"]
+    )
+    assert targets == ["Demo.Chapter14.Basic"]

@@ -327,13 +327,26 @@ def _summarize_build_log(stdout: str, stderr: str) -> str:
     return summary
 
 
-def run_lake_build(repo_dir: Path, timeout: int) -> BuildResult:
+def run_lake_build(
+    repo_dir: Path, timeout: int, targets: Optional[list[str]] = None
+) -> BuildResult:
+    """Run ``lake build``. When ``targets`` is given (a list of Lean module
+    names like ``GeometricAnalysis.LeeSM.Chapter15.OrientationForms``), those
+    are passed as EXPLICIT lake targets so the build actually compiles the
+    files this iteration changed — even leaf modules outside the default
+    target's import closure. When ``targets`` is None/empty the behavior is
+    unchanged: a bare ``lake build`` of the default target(s).
+
+    The explicit-target form is the build-gate fix: a bare ``lake build``
+    only compiles the default target's import closure, so a refine that edits
+    a leaf file nothing in that closure imports would never get compiled and
+    would be wrongly tagged ``[build:OK]`` at rc=0."""
     if not shutil.which("lake"):
         return BuildResult(skipped_reason="lake CLI not on PATH")
     started = datetime.now()
     try:
         proc = subprocess.run(
-            ["lake", "build"],
+            ["lake", "build", *(targets or [])],
             cwd=str(repo_dir),
             capture_output=True,
             text=True,
@@ -1152,6 +1165,80 @@ def _modified_lean_files(repo_dir: Path) -> list[str]:
     return [ln.strip() for ln in cp.stdout.splitlines() if ln.strip()]
 
 
+def _lib_source_roots(repo_dir: Path) -> set[str]:
+    """First-path-segment names of the repo's Lean libraries — the source
+    roots under which ``.lean`` files are buildable lake targets. Derived
+    from ``[[lean_lib]]`` entries in ``lakefile.toml`` (e.g. the
+    ``GeometricAnalysis`` lib → root ``GeometricAnalysis``). Best-effort:
+    a missing/unparseable lakefile yields the empty set, and callers fall
+    back to a capitalized-first-segment heuristic."""
+    roots: set[str] = set()
+    toml_path = Path(repo_dir) / "lakefile.toml"
+    if toml_path.is_file():
+        try:
+            import tomllib
+
+            data = tomllib.loads(toml_path.read_text())
+        except Exception:  # noqa: BLE001 — best-effort; fall back to heuristic
+            return roots
+        for lib in data.get("lean_lib") or []:
+            if isinstance(lib, dict):
+                # `srcDir` (default ".") + lib name give the source root dir;
+                # for the common flat layout the root is just the lib name.
+                name = lib.get("name")
+                if isinstance(name, str) and name:
+                    roots.add(name)
+    return roots
+
+
+def lean_paths_to_targets(repo_dir: Path, rel_paths: list[str]) -> list[str]:
+    """Map repo-relative ``.lean`` paths to explicit lake targets (Lean
+    module names) so a build of them means *these files compile*.
+
+    Only files under a Lean library source root become targets — tests,
+    scripts, and ``.marathon`` scratch are skipped (they aren't buildable
+    lake targets, and passing them would make lake error on an unknown
+    target). Library roots come from the lakefile; if that can't be parsed,
+    a path is admitted when its first segment is a capitalized, splice-safe
+    module-root name (the Mathlib/Lean convention)."""
+    from marathon.formalization import module_from_file_path
+
+    roots = _lib_source_roots(repo_dir)
+    targets: list[str] = []
+    seen: set[str] = set()
+    for rel in rel_paths:
+        rel = rel.strip()
+        if not rel:
+            continue
+        parts = Path(rel).parts
+        if not parts or any(p.startswith(".") for p in parts):
+            continue  # .lake/.marathon scratch — never source modules
+        first = parts[0]
+        in_lib = first in roots if roots else (first[:1].isupper())
+        if not in_lib:
+            continue
+        mod = module_from_file_path(rel)
+        if mod is None or not _LEAN_TARGET_RE.match(mod):
+            continue  # hyphens / weird chars — not a spliceable lake target
+        if mod not in seen:
+            seen.add(mod)
+            targets.append(mod)
+    return targets
+
+
+def _changed_lean_targets(repo_dir: Path) -> list[str]:
+    """The working-tree-changed ``.lean`` files (vs HEAD), mapped to explicit
+    lake targets so ``[build:OK]`` means *this iteration's files compile*."""
+    return lean_paths_to_targets(repo_dir, _modified_lean_files(repo_dir))
+
+
+# A safe Lean module name (dotted identifiers): the only strings valid as
+# explicit ``lake build`` targets. Mirrors marathon.audit's _LEAN_NAME_RE.
+_LEAN_TARGET_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*$"
+)
+
+
 def run_post_pipeline(
     config: PipelineConfig,
     repo_dir: Path,
@@ -1224,7 +1311,16 @@ def run_post_pipeline(
             print(f"  statement-guard: skipped ({exc})")
 
     if config.auto_build:
-        b = run_lake_build(repo_dir, config.build_timeout)
+        # Build the files THIS iteration changed as explicit lake targets, so
+        # [build:OK] means those files actually compile. A bare `lake build`
+        # only compiles the default target's import closure, so a refine that
+        # edits a leaf module nothing in that closure imports would never get
+        # compiled and would be wrongly tagged build:OK at rc=0. Empty list
+        # (no mappable lib-source changes) falls back to the bare build.
+        changed_targets = _changed_lean_targets(repo_dir)
+        b = run_lake_build(
+            repo_dir, config.build_timeout, targets=changed_targets or None
+        )
         out["build"] = b
         if b.skipped_reason:
             print(f"  build: skipped — {b.skipped_reason}")

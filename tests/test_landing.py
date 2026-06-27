@@ -123,6 +123,11 @@ class FakeGit:
                 if self.cherry_pick_rc else "",
             )
         if sub == "diff":
+            if "--name-only" in args:
+                # The post-cherry-pick "what .lean files landed" diff that
+                # feeds the explicit build targets. Default fake scenario:
+                # the chapter's Basic.lean landed.
+                return cp(out="Demo/Chapter14/Basic.lean\n")
             return cp(out="+<<<<<<< HEAD conflict hunk")
         if sub == "push":
             return cp(
@@ -155,8 +160,8 @@ def gh_calls(monkeypatch):
 def fake_build(monkeypatch):
     state = SimpleNamespace(calls=[], result=BuildResult(ok=True, duration_seconds=42.0))
 
-    def run(repo_dir, timeout):
-        state.calls.append((Path(repo_dir), timeout))
+    def run(repo_dir, timeout, targets=None):
+        state.calls.append((Path(repo_dir), timeout, targets))
         return state.result
 
     monkeypatch.setattr(landing, "run_lake_build", run)
@@ -319,7 +324,11 @@ def test_happy_path_landing(env):
     # Queue drained; the build ran in the landing worktree with the flag
     # timeout; the gate ran in skeleton mode on the chapter folder.
     assert landing.pop_oldest_request(env.repo) is None
-    assert env.build.calls == [(env.worktree, 1234)]
+    # The landed .lean file is built as an explicit lake target (so
+    # [build:OK] means it compiles), not a bare default build.
+    assert env.build.calls == [
+        (env.worktree, 1234, ["Demo.Chapter14.Basic"])
+    ]
     [g] = env.gate.calls
     assert g.repo_dir == env.worktree
     assert g.target == env.worktree / "Demo/Chapter14"
