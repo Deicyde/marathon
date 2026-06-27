@@ -435,6 +435,30 @@ def test_import_all_skips_absent_surfaces(tmp_path):
     assert Ledger.for_repo(tmp_path).db_path.is_file()
 
 
+def test_all_wall_time_and_prompt_log_reads(tmp_path):
+    """The metrics-backfill source reads: every wall_time / prompt_log row,
+    ordered by project_id, including the build-only sentinel."""
+    ledger = Ledger.for_repo(tmp_path)
+    ledger.upsert_wall_time("bbbb", seconds=200, recorded_at="t-b")
+    ledger.upsert_wall_time("aaaa", seconds=100, recorded_at="t-a")
+    ledger.upsert_wall_time(BUILD_ONLY_PROJECT_ID, seconds=7)
+    ledger.upsert_prompt_log("bbbb", first_seen="2026-06-21")
+    ledger.upsert_prompt_log("aaaa", first_seen="2026-06-20")
+
+    wall = ledger.all_wall_time()
+    # Ordered by project_id; the sentinel '__build_only__' sorts first.
+    assert wall == [
+        (BUILD_ONLY_PROJECT_ID, 7, None),
+        ("aaaa", 100, "t-a"),
+        ("bbbb", 200, "t-b"),
+    ]
+    prompt = ledger.all_prompt_log()
+    assert [(pid, fs) for pid, _url, fs in prompt] == [
+        ("aaaa", "2026-06-20"),
+        ("bbbb", "2026-06-21"),
+    ]
+
+
 def test_import_then_cli_verdict_coexist(tmp_path):
     """Import seeds history; a later CLI verdict on the same issue
     upserts the row and appends a second, distinct event — the

@@ -25,6 +25,7 @@ import pytest
 
 import marathon.metrics as metrics
 import marathon.post_pipeline as pp
+from marathon.ledger import Ledger
 
 
 # --- shard write: unique path, correct content -----------------------------
@@ -254,6 +255,199 @@ def test_backfill_is_idempotent(tmp_path):
     assert n1 == n2 == 1
     wt = metrics.aggregate_rollups(repo)["wall_time"]
     assert wt["projects"]["11111111-1111-1111-1111-111111111111"]["seconds"] == 100
+
+
+# --- backfill sources from the ledger ∪ files (recovers trimmed rows) -------
+
+
+def _seed_ledger(repo: Path, *, wall: dict, prompt: dict, build_only: int = 0) -> None:
+    """Populate the authoritative ledger (the write-once record) with
+    ``wall`` (pid -> seconds), ``prompt`` (pid -> first_seen), and an
+    optional build-only lump under the sentinel id."""
+    from marathon.ledger import BUILD_ONLY_PROJECT_ID
+
+    ledger = Ledger.for_repo(repo)
+    for pid, secs in wall.items():
+        ledger.upsert_wall_time(pid, seconds=secs, recorded_at="led")
+    if build_only:
+        ledger.upsert_wall_time(BUILD_ONLY_PROJECT_ID, seconds=build_only)
+    for pid, first_seen in prompt.items():
+        ledger.upsert_prompt_log(pid, first_seen=first_seen)
+
+
+def test_backfill_recovers_ledger_entries_missing_from_files(tmp_path):
+    """THE BUG FIX: the committed files are a LOSSY subset; the ledger holds
+    the fuller record. Backfill must source from (ledger ∪ files) so the
+    aggregate reproduces the FULL record — not the trimmed file.
+
+    Mirrors the live consumer's shape in miniature: files carry 2 wall
+    projects + 2 promptlog UUIDs, the ledger carries 3 + 3 (one extra each
+    that an earlier PR-conflict sync trimmed out of the files)."""
+    repo = tmp_path
+    pid_a = "11111111-1111-1111-1111-111111111111"  # in files + ledger
+    pid_b = "22222222-2222-2222-2222-222222222222"  # in files + ledger
+    pid_c = "33333333-3333-3333-3333-333333333333"  # LEDGER ONLY (trimmed)
+    # The trimmed files (the lossy projection).
+    _write_legacy(
+        repo,
+        projects={
+            pid_a: {"seconds": 100, "added_at": "t1"},
+            pid_b: {"seconds": 200, "added_at": "t2"},
+        },
+        build_only=0,
+        promptlog=(
+            f"2026-06-20T01:00:00-04:00  {pid_a}\n"
+            f"2026-06-21T01:00:00-04:00  {pid_b}\n"
+        ),
+    )
+    # The authoritative ledger (fuller — keeps the extra pid_c).
+    _seed_ledger(
+        repo,
+        wall={pid_a: 100, pid_b: 200, pid_c: 555},
+        prompt={
+            pid_a: "2026-06-20T01:00:00-04:00",
+            pid_b: "2026-06-21T01:00:00-04:00",
+            pid_c: "2026-06-22T09:09:09-04:00",
+        },
+    )
+
+    summary = metrics.backfill_shards(repo)
+    # 3 wall + 3 promptlog shards (the recovered pid_c is now present).
+    assert summary["wall_shards"] == 3
+    assert summary["promptlog_shards"] == 3
+
+    # Blow away the trimmed files — shards must carry the FULL record.
+    (repo / ".marathon" / "wall-time.json").unlink()
+    (repo / ".marathon" / "PromptLog.md").unlink()
+
+    roll = metrics.aggregate_rollups(repo)
+    wt = roll["wall_time"]
+    # FULL total (100 + 200 + 555), not the trimmed file's 300.
+    total = wt["build_only_seconds"] + sum(p["seconds"] for p in wt["projects"].values())
+    assert total == 855
+    assert set(wt["projects"]) == {pid_a, pid_b, pid_c}
+    assert wt["projects"][pid_c]["seconds"] == 555
+    got_uuids = {ln.split()[-1] for ln in roll["promptlog_lines"]}
+    assert got_uuids == {pid_a, pid_b, pid_c}
+    # The ledger-only UUID gets a synthesized line from its first_seen.
+    assert f"2026-06-22T09:09:09-04:00  {pid_c}" in roll["promptlog_lines"]
+
+
+def test_backfill_preserves_verbatim_file_line_over_ledger_synthesis(tmp_path):
+    """For a UUID present in BOTH, the file's verbatim line (which may be a
+    hand-written non-ISO legacy line) is authoritative for the TEXT; the
+    ledger only supplies UUIDs the file lost."""
+    repo = tmp_path
+    pid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    _write_legacy(
+        repo,
+        projects={},
+        build_only=0,
+        promptlog=f"April 25th hand-written  {pid}\n",
+    )
+    _seed_ledger(repo, wall={}, prompt={pid: "2026-06-20T01:00:00-04:00"})
+    metrics.backfill_shards(repo)
+    (repo / ".marathon" / "PromptLog.md").unlink()
+    lines = metrics.aggregate_rollups(repo)["promptlog_lines"]
+    # The verbatim hand-written line wins (NOT the synthesized ISO line).
+    assert lines == [f"April 25th hand-written  {pid}"]
+
+
+def test_backfill_ledger_seconds_win_on_disagreement(tmp_path):
+    """If the trimmed file and the authoritative ledger disagree on a shared
+    project's seconds, the ledger value wins (it is the write-once record;
+    the file is the trimmable projection)."""
+    repo = tmp_path
+    pid = "11111111-1111-1111-1111-111111111111"
+    _write_legacy(
+        repo, projects={pid: {"seconds": 100, "added_at": "t"}},
+        build_only=0, promptlog="",
+    )
+    _seed_ledger(repo, wall={pid: 999}, prompt={})
+    metrics.backfill_shards(repo)
+    (repo / ".marathon" / "wall-time.json").unlink()
+    wt = metrics.aggregate_rollups(repo)["wall_time"]
+    assert wt["projects"][pid]["seconds"] == 999  # ledger, not the file's 100
+
+
+def test_backfill_recovers_build_only_from_ledger(tmp_path):
+    """A build-only lump trimmed from the file but kept in the ledger is
+    recovered (max of the two; the ledger sentinel row survives)."""
+    repo = tmp_path
+    _write_legacy(repo, projects={}, build_only=0, promptlog="")
+    _seed_ledger(repo, wall={}, prompt={}, build_only=4321)
+    metrics.backfill_shards(repo)
+    (repo / ".marathon" / "wall-time.json").unlink()
+    wt = metrics.aggregate_rollups(repo)["wall_time"]
+    assert wt["build_only_seconds"] == 4321
+
+
+def test_backfill_no_ledger_falls_back_to_files(tmp_path):
+    """A fresh checkout with NO ledger degrades gracefully to files-only —
+    exactly the pre-fix behavior."""
+    repo = tmp_path
+    pid = "11111111-1111-1111-1111-111111111111"
+    _write_legacy(
+        repo, projects={pid: {"seconds": 77, "added_at": "t"}},
+        build_only=12,
+        promptlog=f"2026-06-20T01:00:00-04:00  {pid}\n",
+    )
+    # No ledger db exists.
+    assert not (repo / ".marathon" / "marathon.db").is_file()
+    summary = metrics.backfill_shards(repo)
+    assert summary["wall_shards"] == 1
+    assert summary["promptlog_shards"] == 1
+    (repo / ".marathon" / "wall-time.json").unlink()
+    (repo / ".marathon" / "PromptLog.md").unlink()
+    roll = metrics.aggregate_rollups(repo)
+    wt = roll["wall_time"]
+    total = wt["build_only_seconds"] + sum(p["seconds"] for p in wt["projects"].values())
+    assert total == 89  # 77 + 12
+    assert {ln.split()[-1] for ln in roll["promptlog_lines"]} == {pid}
+
+
+def test_backfill_then_aggregate_is_deterministic_byte_identical(tmp_path):
+    """DETERMINISM / IDEMPOTENCE: with the ledger fuller than the files,
+    backfill→aggregate→write run TWICE yields byte-identical rollups — the
+    migration is a pure function of (ledger ∪ files), with no dependence on
+    transient state or run order."""
+    repo = tmp_path
+    pid_a = "11111111-1111-1111-1111-111111111111"
+    pid_b = "22222222-2222-2222-2222-222222222222"  # ledger-only
+    _write_legacy(
+        repo,
+        projects={pid_a: {"seconds": 100, "added_at": "t1"}},
+        build_only=5,
+        promptlog=f"2026-06-20T01:00:00-04:00  {pid_a}\n",
+    )
+    _seed_ledger(
+        repo,
+        wall={pid_a: 100, pid_b: 200},
+        prompt={pid_a: "2026-06-20T01:00:00-04:00",
+                pid_b: "2026-06-21T02:00:00-04:00"},
+        build_only=5,
+    )
+
+    def run_once() -> tuple[bytes, bytes]:
+        metrics.backfill_shards(repo)
+        metrics.write_rollups(repo, metrics.aggregate_rollups(repo))
+        wt = (repo / ".marathon" / "wall-time.json").read_bytes()
+        # last_updated is a wall-clock field; normalize it out so the
+        # comparison is over the load-bearing content, not the timestamp.
+        import json as _json
+        d = _json.loads(wt)
+        d.pop("last_updated", None)
+        wt_norm = _json.dumps(d, sort_keys=True).encode()
+        pl = (repo / ".marathon" / "PromptLog.md").read_bytes()
+        return wt_norm, pl
+
+    first = run_once()
+    second = run_once()
+    assert first == second
+    # And the recovered ledger-only project is present in the result.
+    final = json.loads((repo / ".marathon" / "wall-time.json").read_text())
+    assert set(final["projects"]) == {pid_a, pid_b}
+    assert final["projects"][pid_b]["seconds"] == 200
 
 
 def test_write_rollups_promptlog_one_line_per_uuid(tmp_path):

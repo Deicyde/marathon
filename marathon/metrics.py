@@ -131,6 +131,12 @@ def write_shard(
     # post-pipeline call (wall_seconds) for the SAME project write the same
     # shard at different moments, and neither should clobber the other's
     # field. Last-writer-wins per field, preserving prior non-null values.
+    # ``added_at`` is write-once (the earliest write's stamp survives) so a
+    # re-write of the same shard — e.g. re-running the one-time backfill — is
+    # byte-stable and never churns the derived rollup's per-project
+    # ``added_at``. This is what makes backfill→aggregate idempotent down to
+    # the byte (the migration is a pure function of its inputs, with no
+    # wall-clock leaking into the result on re-run).
     if path.is_file():
         try:
             prev = json.loads(path.read_text())
@@ -141,6 +147,9 @@ def write_shard(
                 ):
                     if payload.get(key) is None and prev.get(key) is not None:
                         payload[key] = prev[key]
+                prev_added = prev.get("added_at")
+                if prev_added:
+                    payload["added_at"] = prev_added
         except (OSError, ValueError):
             pass
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -341,20 +350,71 @@ def regenerate_rollups(repo_dir: Path) -> list[Path]:
 
 def backfill_shards(repo_dir: Path) -> dict:
     """One-time, lossless: emit one shard per project/run under
-    ``.marathon/metrics/`` from the CURRENT ``wall-time.json`` (its
-    ``projects`` + ``build_only_seconds``) and ``PromptLog.md`` (its UUID
-    lines). After this, regenerating the rollups from (legacy + shards)
-    reproduces today's content; nothing is lost.
+    ``.marathon/metrics/`` from the UNION of the AUTHORITATIVE ledger
+    (``.marathon/marathon.db`` — the write-once ``wall_time`` /
+    ``prompt_log`` tables) AND the current committed rollups
+    (``wall-time.json`` + ``PromptLog.md``). After this, regenerating the
+    rollups from (legacy + shards) reproduces the COMPLETE record; nothing
+    is lost.
 
-    Idempotent: a shard's path is keyed by project UUID, so re-running
-    overwrites the same shards rather than duplicating. Returns a summary
+    Why the union (and not just the files): the committed rollups are a
+    LOSSY projection — earlier PR-conflict-resolution syncs trimmed entries
+    out of them, but the write-once ledger kept the fuller record (e.g. the
+    live consumer holds 19 wall-time projects / 296 promptlog UUIDs in the
+    files vs 21 / 298 in the ledger). Sourcing from the files alone would
+    just reproduce the trimmed files and silently drop the recovered rows —
+    defeating the whole point. So the ledger is authoritative for
+    COMPLETENESS (which UUIDs/projects exist) and for a project's seconds;
+    the file is authoritative for a PromptLog line's verbatim TEXT
+    (preserving hand-written / legacy non-ISO lines exactly). A UUID present
+    only in the ledger gets a synthesized ``<first_seen>  <project_id>``
+    line.
+
+    Determinism / idempotence: the result is a PURE FUNCTION of
+    (ledger ∪ files). Both sources are read in a deterministic order
+    (the ledger reads are ``ORDER BY project_id``; the file lines keep
+    their on-disk order), and each shard is UUID-keyed so re-running
+    overwrites the same shard rather than duplicating. Running
+    backfill→aggregate twice therefore yields byte-identical rollups. If
+    the repo has NO ledger (fresh checkout), this falls back gracefully to
+    the files-only behavior.
+
+    Returns a summary
     ``{"wall_shards": N, "promptlog_shards": M, "build_only_seconds": S}``.
     """
     from marathon.formalization import _load_sidecar, _WALL_TIME_SIDECAR
 
     summary = {"wall_shards": 0, "promptlog_shards": 0, "build_only_seconds": 0}
 
-    # PromptLog: a shard per UUID carrying the verbatim line + parsed ts.
+    # --- gather the authoritative ledger record (best-effort) ----------
+    # The ledger is the FULLER source; a missing/unreadable/newer-version
+    # ledger degrades to files-only (the same posture as the rest of the
+    # dual-write subsystem — the ledger must never be load-bearing in a way
+    # that crashes a fresh checkout).
+    ledger_wall: dict[str, int] = {}
+    ledger_build_only = 0
+    ledger_prompt: dict[str, Optional[str]] = {}  # pid -> first_seen
+    try:
+        from marathon.ledger import BUILD_ONLY_PROJECT_ID, Ledger
+
+        ledger = Ledger.for_repo(repo_dir)
+        if ledger.db_path.is_file():
+            for pid, secs, _recorded_at in ledger.all_wall_time():
+                if pid == BUILD_ONLY_PROJECT_ID:
+                    ledger_build_only += int(secs)
+                else:
+                    ledger_wall[pid] = int(secs)
+            for pid, _url, first_seen in ledger.all_prompt_log():
+                ledger_prompt[pid] = first_seen
+    except Exception:  # noqa: BLE001 — ledger read must never break backfill
+        ledger_wall, ledger_build_only, ledger_prompt = {}, 0, {}
+
+    # --- PromptLog: union(file lines, ledger UUIDs) --------------------
+    # The file's verbatim line is authoritative for its TEXT; a ledger-only
+    # UUID is synthesized from its first_seen timestamp. Iterated in a
+    # deterministic order (file order first — preserving its precedence for
+    # shared UUIDs — then the remaining ledger UUIDs sorted) so the shard
+    # set is a pure function of the inputs.
     log_lines = _read_legacy_promptlog(repo_dir)
     seen_uuids: set[str] = set()
     for line in log_lines:
@@ -374,21 +434,52 @@ def backfill_shards(repo_dir: Path) -> dict:
             promptlog_line=line,
         )
         summary["promptlog_shards"] += 1
+    # Ledger-only UUIDs (recovered rows the trimmed file dropped): one shard
+    # each, with a synthesized line so the aggregate emits a PromptLog entry.
+    for pid in sorted(ledger_prompt):
+        if pid in seen_uuids:
+            continue
+        seen_uuids.add(pid)
+        first_seen = ledger_prompt[pid]
+        synth = f"{first_seen}  {pid}" if first_seen else None
+        write_shard(
+            repo_dir,
+            project_id=pid,
+            submitted_at=first_seen,
+            promptlog_line=synth,
+        )
+        summary["promptlog_shards"] += 1
 
-    # wall-time: fold each project's seconds into its shard (merging, so a
-    # PromptLog-only shard written above gains its wall_seconds here).
+    # --- wall-time: union(file projects, ledger projects) --------------
+    # Fold each project's seconds into its shard (merging, so a
+    # PromptLog-only shard written above gains its wall_seconds here). The
+    # ledger is authoritative for completeness AND for a shared project's
+    # seconds (it is the write-once record; the file is the trimmable
+    # projection). They should agree; on the rare disagreement, the ledger
+    # value wins. Start from the file's projects, then overlay the ledger.
     legacy = _load_sidecar(repo_dir / _WALL_TIME_SIDECAR)
+    wall_by_pid: dict[str, int] = {}
     for pid, entry in (legacy.get("projects") or {}).items():
         if not isinstance(entry, dict):
             continue
         secs = _coerce_int(entry.get("seconds"))
         if secs is None:
             continue
-        write_shard(repo_dir, project_id=str(pid), wall_seconds=secs)
+        wall_by_pid[str(pid)] = secs
+    # Ledger overlays the file (authoritative for completeness + value).
+    for pid, secs in ledger_wall.items():
+        wall_by_pid[pid] = secs
+    for pid in sorted(wall_by_pid):
+        write_shard(repo_dir, project_id=pid, wall_seconds=wall_by_pid[pid])
         summary["wall_shards"] += 1
 
-    # build_only_seconds: a single dedicated build-only shard (no project).
-    build_only = int(legacy.get("build_only_seconds", 0) or 0)
+    # --- build_only_seconds: a single dedicated build-only shard -------
+    # The file and ledger should carry the same lump; take the max so a
+    # trimmed file never UNDERcounts the recovered ledger value (and a
+    # ledger-less checkout still keeps the file's lump). No double-count:
+    # exactly one build-only shard, replacing any prior one (same path).
+    file_build_only = int(legacy.get("build_only_seconds", 0) or 0)
+    build_only = max(file_build_only, ledger_build_only)
     if build_only > 0:
         write_shard(
             repo_dir,

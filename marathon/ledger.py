@@ -602,6 +602,37 @@ class Ledger:
         with self._tx() as conn:
             _upsert_prompt_log(conn, project_id, url, first_seen)
 
+    # --- wall-time / prompt-log reads (the metrics-backfill source) -----
+    #
+    # The ledger is the AUTHORITATIVE, fuller record of these two surfaces:
+    # the committed rollups (.marathon/wall-time.json / PromptLog.md) are a
+    # lossy projection that earlier PR-conflict syncs trimmed, but the
+    # write-once ledger kept every row. The metrics backfill reads these to
+    # recover the entries the trimmed files dropped (see
+    # marathon.metrics.backfill_shards). Returned sorted by project_id for
+    # deterministic, byte-stable downstream aggregation.
+
+    def all_wall_time(self) -> list[tuple[str, int, Optional[str]]]:
+        """Every ``wall_time`` row as ``(project_id, seconds, recorded_at)``,
+        ordered by project_id. Includes the ``__build_only__`` sentinel row
+        (callers split it out — it is not a real project)."""
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT project_id, seconds, recorded_at FROM wall_time "
+                "ORDER BY project_id"
+            ).fetchall()
+        return [(str(pid), int(secs), ra) for pid, secs, ra in rows]
+
+    def all_prompt_log(self) -> list[tuple[str, Optional[str], Optional[str]]]:
+        """Every ``prompt_log`` row as ``(project_id, url, first_seen)``,
+        ordered by project_id."""
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT project_id, url, first_seen FROM prompt_log "
+                "ORDER BY project_id"
+            ).fetchall()
+        return [(str(pid), url, fs) for pid, url, fs in rows]
+
     # --- decl verdict events (v2, append-only — no update/delete) -------
 
     def append_decl_verdict(
