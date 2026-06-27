@@ -946,10 +946,22 @@ def regenerate_metadata(
     push: bool = False,
     github_repo: Optional[str] = None,
     base_branch: str = "main",
+    extra_paths: Optional[list[str]] = None,
 ) -> bool:
     """Regenerate ``formalization.yaml``'s auto-fields, optionally
     committing the result. Returns True iff the yaml meaningfully
-    changed.
+    changed OR ``extra_paths`` carried a staged change.
+
+    ``extra_paths`` (repo-relative POSIX paths) are ADDITIONAL files
+    staged into the SAME mechanical commit and shipped on the SAME
+    ``METADATA_REGEN_BRANCH`` PR — used by the conductor to carry the
+    centrally-aggregated metric rollups (``.marathon/wall-time.json``,
+    ``.marathon/PromptLog.md``) and any newly-merged shards alongside the
+    yaml, so there is exactly ONE central writer and ONE merge path for
+    every derived-metadata file (no second PR cycle). They are exempt from
+    the unrelated-dirt guard (they are machine-managed, like the yaml), and
+    when only they changed (the yaml is timestamp-stable) the commit still
+    proceeds so a rollup-only update is never dropped.
 
     WHY this exists: under the Phase-3 Conductor, metadata files move
     to Conductor-side regeneration — workers run with
@@ -992,17 +1004,23 @@ def regenerate_metadata(
     no GitHub repo is configured), it falls back to the legacy direct
     ``git push``.
     """
+    extra = [p for p in (extra_paths or []) if p]
     yaml_path = repo_dir / FORMALIZATION_FILENAME
-    if not yaml_path.is_file():
-        return False
-    before = yaml_path.read_text()
-    written = update_formalization(repo_dir, framework="Marathon")
-    if written is None:
-        return False
-    after = written.read_text()
-    if _strip_auto_stamp(before) == _strip_auto_stamp(after):
-        # Timestamp-only churn: restore so the checkout stays clean.
-        written.write_text(before)
+    yaml_changed = False
+    if yaml_path.is_file():
+        before = yaml_path.read_text()
+        written = update_formalization(repo_dir, framework="Marathon")
+        if written is not None:
+            after = written.read_text()
+            if _strip_auto_stamp(before) == _strip_auto_stamp(after):
+                # Timestamp-only churn: restore so the checkout stays clean.
+                written.write_text(before)
+            else:
+                yaml_changed = True
+    # Nothing to ship: no meaningful yaml change AND no extra rollup/shard
+    # paths to carry. (extra_paths with no real diff is handled by the
+    # staged-diff check below — git commit no-ops cleanly.)
+    if not yaml_changed and not extra:
         return False
     if commit:
         status = subprocess.run(
@@ -1011,39 +1029,57 @@ def regenerate_metadata(
         )
         # Porcelain v1: 2-char status code + space; path from column 3.
         # Unstaged .marathon/ bookkeeping is expected dirt (see
-        # MARATHON_BOOKKEEPING_DIR) and never blocks the commit; it is
-        # never staged here either — only the yaml is added below, so
-        # the carved-out files cannot ride along.
+        # MARATHON_BOOKKEEPING_DIR) and never blocks the commit; the yaml
+        # and any explicitly-passed extra_paths (machine-managed rollups /
+        # shards) are also exempt — they are what we are about to stage.
+        # Everything else is (potential) operator work and still defers.
+        exempt = {FORMALIZATION_FILENAME, *extra}
         dirty_others = [
             line for line in (status.stdout or "").rstrip("\n").splitlines()
             if line.strip()
-            and line[3:] != FORMALIZATION_FILENAME
+            and line[3:] not in exempt
             and not is_ignorable_bookkeeping_dirt(line)
         ]
         if status.returncode != 0 or dirty_others:
             print(
-                "  formalization: yaml regenerated but NOT committed — "
-                "the checkout has other uncommitted changes; the yaml "
+                "  formalization: metadata regenerated but NOT committed — "
+                "the checkout has other uncommitted changes; the metadata "
                 "will ride along with the next commit"
             )
             return True
+        add_paths = ([FORMALIZATION_FILENAME] if yaml_changed else []) + extra
         add = subprocess.run(
-            ["git", "add", "--", FORMALIZATION_FILENAME],
+            ["git", "add", "--", *add_paths],
             cwd=str(repo_dir), capture_output=True, text=True, check=False,
         )
+        # When the yaml did NOT change (pure rollup/shard aggregation), the
+        # extra_paths may stage no real diff — git commit would then error
+        # "nothing to commit". Guard only this case so a no-op aggregation
+        # never errors the loop; a real yaml change always has a staged diff,
+        # so the historical always-commit behavior is untouched.
+        if not yaml_changed:
+            staged_diff = subprocess.run(
+                ["git", "diff", "--cached", "--quiet"],
+                cwd=str(repo_dir), check=False,
+            )
+            if staged_diff.returncode == 0:
+                return False
         commit_proc = subprocess.run(
             ["git", "commit", "-m", REGENERATE_COMMIT_MESSAGE],
             cwd=str(repo_dir), capture_output=True, text=True, check=False,
         )
         if add.returncode != 0 or commit_proc.returncode != 0:
             print(
-                "  formalization: yaml regenerated but commit failed — "
+                "  formalization: metadata regenerated but commit failed — "
                 f"{((commit_proc.stderr or commit_proc.stdout) or '').strip()[:200]}"
             )
             return True
         if push:
             if github_repo:
-                _push_metadata_via_pr(repo_dir, github_repo, base_branch)
+                _push_metadata_via_pr(
+                    repo_dir, github_repo, base_branch,
+                    committed_paths=add_paths,
+                )
             else:
                 # Legacy direct push — only reached when no GitHub repo is
                 # configured (or main is known-unprotected). main IS
@@ -1062,11 +1098,18 @@ def regenerate_metadata(
 
 
 def _push_metadata_via_pr(
-    repo_dir: Path, github_repo: str, base_branch: str
+    repo_dir: Path, github_repo: str, base_branch: str,
+    committed_paths: Optional[list[str]] = None,
 ) -> None:
     """Ship the just-made metadata commit (now at HEAD of the primary
     checkout) through an auto-merged PR instead of a direct push to the
     ruleset-protected ``base_branch``.
+
+    ``committed_paths`` is the full set of repo-relative paths the regen
+    commit staged (the yaml plus any rollup/shard ``extra_paths``); ALL of
+    them are restored by the un-strand below — restoring only the yaml would
+    leave the rollups/shards staged in the index and wedge every future
+    regen (the conductor's clean-tree gate counts a staged path as dirt).
 
     Steps:
       (a) point the throwaway regen branch at the new commit;
@@ -1107,7 +1150,9 @@ def _push_metadata_via_pr(
     # (c) idempotent PR: create only when none is open for this head.
     _ensure_metadata_regen_pr(repo_dir, github_repo, base_branch)
     # (d) un-strand the local commit (see helper for the safety argument).
-    _unstrand_primary_after_regen_push(repo_dir, base_branch)
+    #     ALL committed paths are restored — not just the yaml — so the
+    #     index is left clean and the next regen's clean-tree gate passes.
+    _unstrand_primary_after_regen_push(repo_dir, base_branch, committed_paths)
 
 
 def _ensure_metadata_regen_pr(
@@ -1150,7 +1195,10 @@ def _ensure_metadata_regen_pr(
     )
 
 
-def _unstrand_primary_after_regen_push(repo_dir: Path, base_branch: str) -> None:
+def _unstrand_primary_after_regen_push(
+    repo_dir: Path, base_branch: str,
+    committed_paths: Optional[list[str]] = None,
+) -> None:
     """Return the primary checkout to a clean base-branch state so the
     just-made regen commit (now stranded only on the local branch tip) is
     not later discarded by a ``git reset``/``git pull`` — origin holds it
@@ -1162,18 +1210,21 @@ def _unstrand_primary_after_regen_push(repo_dir: Path, base_branch: str) -> None
       (``_regenerate_metadata_after_success``) the primary checkout is on
       the base branch with a tree clean of everything except UNSTAGED
       ``.marathon/`` bookkeeping. ``regenerate_metadata`` then staged and
-      committed ONLY ``formalization.yaml``, so the lone tracked delta we
-      introduced is that one-file commit.
-    - We undo it in two narrow steps that never touch ``.marathon/`` or
-      any other path:
+      committed ``committed_paths`` (the yaml plus any rollup/shard
+      ``extra_paths``), so those are the only tracked deltas we introduced.
+    - We undo it in two narrow steps:
         (1) ``git reset --soft HEAD~1`` drops the regen commit from the
             current branch (HEAD → its parent = origin/main tip) WITHOUT
             touching the working tree; the commit stays reachable via
-            ``METADATA_REGEN_BRANCH`` + origin. This leaves ``yaml``
-            staged-as-modified and otherwise preserves all worktree state.
-        (2) ``git checkout HEAD -- formalization.yaml`` restores ONLY that
-            one path (index + worktree) to the parent commit's version, so
-            the checkout matches origin/main exactly and is clean again.
+            ``METADATA_REGEN_BRANCH`` + origin. This leaves the committed
+            paths staged-as-modified and otherwise preserves worktree state.
+        (2) ``git checkout HEAD -- <committed_paths>`` restores EVERY
+            committed path (index + worktree) to the parent commit's
+            version, so the checkout matches origin/main exactly and the
+            index is clean again. Restoring only the yaml (the old behavior)
+            would leave the rollup/shard paths STAGED — and the next regen's
+            clean-tree gate counts a staged path as dirt, permanently
+            wedging metadata regeneration after the first PR-routed success.
       A ``reset --hard`` is deliberately avoided: it would revert
       modified-but-unstaged tracked ``.marathon/`` bookkeeping the
       conductor relies on (untracked ``.marathon/`` files survive, but
@@ -1191,16 +1242,43 @@ def _unstrand_primary_after_regen_push(repo_dir: Path, base_branch: str) -> None
             f"(reset --soft) failed — {((reset.stderr or reset.stdout) or '').strip()[:200]}"
         )
         return
-    restore = subprocess.run(
-        ["git", "checkout", "HEAD", "--", FORMALIZATION_FILENAME],
-        cwd=str(repo_dir), capture_output=True, text=True, check=False,
-    )
-    if restore.returncode != 0:
-        print(
-            "  formalization: metadata regen shipped + branch un-stranded, "
-            "but restoring the worktree yaml left it staged — "
-            f"{((restore.stderr or restore.stdout) or '').strip()[:200]}"
+    # Restore the index to HEAD for EVERY committed path so nothing is left
+    # staged (a staged path is dirt to the next regen's clean-tree gate).
+    # Two different restores, by where the path lives:
+    #   * the yaml (a root, build-gated file) is checked out — index AND
+    #     worktree go back to HEAD, so the tree matches origin/main exactly;
+    #   * the .marathon/ rollups + shards are merely UNSTAGED (``git reset``):
+    #     their worktree content (the freshly-aggregated rollups / merged
+    #     shards) is kept as exempt unstaged bookkeeping — the conductor's
+    #     gate ignores unstaged .marathon/ dirt, and the next regen
+    #     re-aggregates it idempotently. ``git reset -- <path>`` handles both
+    #     modified-and-staged and newly-added-and-staged files (the latter
+    #     become untracked, still exempt), which ``git checkout`` cannot.
+    committed = committed_paths or [FORMALIZATION_FILENAME]
+    yaml_paths = [p for p in committed if p == FORMALIZATION_FILENAME]
+    other_paths = [p for p in committed if p != FORMALIZATION_FILENAME]
+    if yaml_paths:
+        restore = subprocess.run(
+            ["git", "checkout", "HEAD", "--", *yaml_paths],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
         )
+        if restore.returncode != 0:
+            print(
+                "  formalization: metadata regen shipped + branch un-stranded, "
+                "but restoring the worktree yaml left it staged — "
+                f"{((restore.stderr or restore.stdout) or '').strip()[:200]}"
+            )
+    if other_paths:
+        unstage = subprocess.run(
+            ["git", "reset", "--quiet", "HEAD", "--", *other_paths],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
+        )
+        if unstage.returncode != 0:
+            print(
+                "  formalization: metadata regen shipped, but un-staging the "
+                "rollup/shard paths failed — the next regen may defer on a "
+                f"staged path: {((unstage.stderr or unstage.stdout) or '').strip()[:200]}"
+            )
 
 
 def _strip_auto_stamp(text: str) -> str:

@@ -132,6 +132,45 @@ if TYPE_CHECKING:  # pragma: no cover — type-only; avoids review-package dep
 SCHEMA_VERSION = 5
 LEDGER_RELPATH = Path(".marathon") / "marathon.db"
 
+# Patterns every consumer's ``.marathon/.gitignore`` should carry: the
+# runtime SQLite db (+ its WAL ``-wal``/``-shm`` siblings) is never
+# committed, and stale ``*.bak`` editor backups are noise. Unlike the
+# self-ignoring runtime sub-dirs (conductor/, landing's queue, which write
+# ``*``), the ``.marathon/`` ROOT holds TRACKED bookkeeping (review state,
+# the metric shards), so we ignore only these specific patterns — never the
+# whole directory.
+_MARATHON_GITIGNORE_PATTERNS = ("marathon.db", "marathon.db-wal", "marathon.db-shm", "*.bak")
+
+
+def ensure_marathon_gitignore(repo_dir: Path) -> bool:
+    """Make sure ``<repo>/.marathon/.gitignore`` ignores ``marathon.db*``
+    (and stale ``*.bak``) so the runtime db can never be committed by ANY
+    consumer — not just one hand-fixed repo. Idempotent: adds only the
+    missing patterns, preserving any the operator already wrote. Returns
+    True if the file was created or amended.
+
+    Mirrors the self-ignore convention of the runtime sub-dirs
+    (landing.py / conductor.py write ``*`` into their own scratch dirs),
+    but scoped to specific patterns because ``.marathon/`` itself is the
+    consumer's tracked bookkeeping root."""
+    marathon_dir = repo_dir / ".marathon"
+    marathon_dir.mkdir(parents=True, exist_ok=True)
+    gitignore = marathon_dir / ".gitignore"
+    existing_lines: list[str] = []
+    if gitignore.is_file():
+        existing_lines = gitignore.read_text().splitlines()
+    present = {ln.strip() for ln in existing_lines}
+    missing = [p for p in _MARATHON_GITIGNORE_PATTERNS if p not in present]
+    if not missing:
+        return False
+    lines = list(existing_lines)
+    if lines and lines[-1].strip() != "":
+        # keep a clean trailing structure
+        pass
+    lines.extend(missing)
+    gitignore.write_text("\n".join(lines).rstrip("\n") + "\n")
+    return True
+
 #: Allowed ``targets.kind`` values (the planner's intake taxonomy):
 #: 'sorry' (a sorry-bodied declaration to discharge), 'axiom' (a named
 #: axiom/decl to discharge), 'theorem'/'def'/'statement' (textbook-extracted
@@ -474,9 +513,17 @@ class Ledger:
         statement is ``IF NOT EXISTS`` and the version row is
         insert-or-ignore, so calling against an existing current-version
         db is a no-op; a v1 db upgrades in place (additive). Raises
-        :class:`LedgerError` against a newer-versioned db."""
+        :class:`LedgerError` against a newer-versioned db.
+
+        Also ensures ``.marathon/.gitignore`` ignores ``marathon.db*`` so
+        the runtime db this very call creates can never be committed —
+        every consumer gets the ignore, not just a hand-fixed one."""
         with self._tx():
             pass
+        try:
+            ensure_marathon_gitignore(self.db_path.parent.parent)
+        except OSError:
+            pass  # gitignore hygiene is best-effort, never fatal
         return self.db_path
 
     # --- upsert helpers (the dual-write surface) ------------------------

@@ -933,6 +933,31 @@ def _regenerate_metadata_after_success(cfg: ReviewConfig) -> None:
             flush=True,
         )
         return
+    # Central metric aggregation (plan §2): fold every per-run shard under
+    # .marathon/metrics/ — written by the refines that just merged, whose
+    # PRs never collided because each shard path is project-UUID-keyed —
+    # back into the two human-readable rollups (.marathon/wall-time.json,
+    # .marathon/PromptLog.md) and refresh the ledger. The rollups + any
+    # newly-merged shards then ride the SAME metadata-regen PR as the yaml
+    # (one central writer, one merge path). Best-effort: a failure here
+    # must not block the yaml regen below.
+    extra_paths: list[str] = []
+    try:
+        from marathon.metrics import METRICS_DIR_RELPATH, regenerate_rollups
+
+        written = regenerate_rollups(cfg.repo_dir)
+        for p in written:
+            try:
+                extra_paths.append(p.relative_to(cfg.repo_dir).as_posix())
+            except ValueError:
+                pass
+        # Stage the shards directory too, so shards that merged via refine
+        # PRs (and any written here) are tracked in the same central commit.
+        if (cfg.repo_dir / METRICS_DIR_RELPATH).is_dir():
+            extra_paths.append(METRICS_DIR_RELPATH.as_posix())
+    except Exception as e:  # noqa: BLE001 — aggregation must not kill the loop
+        print(f"  metadata: metric aggregation skipped — {type(e).__name__}: {e}")
+
     try:
         changed = regenerate_metadata(
             cfg.repo_dir, commit=True, push=_metadata_push_enabled(),
@@ -942,12 +967,14 @@ def _regenerate_metadata_after_success(cfg: ReviewConfig) -> None:
             # silently never reaches origin (GH013 metadata-push bug).
             github_repo=cfg.github_repo,
             base_branch=METADATA_BASE_BRANCH,
+            # Carry the centrally-aggregated rollups + shards on the same PR.
+            extra_paths=extra_paths,
         )
     except Exception as e:  # noqa: BLE001 — bookkeeping must not kill the loop
         print(f"  metadata: regeneration skipped — {type(e).__name__}: {e}")
         return
     if changed:
-        print("  metadata: formalization.yaml regenerated + committed", flush=True)
+        print("  metadata: formalization.yaml + metric rollups regenerated + committed", flush=True)
 
 
 def _enqueue_landing_after_success(cfg: ReviewConfig, job: ConductorJob) -> None:
@@ -1443,6 +1470,15 @@ def run_conductor(
 
     signal.signal(signal.SIGTERM, _handle_stop_signal)
     signal.signal(signal.SIGINT, _handle_stop_signal)
+
+    # Belt-and-suspenders: ensure the consumer's .marathon/.gitignore
+    # ignores marathon.db* so the runtime SQLite db is never committed by
+    # any consumer (mirrors Ledger.init; harmless if already present).
+    try:
+        from marathon.ledger import ensure_marathon_gitignore
+        ensure_marathon_gitignore(cfg.repo_dir)
+    except Exception:  # noqa: BLE001 — gitignore hygiene must not block startup
+        pass
 
     mode = "one-shot" if once else "daemon"
     print(

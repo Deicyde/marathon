@@ -231,26 +231,39 @@ def _resolve_promptlog_path(repo_dir: Path) -> Optional[Path]:
     return None
 
 
-def append_promptlog_url(repo_dir: Path, project_id: str) -> bool:
-    """If ``PromptLog.md`` exists (preferred under ``.marathon/``, legacy
-    at repo root), append a blank line plus a ``<timestamp>  <project_id>``
-    entry. Skips silently if the file doesn't exist or ``project_id`` is
-    empty.
+def append_promptlog_url(
+    repo_dir: Path,
+    project_id: str,
+    *,
+    chapter: Optional[object] = None,
+    issue: Optional[object] = None,
+) -> bool:
+    """Record an Aristotle submission for ``project_id`` as a per-run METRIC
+    SHARD under ``.marathon/metrics/`` (NOT a direct append to the shared
+    ``PromptLog.md``). The shard carries the ``submitted_at`` timestamp and
+    the verbatim PromptLog line; its path is keyed by the project UUID, so
+    two submissions racing off the same base never collide on a shared file
+    — the textual collision that stranded concurrent refine PRs. The
+    conductor aggregates every shard back into ``PromptLog.md`` centrally.
 
-    Returns True if the file was appended to, False if skipped.
+    Returns True if a shard was written, False if skipped (empty
+    ``project_id``).
     """
     if not project_id:
         return False
-    log_path = _resolve_promptlog_path(repo_dir)
-    if log_path is None:
-        return False
-    # Local import to avoid a top-level circular dep with marathon.state.
+    from marathon.metrics import write_shard
     from marathon.state import now_iso
-    line = f"{now_iso()}  {project_id}"
-    existing = log_path.read_text()
-    sep = "" if existing.endswith("\n\n") else ("\n" if existing.endswith("\n") else "\n\n")
-    with log_path.open("a") as f:
-        f.write(f"{sep}{line}\n")
+
+    submitted_at = now_iso()
+    line = f"{submitted_at}  {project_id}"
+    write_shard(
+        repo_dir,
+        project_id=project_id,
+        chapter=chapter,
+        issue=issue,
+        submitted_at=submitted_at,
+        promptlog_line=line,
+    )
     return True
 
 
@@ -379,15 +392,25 @@ def run_git_commit(
     claude_in_loop: bool = False,
     extra_paths: Optional[list[str]] = None,
     commit_metadata: bool = True,
+    metrics_shard: Optional[str] = None,
 ) -> CommitResult:
-    """Stage ``target_path`` (and ``PromptLog.md`` if it exists and is
-    dirty) and commit. ``extra_paths`` (repo-relative POSIX paths) are
-    additionally staged — used for cross-chapter refactor iterations
-    where Aristotle edits files in ``extra_writable_paths`` outside the
-    primary target. ``commit_metadata=False`` excludes
-    ``formalization.yaml`` from the staging (conductor workers; the
-    yaml is regenerated centrally — see ``PipelineConfig``); the
-    merge-friendly PromptLog + wall-time sidecar are staged regardless.
+    """Stage ``target_path`` (and this run's metric shard) and commit.
+    ``extra_paths`` (repo-relative POSIX paths) are additionally staged —
+    used for cross-chapter refactor iterations where Aristotle edits files
+    in ``extra_writable_paths`` outside the primary target.
+    ``commit_metadata=False`` excludes ``formalization.yaml`` from the
+    staging (conductor workers; the yaml is regenerated centrally — see
+    ``PipelineConfig``).
+
+    ``metrics_shard`` (repo-relative POSIX path) is this run's UNIQUE
+    metric shard under ``.marathon/metrics/`` — the per-run replacement for
+    the old shared ``PromptLog.md`` + ``wall-time.json`` staging that made
+    concurrent refine PRs textually collide (stranding #159/#162/#165). The
+    shard path is keyed by the Aristotle project UUID, so no two PRs ever
+    touch the same path; the conductor aggregates every shard back into the
+    two rollups centrally after each success. The shared rollups are NEVER
+    staged from a refine path anymore.
+
     The final commit message includes a project URL line (when
     ``project_id`` is set) and a Co-authored-by trailer block
     crediting Aristotle (and Claude, when ``claude_in_loop`` is True).
@@ -398,19 +421,13 @@ def run_git_commit(
         return CommitResult(skipped_reason=f"{target_path} not under repo {repo_dir}")
 
     paths_to_stage = [str(rel)]
-    promptlog = _resolve_promptlog_path(repo_dir)
-    if promptlog is not None:
-        try:
-            paths_to_stage.append(str(promptlog.relative_to(repo_dir)))
-        except ValueError:
-            pass
-    # The project-id-keyed wall-time sidecar is staged with every
-    # iteration commit: write-once keys merge cleanly across parallel
-    # workers (unlike the yaml's derived counter fields), so committing
-    # it from N workers is safe by construction.
-    from marathon.formalization import WALL_TIME_SIDECAR_RELPATH
-    if (repo_dir / WALL_TIME_SIDECAR_RELPATH).is_file():
-        paths_to_stage.append(WALL_TIME_SIDECAR_RELPATH.as_posix())
+    # This run's UNIQUE metric shard (project-UUID-keyed path → no two PRs
+    # collide). Replaces the old shared-file staging of PromptLog.md +
+    # wall-time.json, whose textual collisions stranded concurrent refine
+    # PRs. The shared rollups are now written ONLY centrally by the
+    # conductor's shard aggregation — never on a refine PR.
+    if metrics_shard and (repo_dir / metrics_shard).is_file():
+        paths_to_stage.append(metrics_shard)
     # Cross-chapter refactor support: stage every file outside the
     # primary target that the extractor reported writing. Dedup since
     # any path under ``rel`` is already covered by the primary stage
@@ -689,9 +706,19 @@ def prepare_auto_pr_branch(
                 f"Offending lines: {offending!r}"
             )
         # All dirt is marathon bookkeeping — auto-commit it inline so the
-        # branch switch is safe and the audit trail stays tracked.
+        # branch switch is safe and the audit trail stays tracked. Stage the
+        # EXACT dirty paths (not a wholesale ``git add -- .marathon/``): a
+        # blanket add of the directory could sweep in an un-gitignored
+        # ``marathon.db`` (runtime SQLite, now gitignored per consumer but
+        # belt-and-suspenders here) or any other untracked bookkeeping that
+        # has no business in this branch-switch commit. Each path is taken
+        # verbatim from the porcelain lines, so only the already-detected
+        # ``.marathon/`` dirt is staged.
+        # Porcelain v1 renders a rename as ``old -> new``; take the
+        # destination path so the add targets the real file.
+        dirty_paths = [line[3:].split(" -> ")[-1] for line in dirty_lines]
         subprocess.run(
-            ["git", "add", "--", ".marathon/"],
+            ["git", "add", "--", *dirty_paths],
             cwd=str(repo_dir), capture_output=True, text=True, check=False,
         )
         commit = subprocess.run(
@@ -1239,6 +1266,34 @@ _LEAN_TARGET_RE = re.compile(
 )
 
 
+def _metrics_shard_relpath(
+    repo_dir: Path,
+    written_shard: Optional[Path],
+    project_id: Optional[str],
+    chapter_label: str,
+    iteration: Optional[int],
+) -> Optional[str]:
+    """Repo-relative POSIX path of this run's metric shard, for staging.
+    Prefers the shard actually written this iteration; otherwise resolves
+    the deterministic path (so a submit-time-only shard — a PromptLog line
+    with no wall-clock — still gets committed). Returns None when no shard
+    exists on disk to stage."""
+    from marathon.metrics import shard_path
+
+    path = written_shard
+    if path is None:
+        path = shard_path(
+            repo_dir, project_id=project_id,
+            chapter=chapter_label, issue=iteration,
+        )
+    if not path.is_file():
+        return None
+    try:
+        return path.relative_to(repo_dir).as_posix()
+    except ValueError:
+        return None
+
+
 def run_post_pipeline(
     config: PipelineConfig,
     repo_dir: Path,
@@ -1264,6 +1319,10 @@ def run_post_pipeline(
         "gate": None,
         "gate_posture": None,
         "jury": None,
+        # The per-run metric shard written this iteration (a Path), or
+        # None when no wall-clock was recorded. Staged into the commit
+        # instead of the old shared PromptLog.md + wall-time.json.
+        "metrics_shard": None,
         "frozen_reverts": [],
         # None = not attempted; True/False = a REQUESTED push/PR succeeded/failed.
         # The caller (refine) fails the iteration on a False so the conductor
@@ -1331,11 +1390,14 @@ def run_post_pipeline(
             duration = format_duration(b.duration_seconds)
             status = "OK" if b.ok else "FAIL"
             print(f"  build: {status} ({duration})")
-        # Accumulate iteration wall-clock into the formalization wall-time
-        # sidecar (when --update-formalization is on). The yaml's
-        # automation.cost.wall_time field is re-derived from the sidecar
-        # on each refresh. Build-failed iterations still count — the
-        # compute (Aristotle + lake) was spent.
+        # Record the iteration wall-clock into this run's per-run METRIC
+        # SHARD (when --update-formalization is on). The shard — not the
+        # shared wall-time.json — is what gets staged/committed: its path is
+        # keyed by the Aristotle project UUID, so concurrent refine PRs
+        # never collide on it. The conductor aggregates every shard back
+        # into wall-time.json (and the yaml's automation.cost.wall_time)
+        # centrally after each success. Build-failed iterations still count
+        # — the compute (Aristotle + lake) was spent.
         if config.update_formalization:
             seconds_to_add = 0.0
             if iteration_duration_seconds is not None and iteration_duration_seconds > 0:
@@ -1344,13 +1406,24 @@ def run_post_pipeline(
                 seconds_to_add += float(b.duration_seconds)
             if seconds_to_add > 0:
                 try:
-                    from marathon.formalization import add_wall_seconds
-                    # Pass the Aristotle project_id so the sidecar entry
-                    # is keyed by project — idempotent on re-runs, and
-                    # immune to the merge race that caused main's
-                    # wall_time to go *down* when two iteration branches
-                    # racing off the same base both PR'd a counter update.
-                    add_wall_seconds(repo_dir, seconds_to_add, project_id=project_id)
+                    from marathon.metrics import write_shard
+                    # Keyed by project_id so the shard is unique per run,
+                    # idempotent on re-runs (continuations/retries overwrite
+                    # the same shard), and never double-counted. When there
+                    # is no project_id (rare non-Aristotle path) the seconds
+                    # land in the shard's build_only bucket.
+                    if project_id:
+                        out["metrics_shard"] = write_shard(
+                            repo_dir, project_id=project_id,
+                            chapter=chapter_label, issue=iteration,
+                            wall_seconds=int(seconds_to_add),
+                        )
+                    else:
+                        out["metrics_shard"] = write_shard(
+                            repo_dir, project_id=None,
+                            chapter=chapter_label, issue=iteration,
+                            build_only_seconds=int(seconds_to_add),
+                        )
                 except Exception:  # noqa: BLE001 — soft-warning
                     pass
 
@@ -1476,6 +1549,14 @@ def run_post_pipeline(
         if project_id:
             msg_parts.append(f"(project={project_id[:8]})")
         message = " ".join(msg_parts)
+        # The metric shard (project-UUID-keyed, never-colliding) is staged
+        # in place of the old shared rollups. Compute its repo-relative
+        # path: from the shard written above, or fall back to the
+        # deterministic path so a submit-time-only shard (PromptLog line,
+        # no wall-clock yet) still rides into this commit.
+        shard_rel = _metrics_shard_relpath(
+            repo_dir, out.get("metrics_shard"), project_id, chapter_label, iteration
+        )
         c = run_git_commit(
             repo_dir,
             target_path,
@@ -1484,6 +1565,7 @@ def run_post_pipeline(
             claude_in_loop=config.claude_in_loop,
             extra_paths=extra_paths_to_stage,
             commit_metadata=config.commit_metadata,
+            metrics_shard=shard_rel,
         )
         out["commit"] = c
         if c.sha:

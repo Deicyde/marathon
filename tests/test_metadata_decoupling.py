@@ -100,32 +100,45 @@ def staged_paths(calls: list[list[str]]) -> list[str]:
 # --- run_git_commit staging ------------------------------------------------------
 
 
-def test_no_metadata_commit_excludes_yaml_keeps_sidecar_and_promptlog(
-    tmp_path, git_calls
-):
-    """The decoupling itself: under commit_metadata=False the yaml never
-    enters the index, but the two merge-friendly surfaces (write-once-
-    keyed sidecar, append-only PromptLog) are staged as always."""
+def test_no_metadata_commit_excludes_yaml_stages_only_shard(tmp_path, git_calls):
+    """The decoupling + shard redesign: under commit_metadata=False the
+    yaml never enters the index, and the SHARED rollups (PromptLog.md,
+    wall-time.json) are NEVER staged from a refine path anymore — only the
+    per-run, project-UUID-keyed metric shard is. That non-colliding shard
+    is the fix for the textual collisions that stranded #159/#162/#165."""
     repo = make_repo(tmp_path)
+    shard = ".marathon/metrics/Chapter14-1-proj.json"
+    (repo / ".marathon" / "metrics").mkdir(parents=True)
+    (repo / shard).write_text("{}")
     result = pp.run_git_commit(
-        repo, repo / "Demo" / "Chapter14", "msg", commit_metadata=False
+        repo, repo / "Demo" / "Chapter14", "msg",
+        commit_metadata=False, metrics_shard=shard,
     )
     assert result.sha == "abcdef12"
     staged = staged_paths(git_calls)
     assert "Demo/Chapter14" in staged
-    assert ".marathon/PromptLog.md" in staged
-    assert ".marathon/wall-time.json" in staged
+    assert shard in staged
+    # The shared rollups must NOT ride a refine commit — that's the bug.
+    assert ".marathon/PromptLog.md" not in staged
+    assert ".marathon/wall-time.json" not in staged
     assert "formalization.yaml" not in staged
 
 
-def test_default_commit_still_stages_yaml(tmp_path, git_calls):
-    """Parity: single-flight runs (no conductor) keep today's behavior —
-    the yaml is bundled into the iteration commit."""
+def test_default_commit_stages_yaml_and_shard_not_rollups(tmp_path, git_calls):
+    """Parity: single-flight runs still bundle the yaml, plus the per-run
+    shard — but never the shared rollups."""
     repo = make_repo(tmp_path)
-    pp.run_git_commit(repo, repo / "Demo" / "Chapter14", "msg")
+    shard = ".marathon/metrics/Chapter14-1-proj.json"
+    (repo / ".marathon" / "metrics").mkdir(parents=True)
+    (repo / shard).write_text("{}")
+    pp.run_git_commit(
+        repo, repo / "Demo" / "Chapter14", "msg", metrics_shard=shard,
+    )
     staged = staged_paths(git_calls)
     assert "formalization.yaml" in staged
-    assert ".marathon/wall-time.json" in staged
+    assert shard in staged
+    assert ".marathon/wall-time.json" not in staged
+    assert ".marathon/PromptLog.md" not in staged
 
 
 # --- run_post_pipeline: refresh skipped, flag threaded ----------------------------
@@ -136,7 +149,7 @@ def _commit_spy(monkeypatch):
 
     def fake_commit(repo_dir, target_path, message, project_id=None,
                     claude_in_loop=False, extra_paths=None,
-                    commit_metadata=True):
+                    commit_metadata=True, metrics_shard=None):
         seen["commit_metadata"] = commit_metadata
         return pp.CommitResult(sha="abc1234")
 
@@ -467,12 +480,20 @@ def test_hook_regenerates_on_clean_base_branch(tmp_path, conductor_git, monkeypa
     """Clean primary checkout on the base branch: regenerate, commit,
     push following the jobs' auto-push setting (DEFAULT_REFINE_ARGS)."""
     cfg = make_cfg(tmp_path)
+    # A merged refine left a shard behind; the hook aggregates it and ships
+    # the metrics dir on the same PR.
+    (cfg.repo_dir / ".marathon" / "metrics").mkdir(parents=True)
+    (cfg.repo_dir / ".marathon" / "metrics" / "Chapter14-22-proj.json").write_text(
+        '{"project_id": "proj", "wall_seconds": 10}'
+    )
     seen: dict = {}
 
-    def spy(repo_dir, *, commit, push, github_repo=None, base_branch="main"):
+    def spy(repo_dir, *, commit, push, github_repo=None, base_branch="main",
+            extra_paths=None):
         seen.update(
             repo_dir=repo_dir, commit=commit, push=push,
             github_repo=github_repo, base_branch=base_branch,
+            extra_paths=extra_paths,
         )
         return True
 
@@ -480,16 +501,18 @@ def test_hook_regenerates_on_clean_base_branch(tmp_path, conductor_git, monkeypa
 
     conductor._regenerate_metadata_after_success(cfg)
 
-    assert seen == {
-        "repo_dir": cfg.repo_dir,
-        "commit": True,
-        "push": "--auto-push" in daemon.DEFAULT_REFINE_ARGS,
-        # The GH013 fix routes the central regen through a PR: the
-        # conductor threads the repo slug + base branch so regenerate
-        # never direct-pushes the ruleset-protected main.
-        "github_repo": cfg.github_repo,
-        "base_branch": conductor.METADATA_BASE_BRANCH,
-    }
+    assert seen["repo_dir"] == cfg.repo_dir
+    assert seen["commit"] is True
+    assert seen["push"] == ("--auto-push" in daemon.DEFAULT_REFINE_ARGS)
+    # The GH013 fix routes the central regen through a PR: the conductor
+    # threads the repo slug + base branch so regenerate never direct-pushes
+    # the ruleset-protected main.
+    assert seen["github_repo"] == cfg.github_repo
+    assert seen["base_branch"] == conductor.METADATA_BASE_BRANCH
+    # The shard aggregation rides the SAME PR: the conductor passes the
+    # regenerated rollups + the metrics dir as extra_paths.
+    assert ".marathon/wall-time.json" in (seen["extra_paths"] or [])
+    assert ".marathon/metrics" in (seen["extra_paths"] or [])
 
 
 def test_hook_defers_on_non_base_branch(tmp_path, conductor_git, monkeypatch, capsys):
@@ -530,8 +553,8 @@ def test_hook_proceeds_over_marathon_bookkeeping_dirt(
     seen: dict = {}
     monkeypatch.setattr(
         formalization, "regenerate_metadata",
-        lambda repo_dir, *, commit, push, github_repo=None, base_branch="main":
-            seen.update(commit=commit) or True,
+        lambda repo_dir, *, commit, push, github_repo=None, base_branch="main",
+        extra_paths=None: seen.update(commit=commit) or True,
     )
 
     conductor._regenerate_metadata_after_success(cfg)

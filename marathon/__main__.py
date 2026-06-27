@@ -545,6 +545,53 @@ def _add_formalization_subparser(subparsers) -> None:
     )
     p_bf.set_defaults(func=_run_formalization_backfill_wall_time)
 
+    p_bfs = sub.add_parser(
+        "backfill-shards",
+        help=(
+            "One-time: emit per-run metric shards from the existing "
+            "wall-time.json + PromptLog.md (lossless, idempotent)."
+        ),
+        description=(
+            "Reads the CURRENT .marathon/wall-time.json (its projects + "
+            "build_only_seconds) and .marathon/PromptLog.md (its UUID "
+            "lines) and writes one shard per project/run under "
+            ".marathon/metrics/. After this, regenerating the rollups from "
+            "(legacy + shards) reproduces today's content — nothing is "
+            "lost. Idempotent: shard paths are keyed by project UUID, so "
+            "re-running overwrites rather than duplicates. Run this once "
+            "per consumer repo when upgrading to the shard-based metrics, "
+            "then `marathon formalization aggregate-metrics` to verify the "
+            "rollups round-trip. Offline: no Aristotle/network calls."
+        ),
+    )
+    p_bfs.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Repo root (must contain .marathon/). Default: current directory.",
+    )
+    p_bfs.set_defaults(func=_run_formalization_backfill_shards)
+
+    p_agg = sub.add_parser(
+        "aggregate-metrics",
+        help=(
+            "Aggregate every .marathon/metrics/ shard back into the "
+            "wall-time.json + PromptLog.md rollups and refresh the ledger."
+        ),
+        description=(
+            "The central rollup step the conductor runs after each "
+            "successful job, exposed as a CLI for manual regeneration / "
+            "verification. Folds every per-run shard (plus whatever is "
+            "already in the two rollups) into .marathon/wall-time.json "
+            "(sum/merge by project UUID) and .marathon/PromptLog.md "
+            "(deduped, sorted lines), then imports them into the ledger. "
+            "Offline: no Aristotle/network calls."
+        ),
+    )
+    p_agg.add_argument(
+        "--repo-dir", type=Path, default=Path.cwd(),
+        help="Repo root (must contain .marathon/). Default: current directory.",
+    )
+    p_agg.set_defaults(func=_run_formalization_aggregate_metrics)
+
 
 def _add_ledger_subparser(subparsers) -> None:
     """Adds `marathon ledger init/import/status` for the Phase-1 runtime
@@ -2572,6 +2619,50 @@ def _run_formalization_backfill_wall_time(args) -> None:
             print(f"  (no formalization.yaml at {repo_dir}; sidecar updated, yaml unchanged)")
         else:
             print(f"  refreshed {written} (wall_time = {format_wall_time(total)})")
+
+
+def _run_formalization_backfill_shards(args) -> None:
+    """`marathon formalization backfill-shards` — turn the existing
+    wall-time.json + PromptLog.md rollups into per-run metric shards."""
+    from marathon.metrics import METRICS_DIR_RELPATH, backfill_shards
+
+    repo_dir: Path = args.repo_dir.resolve()
+    summary = backfill_shards(repo_dir)
+    metrics_dir = repo_dir / METRICS_DIR_RELPATH
+    print(
+        f"backfilled metric shards into {metrics_dir}:\n"
+        f"  PromptLog submissions: {summary['promptlog_shards']} shard(s)\n"
+        f"  wall-time projects:    {summary['wall_shards']} shard(s)\n"
+        f"  build-only seconds:    {summary['build_only_seconds']}"
+    )
+    if summary["promptlog_shards"] == 0 and summary["wall_shards"] == 0:
+        print(
+            "  (no PromptLog UUIDs or wall-time projects found under "
+            f"{repo_dir} — is --repo-dir the consumer repo?)"
+        )
+        return
+    print(
+        "  next: `marathon formalization aggregate-metrics` regenerates "
+        "the rollups from these shards (should reproduce today's content)."
+    )
+
+
+def _run_formalization_aggregate_metrics(args) -> None:
+    """`marathon formalization aggregate-metrics` — fold every shard back
+    into the rollups + refresh the ledger (the conductor's central step)."""
+    from marathon.metrics import read_shards, regenerate_rollups
+
+    repo_dir: Path = args.repo_dir.resolve()
+    n_shards = len(read_shards(repo_dir))
+    written = regenerate_rollups(repo_dir)
+    print(f"aggregated {n_shards} shard(s) → rollups:")
+    for p in written:
+        try:
+            rel = p.relative_to(repo_dir)
+        except ValueError:
+            rel = p
+        print(f"  wrote {rel}")
+    print("  ledger refreshed from the regenerated rollups.")
 
 
 def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:

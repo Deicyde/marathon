@@ -523,7 +523,7 @@ async def _submit_fresh(
     save_state(state_path, state)
     print(f"    submitted: project_id={project.project_id} task_id={task.agent_task_id}")
     if append_promptlog_url(repo_dir, project.project_id):
-        print(f"    PromptLog.md updated")
+        print(f"    metric shard recorded (PromptLog submission)")
     return project, task
 
 
