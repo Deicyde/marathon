@@ -158,6 +158,16 @@ def _writable_paths_for_attempt(
     cross-chapter whitelist applies, preserving deliberate cross-chapter work.
     """
     if review_rejection is not None:
+        # Anti-sprawl: focused rejections are fenced to the target chapter by
+        # default (whitelist dropped to []). An operator can deliberately widen
+        # the writable scope for a genuinely cross-chapter rejection — e.g.
+        # deleting a structure defined in another chapter and migrating its
+        # consumers — via MARATHON_FOCUSED_EXTRA_WRITABLE, a colon-separated
+        # list of repo-relative paths. Empty/unset preserves the fence.
+        import os
+        extra = os.environ.get("MARATHON_FOCUSED_EXTRA_WRITABLE", "").strip()
+        if extra:
+            return [PurePosixPath(p) for p in extra.split(":") if p.strip()]
         return []
     return _load_additional_writable_paths(repo_dir, expected_path)
 
