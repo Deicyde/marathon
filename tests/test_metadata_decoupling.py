@@ -225,7 +225,8 @@ def test_regenerate_metadata_false_when_yaml_missing(tmp_path, formalization_git
 
 def test_regenerate_metadata_commits_real_change(tmp_path, formalization_git):
     """A sorry-count change is a meaningful change: True, plus the
-    mechanical commit (yaml only) and the push the caller asked for."""
+    mechanical commit (yaml only) and, with no github_repo, the LEGACY
+    direct push (the fallback for an unprotected/repo-less main)."""
     repo = seeded_yaml_repo(tmp_path, formalization_git)
     (repo / "Demo" / "Chapter14" / "A.lean").write_text(
         "theorem foo : True := by sorry\n"
@@ -240,6 +241,95 @@ def test_regenerate_metadata_commits_real_change(tmp_path, formalization_git):
     assert ["git", "add", "--", "formalization.yaml"] in git
     assert ["git", "commit", "-m", formalization.REGENERATE_COMMIT_MESSAGE] in git
     assert ["git", "push"] in git
+
+
+def test_regenerate_metadata_routes_push_via_pr_when_repo_given(
+    tmp_path, formalization_git, monkeypatch, capsys
+):
+    """GH013 fix: with a github_repo, a real change is shipped through an
+    auto-merged PR — NOT a direct push to the ruleset-protected main.
+    The regen branch is created + force-pushed, a PR is opened (none yet),
+    and the local commit is un-stranded (reset --soft + restore yaml) so a
+    later reset/pull can't discard it."""
+    repo = seeded_yaml_repo(tmp_path, formalization_git)
+    (repo / "Demo" / "Chapter14" / "A.lean").write_text(
+        "theorem foo : True := by sorry\n"
+    )
+    formalization_git.ls_files = b"Demo/Chapter14/A.lean\x00"
+    formalization_git.porcelain = " M formalization.yaml\n"
+
+    gh_calls: list[list[str]] = []
+
+    def fake_gh(*args, check=True, capture=True):
+        gh_calls.append(list(args))
+        if args[:2] == ("pr", "list"):  # no open PR yet → empty stdout
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if args[:2] == ("pr", "create"):
+            return subprocess.CompletedProcess(
+                args, 0, stdout="https://github.com/x/y/pull/42\n", stderr=""
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    import marathon.review.github as ghmod
+    monkeypatch.setattr(ghmod, "gh", fake_gh)
+
+    assert formalization.regenerate_metadata(
+        repo, commit=True, push=True,
+        github_repo="x/y", base_branch="main",
+    ) is True
+
+    git = [c for c in formalization_git.calls if c[0] == "git"]
+    # Committed the yaml, then routed via the regen branch — NEVER a bare push.
+    assert ["git", "commit", "-m", formalization.REGENERATE_COMMIT_MESSAGE] in git
+    assert ["git", "push"] not in git
+    assert ["git", "branch", "-f", formalization.METADATA_REGEN_BRANCH, "HEAD"] in git
+    assert [
+        "git", "push", "--force", "origin",
+        f"HEAD:refs/heads/{formalization.METADATA_REGEN_BRANCH}",
+    ] in git
+    # Un-stranding: drop the local commit without touching the worktree, then
+    # restore ONLY the yaml (never a --hard that would revert .marathon/ dirt).
+    assert ["git", "reset", "--soft", "HEAD~1"] in git
+    assert ["git", "checkout", "HEAD", "--", "formalization.yaml"] in git
+    assert not any(c[:2] == ["git", "reset"] and "--hard" in c for c in git)
+    # PR opened idempotently: list first (none open), then create.
+    assert gh_calls[0][:2] == ["pr", "list"]
+    create = [c for c in gh_calls if c[:2] == ["pr", "create"]]
+    assert create and "--base" in create[0] and "main" in create[0]
+    assert formalization.METADATA_REGEN_BRANCH in create[0]
+
+
+def test_regenerate_metadata_pr_route_is_idempotent_when_pr_open(
+    tmp_path, formalization_git, monkeypatch, capsys
+):
+    """An already-open PR for the regen head must NOT be re-created: the
+    force-push alone updates it. Only `pr list` runs; `pr create` is
+    skipped."""
+    repo = seeded_yaml_repo(tmp_path, formalization_git)
+    (repo / "Demo" / "Chapter14" / "A.lean").write_text(
+        "theorem foo : True := by sorry\n"
+    )
+    formalization_git.ls_files = b"Demo/Chapter14/A.lean\x00"
+    formalization_git.porcelain = " M formalization.yaml\n"
+
+    gh_calls: list[list[str]] = []
+
+    def fake_gh(*args, check=True, capture=True):
+        gh_calls.append(list(args))
+        if args[:2] == ("pr", "list"):  # an open PR already exists → "7"
+            return subprocess.CompletedProcess(args, 0, stdout="7\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    import marathon.review.github as ghmod
+    monkeypatch.setattr(ghmod, "gh", fake_gh)
+
+    assert formalization.regenerate_metadata(
+        repo, commit=True, push=True,
+        github_repo="x/y", base_branch="main",
+    ) is True
+
+    assert [c for c in gh_calls if c[:2] == ["pr", "create"]] == []
+    assert "#7" in capsys.readouterr().out
 
 
 def test_regenerate_metadata_timestamp_only_is_not_a_change(
@@ -379,8 +469,11 @@ def test_hook_regenerates_on_clean_base_branch(tmp_path, conductor_git, monkeypa
     cfg = make_cfg(tmp_path)
     seen: dict = {}
 
-    def spy(repo_dir, *, commit, push):
-        seen.update(repo_dir=repo_dir, commit=commit, push=push)
+    def spy(repo_dir, *, commit, push, github_repo=None, base_branch="main"):
+        seen.update(
+            repo_dir=repo_dir, commit=commit, push=push,
+            github_repo=github_repo, base_branch=base_branch,
+        )
         return True
 
     monkeypatch.setattr(formalization, "regenerate_metadata", spy)
@@ -391,6 +484,11 @@ def test_hook_regenerates_on_clean_base_branch(tmp_path, conductor_git, monkeypa
         "repo_dir": cfg.repo_dir,
         "commit": True,
         "push": "--auto-push" in daemon.DEFAULT_REFINE_ARGS,
+        # The GH013 fix routes the central regen through a PR: the
+        # conductor threads the repo slug + base branch so regenerate
+        # never direct-pushes the ruleset-protected main.
+        "github_repo": cfg.github_repo,
+        "base_branch": conductor.METADATA_BASE_BRANCH,
     }
 
 
@@ -432,7 +530,8 @@ def test_hook_proceeds_over_marathon_bookkeeping_dirt(
     seen: dict = {}
     monkeypatch.setattr(
         formalization, "regenerate_metadata",
-        lambda repo_dir, *, commit, push: seen.update(commit=commit) or True,
+        lambda repo_dir, *, commit, push, github_repo=None, base_branch="main":
+            seen.update(commit=commit) or True,
     )
 
     conductor._regenerate_metadata_after_success(cfg)

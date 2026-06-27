@@ -936,6 +936,12 @@ def _regenerate_metadata_after_success(cfg: ReviewConfig) -> None:
     try:
         changed = regenerate_metadata(
             cfg.repo_dir, commit=True, push=_metadata_push_enabled(),
+            # Route the central regen through an auto-merged PR instead of
+            # a direct push to main: main is ruleset-protected, so a direct
+            # push to refs/heads/main is rejected with GH013 and the commit
+            # silently never reaches origin (GH013 metadata-push bug).
+            github_repo=cfg.github_repo,
+            base_branch=METADATA_BASE_BRANCH,
         )
     except Exception as e:  # noqa: BLE001 — bookkeeping must not kill the loop
         print(f"  metadata: regeneration skipped — {type(e).__name__}: {e}")

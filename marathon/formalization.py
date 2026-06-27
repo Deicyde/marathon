@@ -894,6 +894,23 @@ def update_formalization(
 # derived from repo state, not from any one job).
 REGENERATE_COMMIT_MESSAGE = "chore(marathon): regenerate formalization.yaml"
 
+# Dedicated throwaway head branch for the central metadata regen PR. The
+# conductor regenerates the root ``formalization.yaml`` in the PRIMARY
+# checkout (which sits on the protected ``main``); a direct push to
+# ``refs/heads/main`` is rejected by the branch ruleset with GH013
+# (pull_request + non_fast_forward + deletion required). So instead of
+# pushing the current branch to main, we force-push the regen commit to
+# this side branch and route it through an auto-merged PR (the existing
+# automerge cycle squash-merges it — root-level formalization.yaml is not
+# a gated SAFE_INFRA_PR). The branch is a single-writer scratch ref, so a
+# plain --force is safe.
+METADATA_REGEN_BRANCH = "marathon/metadata-regen"
+METADATA_REGEN_PR_TITLE = "chore(marathon): regenerate formalization.yaml"
+METADATA_REGEN_PR_BODY = (
+    "Automated metadata regeneration (routed via PR because `main` is "
+    "ruleset-protected). Squash-merged by the marathon auto-merge cycle."
+)
+
 # Marathon's own runtime bookkeeping lives under .marathon/ —
 # review/state.json, wall-time.json, PromptLog.md, conductor/ — and
 # record_iteration & friends rewrite it on every success. Consumer
@@ -927,6 +944,8 @@ def regenerate_metadata(
     *,
     commit: bool = False,
     push: bool = False,
+    github_repo: Optional[str] = None,
+    base_branch: str = "main",
 ) -> bool:
     """Regenerate ``formalization.yaml``'s auto-fields, optionally
     committing the result. Returns True iff the yaml meaningfully
@@ -954,8 +973,24 @@ def regenerate_metadata(
     Committing alongside unrelated dirt would smuggle operator
     work-in-progress into a machine commit; in that case the file is
     still updated (the change rides along with the next commit) and a
-    note is printed. ``push=True`` runs ``git push`` after a
-    successful commit.
+    note is printed.
+
+    ``push=True`` ships the metadata commit. It does NOT push the current
+    branch to ``base_branch`` directly: the primary checkout sits on the
+    protected ``main`` and a direct push to ``refs/heads/main`` is
+    rejected by the branch ruleset with GH013 (the commit lands locally
+    but never reaches origin, then a later reset/pull silently discards
+    it — a metadata-update outage). Instead, when ``github_repo`` is
+    given, the regen commit is force-pushed to the throwaway
+    ``METADATA_REGEN_BRANCH`` and routed through an idempotent PR
+    (created once; thereafter the branch is just re-force-pushed so the
+    open PR picks up the new content). The existing auto-merge cycle
+    squash-merges it. The local primary-checkout commit is then
+    un-stranded with ``git reset --soft base_branch``'s origin tip so the
+    regen commit is not later discarded and unrelated work is preserved.
+    When ``github_repo`` is None (e.g. main is not ruleset-protected, or
+    no GitHub repo is configured), it falls back to the legacy direct
+    ``git push``.
     """
     yaml_path = repo_dir / FORMALIZATION_FILENAME
     if not yaml_path.is_file():
@@ -1007,16 +1042,165 @@ def regenerate_metadata(
             )
             return True
         if push:
-            push_proc = subprocess.run(
-                ["git", "push"],
-                cwd=str(repo_dir), capture_output=True, text=True, check=False,
-            )
-            if push_proc.returncode != 0:
-                print(
-                    "  formalization: metadata commit landed but push "
-                    f"failed — {((push_proc.stderr or push_proc.stdout) or '').strip()[:200]}"
+            if github_repo:
+                _push_metadata_via_pr(repo_dir, github_repo, base_branch)
+            else:
+                # Legacy direct push — only reached when no GitHub repo is
+                # configured (or main is known-unprotected). main IS
+                # ruleset-protected in the live project, so the conductor
+                # always passes github_repo and takes the PR route above.
+                push_proc = subprocess.run(
+                    ["git", "push"],
+                    cwd=str(repo_dir), capture_output=True, text=True, check=False,
                 )
+                if push_proc.returncode != 0:
+                    print(
+                        "  formalization: metadata commit landed but push "
+                        f"failed — {((push_proc.stderr or push_proc.stdout) or '').strip()[:200]}"
+                    )
     return True
+
+
+def _push_metadata_via_pr(
+    repo_dir: Path, github_repo: str, base_branch: str
+) -> None:
+    """Ship the just-made metadata commit (now at HEAD of the primary
+    checkout) through an auto-merged PR instead of a direct push to the
+    ruleset-protected ``base_branch``.
+
+    Steps:
+      (a) point the throwaway regen branch at the new commit;
+      (b) force-push it to origin (single-writer scratch ref → --force is
+          safe, and avoids stale remote-tracking / push.default surprises);
+      (c) idempotently ensure an open PR exists for that head (skip create
+          when one is already open — the force-push above already updated
+          its content);
+      (d) un-strand the local commit so a later reset/pull in the primary
+          checkout does not silently discard it.
+
+    Any failure is reported and swallowed: a metadata-shipping hiccup must
+    never crash the conductor loop (the caller already wraps this, but we
+    keep each git/gh boundary non-fatal for a precise message)."""
+    # (a) regen branch -> the new commit (HEAD).
+    br = subprocess.run(
+        ["git", "branch", "-f", METADATA_REGEN_BRANCH, "HEAD"],
+        cwd=str(repo_dir), capture_output=True, text=True, check=False,
+    )
+    if br.returncode != 0:
+        print(
+            "  formalization: metadata commit landed but regen-branch "
+            f"reset failed — {((br.stderr or br.stdout) or '').strip()[:200]}"
+        )
+        return
+    # (b) force-push to the explicit refspec (robust to stale tracking refs).
+    push = subprocess.run(
+        ["git", "push", "--force", "origin",
+         f"HEAD:refs/heads/{METADATA_REGEN_BRANCH}"],
+        cwd=str(repo_dir), capture_output=True, text=True, check=False,
+    )
+    if push.returncode != 0:
+        print(
+            "  formalization: metadata commit landed but regen-branch push "
+            f"failed — {((push.stderr or push.stdout) or '').strip()[:200]}"
+        )
+        return
+    # (c) idempotent PR: create only when none is open for this head.
+    _ensure_metadata_regen_pr(repo_dir, github_repo, base_branch)
+    # (d) un-strand the local commit (see helper for the safety argument).
+    _unstrand_primary_after_regen_push(repo_dir, base_branch)
+
+
+def _ensure_metadata_regen_pr(
+    repo_dir: Path, github_repo: str, base_branch: str
+) -> None:
+    """Open a PR for the regen branch only if one is not already open
+    (idempotent — re-running just lets the existing PR pick up the
+    re-force-pushed content)."""
+    from marathon.review.github import gh
+
+    listed = gh(
+        "pr", "list", "--repo", github_repo,
+        "--head", METADATA_REGEN_BRANCH, "--state", "open",
+        "--json", "number", "--jq", ".[0].number // empty",
+        check=False,
+    )
+    if listed.returncode == 0 and (listed.stdout or "").strip():
+        # An open PR already tracks this head — the force-push updated it.
+        print(
+            "  formalization: metadata regen pushed to existing PR "
+            f"#{listed.stdout.strip()} ({METADATA_REGEN_BRANCH})", flush=True
+        )
+        return
+    created = gh(
+        "pr", "create", "--repo", github_repo,
+        "--base", base_branch, "--head", METADATA_REGEN_BRANCH,
+        "--title", METADATA_REGEN_PR_TITLE, "--body", METADATA_REGEN_PR_BODY,
+        check=False,
+    )
+    if created.returncode != 0:
+        print(
+            "  formalization: metadata regen pushed but PR create failed — "
+            f"{((created.stderr or created.stdout) or '').strip()[:200]}"
+        )
+        return
+    url = (created.stdout or "").strip().splitlines()
+    print(
+        "  formalization: metadata regen routed via PR "
+        f"{url[-1] if url else METADATA_REGEN_BRANCH}", flush=True
+    )
+
+
+def _unstrand_primary_after_regen_push(repo_dir: Path, base_branch: str) -> None:
+    """Return the primary checkout to a clean base-branch state so the
+    just-made regen commit (now stranded only on the local branch tip) is
+    not later discarded by a ``git reset``/``git pull`` — origin holds it
+    via the regen branch + PR, and the next conductor fast-forward brings
+    it back once the PR squash-merges.
+
+    What "clean" means here, and why this is safe:
+    - The conductor only calls ``regenerate_metadata`` after confirming
+      (``_regenerate_metadata_after_success``) the primary checkout is on
+      the base branch with a tree clean of everything except UNSTAGED
+      ``.marathon/`` bookkeeping. ``regenerate_metadata`` then staged and
+      committed ONLY ``formalization.yaml``, so the lone tracked delta we
+      introduced is that one-file commit.
+    - We undo it in two narrow steps that never touch ``.marathon/`` or
+      any other path:
+        (1) ``git reset --soft HEAD~1`` drops the regen commit from the
+            current branch (HEAD → its parent = origin/main tip) WITHOUT
+            touching the working tree; the commit stays reachable via
+            ``METADATA_REGEN_BRANCH`` + origin. This leaves ``yaml``
+            staged-as-modified and otherwise preserves all worktree state.
+        (2) ``git checkout HEAD -- formalization.yaml`` restores ONLY that
+            one path (index + worktree) to the parent commit's version, so
+            the checkout matches origin/main exactly and is clean again.
+      A ``reset --hard`` is deliberately avoided: it would revert
+      modified-but-unstaged tracked ``.marathon/`` bookkeeping the
+      conductor relies on (untracked ``.marathon/`` files survive, but
+      tracked ones do not)."""
+    reset = subprocess.run(
+        ["git", "reset", "--soft", "HEAD~1"],
+        cwd=str(repo_dir), capture_output=True, text=True, check=False,
+    )
+    if reset.returncode != 0:
+        # Non-fatal: the commit is already safely on the regen branch +
+        # the PR. Worst case a later reset discards the LOCAL copy, which
+        # is fine — origin has it. Just note it.
+        print(
+            "  formalization: metadata regen shipped, but local un-strand "
+            f"(reset --soft) failed — {((reset.stderr or reset.stdout) or '').strip()[:200]}"
+        )
+        return
+    restore = subprocess.run(
+        ["git", "checkout", "HEAD", "--", FORMALIZATION_FILENAME],
+        cwd=str(repo_dir), capture_output=True, text=True, check=False,
+    )
+    if restore.returncode != 0:
+        print(
+            "  formalization: metadata regen shipped + branch un-stranded, "
+            "but restoring the worktree yaml left it staged — "
+            f"{((restore.stderr or restore.stdout) or '').strip()[:200]}"
+        )
 
 
 def _strip_auto_stamp(text: str) -> str:
