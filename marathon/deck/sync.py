@@ -52,13 +52,24 @@ def _recover_from_marathon_divergence(repo_dir: Path, before: str) -> str:
     """Recover a deck checkout that ``git pull --ff-only`` can no longer advance.
 
     The deck's tree is a read-only MIRROR of its upstream, but the co-located
-    ``marathon conductor`` commits a ``formalization.yaml`` regen onto it; if that
-    commit doesn't push (e.g. origin advanced via automerge first) the checkout
-    diverges and the ff-only pull wedges FOREVER — the silent staleness that made
-    a reviewer re-reject an already-fixed decl. Reset to the upstream, but ONLY
-    when every local-ahead commit is a marathon metadata commit (never clobber
-    operator commits), preserving tracked review-state edits across the reset
-    (untracked files survive ``reset --hard``)."""
+    ``marathon conductor`` writes review state and commits a ``formalization.yaml``
+    regen onto it. Two failure shapes wedge the ff-only pull FOREVER — the silent
+    staleness that made a reviewer re-reject an already-fixed decl (its card never
+    dropped because the stale tree still ``in_code``-matched it):
+
+      * DIVERGED — a local metadata commit didn't push (origin advanced via
+        automerge first), so HEAD is ahead of upstream; reset --hard to upstream,
+        but ONLY when every local-ahead commit is a marathon metadata commit
+        (operator commits are never clobbered).
+      * BEHIND-BLOCKED — HEAD is merely behind, but dirty/untracked review-state
+        churn under ``.marathon`` blocks the fast-forward; stash it and ff-only.
+
+    Both end with a CURRENT working tree. The dirty TRACKED review-state churn is
+    stashed across the advance and restored after; untracked deck-local state
+    (in-progress per-decl verdicts) is left in place — never upstream-tracked, it
+    neither blocks the ff nor is lost. The conductor re-derives the tracked review
+    state from upstream, so an unresolvable restore conflict keeps the advanced
+    (upstream) tree rather than re-wedging."""
     _git(repo_dir, "fetch", "origin", "--quiet")
     up = _git(repo_dir, "rev-parse", "--abbrev-ref", "@{u}")
     if up.returncode != 0:
@@ -66,26 +77,58 @@ def _recover_from_marathon_divergence(repo_dir: Path, before: str) -> str:
     upstream = up.stdout.strip()
     log = _git(repo_dir, "log", "--format=%s", f"{upstream}..HEAD")
     subjects = [s for s in (log.stdout or "").splitlines() if s.strip()]
-    if not subjects:
-        return f"pull failed (ff-only) but not ahead of {upstream}; manual check"
-    if not all(_MARATHON_METADATA_RE.search(s) for s in subjects):
+    # Never clobber operator commits: if AHEAD by any non-marathon commit, bail.
+    if subjects and not all(_MARATHON_METADATA_RE.search(s) for s in subjects):
         return (f"diverged from {upstream} by {len(subjects)} non-marathon "
                 "commit(s); NOT resetting — resolve manually")
+    bc = _git(repo_dir, "rev-list", "--count", f"HEAD..{upstream}")
+    n_behind = int(bc.stdout.strip()) if bc.returncode == 0 and bc.stdout.strip().isdigit() else 0
+    if not subjects and n_behind == 0:
+        # ff-only failed yet we are neither ahead nor behind — a genuine oddity
+        # (detached HEAD, ref race). Leave it for a human rather than guess.
+        return f"pull failed (ff-only) but in sync with {upstream}; manual check"
+
+    # Two recoverable shapes, both ending with a CURRENT working tree (which is all
+    # the deck's in_code/reconcile needs so stale cards drop themselves):
+    #   AHEAD only by marathon-metadata commits  -> reset --hard to upstream
+    #   purely BEHIND, ff blocked by dirty/untracked review-state churn -> ff-only
+    # Stash the dirty TRACKED churn (review-state files the conductor co-writes) so
+    # the advance is clean; untracked deck-local state (in-progress per-decl
+    # verdicts) is left in place — it is never upstream-tracked, so it neither
+    # blocks the ff nor risks being lost in the stash. The conductor authoritatively
+    # re-derives the tracked review state from upstream, so on an unresolvable
+    # restore conflict we keep the advanced (upstream) tree rather than re-wedge.
     stash = _git(repo_dir, "stash", "push", "-m", "deck-sync-autostash")
     stashed = stash.returncode == 0 and "No local changes" not in (stash.stdout or "")
-    reset = _git(repo_dir, "reset", "--hard", upstream)
-    if reset.returncode != 0:
+    if subjects:
+        adv = _git(repo_dir, "reset", "--hard", upstream)
+        kind = f"dropped {len(subjects)} marathon metadata commit(s)"
+    else:
+        adv = _git(repo_dir, "merge", "--ff-only", upstream, "--quiet")
+        kind = f"fast-forwarded {n_behind} commit(s)"
+    if adv.returncode != 0:
         if stashed:
             _git(repo_dir, "stash", "pop")
-        return f"diverged; reset to {upstream} failed: {(reset.stderr or '')[:80]}"
+        return f"recover to {upstream} failed: {(adv.stderr or '')[:80]}"
+    after = _head(repo_dir)  # tree is now current — in_code is accurate from here
     if stashed:
         pop = _git(repo_dir, "stash", "pop")
         if pop.returncode != 0:
-            return (f"recovered to {upstream} but review-state stash pop "
-                    "conflicted — restore manually (`git stash list`)")
-    after = _head(repo_dir)
-    return (f"recovered diverged checkout {before[:7]} → {after[:7]} "
-            f"(dropped {len(subjects)} marathon metadata commit(s))")
+            # The advance already won (current code = the goal). Keep what applied
+            # cleanly; resolve ONLY the genuinely-conflicting review-state files
+            # toward upstream (the conductor re-derives those), so the deck
+            # self-heals without re-wedging or discarding clean local edits.
+            unmerged = [p for p in (_git(
+                repo_dir, "diff", "--name-only", "--diff-filter=U").stdout or ""
+            ).splitlines() if p.strip()]
+            if unmerged:
+                _git(repo_dir, "checkout", "HEAD", "--", *unmerged)
+            else:
+                _git(repo_dir, "reset", "--hard", "HEAD")
+            _git(repo_dir, "stash", "drop")
+            return (f"recovered wedged checkout {before[:7]} → {after[:7]} ({kind}); "
+                    f"{len(unmerged)} review-state file(s) conflicted — kept upstream")
+    return f"recovered wedged checkout {before[:7]} → {after[:7]} ({kind})"
 
 
 def pull_once(repo_dir: Path) -> str:
