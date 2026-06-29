@@ -738,8 +738,193 @@ def orphaned_chapter_decls(
     return [n for n in live_names if n not in cited_union]
 
 
+def _chapter_diff_paths(cfg: "ReviewConfig", chapter: int) -> "list[str]":
+    """The git ``-- <pathspec>`` list that scopes a diff to ``chapter``'s Lean
+    source — its target FOLDER and the single-file ``<folder>.lean`` form (the
+    chapter may be either a directory of modules or one flat file). Repo-relative
+    POSIX, the shape ``git diff -- …`` expects. ``[]`` when the path can't be
+    made repo-relative (then the caller's diff-window step is skipped)."""
+    try:
+        rel = cfg.target_path(chapter).relative_to(cfg.repo_dir).as_posix()
+    except ValueError:
+        return []
+    return [rel, rel + ".lean"]
+
+
+def _leaf_of(name: str) -> str:
+    """The last dotted component of ``name`` (``A.B.foo`` → ``foo``; a bare
+    ``foo`` → ``foo``)."""
+    return name.rsplit(".", 1)[-1]
+
+
+def _live_name_for(added_leaf: str, live_names: "list[str]") -> Optional[str]:
+    """The UNIQUE live decl whose dotted-leaf equals ``added_leaf`` — the bridge
+    from a diff-window added NAME (which the diff sees with whatever qualification
+    the source line carried, often bare under an open ``namespace``) to its
+    fully-qualified live snapshot name. ``None`` when zero or ≥2 live decls share
+    the leaf (ambiguous → no confident map)."""
+    matches = [n for n in live_names if _leaf_of(n) == added_leaf]
+    return matches[0] if len(matches) == 1 else None
+
+
+def classify_diff_window(
+    stale: "list[str]",
+    added_decls: "set[str]",
+    removed_decls: "set[str]",
+    *,
+    live_names: "list[str]",
+    orphaned: "list[str]",
+    cited_set: "set[str]",
+) -> dict:
+    """Classify each STALE cited decl against the refine diff window's
+    ``added``/``removed`` decl sets (the step-1 oracle), driving the
+    restate-after-refine reconcile. Pure — no I/O. Returns a dict:
+
+    * ``renames`` — ``[{old, new}]``: exactly ONE added decl replaces the stale
+      one (RENAME). Matched by a shared dotted-LEAF, OR — when the leaf differs —
+      when the stale decl and the added decl are the SOLE removed/added pair in
+      this window (provenance: one decl went out, one came in). ``new`` is the
+      live, fully-qualified name (resolved via the leaf, so the caller can re-pin
+      the permalink).
+    * ``splits`` — ``[{old, targets:[…]}]``: TWO OR MORE added decls replace the
+      stale one (SPLIT). A stale ``A_iff_C`` whose window added ``A_imp_C`` +
+      ``C_imp_A`` (the #166 shape) maps to both. ``targets`` are live qualified
+      names; a split is only emitted when EVERY target resolves to a live name.
+    * ``deletes`` — ``[old]``: the stale decl was REMOVED in this window and NO
+      added decl is its replacement (a confirmed dead-end). Only the diff
+      CONFIRMING the removal (``old`` ∈ ``removed``) qualifies — an in_code=False
+      from an unrelated cause is left to ``kept_stale``.
+    * ``adds`` — ``[name]``: live qualified names the window ADDED that are not
+      any stale decl's rename/split target — the leftover sublemmas/new decls the
+      issue should also cite. (Association to the issue is the caller's job —
+      this returns every window-added decl that survived as a leftover.)
+    * ``kept_stale`` — ``[old]``: stale decls the window does NOT explain (no
+      window removal, or a split with an unresolvable target). Left for the
+      caller's fallback (leaf-match) / a future pass — never dropped here.
+
+    SPLIT vs RENAME vs DELETE is decided per stale decl by how many of the
+    window's added decls are ITS replacements:
+
+    * The candidate replacements of a stale ``S`` are the window-added decls
+      sharing ``S``'s LEAF-family — added decls whose leaf starts with / contains
+      ``S``'s key part, PLUS (for the sole-pair case) the lone added decl when
+      ``S`` is the lone removal. We keep it conservative: a split's targets must
+      each be window-added AND share a recognisable relationship to ``S`` (its
+      leaf is a substring of the target's leaf, the natural ``a_iff_c`` →
+      ``a_imp_c``/``c_imp_a`` shape), else we don't claim them.
+    """
+    out: dict = {
+        "renames": [], "splits": [], "deletes": [], "adds": [], "kept_stale": [],
+    }
+    # Live names available to resolve an added leaf → qualified name. Includes
+    # orphaned (a fresh decl is orphaned) plus the whole live set as a fallback.
+    consumed_targets: set[str] = set()
+
+    # Added decls as (leaf -> qualified-live-name) where resolvable; an added
+    # decl that resolves to nothing live (e.g. immediately renamed again) is held
+    # by its raw leaf so split/rename matching can still see it by leaf.
+    added_leaves = {_leaf_of(a) for a in added_decls}
+
+    def _resolve_added(leaf: str) -> Optional[str]:
+        # Prefer an orphaned live decl with this leaf (the fresh-decl home), then
+        # any unique live decl with the leaf.
+        for pool in (orphaned, live_names):
+            hit = _live_name_for(leaf, pool)
+            if hit is not None and hit not in consumed_targets:
+                return hit
+        return None
+
+    sole_removal = len(removed_decls) == 1
+    sole_addition = len(added_decls) == 1
+
+    for s in stale:
+        s_leaf = _leaf_of(s)
+        s_removed = s in removed_decls or s_leaf in {_leaf_of(r) for r in removed_decls}
+
+        # The window-added decls that are plausibly THIS stale decl's replacement:
+        # an added leaf that CONTAINS the stale leaf's distinguishing part, or the
+        # stale leaf contains the added (a split sublemma narrows the iff). We use
+        # a token-overlap test on the leaf words so `Foo_a_iff_c` matches
+        # `Foo_a_imp_c` / `Foo_c_imp_a` but not an unrelated `bar`.
+        split_targets_leaves = [
+            al for al in added_leaves if _leaves_related(s_leaf, al)
+        ]
+
+        if len(split_targets_leaves) >= 2:
+            resolved = [_resolve_added(al) for al in sorted(split_targets_leaves)]
+            if all(r is not None for r in resolved):
+                for r in resolved:
+                    consumed_targets.add(r)  # type: ignore[arg-type]
+                out["splits"].append({"old": s, "targets": resolved})
+                continue
+            # A target couldn't be located → don't drop; leave for next pass.
+            out["kept_stale"].append(s)
+            continue
+
+        if len(split_targets_leaves) == 1:
+            new = _resolve_added(split_targets_leaves[0])
+            if new is not None:
+                consumed_targets.add(new)
+                out["renames"].append({"old": s, "new": new})
+                continue
+            out["kept_stale"].append(s)
+            continue
+
+        # No leaf-related added decl. Sole-pair provenance: exactly one removal
+        # (this stale) and exactly one addition in the window ⇒ that addition is
+        # the rename target even when the leaf changed entirely.
+        if s_removed and sole_removal and sole_addition:
+            only_added_leaf = next(iter(added_leaves))
+            new = _resolve_added(only_added_leaf)
+            if new is not None:
+                consumed_targets.add(new)
+                out["renames"].append({"old": s, "new": new})
+                continue
+
+        # The stale decl was removed in THIS window with no replacement found ⇒ a
+        # confirmed DELETE. Otherwise the window doesn't explain it → keep.
+        if s_removed:
+            out["deletes"].append(s)
+        else:
+            out["kept_stale"].append(s)
+
+    # Leftover ADDs: window-added decls that no rename/split claimed, resolved to
+    # their live qualified names, excluding anything already cited by the issue.
+    for leaf in sorted(added_leaves):
+        new = _resolve_added(leaf)
+        if new is None or new in consumed_targets or new in cited_set:
+            continue
+        out["adds"].append(new)
+        consumed_targets.add(new)
+
+    return out
+
+
+def _leaves_related(stale_leaf: str, added_leaf: str) -> bool:
+    """Whether ``added_leaf`` is plausibly a RENAME/SPLIT product of
+    ``stale_leaf`` — a conservative word-token test on the underscore-delimited
+    leaf parts. True when the two leaves are equal (a namespace-only rename keeps
+    the leaf), or when ``stale_leaf``'s word-tokens are a STRICT subset of (or
+    superset-overlap with) ``added_leaf``'s tokens sharing ≥2 tokens (so an
+    ``a_iff_c`` stale matches the ``a_imp_c`` / ``c_imp_a`` split products — they
+    share ``a``/``c`` plus the result root — but an unrelated ``helper`` does
+    not). The ≥2 shared-token floor is what stops a single common word (``of``,
+    ``to``) over-matching."""
+    if stale_leaf == added_leaf:
+        return True
+    s_tokens = set(stale_leaf.split("_"))
+    a_tokens = set(added_leaf.split("_"))
+    shared = s_tokens & a_tokens
+    if len(shared) < 2:
+        return False
+    # The added leaf must carry MOST of the stale leaf's tokens (a split product
+    # keeps the result root + one direction, dropping the connective like `iff`).
+    return len(shared) >= len(s_tokens) - 1
+
+
 def auto_reconcile_issue(
-    cfg: "ReviewConfig", issue_num: int, *, dry_run: bool = False
+    cfg: "ReviewConfig", issue_num: int, *, dry_run: bool = False,
+    diff_window: "Optional[tuple[str, str]]" = None,
 ) -> dict:
     """SAFE automatic reconcile of one issue's Lean-declaration citations against
     the LIVE code — the hands-off replacement for the manual "refresh from code"
@@ -842,6 +1027,7 @@ def auto_reconcile_issue(
         live_names = live_chapter_decls(cfg, chapter)
         orphaned = orphaned_chapter_decls(cfg, chapter, live_names)
     else:
+        live_names = []
         orphaned = []
 
     # Stale citations: decls cited in the body that are no longer in the code.
@@ -860,6 +1046,7 @@ def auto_reconcile_issue(
         return _reconcile_declarations_format(
             cfg, issue_num, body, sha, stale, orphaned, cited_set,
             empty=empty, dry_run=dry_run,
+            diff_window=diff_window, chapter=chapter, live_names=live_names,
         )
 
     # ADD candidates: uncited (cited_by empty) in-code decls matching the
@@ -1350,6 +1537,36 @@ def _swap_decl_token(section: str, old_name: str, new_name: str) -> tuple[str, b
     return _BACKTICK_TOKEN_RE.sub(_sub, section), replaced
 
 
+def _remove_decl_bullet_lines(
+    section: str, names: "list[str]",
+) -> "tuple[str, set[str]]":
+    """Remove ``- …`` bullet lines in a ``### Lean declarations`` section whose
+    backtick'd decl token (bare ``Foo.bar`` or keyword ``theorem Foo.bar``) is in
+    ``names`` — used to drop a SPLIT's stale parent bullet (its directional
+    targets are appended fresh below). Returns ``(new_section, removed_names)``;
+    lines matching no name are preserved verbatim."""
+    want = set(names)
+    if not want:
+        return section, set()
+    removed: "set[str]" = set()
+    kept: "list[str]" = []
+    for line in section.split("\n"):
+        if line.lstrip().startswith("-"):
+            hit = None
+            for mm in _BACKTICK_TOKEN_RE.finditer(line):
+                content = mm.group(1).strip()
+                dm = _DECL_KW_PREFIX_RE.match(content)
+                cand = dm.group("name") if dm else content
+                if cand in want:
+                    hit = cand
+                    break
+            if hit is not None:
+                removed.add(hit)
+                continue
+        kept.append(line)
+    return "\n".join(kept), removed
+
+
 def _reconcile_declarations_format(
     cfg: "ReviewConfig",
     issue_num: int,
@@ -1361,6 +1578,9 @@ def _reconcile_declarations_format(
     *,
     empty: dict,
     dry_run: bool,
+    diff_window: "Optional[tuple[str, str]]" = None,
+    chapter: "Optional[int]" = None,
+    live_names: "Optional[list[str]]" = None,
 ) -> dict:
     """Reconcile a ``### Lean declarations`` (chapter-intake) body: TWO edits,
     mirroring the signatures path —
@@ -1386,19 +1606,55 @@ def _reconcile_declarations_format(
         _build_decl_view, _load_context, _ledger, missing_suggestions_for_issue,
     )
 
-    # Resolve renames against the ORPHANED pool, with many-to-one dedup: a second
-    # stale sharing a leaf with an already-claimed target collapses to kept_stale.
+    # Resolve each stale citation to its replacement(s). When the refine diff
+    # window (old..new SHAs) is available it drives the classification — the diff
+    # sees BOTH removed and added decls, so it distinguishes rename (1 target),
+    # split (2+ targets), and delete (0), which a leaf-only match (needs the leaf
+    # preserved) cannot. A git failure (oracle is None) falls back to leaf match,
+    # so a transient failure simply retries on the next HEAD move.
+    live_names = live_names or []
     renamed: list[dict] = []
+    splits: list[dict] = []
     claimed: set[str] = set()
     kept_stale: list[str] = []
-    for s in stale:
-        pool = [n for n in orphaned if n not in claimed]
-        r = _leaf_match_rename(s, pool, cited_set)
-        if r is not None:
-            renamed.append({"old": s, "new": r})
-            claimed.add(r)
-        else:
-            kept_stale.append(s)
+    used_window = False
+    if diff_window is not None and chapter is not None and stale:
+        from marathon.review.verified_decls import (
+            declarations_added_removed_in_diff,
+        )
+        paths = _chapter_diff_paths(cfg, chapter)
+        oracle = (
+            declarations_added_removed_in_diff(
+                Path(cfg.repo_dir), diff_window[0], diff_window[1], paths)
+            if paths else None
+        )
+        if oracle is not None:
+            used_window = True
+            added_decls, removed_decls = oracle
+            cls = classify_diff_window(
+                stale, added_decls, removed_decls,
+                live_names=live_names, orphaned=orphaned, cited_set=cited_set,
+            )
+            renamed = cls["renames"]
+            splits = cls["splits"]
+            # A diff-confirmed delete is left STALE (the deck footnotes an
+            # in_code=false citation) — never auto-dropped on a guess.
+            kept_stale = list(cls["kept_stale"]) + list(cls["deletes"])
+            for r in renamed:
+                claimed.add(r["new"])
+            for sg in splits:
+                claimed.update(sg["targets"])
+    if not used_window:
+        # Legacy fallback: unique-orphaned leaf match (rename only), many-to-one
+        # dedup — a second stale sharing a claimed leaf collapses to kept_stale.
+        for s in stale:
+            pool = [n for n in orphaned if n not in claimed]
+            r = _leaf_match_rename(s, pool, cited_set)
+            if r is not None:
+                renamed.append({"old": s, "new": r})
+                claimed.add(r)
+            else:
+                kept_stale.append(s)
 
     # ADD candidates: uncited (cited_by empty) in-code decls matching the
     # result-key — the SAME source the signatures path uses. Exclude any
@@ -1417,37 +1673,63 @@ def _reconcile_declarations_format(
         and s["decl"].rsplit(".", 1)[-1] not in folded_leaves
     ]
 
-    if not renamed and not add_only:
+    # Pre-render the bullets we MIGHT append (split targets + plain adds): locate
+    # each in the current source and build its permalink at ``sha``. A SPLIT only
+    # drops its stale parent once EVERY target renders — so we never remove a
+    # citation without its replacement(s) present.
+    ctx = _load_context(cfg, [issue_num])
+    ledger = _ledger(cfg)
+
+    def _bullet_for(name: str) -> "Optional[str]":
+        view = _build_decl_view(ctx, ledger, name, Path(cfg.repo_dir))
+        file_rel, a, b, _sig = _locate_in_source(Path(cfg.repo_dir), view)
+        if file_rel is None:
+            return None
+        url = _permalink(cfg.github_repo, sha, file_rel, a, b)
+        return f"- [{file_rel}:L{a}-L{b}]({url}) — `{name}`"
+
+    rendered: dict = {}
+    for nm in {t for sg in splits for t in sg["targets"]} | set(add_only):
+        bl = _bullet_for(nm)
+        if bl is not None:
+            rendered[nm] = bl
+    splits_ok = [sg for sg in splits if all(t in rendered for t in sg["targets"])]
+    split_olds = [sg["old"] for sg in splits_ok]
+    kept_stale.extend(sg["old"] for sg in splits if sg not in splits_ok)
+
+    if not renamed and not splits_ok and not add_only:
         return {**empty, "sha": sha, "kept_stale": kept_stale,
                 "message": f"#{issue_num}: already reconciled ({len(kept_stale)} "
-                           "stale declaration(s) kept — no leaf match)"}
+                           "stale declaration(s) kept)"}
 
     # VERIFIED-ISSUE SAFETY: a human-verified/frozen statement is NEVER silently
-    # rewritten — not by a rename, not by an ADD. Flag the renames for a human
-    # and write NOTHING (the ADD is suppressed too — no write path reaches
-    # ``_gh_edit_body``).
+    # rewritten — renames/splits are flagged for a human, the ADD suppressed, and
+    # NO write path reaches ``_gh_edit_body``.
     if _issue_is_frozen(cfg, issue_num, cited_set):
         return {**empty, "sha": sha, "kept_stale": kept_stale,
                 "flagged_renames": [dict(r) for r in renamed],
+                "flagged_splits": [dict(s) for s in splits_ok],
                 "message": (
-                    f"#{issue_num} is verified/frozen — {len(renamed)} rename(s) "
-                    f"flagged for human review, {len(add_only)} add(s) suppressed, "
-                    "NOT auto-applied")}
+                    f"#{issue_num} is verified/frozen — {len(renamed)} rename(s) + "
+                    f"{len(splits_ok)} split(s) flagged for human review, "
+                    f"{len(add_only)} add(s) suppressed, NOT auto-applied")}
 
-    # Replace ONLY within ``### Lean declarations`` sections so prose backticks
-    # elsewhere are never touched. The extractor reads ALL such sections
-    # (``finditer``), so splice EVERY one — a stale token can live in any of them.
-    # Splice matches right-to-left so each (start, end) stays valid as we rewrite.
+    # Edit ONLY within ``### Lean declarations`` sections (prose backticks
+    # elsewhere are never touched). Splice right-to-left so offsets stay valid.
     matches = list(_DECL_SECTION_RE.finditer(body))
     if not matches:  # pragma: no cover — caller only enters with a section present
         return {**empty, "sha": sha, "kept_stale": kept_stale,
                 "message": f"#{issue_num}: declarations section vanished"}
     new_body = body
     applied_set: set[str] = set()
+    removed_set: set[str] = set()
     for m in reversed(matches):
         section = m.group(1)
         new_section = section
-        for r in renamed:
+        if split_olds:  # SPLIT: drop the stale parent bullet(s).
+            new_section, rem = _remove_decl_bullet_lines(new_section, split_olds)
+            removed_set |= rem
+        for r in renamed:  # RENAME: swap the stale name token in place.
             swapped, ok = _swap_decl_token(new_section, r["old"], r["new"])
             if ok:
                 new_section = swapped
@@ -1456,40 +1738,37 @@ def _reconcile_declarations_format(
             new_body = new_body[:m.start(1)] + new_section + new_body[m.end(1):]
     applied = [r for r in renamed if r["old"] in applied_set]
     kept_stale.extend(r["old"] for r in renamed if r["old"] not in applied_set)
+    # Only append a split's targets if its parent bullet was actually removed.
+    splits_applied = [sg for sg in splits_ok if sg["old"] in removed_set]
+    kept_stale.extend(sg["old"] for sg in splits_ok if sg["old"] not in removed_set)
 
-    # ADD: render each candidate as an intake-style bullet and append at the END
-    # of the LAST ``### Lean declarations`` section (after the existing bullets,
-    # before the next ``### `` header). Re-find the sections in ``new_body`` so
-    # the splice offsets stay valid after the rename rewrites above. Skip any
-    # candidate whose source can't be located (never emit a broken bullet).
-    ctx = _load_context(cfg, [issue_num])
-    ledger = _ledger(cfg)
+    # APPEND: split targets (for applied splits) + plain adds, deduped, at the END
+    # of the LAST ``### Lean declarations`` section.
+    append_names: list[str] = []
+    for sg in splits_applied:
+        append_names.extend(sg["targets"])
+    append_names.extend(n for n in sorted(add_only) if n in rendered)
     added_names: list[str] = []
-    if add_only:
-        bullets: list[str] = []
-        for name in sorted(add_only):
-            view = _build_decl_view(ctx, ledger, name, Path(cfg.repo_dir))
-            file_rel, a, b, _signature = _locate_in_source(Path(cfg.repo_dir), view)
-            if file_rel is None:
-                continue
-            url = _permalink(cfg.github_repo, sha, file_rel, a, b)
-            bullets.append(f"- [{file_rel}:L{a}-L{b}]({url}) — `{name}`")
+    bullets: list[str] = []
+    for name in dict.fromkeys(append_names):  # preserve order, dedup
+        if name in rendered:
+            bullets.append(rendered[name])
             added_names.append(name)
-        if bullets:
-            new_body = _append_declaration_bullets(new_body, bullets)
+    if bullets:
+        new_body = _append_declaration_bullets(new_body, bullets)
 
-    if (not applied and not added_names) or new_body == body:
+    if (not applied and not splits_applied and not added_names) or new_body == body:
         return {**empty, "sha": sha, "kept_stale": kept_stale,
-                "message": f"#{issue_num}: nothing to write (no token swapped)"}
+                "message": f"#{issue_num}: nothing to write"}
 
     result = {
         "ok": True, "updated": True, "added": added_names,
-        "renamed": applied, "kept_stale": kept_stale,
-        "flagged_renames": [], "sha": sha,
+        "renamed": applied, "splits": [dict(s) for s in splits_applied],
+        "kept_stale": kept_stale, "flagged_renames": [], "sha": sha,
         "message": (
             f"#{issue_num} declarations reconciled to {sha[:7]}: "
             f"{len(added_names)} added, {len(applied)} renamed, "
-            f"{len(kept_stale)} stale kept"),
+            f"{len(splits_applied)} split, {len(kept_stale)} stale kept"),
     }
     if dry_run:
         result["new_body"] = new_body

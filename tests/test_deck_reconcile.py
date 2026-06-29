@@ -137,7 +137,7 @@ def test_conductor_reconcile_pass_gating(tmp_path, monkeypatch):
     calls: list[int] = []
     monkeypatch.setattr(
         refresh_mod, "auto_reconcile_issue",
-        lambda c, n: (calls.append(n), {"updated": False})[1],
+        lambda c, n, **kw: (calls.append(n), {"updated": False})[1],
     )
     monkeypatch.setattr(refresh_mod, "head_sha", lambda d: "SHA1")
 

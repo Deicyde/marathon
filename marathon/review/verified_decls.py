@@ -233,6 +233,68 @@ def verified_declarations(
     return out
 
 
+def declarations_added_removed_in_diff(
+    repo_dir: Path,
+    old_sha: str,
+    new_sha: str,
+    paths: "Optional[list[str]]" = None,
+) -> "Optional[tuple[set[str], set[str]]]":
+    """Run ``git diff <old>..<new> --unified=0`` over the Lean ``paths`` and
+    return ``(added_decls, removed_decls)`` — the declaration names parsed
+    SEPARATELY from the inserted (``+``) and deleted (``-``) lines.
+
+    ``paths`` scopes the diff to the issue's chapter file/folder (e.g.
+    ``["Demo/Chapter15", "Demo/Chapter15.lean"]``); ``None`` falls back to every
+    ``*.lean`` (the project-wide audit shape :func:`declarations_modified_in_diff`
+    used). Uses ``--unified=0`` so context lines don't pollute the match (only
+    changed lines), reusing the same ``_DECL_RE`` keyword/identifier rule.
+
+    Return value distinguishes two cases the caller MUST treat differently:
+
+    * ``None`` — the ``git diff`` FAILED (nonzero exit, or the subprocess
+      raised). A transient failure is NOT "nothing changed"; the caller should
+      retry on the next HEAD move rather than acting on a phantom-empty diff.
+    * ``(set(), set())`` — the diff RAN but the window changed no declaration
+      under ``paths`` (an honest empty result).
+
+    NOTE: false positives possible if a Lean keyword (`def`, `theorem`, …)
+    appears inside a comment or string on a changed line. Empirically rare and
+    acceptable (the reconcile classification cross-checks against the live code).
+    """
+    pathspecs = list(paths) if paths else ["*.lean"]
+    try:
+        cp = subprocess.run(
+            [
+                "git", "diff",
+                f"{old_sha}..{new_sha}",
+                "--unified=0",
+                "--", *pathspecs,
+            ],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if cp.returncode != 0:
+        return None
+    added: set[str] = set()
+    removed: set[str] = set()
+    for line in cp.stdout.splitlines():
+        # We want diff lines starting with '+' or '-' (but not '+++' / '---'
+        # which are file headers). Strip the leading marker and match the regex.
+        if line.startswith("+") and not line.startswith("+++"):
+            m = _DECL_RE.match(line[1:])
+            if m:
+                added.add(m.group("name"))
+        elif line.startswith("-") and not line.startswith("---"):
+            m = _DECL_RE.match(line[1:])
+            if m:
+                removed.add(m.group("name"))
+    return added, removed
+
+
 def declarations_modified_in_diff(
     repo_dir: Path, ref_old: str, ref_new: str
 ) -> set[str]:
@@ -244,38 +306,21 @@ def declarations_modified_in_diff(
     and an added line is counted once — typical for a body edit that
     keeps the signature unchanged.
 
+    Delegates to :func:`declarations_added_removed_in_diff` (the
+    added|removed union). A git failure there returns ``None``; we map it
+    back to the empty set so this audit-side caller's behaviour is unchanged
+    (a failed diff reads as "no modified decls", same as before).
+
     NOTE: false positives possible if a Lean keyword (`def`,
     `theorem`, etc.) appears inside a comment or string on a changed
     line. Empirically rare in this codebase and acceptable for a v1
     audit; the human can dismiss false positives by inspection.
     """
-    cp = subprocess.run(
-        [
-            "git", "diff",
-            f"{ref_old}..{ref_new}",
-            "--unified=0",
-            "--", "*.lean",
-        ],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if cp.returncode != 0:
+    pair = declarations_added_removed_in_diff(repo_dir, ref_old, ref_new)
+    if pair is None:
         return set()
-    out: set[str] = set()
-    for line in cp.stdout.splitlines():
-        # We want diff lines starting with '+' or '-' (but not '+++' / '---'
-        # which are file headers).
-        if (line.startswith("+") and not line.startswith("+++")) or (
-            line.startswith("-") and not line.startswith("---")
-        ):
-            # Strip the leading +/- and match the decl regex.
-            content = line[1:]
-            m = _DECL_RE.match(content)
-            if m:
-                out.add(m.group("name"))
-    return out
+    added, removed = pair
+    return added | removed
 
 
 def audit_iteration(

@@ -1369,7 +1369,14 @@ def _maybe_reconcile_signatures(
         if num in exclude_issues:
             continue
         try:
-            r = auto_reconcile_issue(cfg, num)
+            # The HEAD move since last_sha IS the refine's diff window — it tells
+            # the reconcile which decls were removed/added (rename/split/delete),
+            # not just which are missing. None on the first pass (no prior sha) →
+            # the reconcile falls back to leaf-match.
+            r = auto_reconcile_issue(
+                cfg, num,
+                diff_window=((last_sha, cur) if last_sha else None),
+            )
             if r.get("updated"):
                 print(f"--- reconciled #{num}: {r.get('message', '')} ---", flush=True)
         except Exception as e:  # noqa: BLE001 — one issue's failure isn't fatal
