@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from marathon.review.automerge import _head_build_verdict
 from marathon.review.config import ReviewConfig, load_config
 from marathon.review.github import (
     fetch_issues_bulk,
@@ -596,14 +597,14 @@ def _maybe_merge_marathon_pr(cfg: ReviewConfig, issue_num: int) -> None:
         return
 
     branch = f"marathon/refine-c{chapter}-i{issue_num}"
-    # Look for an open PR with this head branch.
+    # Look for an open PR with this head branch — fetch its head-commit build tag
+    # in the SAME call so the gate below reads it without a second round-trip.
     proc = gh(
         "pr", "list",
         "--repo", cfg.github_repo,
         "--head", branch,
         "--state", "open",
-        "--json", "number",
-        "--jq", ".[0].number // empty",
+        "--json", "number,commits",
         check=False,
     )
     if proc.returncode != 0:
@@ -612,14 +613,36 @@ def _maybe_merge_marathon_pr(cfg: ReviewConfig, issue_num: int) -> None:
             f"{(proc.stderr or proc.stdout).strip()[:200]}"
         )
         return
-    if not proc.stdout.strip():
-        return  # no open PR — the normal silent skip
     try:
-        pr_num = int(proc.stdout.strip())
-    except ValueError:
+        prs = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        print(f"  pr: WARN — could not parse `gh pr list` JSON for head {branch}")
+        return
+    if not prs:
+        return  # no open PR — the normal silent skip
+    pr = prs[0] if isinstance(prs, list) else None
+    pr_num = pr.get("number") if isinstance(pr, dict) else None
+    if not isinstance(pr_num, int):
         print(
             f"  pr: WARN — unexpected `gh pr list` output for {branch}: "
-            f"{proc.stdout.strip()[:200]!r}"
+            f"{str(pr)[:200]!r}"
+        )
+        return
+    # Build-verdict gate — the verify-path twin of the automerge gate
+    # (:func:`marathon.review.automerge._head_build_verdict`). NEVER merge a
+    # refine PR whose head build is RED: verifying an issue's STATEMENT does not
+    # certify its BUILD, and merging a ``[build:FAIL]``/``[build:TIMEOUT]`` head
+    # would put a red build on main (the #212 class — a non-compiling pullback
+    # once reached main this way). Human-initiated, so an UNTAGGED head is allowed
+    # through (the human is watching); only an EXPLICIT red verdict is refused,
+    # and the human can still merge by hand if they truly intend to land it red.
+    verdict = _head_build_verdict(pr.get("commits"))
+    if verdict in ("FAIL", "TIMEOUT"):
+        print(
+            f"  pr: WARN — NOT merging #{pr_num} ({branch}): head build is "
+            f"[build:{verdict}]. #{issue_num} is verified, but the build is red — "
+            f"fix forward with a new refine iteration, or `gh pr merge {pr_num}` "
+            f"by hand to land it red."
         )
         return
     # Merge with --delete-branch so the marathon branch goes away on

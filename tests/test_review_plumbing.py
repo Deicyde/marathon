@@ -98,7 +98,10 @@ def test_maybe_merge_reaches_merge_attempt(tmp_path, monkeypatch, capsys):
 
     def handler(args):
         if args[:2] == ("pr", "list"):
-            return completed(stdout="55\n")
+            return completed(stdout=json.dumps([
+                {"number": 55, "commits": [
+                    {"messageHeadline": "marathon: c14 iter for #15 [build:OK]",
+                     "oid": "sha55"}]}]))
         if args[:2] == ("pr", "merge"):
             return completed()
         return None
@@ -147,7 +150,10 @@ def test_maybe_merge_failures_are_visible(tmp_path, monkeypatch, capsys):
     # and no exception propagates.
     def handler(args):
         if args[:2] == ("pr", "list"):
-            return completed(stdout="55\n")
+            return completed(stdout=json.dumps([
+                {"number": 55, "commits": [
+                    {"messageHeadline": "marathon: c14 iter for #15 [build:OK]",
+                     "oid": "sha55"}]}]))
         if args[:2] == ("pr", "merge"):
             return completed(returncode=1, stderr="merge conflict with main")
         return None
@@ -156,6 +162,75 @@ def test_maybe_merge_failures_are_visible(tmp_path, monkeypatch, capsys):
     review_mod._maybe_merge_marathon_pr(cfg, 15)
     out = capsys.readouterr().out
     assert "WARN" in out and "merge conflict" in out
+
+
+def test_maybe_merge_refuses_build_fail_head(tmp_path, monkeypatch, capsys):
+    """A verify must NOT land a red build: when the refine PR's head commit is
+    tagged [build:FAIL], the merge is refused with a WARN (the #212 class). The
+    issue stays verified; the human fixes forward or merges by hand."""
+    cfg = make_cfg(tmp_path)
+
+    def handler(args):
+        if args[:2] == ("pr", "list"):
+            return completed(stdout=json.dumps([
+                {"number": 77, "commits": [
+                    {"messageHeadline": "marathon: c14 iter for #15 [build:FAIL]",
+                     "oid": "sha77"}]}]))
+        if args[:2] == ("pr", "merge"):
+            return completed()
+        return None
+
+    fake = FakeGh(handler)
+    monkeypatch.setattr(review_mod, "gh", fake)
+    review_mod._maybe_merge_marathon_pr(cfg, 15)
+
+    assert fake.calls_starting_with("pr", "list")
+    assert not fake.calls_starting_with("pr", "merge")   # red → never merged
+    out = capsys.readouterr().out
+    assert "WARN" in out and "build:FAIL" in out
+
+
+def test_maybe_merge_build_ok_head_merges(tmp_path, monkeypatch, capsys):
+    """A [build:OK] head still merges — the gate doesn't over-block green PRs."""
+    cfg = make_cfg(tmp_path)
+
+    def handler(args):
+        if args[:2] == ("pr", "list"):
+            return completed(stdout=json.dumps([
+                {"number": 78, "commits": [
+                    {"messageHeadline": "marathon: c14 iter for #15 [build:OK]",
+                     "oid": "sha78"}]}]))
+        if args[:2] == ("pr", "merge"):
+            return completed()
+        return None
+
+    fake = FakeGh(handler)
+    monkeypatch.setattr(review_mod, "gh", fake)
+    review_mod._maybe_merge_marathon_pr(cfg, 15)
+
+    merges = fake.calls_starting_with("pr", "merge")
+    assert merges and merges[0][2] == "78"
+    assert "merged #78" in capsys.readouterr().out
+
+
+def test_maybe_merge_untagged_head_still_merges(tmp_path, monkeypatch, capsys):
+    """Unlike the unattended automerge, the human-initiated verify path lets an
+    UNTAGGED head through — only an EXPLICIT red verdict is refused."""
+    cfg = make_cfg(tmp_path)
+
+    def handler(args):
+        if args[:2] == ("pr", "list"):
+            return completed(stdout=json.dumps([
+                {"number": 79, "commits": [
+                    {"messageHeadline": "wip no build tag", "oid": "sha79"}]}]))
+        if args[:2] == ("pr", "merge"):
+            return completed()
+        return None
+
+    fake = FakeGh(handler)
+    monkeypatch.setattr(review_mod, "gh", fake)
+    review_mod._maybe_merge_marathon_pr(cfg, 15)
+    assert fake.calls_starting_with("pr", "merge")       # untagged → allowed
 
 
 # --- cmd_verify: tracker flip is independent of the PR merge ------------------
