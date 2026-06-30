@@ -18,6 +18,12 @@ The gates are HARD and fail-safe:
   branch is never touched;
 * **checks not failing**, and (unless ``require_checks=False``) not still
   pending — so an unattended merge cannot land a red build on ``main``;
+* **build verdict not red** — the head commit's ``[build:OK|FAIL|TIMEOUT]`` tag
+  (stamped by the refine pipeline) must not be FAIL/TIMEOUT, and a refine head
+  must AFFIRMATIVELY carry ``[build:OK]``; on a CI-less repo this commit tag is
+  the ONLY build signal (``statusCheckRollup`` is empty), so it is what stops a
+  red refine from landing unattended — the gap that let a ``[build:FAIL]`` head
+  reach ``main``;
 * **not blocked by branch protection** (required review/approval) — left for
   the human; ``gh`` would refuse anyway.
 
@@ -45,10 +51,12 @@ if TYPE_CHECKING:  # pragma: no cover — type-only
 _REFINE_BRANCH_RE = re.compile(r"^marathon/refine-c\d+-i(\d+)$")
 
 #: PR JSON fields the gate needs. ``mergeable``/``mergeStateStatus`` are the
-#: conflict + protection signals; ``statusCheckRollup`` is the CI signal.
+#: conflict + protection signals; ``statusCheckRollup`` is the CI signal;
+#: ``commits`` carries the head commit's ``[build:*]`` verdict tag (the only
+#: build signal on a CI-less repo) — it rides in this one ``gh pr list`` call.
 _PR_FIELDS = (
     "number,title,headRefName,baseRefName,isDraft,mergeable,"
-    "mergeStateStatus,statusCheckRollup"
+    "mergeStateStatus,statusCheckRollup,commits"
 )
 
 #: ``conclusion`` (CheckRun) / ``state`` (StatusContext) values that mean a
@@ -112,12 +120,37 @@ def _check_summary(rollup: Optional[list]) -> tuple[int, int]:
     return failing, pending
 
 
+#: The refine pipeline stamps each commit SUBJECT (and the PR title) with the
+#: lake build verdict — ``[build:OK]`` / ``[build:FAIL]`` / ``[build:TIMEOUT]``
+#: (see ``post_pipeline.run_post_pipeline``, the ``[build:{tag}]`` writer — the
+#: SINGLE source of this format; keep them in sync). On a CI-less repo the
+#: ``statusCheckRollup`` is empty, so this commit tag is the ONLY machine-readable
+#: build signal the gate has. Read from the commit (immutable, travels on the PR
+#: head), NOT the title (a human can rename it).
+_BUILD_TAG_RE = re.compile(r"\[build:(OK|FAIL|TIMEOUT)\]", re.IGNORECASE)
+
+
+def _head_build_verdict(commits: Optional[list]) -> Optional[str]:
+    """The lake build verdict — ``"OK"`` / ``"FAIL"`` / ``"TIMEOUT"`` — parsed
+    from the HEAD commit's subject of a PR (the LAST element of ``gh``'s
+    ``commits`` array, which is chronological — newest last). None when there are
+    no commits or the head subject carries no ``[build:*]`` tag. The head commit
+    governs: an earlier commit's stale verdict is ignored (a later fixing commit
+    is what counts)."""
+    if not commits:
+        return None
+    head = commits[-1] if isinstance(commits[-1], dict) else {}
+    m = _BUILD_TAG_RE.search(head.get("messageHeadline") or "")
+    return m.group(1).upper() if m else None
+
+
 def eligibility(
     pr: dict,
     *,
     base: str,
     exclude_heads: "frozenset[str]" = frozenset(),
     require_checks: bool = True,
+    require_build_ok: bool = True,
 ) -> tuple[bool, str]:
     """Decide whether ``pr`` (a parsed ``gh`` JSON object) may be auto-merged
     onto ``base``. Returns ``(ok, reason)``. PURE — fully unit-testable.
@@ -154,6 +187,18 @@ def eligibility(
         return False, f"{failing} check(s) failing"
     if require_checks and pending:
         return False, f"{pending} check(s) still pending"
+    # Build verdict from the head commit's [build:*] tag — on a CI-less repo this
+    # is the ONLY build signal (statusCheckRollup is empty, so the check gate
+    # above is a no-op). The contract: "an unattended merge cannot land a red
+    # build on main". A red tag is refused on ANY head; a refine head must
+    # AFFIRMATIVELY carry [build:OK] (its absence = unknown build → fail safe and
+    # retry), while a human/infra PR — legitimately untagged and NOT on a refine
+    # branch — is left untouched.
+    verdict = _head_build_verdict(pr.get("commits"))
+    if verdict in ("FAIL", "TIMEOUT"):
+        return False, f"build {verdict.lower()} (head tagged [build:{verdict}])"
+    if require_build_ok and verdict is None and _REFINE_BRANCH_RE.match(head):
+        return False, "no [build:*] verdict on refine head (retry/needs build)"
     return True, "clean" if state in ("", "CLEAN") else state.lower()
 
 
@@ -290,6 +335,7 @@ def automerge(
     exclude_heads: "frozenset[str]" = frozenset(),
     scope: str = "any",
     require_checks: bool = True,
+    require_build_ok: bool = True,
     dry_run: bool = False,
 ) -> list[AutoMergeResult]:
     """Merge every eligible open PR targeting ``base`` (default the config's
@@ -303,7 +349,11 @@ def automerge(
       (deleting the branch would break a running job's push).
     * ``dry_run`` reports what WOULD merge but calls no ``gh pr merge``.
     * ``require_checks=False`` merges a conflict-free PR with PENDING checks
-      (still never a FAILING one)."""
+      (still never a FAILING one).
+    * ``require_build_ok=True`` (default) refuses any head tagged ``[build:FAIL]``
+      / ``[build:TIMEOUT]`` and requires an affirmative ``[build:OK]`` on a refine
+      head — the only build gate on a CI-less repo. Set False to merge an untagged
+      refine head (an explicit red tag is STILL refused)."""
     base = base or getattr(cfg, "auto_pr_base", None) or "main"
     repo = cfg.github_repo
     prs = _list_open_prs(repo, base)
@@ -329,7 +379,8 @@ def automerge(
             ))
             continue
         ok, reason = eligibility(
-            pr, base=base, exclude_heads=exclude_heads, require_checks=require_checks
+            pr, base=base, exclude_heads=exclude_heads,
+            require_checks=require_checks, require_build_ok=require_build_ok,
         )
         if ok and scope == "infra":
             ok, reason = _infra_only(repo, num, reason)

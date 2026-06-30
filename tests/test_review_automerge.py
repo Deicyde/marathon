@@ -19,7 +19,15 @@ def _cfg(base="main"):
 
 
 def _pr(num, *, mergeable="MERGEABLE", state="CLEAN", draft=False,
-        checks=None, head=None, base="main", title="t"):
+        checks=None, head=None, base="main", title="t", commits=None, build=None):
+    # `build="OK"/"FAIL"/"TIMEOUT"` synthesizes a head commit whose subject
+    # carries the pipeline's [build:*] verdict tag; `commits` overrides outright.
+    if commits is None:
+        commits = (
+            [{"messageHeadline": f"marathon: c1 iter for #{num} [build:{build}]",
+              "oid": f"sha{num}"}]
+            if build is not None else []
+        )
     return {
         "number": num,
         "title": title,
@@ -29,6 +37,7 @@ def _pr(num, *, mergeable="MERGEABLE", state="CLEAN", draft=False,
         "mergeable": mergeable,
         "mergeStateStatus": state,
         "statusCheckRollup": checks or [],
+        "commits": commits,
     }
 
 
@@ -60,7 +69,7 @@ def test_eligibility_core_gates(pr, ok, reason_has):
 
 
 def test_eligibility_excludes_in_flight_refine_branches():
-    pr = _pr(1, head="marathon/refine-c12-i93")
+    pr = _pr(1, head="marathon/refine-c12-i93", build="OK")
     # normally mergeable…
     assert am.eligibility(pr, base="main")[0] is True
     # …but excluded while a refine is live on that branch
@@ -104,6 +113,63 @@ def test_eligibility_mixed_checks_one_failure_blocks():
         {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"},
     ])
     assert am.eligibility(pr, base="main")[0] is False
+
+
+# --- eligibility() build-verdict gate (the [build:FAIL] → main gap) ---------
+
+def test_eligibility_build_fail_head_refused():
+    # the #212 shape: head commit tagged [build:FAIL], no CI checks → REFUSE.
+    ok, reason = am.eligibility(
+        _pr(1, head="marathon/refine-c15-i168", build="FAIL"), base="main")
+    assert ok is False and "build fail" in reason.lower()
+
+
+def test_eligibility_build_timeout_head_refused():
+    ok, reason = am.eligibility(_pr(1, build="TIMEOUT"), base="main")
+    assert ok is False and "timeout" in reason.lower()
+
+
+def test_eligibility_build_ok_head_merges():
+    # the legit refine / sorry-only skeleton case: [build:OK] still clears.
+    ok, reason = am.eligibility(
+        _pr(1, head="marathon/refine-c15-i168", build="OK"), base="main")
+    assert ok is True and reason == "clean"
+
+
+def test_eligibility_untagged_refine_head_skipped():
+    # a refine head with no [build:*] tag → unknown build → fail safe + retry.
+    ok, reason = am.eligibility(
+        _pr(1, head="marathon/refine-c1-i9",
+            commits=[{"messageHeadline": "wip", "oid": "x"}]), base="main")
+    assert ok is False and "build" in reason.lower()
+
+
+def test_eligibility_untagged_human_pr_not_overblocked():
+    # a human/infra PR (NOT a refine branch) legitimately has no tag → passes.
+    ok, _ = am.eligibility(
+        _pr(1, head="chore/register-ch12",
+            commits=[{"messageHeadline": "register ch12", "oid": "y"}]),
+        base="main")
+    assert ok is True
+
+
+def test_eligibility_uses_head_commit_for_verdict():
+    # the HEAD (last) commit governs — an earlier [build:FAIL] is superseded.
+    pr = _pr(1, head="marathon/refine-c1-i9", commits=[
+        {"messageHeadline": "wip [build:FAIL]", "oid": "a"},
+        {"messageHeadline": "marathon: c1 [build:OK]", "oid": "b"},
+    ])
+    assert am.eligibility(pr, base="main")[0] is True
+
+
+def test_eligibility_require_build_ok_false_allows_untagged_but_not_red():
+    # the escape hatch: require_build_ok=False lets an UNTAGGED refine head
+    # through, but an explicit [build:FAIL] is STILL refused.
+    untagged = _pr(1, head="marathon/refine-c1-i9",
+                   commits=[{"messageHeadline": "wip", "oid": "x"}])
+    assert am.eligibility(untagged, base="main", require_build_ok=False)[0] is True
+    red = _pr(2, head="marathon/refine-c1-i9", build="FAIL")
+    assert am.eligibility(red, base="main", require_build_ok=False)[0] is False
 
 
 # --- automerge() (one cycle, gh mocked) ------------------------------------
@@ -157,6 +223,25 @@ def test_automerge_merges_only_eligible(monkeypatch):
     skipped = {r.pr for r in results if r.action == "skipped"}
     assert merged == {10, 14}
     assert skipped == {11, 12, 13}
+
+
+def test_automerge_refuses_build_fail_head(monkeypatch):
+    # End-to-end analogue of the #212 regression: a [build:FAIL] refine head
+    # reaches the gate and is SKIPPED; a [build:OK] head still lands.
+    prs = [
+        _pr(10, head="marathon/refine-c15-i166", build="OK"),
+        _pr(11, head="marathon/refine-c15-i168", build="FAIL"),
+    ]
+    calls = _install_gh(monkeypatch, prs)
+    results = am.automerge(_cfg())
+    assert calls["merged"] == [10]
+    assert any(r.pr == 11 and r.action == "skipped"
+               and "build fail" in r.reason.lower() for r in results)
+
+
+def test_pr_fields_include_commits():
+    # The build-verdict signal must ride in the single `gh pr list` call.
+    assert "commits" in am._PR_FIELDS
 
 
 def test_automerge_uses_the_repos_allowed_merge_method(monkeypatch):
@@ -229,7 +314,8 @@ def test_automerge_requeues_a_refined_issue(monkeypatch):
                         lambda cfg, issue: requeued.append(issue) or True)
     cfg = SimpleNamespace(github_repo="o/r", auto_pr_base="main",
                           labels=SimpleNamespace(rejected="review:rejected"))
-    calls = _install_gh(monkeypatch, [_pr(109, head="marathon/refine-c12-i93")])
+    calls = _install_gh(monkeypatch, [_pr(109, head="marathon/refine-c12-i93",
+                                          build="OK")])
 
     res = am.automerge(cfg)
 
