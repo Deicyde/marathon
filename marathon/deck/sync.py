@@ -114,24 +114,116 @@ def _recover_from_marathon_divergence(repo_dir: Path, before: str) -> str:
     if stashed:
         pop = _git(repo_dir, "stash", "pop")
         if pop.returncode != 0:
-            # The advance already won (current code = the goal). Keep what applied
-            # cleanly; resolve ONLY the genuinely-conflicting review-state files
-            # toward upstream (the conductor re-derives those), so the deck
-            # self-heals without re-wedging or discarding clean local edits.
-            unmerged = [p for p in (_git(
-                repo_dir, "diff", "--name-only", "--diff-filter=U").stdout or ""
-            ).splitlines() if p.strip()]
-            if unmerged:
-                _git(repo_dir, "checkout", "HEAD", "--", *unmerged)
-            else:
-                _git(repo_dir, "reset", "--hard", "HEAD")
+            # The advance already won (current code = the goal). Resolve the
+            # conflicting review-state files WITHOUT data loss: UNION the
+            # append-only logs (verdicts.jsonl — every line a permanent verdict
+            # nothing re-derives) and keep upstream for rederivable state
+            # (state.json — the conductor rebuilds it). Then the stash is safe to
+            # drop. (Previously this discarded the conflicting files toward
+            # upstream, which could destroy an uncommitted human verdict.)
+            n_union, n_keep = _resolve_pop_conflicts(repo_dir)
             _git(repo_dir, "stash", "drop")
-            return (f"recovered wedged checkout {before[:7]} → {after[:7]} ({kind}); "
-                    f"{len(unmerged)} review-state file(s) conflicted — kept upstream")
+            tail = []
+            if n_union:
+                tail.append(f"{n_union} append-only log(s) unioned (no verdict lost)")
+            if n_keep:
+                tail.append(f"{n_keep} rederivable file(s) kept upstream")
+            return (f"recovered wedged checkout {before[:7]} → {after[:7]} ({kind})"
+                    + ("; " + ", ".join(tail) if tail else ""))
     return f"recovered wedged checkout {before[:7]} → {after[:7]} ({kind})"
 
 
-def pull_once(repo_dir: Path) -> str:
+def _review_branch(repo_dir: Path) -> str:
+    """The branch the deck MIRRORS — the remote's default branch (``origin/HEAD``,
+    e.g. ``main``). Falls back to ``main`` when ``origin/HEAD`` is unset."""
+    cp = _git(repo_dir, "rev-parse", "--abbrev-ref", "origin/HEAD")
+    ref = cp.stdout.strip() if cp.returncode == 0 else ""
+    return ref[len("origin/"):] if ref.startswith("origin/") else "main"
+
+
+def _current_branch(repo_dir: Path) -> str:
+    """The checked-out branch, or ``""`` when detached."""
+    cp = _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
+    b = cp.stdout.strip() if cp.returncode == 0 else ""
+    return "" if b in ("", "HEAD") else b
+
+
+#: Append-only review logs whose every line is a permanent record nothing
+#: re-derives (unlike state.json, which the conductor rebuilds from upstream). On
+#: a merge / stash-pop conflict these are UNIONed, never discarded — discarding
+#: one would destroy a recorded human verdict with no recovery.
+_APPEND_ONLY_LOGS = frozenset({"verdicts.jsonl"})
+
+
+def _union_lines(ours: str, theirs: str) -> str:
+    """All unique lines of ``ours`` then ``theirs``, first-seen order preserved,
+    newline-terminated — the loss-free conflict resolution for an append-only log
+    (no verdict on either side is dropped)."""
+    seen: "set[str]" = set()
+    out: "list[str]" = []
+    for ln in ours.splitlines() + theirs.splitlines():
+        if ln and ln not in seen:
+            seen.add(ln)
+            out.append(ln)
+    return "\n".join(out) + ("\n" if out else "")
+
+
+def _resolve_pop_conflicts(repo_dir: Path) -> "tuple[int, int]":
+    """Resolve a failed ``stash pop``'s conflicts WITHOUT data loss. Each
+    conflicting append-only log (:data:`_APPEND_ONLY_LOGS`) is UNIONed from its two
+    index stages — ``:2`` (upstream) + ``:3`` (stashed-local) — so every recorded
+    verdict survives; any other (rederivable) review-state file keeps upstream (the
+    conductor rebuilds it). Returns ``(n_unioned, n_kept_upstream)``; afterwards the
+    conflicts are resolved and the stash is safe to drop. No conflicting paths →
+    ``reset --hard HEAD`` to clear a half-applied pop."""
+    unmerged = [p for p in (_git(
+        repo_dir, "diff", "--name-only", "--diff-filter=U").stdout or ""
+    ).splitlines() if p.strip()]
+    if not unmerged:
+        _git(repo_dir, "reset", "--hard", "HEAD")
+        return (0, 0)
+    n_union = n_keep = 0
+    for p in unmerged:
+        if p.rsplit("/", 1)[-1] in _APPEND_ONLY_LOGS:
+            ours = _git(repo_dir, "show", f":2:{p}").stdout or ""    # upstream
+            theirs = _git(repo_dir, "show", f":3:{p}").stdout or ""  # stashed local
+            (Path(repo_dir) / p).write_text(_union_lines(ours, theirs))
+            _git(repo_dir, "add", "--", p)
+            n_union += 1
+        else:
+            _git(repo_dir, "checkout", "HEAD", "--", p)  # rederivable → upstream
+            n_keep += 1
+    return (n_union, n_keep)
+
+
+def _ensure_on_review_branch(repo_dir: Path, base: str) -> Optional[str]:
+    """Guard against the deck's checkout silently drifting OFF the review branch
+    (``base``) — the failure that parked a checkout on a feature branch for a DAY
+    while the ff-pull quietly mirrored the wrong branch (a buried "manual check"
+    line the only clue) and every card showed stale source.
+
+    Returns ``None`` when the checkout is on ``base`` (the caller proceeds to its
+    normal ff-pull); otherwise a LOUD ``⚠ STALE`` warning naming the branch and the
+    one-line fix, repeated each cycle until a human resolves it — impossible to
+    gloss over, unlike "manual check".
+
+    DELIBERATELY warn-only — it never switches the branch itself. A daemon thread
+    that stashed/checked-out the PRIMARY checkout would (a) race the co-located
+    conductor's in-flight commits on the shared ``.git`` index/HEAD, (b) risk the
+    non-rederivable ``verdicts.jsonl`` in a stash-pop conflict, and (c) yank a human
+    off a feature branch they are using. The loud warning is the safe, sufficient
+    fix: a human runs the one-line command (auto-switching a live shared checkout
+    is not worth those hazards)."""
+    cur = _current_branch(repo_dir)
+    if cur == base:
+        return None
+    who = "detached HEAD" if not cur else f"branch '{cur}'"
+    fix = f"git -C {repo_dir} checkout {base} && git pull --ff-only"
+    return (f"⚠ STALE: deck checkout on {who}, not '{base}' — cards show OLD source "
+            f"and will NOT auto-update until you switch back. Fix: {fix}")
+
+
+def pull_once(repo_dir: Path, *, base: Optional[str] = None) -> str:
     """Fast-forward the deck's checkout to its upstream; return a human status.
 
     Uses ``git pull --ff-only`` so it NEVER clobbers operator work. The deck's
@@ -139,8 +231,17 @@ def pull_once(repo_dir: Path) -> str:
     ``formalization.yaml`` regen onto it that can diverge the checkout; on an
     ff-failure we hand off to :func:`_recover_from_marathon_divergence`, which
     resets to upstream ONLY when the divergence is marathon metadata commits (and
-    preserves tracked review state). Fail-soft: never raises."""
+    preserves tracked review state).
+
+    FIRST it guards the review BRANCH (:func:`_ensure_on_review_branch`): a
+    checkout drifted onto a feature branch ff-pulls the WRONG branch and rots
+    silently, so we warn loudly (warn-only — never auto-switch a live checkout).
+    Fail-soft: never raises."""
     try:
+        review = base or _review_branch(repo_dir)
+        guard = _ensure_on_review_branch(repo_dir, review)
+        if guard is not None:
+            return guard
         before = _head(repo_dir)
         cp = _git(repo_dir, "pull", "--ff-only", "--quiet")
         if cp.returncode != 0:

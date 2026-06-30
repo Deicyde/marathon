@@ -18,36 +18,182 @@ def _fake_git(seq):
     return _g
 
 
+def _on_main(*rest):
+    """Prefix the branch-guard calls (origin/HEAD → main, current → main) onto a
+    pull_once sequence so the checkout reads as ON the review branch."""
+    return [(0, "origin/main\n", ""), (0, "main\n", "")] + list(rest)
+
+
 def test_pull_once_up_to_date(monkeypatch, tmp_path):
-    # rev-parse HEAD (before) → same sha; pull --ff-only ok; rev-parse (after) → same
-    monkeypatch.setattr(sync, "_git", _fake_git([
+    # branch guard (on main) → rev-parse before/after same; pull --ff-only ok
+    monkeypatch.setattr(sync, "_git", _fake_git(_on_main(
         (0, "abc123\n", ""),     # before HEAD
         (0, "", ""),             # pull --ff-only
         (0, "abc123\n", ""),     # after HEAD
-    ]))
+    )))
     assert sync.pull_once(tmp_path) == "up to date"
 
 
 def test_pull_once_updated(monkeypatch, tmp_path):
-    monkeypatch.setattr(sync, "_git", _fake_git([
+    monkeypatch.setattr(sync, "_git", _fake_git(_on_main(
         (0, "aaaaaaa\n", ""),    # before
         (0, "", ""),             # pull
         (0, "bbbbbbb\n", ""),    # after
-    ]))
+    )))
     assert sync.pull_once(tmp_path) == "updated aaaaaaa → bbbbbbb"
 
 
 def test_pull_once_non_ff_operator_commit_is_not_reset(monkeypatch, tmp_path):
     # a non-ff divergence whose local-ahead commit is NOT a marathon metadata
     # commit is reported and left ALONE — operator work is never reset away.
-    monkeypatch.setattr(sync, "_git", _fake_git([
+    monkeypatch.setattr(sync, "_git", _fake_git(_on_main(
         (0, "aaaaaaa\n", ""),                            # before (rev-parse HEAD)
         (1, "", "fatal: Not possible to fast-forward"),  # pull --ff-only fails
         (0, "", ""),                                     # recovery: fetch origin
         (0, "origin/main\n", ""),                        # recovery: rev-parse @{u}
         (0, "operator: hand-written work\n", ""),        # recovery: log @{u}..HEAD
-    ]))
+    )))
     assert "NOT resetting" in sync.pull_once(tmp_path)
+
+
+# --- the review-branch guard (off-branch → loud warn; warn-only, never switch) -
+
+def test_review_branch_from_origin_head(monkeypatch, tmp_path):
+    monkeypatch.setattr(sync, "_git", _fake_git([(0, "origin/main\n", "")]))
+    assert sync._review_branch(tmp_path) == "main"
+
+
+def test_review_branch_fallback_when_origin_head_unset(monkeypatch, tmp_path):
+    monkeypatch.setattr(sync, "_git", _fake_git([(1, "", "no origin/HEAD")]))
+    assert sync._review_branch(tmp_path) == "main"
+
+
+def test_current_branch_detached_is_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr(sync, "_git", _fake_git([(0, "HEAD\n", "")]))
+    assert sync._current_branch(tmp_path) == ""
+
+
+def test_ensure_on_base_is_noop(monkeypatch, tmp_path):
+    monkeypatch.setattr(sync, "_git", _fake_git([(0, "main\n", "")]))  # current == base
+    assert sync._ensure_on_review_branch(tmp_path, "main") is None
+
+
+def test_ensure_off_branch_warns_loudly(monkeypatch, tmp_path):
+    # warn-only: off the review branch → a loud ⚠ STALE line + the fix command;
+    # the guard NEVER switches the branch (ONE _git call — no fetch/stash/checkout).
+    monkeypatch.setattr(sync, "_git", _fake_git([(0, "fix/ch15-pullback\n", "")]))
+    out = sync._ensure_on_review_branch(tmp_path, "main")
+    assert "STALE" in out and "fix/ch15-pullback" in out and "checkout main" in out
+
+
+def test_ensure_detached_head_warns(monkeypatch, tmp_path):
+    monkeypatch.setattr(sync, "_git", _fake_git([(0, "HEAD\n", "")]))
+    out = sync._ensure_on_review_branch(tmp_path, "main")
+    assert "STALE" in out and "detached" in out and "checkout main" in out
+
+
+def test_pull_once_off_branch_warns_not_switch(monkeypatch, tmp_path):
+    # end to end: origin/HEAD → main, current → feature → STALE warn, no pull.
+    monkeypatch.setattr(sync, "_git", _fake_git([
+        (0, "origin/main\n", ""),      # _review_branch
+        (0, "feature\n", ""),          # _current_branch (OFF the review branch)
+    ]))
+    out = sync.pull_once(tmp_path)
+    assert "STALE" in out and "feature" in out
+
+
+# --- loss-free stash-pop conflict resolution (verdicts.jsonl never discarded) --
+
+def test_union_lines_preserves_all_dedup_in_order():
+    # upstream {1,2} + stashed-local {1,3} → {1,2,3}; every verdict survives.
+    assert sync._union_lines('{"v":1}\n{"v":2}\n', '{"v":1}\n{"v":3}\n') == \
+        '{"v":1}\n{"v":2}\n{"v":3}\n'
+
+
+def test_union_lines_empty():
+    assert sync._union_lines("", "") == ""
+
+
+def test_resolve_pop_conflicts_unions_verdicts_no_loss(monkeypatch, tmp_path):
+    # THE data-loss scenario the review caught: verdicts.jsonl conflicts on a
+    # stash pop; the local "C" verdict must NOT be discarded.
+    monkeypatch.setattr(sync, "_git", _fake_git([
+        (0, ".marathon/review/verdicts.jsonl\n", ""),   # diff --diff-filter=U
+        (0, '{"v":"A"}\n{"v":"B"}\n', ""),              # show :2 (upstream)
+        (0, '{"v":"A"}\n{"v":"C"}\n', ""),              # show :3 (stashed local)
+        (0, "", ""),                                    # add
+    ]))
+    (tmp_path / ".marathon" / "review").mkdir(parents=True)
+    assert sync._resolve_pop_conflicts(tmp_path) == (1, 0)
+    written = (tmp_path / ".marathon" / "review" / "verdicts.jsonl").read_text()
+    assert written == '{"v":"A"}\n{"v":"B"}\n{"v":"C"}\n'   # local "C" preserved
+
+
+def test_resolve_pop_conflicts_keeps_upstream_for_state(monkeypatch, tmp_path):
+    calls = []
+
+    def g(repo_dir, *args, timeout=90):
+        calls.append(args)
+        if args[:1] == ("diff",):
+            return SimpleNamespace(
+                returncode=0, stdout=".marathon/review/state.json\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sync, "_git", g)
+    assert sync._resolve_pop_conflicts(tmp_path) == (0, 1)   # rederivable → upstream
+    assert any(a[:2] == ("checkout", "HEAD") for a in calls)
+
+
+def test_resolve_pop_conflicts_no_conflicts_resets(monkeypatch, tmp_path):
+    calls = []
+
+    def g(repo_dir, *args, timeout=90):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sync, "_git", g)
+    assert sync._resolve_pop_conflicts(tmp_path) == (0, 0)
+    assert any(a[:2] == ("reset", "--hard") for a in calls)
+
+
+def test_resolve_pop_conflicts_real_git_unions_no_verdict_lost(tmp_path):
+    """Real git, the actual data-loss scenario: a genuine stash-pop CONFLICT on
+    verdicts.jsonl from divergent appends. Both the local and upstream verdict
+    must survive and the conflict must be fully resolved (no markers)."""
+    import subprocess
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(repo), *a],
+                              capture_output=True, text=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    vdir = repo / ".marathon" / "review"
+    vdir.mkdir(parents=True)
+    f = vdir / "verdicts.jsonl"
+    f.write_text('{"v":"base"}\n')
+    git("add", "-A")
+    git("commit", "-q", "-m", "base")
+    # local (stashed) append, then a DIVERGENT upstream append → real conflict
+    f.write_text('{"v":"base"}\n{"v":"LOCAL"}\n')
+    git("stash", "push", "-q")
+    f.write_text('{"v":"base"}\n{"v":"UPSTREAM"}\n')
+    git("add", "-A")
+    git("commit", "-q", "-m", "upstream")
+    assert git("stash", "pop").returncode != 0          # genuinely conflicted
+
+    n_union, n_keep = sync._resolve_pop_conflicts(repo)
+    git("stash", "drop")
+
+    assert n_union == 1
+    text = f.read_text()
+    assert '{"v":"LOCAL"}' in text                       # the local verdict NOT lost
+    assert '{"v":"UPSTREAM"}' in text and '{"v":"base"}' in text
+    assert "<<<<<<<" not in text and ">>>>>>>" not in text   # conflict resolved
 
 
 def test_pull_once_failsoft_on_exception(monkeypatch, tmp_path):
