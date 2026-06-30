@@ -501,6 +501,10 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .issue-tier { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 0.3rem; }
 .issue-row.is-ready { cursor: pointer; }
 .issue-row.is-ready:hover { border-color: var(--accent); }
+/* --- stalled / needs-re-reject surface --- */
+.stuck-block .chap-title { color: var(--warn); }
+.stuck-block .stuck-row { border-color: #d2992255; }
+.issue-requeue { margin-left: auto; flex: none; }
 
 /* --- history timeline --- */
 .hist-row { display: flex; align-items: baseline; gap: 0.6rem; padding: 0.45rem 0.7rem; border-left: 2px solid var(--line); margin-left: 0.3rem; font-size: 0.86rem; }

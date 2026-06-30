@@ -2476,6 +2476,71 @@
   }
 
   // --- Issues tab: every registered issue grouped by chapter ---
+  function postRequeue(issue) {
+    return postJSON("/api/requeue", { issue: issue });
+  }
+
+  // Re-issue a parked issue's stored rejection note (one-click) — mirrors the
+  // dropCitation token-POST pattern: disable + spinner, POST, toast + re-render
+  // on success, toast + re-enable on failure.
+  function requeueIssue(issue, btn) {
+    if (btn) { btn.disabled = true; btn.textContent = "re-queuing…"; }
+    postRequeue(issue)
+      .then(function (res) {
+        if (res && res.requeued) {
+          flashToast("Re-queued #" + issue + " — the conductor will retry it");
+          renderIssuesTab();
+        } else {
+          flashToast((res && res.message) || "Not re-queued");
+          if (btn) { btn.disabled = false; btn.textContent = "Re-queue"; }
+        }
+      })
+      .catch(function (err) {
+        flashToast(err && err.message ? err.message : "Re-queue failed");
+        if (btn) { btn.disabled = false; btn.textContent = "Re-queue"; }
+      });
+  }
+
+  // The "Stalled — needs re-reject" surface: issues the conductor parked (status
+  // 'stalled', or 'rejected' with no pending iteration) — NOT in the swipe queue,
+  // so otherwise unreachable without the CLI. Each gets a one-click Re-queue.
+  // Best-effort: a fetch failure never breaks the Issues tab.
+  function renderStuckSection(host, repo) {
+    getJSON("/api/stuck").then(function (d) {
+      if (state.activeTab !== "issues") return;
+      var stuck = (d && d.issues) || [];
+      if (!stuck.length) return;
+      var rows = stuck.map(function (it) {
+        var kids = [
+          ghLink(repo, "issues", it.num, "#" + it.num, "issue-id"),
+          statusBadge(it.status),
+          el("span", { class: "issue-title", title: it.note_preview || "",
+                       text: it.note_preview || "(no stored note)" }),
+        ];
+        if (it.attempts) kids.push(el("span", { class: "issue-tier",
+                                                text: it.attempts + " tries" }));
+        kids.push(el("button", {
+          class: "btn btn-tiny issue-requeue",
+          type: "button",
+          title: it.has_note
+            ? "Re-issue this rejection's stored note — re-queues it for Aristotle"
+            : "No stored note to re-queue — use the CLI",
+          onclick: (function (id) {
+            return function (ev) { requeueIssue(id, ev.currentTarget); };
+          })(it.num),
+        }, ["Re-queue"]));
+        return el("div", { class: "issue-row stuck-row" }, kids);
+      });
+      var section = el("section", { class: "chap-block stuck-block" }, [
+        el("div", { class: "chap-title" }, [
+          "Stalled — needs re-reject",
+          el("span", { class: "chap-count", text: stuck.length + " parked" }),
+        ]),
+      ].concat(rows));
+      host.insertBefore(section, host.firstChild);
+    }).catch(function () { /* best-effort surface */ });
+  }
+
   function renderIssuesTab() {
     var host = dashHost("dash-issues");
     if (!host) return;
@@ -2515,6 +2580,7 @@
         host.appendChild(block);
       });
       if (!any) host.appendChild(el("div", { class: "dash-empty", text: "no registered issues" }));
+      renderStuckSection(host, d.repo);
     }).catch(function (e) { dashError("dash-issues", e); });
   }
 

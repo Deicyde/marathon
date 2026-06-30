@@ -423,6 +423,38 @@ def _issue_status(
     return "pending"
 
 
+def stuck_issues(cfg) -> "list[dict]":
+    """Issues parked OUTSIDE both the review feed and the refine queue — the
+    conductor won't retry them and they're not in the swipe queue, so a human
+    can't reach them without the CLI. The STUCK set:
+
+      * ``status == "stalled"`` — the conductor exhausted its retry budget; OR
+      * ``status == "rejected"`` with ``needs_iteration() == False`` — already
+        iterated, no fix landed (the silently-stranded case the #170 bug caused).
+
+    Pure read of ``state.json`` (no gh). Each row carries the STORED rejection
+    note so the deck can show it and offer a one-click re-queue (which re-issues
+    that exact note via ``record_rejection`` → ``needs_iteration`` True)."""
+    from marathon.review.state import load_state
+
+    out: "list[dict]" = []
+    for num, s in sorted(load_state(cfg).issues.items()):
+        stuck = s.status == "stalled" or (
+            s.status == "rejected" and not s.needs_iteration())
+        if not stuck:
+            continue
+        note = (s.notes or "").strip()
+        out.append({
+            "num": num,
+            "status": s.status,
+            "verdict_ts": s.verdict_ts,
+            "attempts": getattr(s, "attempts", 0),
+            "has_note": bool(note),
+            "note_preview": (note[:240] + "…") if len(note) > 240 else note,
+        })
+    return out
+
+
 def issues_overview(cfg: "ReviewConfig") -> dict:
     """All registered issues grouped by chapter, each with a combined status,
     tier, and (when available) readiness/blocked-reason + title.

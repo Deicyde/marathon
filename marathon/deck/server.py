@@ -241,6 +241,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                 return self._api_run_detail(path[len("/api/run/"):])
             if path == "/api/issues-overview":
                 return self._api_issues_overview()
+            if path == "/api/stuck":
+                return self._api_stuck()
             if path == "/api/history":
                 return self._api_history(query)
             self._send_error_json(HTTPStatus.NOT_FOUND, f"no route {path!r}")
@@ -440,7 +442,7 @@ class DeckHandler(BaseHTTPRequestHandler):
     # with no side effect.
     _POST_ROUTES = (
         "/api/verdict", "/api/decl-verdict", "/api/missing", "/api/ship",
-        "/api/refresh-issue", "/api/drop-citation",
+        "/api/refresh-issue", "/api/drop-citation", "/api/requeue",
         "/api/add-chapter", "/api/chapter-intake-status", "/api/approve-chapter",
     )
 
@@ -468,6 +470,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                     self._api_refresh_issue()
                 elif parsed.path == "/api/drop-citation":
                     self._api_drop_citation()
+                elif parsed.path == "/api/requeue":
+                    self._api_requeue()
                 elif parsed.path == "/api/add-chapter":
                     self._api_add_chapter()
                 elif parsed.path == "/api/chapter-intake-status":
@@ -933,6 +937,70 @@ class DeckHandler(BaseHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR, f"drop-citation failed: {exc}"
             )
         self._send_json(result)
+
+    def _api_stuck(self) -> None:
+        """The Stalled list (GET /api/stuck): issues parked OUTSIDE both the swipe
+        queue and the refine queue — status 'stalled', or 'rejected' with no
+        pending iteration (already iterated, no fix landed). Pure read; each row
+        carries its stored rejection note so the deck can offer a one-click
+        re-queue. Empty in demo mode."""
+        if self._demo:
+            return self._send_json({"issues": []})
+        from marathon.deck.dashboard import stuck_issues
+        self._send_json({"issues": stuck_issues(self.cfg)})
+
+    def _api_requeue(self) -> None:
+        """One-click RE-QUEUE of a parked rejection (POST /api/requeue) — re-issues
+        the issue's STORED rejection note so the conductor retries it. Token-gated
+        like every POST. Routes through ``record_rejection`` (bumps verdict_ts,
+        resets last_iteration_ts/attempts → ``needs_iteration`` True, un-stalls)
+        then ensures a conductor is running. Quiet by design: it re-issues the
+        SAME note (no fresh GitHub comment — the review:rejected label is already
+        on a parked issue). Refuses anything not genuinely parked, or with no
+        stored note (a re-queue needs the note to re-issue)."""
+        data = self._read_guarded_body()
+        if data is None:
+            return  # the guard already sent the 4xx (origin / body / token)
+        issue_raw = data.get("issue")
+        try:
+            issue_num = int(issue_raw)
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad or missing issue {issue_raw!r}"
+            )
+        if self._demo:
+            return self._send_json(
+                {"ok": False, "requeued": False,
+                 "message": "re-queue is not available in demo mode"}
+            )
+        from marathon.review.state import load_state, record_rejection
+
+        st = load_state(self.cfg).issues.get(issue_num)
+        if st is None or not (st.notes or "").strip():
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                f"#{issue_num}: no stored rejection note to re-queue"
+            )
+        is_stuck = st.status == "stalled" or (
+            st.status == "rejected" and not st.needs_iteration())
+        if not is_stuck:
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                f"#{issue_num} is not parked (status {st.status}) — "
+                "nothing to re-queue"
+            )
+        try:
+            record_rejection(self.cfg, issue_num, st.notes)
+            from marathon.review.review import _ensure_conductor
+            _ensure_conductor(self.cfg)
+        except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
+            return self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, f"re-queue failed: {exc}"
+            )
+        self._send_json(
+            {"ok": True, "requeued": True, "issue": issue_num,
+             "message": f"#{issue_num} re-queued — the conductor will retry it"}
+        )
 
     # --- helpers ----------------------------------------------------------
 
