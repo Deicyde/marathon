@@ -121,6 +121,7 @@ def _make_refine_args(repo_dir, target, workdir):
         tex=None,
         max_iterations=1,
         max_retries=1,
+        polling_interval=5,          # read when building the _run_iteration call
         skeleton=False,
         max_prompt_words=None,
         no_cross_chapter=True,
@@ -209,3 +210,78 @@ def test_conductor_warns_on_auth_abort_exit_code(tmp_path, monkeypatch, capsys):
     assert "GIT AUTH" in out
     assert "gh auth setup-git" in out
     assert "#22" in out
+
+
+# ---------------------------------------------------------------------------
+# BUG 3 — a FAILED iteration (RETRIES_EXHAUSTED / terminal status) is the same
+# phantom-success class on a different path: the refine main loop used to do a
+# bare ``return`` on ``not ok`` (exit 0 → phantom iteration → silently stranded,
+# the #170 symptom). It now ``sys.exit(EXIT_ITERATION_FAILED)`` so the conductor
+# retries with backoff and STALLS (visible + notified) instead of vanishing.
+# ---------------------------------------------------------------------------
+
+def test_refine_iteration_failure_exits_nonzero(monkeypatch, tmp_path):
+    """``_run_iteration`` → False (e.g. RETRIES_EXHAUSTED) makes refine_command
+    sys.exit(EXIT_ITERATION_FAILED), NOT a bare return (exit 0 = phantom success)."""
+    repo_dir = tmp_path / "repo"
+    target = repo_dir / "Demo" / "Chapter14"
+    target.mkdir(parents=True)
+    (repo_dir / ".git").mkdir()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    monkeypatch.setattr(refine, "_ensure_api_key", lambda: "sk-test")
+    monkeypatch.setattr(refine, "_load_pending_rejections_md", lambda *a, **k: None)
+    # branch prep SUCCEEDS so we reach the iteration loop...
+    monkeypatch.setattr(
+        post_pipeline, "prepare_auto_pr_branch",
+        lambda **k: (True, "marathon/refine-c14-i170", "auto-pr: ok"))
+
+    async def _no_reattach(*a, **k):
+        return (None, None, None)
+
+    monkeypatch.setattr(refine, "_try_reattach_or_continue", _no_reattach)
+
+    async def _fail(**k):                      # the iteration FAILS
+        st = k.get("state")
+        if st is not None:
+            st.status = "RETRIES_EXHAUSTED"
+            st.note = "reached max retries (2 attempts)"
+        return False
+
+    monkeypatch.setattr(refine, "_run_iteration", _fail)
+
+    args = _make_refine_args(repo_dir, target, workdir)
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(refine.refine_command(args))
+    assert exc.value.code == refine.EXIT_ITERATION_FAILED
+    assert exc.value.code != 0
+
+
+def test_conductor_iteration_failure_retries_then_stalls(tmp_path, monkeypatch):
+    """A job exiting EXIT_ITERATION_FAILED is FAILED (not succeeded): no phantom
+    last_iteration_ts, needs_iteration stays True so it auto-retries; once the
+    attempt budget is spent it STALLS (visible) instead of silently parking."""
+    monkeypatch.setattr(daemon, "_notify_stall", lambda *a, **k: None)  # no gh
+    cfg = make_cfg(tmp_path)
+    seed_rejections(cfg, {22: "2026-06-10T12:00:00-04:00"})
+    from marathon.review.state import load_state
+
+    def _job():
+        return conductor.ConductorJob(
+            issue_num=22, chapter=14, target="Demo/Chapter14",
+            worktree=str(cfg.repo_dir.parent / "runs" / "wt-i22-x"),
+            workdir=str(cfg.repo_dir.parent / "runs" / "wd-i22-x"),
+            branch="marathon/refine-c14-i22", pid=4001, status="running",
+            proc=SimpleNamespace(poll=lambda: refine.EXIT_ITERATION_FAILED),
+        )
+
+    # 1st failure (budget 2) → failed, retriable, NOT yet stalled, no phantom ts.
+    conductor._reap_finished(cfg, [_job()], {}, {}, max_attempts=2)
+    e = load_state(cfg).issues[22]
+    assert e.attempts == 1 and e.last_iteration_ts is None
+    assert e.status == "rejected" and e.needs_iteration()
+    # 2nd failure hits the budget → STALLED (dropped from the queue, surfaced).
+    conductor._reap_finished(cfg, [_job()], {}, {}, max_attempts=2)
+    e = load_state(cfg).issues[22]
+    assert e.status == "stalled" and not e.needs_iteration()

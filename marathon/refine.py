@@ -78,6 +78,15 @@ RATINGS_FILENAME = "marathon-ratings.jsonl"
 # _reap_finished), so do not reuse it for unrelated failures.
 EXIT_AUTO_PR_BRANCH_ABORT = 12
 
+#: A refine ITERATION failed (RETRIES_EXHAUSTED, a terminal non-retryable status,
+#: or no usable result). Exit non-zero so the conductor's ``_handle_refine_exit``
+#: routes it through the failure branch (``record_failed_attempt`` + backoff retry,
+#: then ``record_stall`` + one notification once the budget is spent) — NOT
+#: ``record_iteration``, which a clean (bare-``return``) exit would trigger and
+#: which silently strands the rejection forever (``needs_iteration`` → False). This
+#: is the iteration-failure twin of EXIT_AUTO_PR_BRANCH_ABORT.
+EXIT_ITERATION_FAILED = 13
+
 
 def _load_additional_writable_paths(
     repo_dir: Path, expected_path: PurePosixPath
@@ -1417,7 +1426,16 @@ async def refine_command(args) -> None:
             if state.note:
                 msg += f"  ({state.note})"
             print(msg)
-            return
+            # CRITICAL: exit NON-ZERO, not a bare return. A bare return exits the
+            # process 0, which the conductor reads as SUCCESS → record_iteration (a
+            # PHANTOM iteration: last_iteration_ts set, needs_iteration flips False)
+            # and the rejection is NEVER retried — silently stranded (the #156
+            # class; #170 sat 'rejected' for days this way after a
+            # RETRIES_EXHAUSTED iteration). A non-zero exit routes through
+            # _handle_refine_exit's failure branch (record_failed_attempt + backoff
+            # retry, then record_stall + one notification once the budget is spent),
+            # so the issue auto-retries and surfaces as STALLED instead of vanishing.
+            sys.exit(EXIT_ITERATION_FAILED)
 
         state.iterations_completed = iteration_idx
         save_refine_state(state_path, state)
