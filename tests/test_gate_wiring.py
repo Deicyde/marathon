@@ -342,6 +342,57 @@ def test_fill_run_is_exempt_from_the_demotion_and_enforces(
     assert "BLOCKED by gate" in console
 
 
+# --- repair faithfulness jury -----------------------------------------------------
+
+
+def test_repair_jury_weakening_blocks_pr(tmp_path, monkeypatch, capsys):
+    """A building repair whose faithfulness jury finds a weakened statement is
+    blocked from opening its PR (commit preserved), so it never merges."""
+    from marathon.repair_jury import RepairFaithfulnessVerdict
+
+    repo, target, workdir = _make_repo(tmp_path)
+    calls: dict = {}
+    _install_boundaries(monkeypatch, calls, build_ok=True)  # a building repair
+    monkeypatch.setattr(
+        "marathon.repair_jury.run_repair_faithfulness_jury",
+        lambda repo_dir, base, **kw: RepairFaithfulnessVerdict(
+            ran=True, passed=False,
+            weakened=[{"decl": "t", "reason": "P∧Q replaced with True"}],
+        ),
+    )
+    config = _config(
+        workdir, gate="warn", repair_run=True,
+        auto_build=True, auto_commit=True, auto_pr=True,
+    )
+
+    _run(config, repo, target)
+
+    assert "pr" not in calls              # PR NOT opened
+    assert len(calls["commit"]) == 1      # commit preserved
+    assert "BLOCKED by the repair faithfulness jury" in capsys.readouterr().out
+
+
+def test_repair_jury_pass_opens_pr(tmp_path, monkeypatch):
+    """A building repair that preserves every statement opens its PR normally."""
+    from marathon.repair_jury import RepairFaithfulnessVerdict
+
+    repo, target, workdir = _make_repo(tmp_path)
+    calls: dict = {}
+    _install_boundaries(monkeypatch, calls, build_ok=True)
+    monkeypatch.setattr(
+        "marathon.repair_jury.run_repair_faithfulness_jury",
+        lambda repo_dir, base, **kw: RepairFaithfulnessVerdict(ran=True, passed=True),
+    )
+    config = _config(
+        workdir, gate="warn", repair_run=True,
+        auto_build=True, auto_commit=True, auto_pr=True,
+    )
+
+    _run(config, repo, target)
+
+    assert len(calls["pr"]) == 1          # PR opened
+
+
 # --- jury ---------------------------------------------------------------------
 
 

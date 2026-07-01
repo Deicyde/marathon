@@ -1756,6 +1756,25 @@ def run_post_pipeline(
                     if extra_chapters else ""
                 )
                 pr_title = f"marathon: {chapter_label}{issue_part}{extra_suffix}{build_tag}"
+                # --- repair faithfulness jury -------------------------
+                # A REPAIR that compiles could still have "fixed" the build by
+                # weakening a statement. Compare each changed decl before/after
+                # and BLOCK the PR (like an enforce-gate FAIL) on any weakening,
+                # so a compiling-but-weakened repair never merges to main. Only
+                # runs on a building repair; an undetermined jury never blocks.
+                repair_verdict = None
+                if (
+                    config.repair_run
+                    and out["build"] is not None
+                    and out["build"].ok
+                ):
+                    from marathon.repair_jury import run_repair_faithfulness_jury
+
+                    repair_verdict = run_repair_faithfulness_jury(
+                        repo_dir, config.auto_pr_base
+                    )
+                    out["repair_jury"] = repair_verdict
+                    print(repair_verdict.render_line())
                 # --- gate enforcement (phase-2) -----------------------
                 # The ONLY step enforcement may block is this PR
                 # open/update. The commit (and any push) already landed
@@ -1777,23 +1796,46 @@ def run_post_pipeline(
                         )
                     else:
                         gate_blocked = True
-                if gate_blocked:
-                    failing = "; ".join(
-                        f"{c.name}: {c.summary}"
-                        for c in gate_report.checks
-                        if c.status == "fail"
-                    ) or "(see gate report above)"
-                    print(
-                        "  pr: BLOCKED by gate — verdict FAIL under "
-                        f"--gate enforce; skipped the PR open/update for "
-                        f"branch {branch} → {config.auto_pr_base}."
-                    )
-                    print(f"      failing checks: {failing}")
-                    print(
-                        f"      commit {out['commit'].sha} was NOT blocked "
-                        "— the work is preserved locally; re-run with "
-                        '--gate-override "REASON" to open the PR anyway.'
-                    )
+                faithfulness_blocked = (
+                    repair_verdict is not None
+                    and repair_verdict.blocks
+                    and not config.gate_override
+                )
+                if gate_blocked or faithfulness_blocked:
+                    if faithfulness_blocked:
+                        weak = "; ".join(
+                            f"{w.get('decl', '?')}: {w.get('reason', '')}"
+                            for w in repair_verdict.weakened
+                        ) or "(see jury above)"
+                        print(
+                            "  pr: BLOCKED by the repair faithfulness jury — the "
+                            "repair WEAKENED a statement; skipped the PR "
+                            f"open/update for branch {branch} → "
+                            f"{config.auto_pr_base}."
+                        )
+                        print(f"      weakened: {weak}")
+                        print(
+                            f"      commit {out['commit'].sha} was NOT blocked — "
+                            "the work is preserved locally; the module still "
+                            "needs a MEANING-PRESERVING repair."
+                        )
+                    else:
+                        failing = "; ".join(
+                            f"{c.name}: {c.summary}"
+                            for c in gate_report.checks
+                            if c.status == "fail"
+                        ) or "(see gate report above)"
+                        print(
+                            "  pr: BLOCKED by gate — verdict FAIL under "
+                            f"--gate enforce; skipped the PR open/update for "
+                            f"branch {branch} → {config.auto_pr_base}."
+                        )
+                        print(f"      failing checks: {failing}")
+                        print(
+                            f"      commit {out['commit'].sha} was NOT blocked "
+                            "— the work is preserved locally; re-run with "
+                            '--gate-override "REASON" to open the PR anyway.'
+                        )
                 else:
                     # Try to embed marathon.md (Aristotle's design log)
                     # when the workdir is known.
