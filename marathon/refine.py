@@ -27,6 +27,7 @@ from typing import Optional
 
 from aristotlelib import AgentTask, AristotleAPIError, Project, TaskStatus
 
+from marathon.formalization import module_from_file_path
 from marathon.aristotle_runtime import (
     CONTINUABLE_STATUS_VALUES,
     CONTINUABLE_STATUSES,
@@ -499,15 +500,48 @@ def _build_refine_submission_dir(
     tex_path: Optional[Path],
     workdir_log: Optional[Path],
     work_dir: Path,
+    target_dir: Optional[Path] = None,
 ) -> Path:
-    """Stage the Aristotle submission tree."""
+    """Stage the Aristotle submission tree.
+
+    With ``target_dir``, the staged tree is SCOPED to the target's import
+    closure: a ``.lean`` file ships only if the target chapter (or the
+    lakefile's root lib) transitively imports it. Downstream consumers and
+    orphans are excluded — a broken module the iteration is not allowed to
+    touch must never ride along and poison Aristotle's own verification
+    (the #170 stall: Chapter 15 refines wedged COMPLETE_WITH_ERRORS on
+    Chapter 16 files that stopped compiling when Ch15's API moved).
+    Non-``.lean`` files (lakefile, toolchain, manifest, …) always ship."""
     staged = work_dir / "submission"
     staged.mkdir()
+
+    allowed = None
+    if target_dir is not None:
+        try:
+            from marathon.module_closure import target_scope
+
+            allowed, excluded = target_scope(repo_dir, target_dir)
+        except Exception as exc:  # noqa: BLE001 — scoping is a filter, never a blocker
+            print(f"  bundle scope: skipped ({exc}); staging the full repo")
+            allowed = None
+        else:
+            if excluded:
+                print(
+                    f"  bundle scope: {len(allowed)} module(s) in the target's "
+                    f"import closure; excluding {len(excluded)} downstream/"
+                    f"orphaned .lean file(s): "
+                    + ", ".join(excluded[:4])
+                    + (", …" if len(excluded) > 4 else "")
+                )
 
     for rel in _list_repo_files(repo_dir):
         src = repo_dir / rel
         if not src.is_file():
             continue
+        if allowed is not None and rel.endswith(".lean"):
+            mod = module_from_file_path(rel)
+            if mod is not None and mod not in allowed:
+                continue  # downstream/orphan — out of this run's scope
         dst = staged / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
@@ -597,6 +631,7 @@ async def _submit_fresh_refine(
     state_path: Path,
     attempt_idx: int,
     max_retries: int,
+    target_dir: Optional[Path] = None,
 ) -> Optional[tuple[Project, AgentTask]]:
     state.attempts += 1
     state.output_path = None
@@ -611,6 +646,7 @@ async def _submit_fresh_refine(
             tex_path=tex_path,
             workdir_log=workdir_log,
             work_dir=Path(stage_tmp),
+            target_dir=target_dir,
         )
         try:
             project, task = await submit_from_directory(prompt=prompt, project_dir=staged)
@@ -751,6 +787,10 @@ async def _run_refine_attempt(
             state_path=state_path,
             attempt_idx=attempt_idx,
             max_retries=max_retries,
+            # Scope the bundle to the target's import closure: a Chapter-15
+            # iteration is judged by Chapter 15 (and upstream) ONLY — a broken
+            # downstream chapter must not ride along to Aristotle.
+            target_dir=repo_dir / Path(*expected_path.parts),
         )
         if submitted is None:
             return None

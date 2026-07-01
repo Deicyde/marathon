@@ -342,6 +342,33 @@ def test_fill_run_is_exempt_from_the_demotion_and_enforces(
     assert "BLOCKED by gate" in console
 
 
+# --- chapter-scoped build fallback -------------------------------------------------
+
+
+def test_no_changes_build_targets_the_chapter_not_default(tmp_path, monkeypatch):
+    """With nothing changed, the gate builds the TARGET chapter's modules
+    explicitly — the [build:*] verdict reflects the refined chapter only,
+    never the default closure (which may omit it) or a downstream chapter."""
+    repo, target, workdir = _make_repo(tmp_path)
+    calls: dict = {}
+    _install_boundaries(monkeypatch, calls, build_ok=True)
+    seen_targets: list = []
+
+    def capture_build(repo_dir, timeout, targets=None):
+        seen_targets.append(targets)
+        return BuildResult(ok=True, duration_seconds=1.0)
+
+    monkeypatch.setattr("marathon.post_pipeline.run_lake_build", capture_build)
+    monkeypatch.setattr(
+        "marathon.post_pipeline._changed_lean_targets", lambda repo_dir: []
+    )
+    config = _config(workdir, gate="off", auto_build=True)
+
+    _run(config, repo, target)
+
+    assert seen_targets == [["Chapter1.A"]]  # the chapter, not None (bare)
+
+
 # --- repair faithfulness jury -----------------------------------------------------
 
 

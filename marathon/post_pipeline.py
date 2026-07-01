@@ -1283,6 +1283,34 @@ def _changed_lean_targets(repo_dir: Path) -> list[str]:
     return lean_paths_to_targets(repo_dir, _modified_lean_files(repo_dir))
 
 
+def _target_lean_modules(repo_dir: Path, target_path: Path) -> list[str]:
+    """The target folder's ``.lean`` files as explicit lake targets — the
+    no-changes fallback: the ``[build:*]`` verdict must always reflect the
+    CHAPTER the run targeted, never the default closure (which may not even
+    include it) nor any downstream chapter. Best-effort: unmappable paths are
+    skipped; any failure yields ``[]`` (caller falls back to the bare build)."""
+    from marathon.formalization import module_from_file_path
+
+    mods: list[str] = []
+    try:
+        target = Path(target_path)
+        if not target.is_absolute():
+            target = repo_dir / target
+        for f in sorted(target.rglob("*.lean")):
+            try:
+                rel = f.relative_to(repo_dir)
+            except ValueError:
+                continue
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            mod = module_from_file_path(str(rel))
+            if mod is not None and _LEAN_TARGET_RE.match(mod):
+                mods.append(mod)
+    except OSError:
+        return []
+    return mods
+
+
 # A safe Lean module name (dotted identifiers): the only strings valid as
 # explicit ``lake build`` targets. Mirrors marathon.audit's _LEAN_NAME_RE.
 _LEAN_TARGET_RE = re.compile(
@@ -1398,9 +1426,19 @@ def run_post_pipeline(
         # [build:OK] means those files actually compile. A bare `lake build`
         # only compiles the default target's import closure, so a refine that
         # edits a leaf module nothing in that closure imports would never get
-        # compiled and would be wrongly tagged build:OK at rc=0. Empty list
-        # (no mappable lib-source changes) falls back to the bare build.
+        # compiled and would be wrongly tagged build:OK at rc=0. When nothing
+        # changed, fall back to the TARGET CHAPTER's own modules — never the
+        # bare default build, whose closure may omit the refined chapter
+        # entirely (vacuous [build:OK]) and must never let another chapter's
+        # build state decide this chapter's verdict.
         changed_targets = _changed_lean_targets(repo_dir)
+        if not changed_targets:
+            changed_targets = _target_lean_modules(repo_dir, target_path)
+            if changed_targets:
+                print(
+                    "  build: no changed lib sources — building the target "
+                    f"chapter's {len(changed_targets)} module(s) explicitly"
+                )
         b = run_lake_build(
             repo_dir, config.build_timeout, targets=changed_targets or None
         )
