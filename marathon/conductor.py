@@ -130,6 +130,10 @@ TICK_SECONDS = 10
 # after this long (the conflicting checkout is usually another live
 # job or a leftover the operator must --prune; hammering won't help).
 WORKTREE_DEFER_SECONDS = 60
+# A FILL (prove) job that exits non-zero backs off this long before the
+# next dispatch. Retries are already hard-bounded by the dispatch-time
+# `max_fill_attempts` cap; this only stops a tight re-dispatch loop.
+FILL_RETRY_BACKOFF_SECONDS = 300
 # Safety valve for --once mode: with per-issue backoffs the queue can
 # stay non-empty for a long time without being stuck; cap the tick
 # count rather than the dispatch count so retries aren't starved.
@@ -204,6 +208,7 @@ class ConductorJob:
     exit_code: Optional[int] = None
     project_id: Optional[str] = None         # from the workdir refine checkpoint
     aristotle_status: Optional[str] = None   # TaskStatus.value from the checkpoint
+    fill: bool = False                       # a PROVE job (marathon fill) vs a refine
     proc: Optional[object] = field(default=None, repr=False, compare=False)
     log_handle: Optional[object] = field(default=None, repr=False, compare=False)
 
@@ -868,6 +873,7 @@ def _dispatch_job(
         pid=popen.pid,
         started_ts=now_iso(),
         status="running",
+        fill=fill,
         proc=popen,
         log_handle=log_handle,
     )
@@ -1077,6 +1083,57 @@ def _requeue_if_no_pr_landed(cfg: ReviewConfig, job: ConductorJob) -> None:
                   f"re-review (was stuck 'rejected') ---", flush=True)
 
 
+def _reap_fill_job(
+    cfg: ReviewConfig,
+    job: ConductorJob,
+    rc: int,
+    interrupted: bool,
+    kept_worktrees: dict[int, str],
+    not_before: dict[int, float],
+) -> None:
+    """Reap a finished FILL (prove) job — the exit ladder a proof needs.
+
+    A fill proves the ``sorry`` bodies of an already-VERIFIED issue. Its
+    rejection state (attempts / stall / the review-queue verdict) belongs
+    to the human review pass, NOT to the prover, so this path deliberately
+    calls NONE of ``record_iteration`` / ``record_failed_attempt`` /
+    ``record_stall`` / ``_requeue_if_no_pr_landed`` (any of which would
+    corrupt a verified issue or bounce a proven statement back into
+    review). Retries are already capped at dispatch by
+    ``max_fill_attempts``; here a failure just backs off so the next tick
+    doesn't tight-loop, and a clean exit lets the automerge path land the
+    proof PR. Whether the ``sorry`` is genuinely discharged is confirmed
+    against the audit snapshot by discovery, not by this exit code."""
+    if interrupted:
+        job.status = "interrupted"
+        kept_worktrees[job.issue_num] = job.worktree
+        print(f"    worktree kept (fill interrupted): {job.worktree}", flush=True)
+        return
+    if rc == 0:
+        job.status = "succeeded"
+        _remove_worktree(cfg.repo_dir, Path(job.worktree))
+        # Ran with --no-metadata-commit; regenerate formalization.yaml centrally
+        # (same completion hook as a clean refine).
+        _regenerate_metadata_after_success(cfg)
+        return
+    # Non-zero: keep the worktree for debugging and back off (bounded by the
+    # dispatch-time attempt cap). No rejection-state mutation.
+    job.status = "failed"
+    kept_worktrees[job.issue_num] = job.worktree
+    not_before[job.issue_num] = _now() + FILL_RETRY_BACKOFF_SECONDS
+    print(
+        f"    fill #{job.issue_num} exited {rc}; worktree kept, backing off "
+        f"{FILL_RETRY_BACKOFF_SECONDS}s: {job.worktree}",
+        flush=True,
+    )
+    if rc == EXIT_AUTO_PR_BRANCH_ABORT:
+        print(
+            f"⚠️  fill #{job.issue_num} aborted on a GIT AUTH failure — run "
+            f"`gh auth setup-git`; retries will keep failing until fixed.",
+            flush=True,
+        )
+
+
 def _reap_finished(
     cfg: ReviewConfig,
     jobs: list[ConductorJob],
@@ -1116,6 +1173,16 @@ def _reap_finished(
         # Mirror the daemon exactly: a non-zero exit after a stop signal
         # reflects the kill (user pausing work), not a refine failure.
         interrupted = _STOP_REQUESTED and rc != 0
+        # A FILL (prove) job acts on a VERIFIED issue whose rejection state it
+        # does NOT own, so it must NEVER run the refine exit ladder
+        # (record_iteration / record_failed_attempt / record_stall /
+        # requeue-for-rereview would corrupt the verified state or bounce a
+        # proven statement back into review). Its retries are bounded at
+        # dispatch by `max_fill_attempts`; the automerge path lands a clean
+        # proof PR. Discharge is confirmed against the audit snapshot elsewhere.
+        if job.fill:
+            _reap_fill_job(cfg, job, rc, interrupted, kept_worktrees, not_before)
+            continue
         backoff = daemon._handle_refine_exit(
             cfg, job.issue_num, rc, max_attempts=max_attempts,
             interrupted=interrupted,

@@ -472,6 +472,73 @@ def test_interrupted_job_records_nothing(cfg, subprocess_calls, monkeypatch):
     assert subprocess_calls == []  # no gh, no worktree removal
 
 
+# --- fill (prove) reap: never touches the verified issue's state -----------------
+
+
+def _seed_verified(cfg, issue: int, ts: str = "2026-06-27T04:05:16-04:00") -> None:
+    """Write state.json with a single VERIFIED issue (the prover only ever
+    fills verified issues)."""
+    path = state_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "issues": {str(issue): {"status": "verified", "verdict_ts": ts}},
+    }))
+
+
+def test_fill_failure_never_mutates_verified_state(cfg, subprocess_calls, monkeypatch):
+    """A FILL job that exits non-zero must NOT run the refine exit ladder:
+    the verified issue's state is byte-identical, the worktree is kept, and
+    it backs off — no record_failed_attempt / record_stall / gh call."""
+    _seed_verified(cfg, 22)
+    before = state_path(cfg).read_text()
+    monkeypatch.setattr(conductor, "_now", lambda: 1000.0)
+    job = conductor.ConductorJob(
+        issue_num=22, chapter=14, target="Demo/Chapter14",
+        worktree=str(cfg.repo_dir.parent / "runs" / "wt-i22-x"),
+        workdir=str(cfg.repo_dir.parent / "runs" / "wd-i22-x"),
+        branch="marathon/refine-c14-i22", pid=4001, status="running",
+        fill=True, proc=SimpleNamespace(poll=lambda: 1),
+    )
+    not_before: dict[int, float] = {}
+    kept: dict[int, str] = {}
+    reaped = conductor._reap_finished(cfg, [job], not_before, kept, max_attempts=3)
+
+    assert reaped == 1
+    assert job.status == "failed"
+    assert state_path(cfg).read_text() == before  # verified state untouched
+    assert not_before[22] == 1000.0 + conductor.FILL_RETRY_BACKOFF_SECONDS
+    assert kept[22] == job.worktree               # worktree kept for debugging
+    assert subprocess_calls == []                 # no gh notification, no removal
+
+
+def test_fill_success_no_requeue_no_iteration(cfg, subprocess_calls, monkeypatch):
+    """A clean FILL job marks succeeded and lets automerge land the proof PR,
+    but never requeues the verified issue for re-review or records an
+    iteration against it (both are refine-only)."""
+    _seed_verified(cfg, 22)
+    before = state_path(cfg).read_text()
+    monkeypatch.setattr(conductor, "_regenerate_metadata_after_success", lambda c: None)
+    requeued: list[int] = []
+    monkeypatch.setattr(
+        conductor, "_requeue_if_no_pr_landed",
+        lambda c, job: requeued.append(job.issue_num),
+    )
+    job = conductor.ConductorJob(
+        issue_num=22, chapter=14, target="Demo/Chapter14",
+        worktree=str(cfg.repo_dir.parent / "runs" / "wt-i22-x"),
+        workdir=str(cfg.repo_dir.parent / "runs" / "wd-i22-x"),
+        branch="marathon/refine-c14-i22", pid=4001, status="running",
+        fill=True, proc=SimpleNamespace(poll=lambda: 0),
+    )
+    reaped = conductor._reap_finished(cfg, [job], {}, {}, max_attempts=3, reconcile=True)
+
+    assert reaped == 1
+    assert job.status == "succeeded"
+    assert state_path(cfg).read_text() == before  # verified state untouched
+    assert requeued == []                         # NOT bounced back to review
+
+
 # --- worktree guard rails --------------------------------------------------------
 
 
