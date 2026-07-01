@@ -709,22 +709,33 @@ def _pick_fill_dispatchable(
     _now_fn=_now,
     _discover=None,
     _open_pr=None,
+    _skeleton_done=None,
 ) -> list[tuple[int, int]]:
     """``[(issue, chapter), …]`` fills to dispatch this tick: verified-but-``sorry``
     issues in ``fill_chapters``, excluding those already running, backed off,
     attempt-capped, or with an open PR (a fill already pending merge). Sorted by
     issue number. Discovery is naturally idempotent — once a fill's PR merges the
     decl is no longer ``sorry`` and drops out — so the only loop risk is a fill
-    that lands nothing, which ``max_fill_attempts`` bounds."""
+    that lands nothing, which ``max_fill_attempts`` bounds.
+
+    A chapter is skipped entirely until its skeleton is done (every registered
+    issue verified) — proving while statements still churn wastes proofs on
+    signatures that may still change under re-review."""
     if not fill_chapters:
         return []
-    from marathon.review.fill_discovery import discover_fill_targets
+    from marathon.review.fill_discovery import (
+        chapter_skeleton_done,
+        discover_fill_targets,
+    )
 
     discover = _discover or discover_fill_targets
+    skeleton_done = _skeleton_done or chapter_skeleton_done
     open_pr = _open_pr or _has_open_pr_for_issue
     now = _now_fn()
     out: list[tuple[int, int]] = []
     for chapter in sorted(fill_chapters):
+        if not skeleton_done(cfg, chapter):
+            continue
         for t in discover(cfg, chapter):
             n = t.issue
             if n in running_issues:
@@ -1591,6 +1602,19 @@ def run_conductor(
     if fill_chapters:
         print(f"  fill (proving) enabled for chapter(s): {sorted(fill_chapters)} "
               f"(max {max_fill_attempts} attempts/issue)", flush=True)
+        # Note which requested chapters are still churning: a chapter is only
+        # proved once its skeleton is done (every statement verified), so an
+        # operator who names a not-yet-done chapter sees why it's idle.
+        try:
+            from marathon.review.fill_discovery import chapter_skeleton_done
+            waiting = sorted(c for c in fill_chapters
+                             if not chapter_skeleton_done(cfg, c))
+            if waiting:
+                print(f"  fill: chapter(s) {waiting} not skeleton-done yet — "
+                      "their fills wait until every statement is verified",
+                      flush=True)
+        except Exception as e:  # noqa: BLE001 — informational only
+            print(f"  fill: skeleton-done check skipped — {e}", flush=True)
     ticks = 0
     last_automerge = float("-inf")  # run the merge orchestrator on tick 1, then ~once/min
     last_reconcile_sha: Optional[str] = None  # reconcile only when HEAD changes

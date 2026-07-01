@@ -276,6 +276,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # repo-level multi-flight dispatcher (see marathon.conductor).
     _add_conductor_subparser(subparsers)
 
+    # Prover tree: `marathon prover status` — read-only per-chapter proving
+    # progress (verified / sorries-left / fill-targets + skeleton-done). The
+    # PROVE loop itself is `marathon conductor run --fill-chapter N`.
+    _add_prover_subparser(subparsers)
+
     # Landing tree: `marathon landing run/status/promote` — the Phase-4
     # serial landing queue onto marathon/next (see marathon.landing).
     _add_landing_subparser(subparsers)
@@ -843,6 +848,57 @@ def _add_conductor_subparser(subparsers) -> None:
         ),
     )
     p_stat.set_defaults(func=_run_conductor_status)
+
+
+def _add_prover_subparser(subparsers) -> None:
+    """`marathon prover status` — the read-only proving-progress surface.
+
+    The prover itself is the conductor's ``--fill-chapter`` mode; this only
+    reports per-chapter progress (verified statements, sorry-bodied decls
+    remaining, live fill targets, and whether the skeleton is done so the
+    chapter is provable)."""
+    p_prov = subparsers.add_parser(
+        "prover",
+        help="Proving-progress surface (the loop is `conductor run --fill-chapter`).",
+    )
+    sub = p_prov.add_subparsers(dest="prover_command", required=True)
+    p_stat = sub.add_parser("status", help="Per-chapter proving progress.")
+    p_stat.add_argument(
+        "--repo-dir", type=Path, default=None, metavar="PATH",
+        help="Consumer repo root. Default: current directory.",
+    )
+    p_stat.add_argument(
+        "--chapter", type=int, action="append", default=None,
+        dest="chapters", metavar="N",
+        help="Restrict to this chapter (repeatable). Default: every "
+             "registered chapter.",
+    )
+    p_stat.set_defaults(func=_run_prover_status)
+
+
+def _run_prover_status(args) -> None:
+    from marathon.review.config import load_config
+    from marathon.review.fill_discovery import prover_status
+
+    cfg = load_config(getattr(args, "repo_dir", None))
+    chapters = getattr(args, "chapters", None) or sorted(cfg.chapters or {})
+    if not chapters:
+        print("no chapters registered.")
+        return
+    rows = prover_status(cfg, chapters)
+    print(f"{'ch':>4}  {'verified':>9}  {'skeleton':>8}  "
+          f"{'sorries':>7}  {'targets':>7}  {'unproved':>8}")
+    for r in rows:
+        done = "done" if r.skeleton_done else "…churn"
+        print(f"{r.chapter:>4}  {f'{r.verified}/{r.registered}':>9}  {done:>8}  "
+              f"{r.sorries_left:>7}  {r.fill_targets:>7}  {r.unproved_decls:>8}")
+    provable = [r.chapter for r in rows if r.skeleton_done]
+    total_sorries = sum(r.sorries_left for r in rows)
+    print(
+        f"\n{total_sorries} sorry-bodied decl(s) across {len(rows)} chapter(s). "
+        f"skeleton-done (provable): "
+        f"{', '.join(map(str, provable)) if provable else 'none'}."
+    )
 
 
 def _run_conductor_run(args) -> None:
@@ -2905,6 +2961,10 @@ def main() -> None:
         # Dispatch via the subparser's set_defaults(func=…) handler.
         # No KeyboardInterrupt wrapper: `conductor run` installs its own
         # SIGINT/SIGTERM handlers (stop dispatching, wait for jobs).
+        args.func(args)
+    elif args.command == "prover":
+        # Dispatch via the subparser's set_defaults(func=…) handler — a
+        # short-lived read-only proving-progress query.
         args.func(args)
     elif args.command == "landing":
         # Dispatch via the subparser's set_defaults(func=…) handler. A

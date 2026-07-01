@@ -2,13 +2,17 @@
 declaration. Proved decls and unverified sorries are excluded."""
 from __future__ import annotations
 
-from marathon.review.config import ReviewConfig, ReviewLabels
-from marathon.review.fill_discovery import discover_fill_targets
+from marathon.review.config import ChapterRegistry, ReviewConfig, ReviewLabels
+from marathon.review.fill_discovery import (
+    chapter_skeleton_done,
+    discover_fill_targets,
+)
 
 
-def _cfg(tmp_path) -> ReviewConfig:
+def _cfg(tmp_path, chapters=None) -> ReviewConfig:
     repo = tmp_path / "repo"
-    repo.mkdir()
+    if not repo.exists():
+        repo.mkdir()
     return ReviewConfig(
         repo_dir=repo,
         config_path=repo / ".marathon/review/config.toml",
@@ -17,7 +21,7 @@ def _cfg(tmp_path) -> ReviewConfig:
         target_path_template="Demo/Chapter{chapter}",
         tracker_section_pattern="### Chapter {chapter}:",
         labels=ReviewLabels(),
-        chapters={},
+        chapters=chapters or {},
     )
 
 
@@ -63,3 +67,49 @@ def test_discover_never_raises_on_bad_verified(tmp_path):
         raise RuntimeError("gh down")
 
     assert discover_fill_targets(cfg, 12, _verified=boom) == []
+
+
+# --- chapter_skeleton_done: proving gate ------------------------------------------
+
+
+def _reg(chapter, entries):
+    return {chapter: ChapterRegistry(chapter=chapter, entries=list(entries))}
+
+
+def test_skeleton_done_true_when_all_registered_verified(tmp_path):
+    cfg = _cfg(tmp_path, _reg(12, [(55, "A"), (56, "B")]))
+    assert chapter_skeleton_done(
+        cfg, 12, _verified=lambda c, ch: {55: {"a"}, 56: {"b"}}
+    ) is True
+
+
+def test_skeleton_done_false_when_one_still_churning(tmp_path):
+    cfg = _cfg(tmp_path, _reg(12, [(55, "A"), (56, "B")]))
+    # 56 not yet verified → the chapter's skeleton is not done.
+    assert chapter_skeleton_done(
+        cfg, 12, _verified=lambda c, ch: {55: {"a"}}
+    ) is False
+
+
+def test_skeleton_done_false_when_no_registry(tmp_path):
+    cfg = _cfg(tmp_path)  # chapters={}
+    assert chapter_skeleton_done(
+        cfg, 12, _verified=lambda c, ch: {55: {"a"}}
+    ) is False
+
+
+def test_skeleton_done_ignores_verified_with_empty_declset(tmp_path):
+    cfg = _cfg(tmp_path, _reg(12, [(55, "A")]))
+    # A verified-labelled issue that surfaced no decls doesn't count as done.
+    assert chapter_skeleton_done(
+        cfg, 12, _verified=lambda c, ch: {55: set()}
+    ) is False
+
+
+def test_skeleton_done_never_raises(tmp_path):
+    cfg = _cfg(tmp_path, _reg(12, [(55, "A")]))
+
+    def boom(c, ch):
+        raise RuntimeError("gh down")
+
+    assert chapter_skeleton_done(cfg, 12, _verified=boom) is False

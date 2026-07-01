@@ -24,8 +24,23 @@ def test_pick_fill_excludes_running_backoff_capped_and_open_pr():
         _now_fn=lambda: 1000.0,
         _discover=lambda c, ch: targets.get(ch, []),
         _open_pr=lambda c, n, ch: n == 104,  # 104 has a fill PR pending merge
+        _skeleton_done=lambda c, ch: True,
     )
     assert picks == [(105, 12)]
+
+
+def test_pick_fill_skips_chapters_whose_skeleton_is_not_done():
+    """A chapter is not proved until every registered statement is verified —
+    even one still-churning issue blocks the whole chapter's fills."""
+    cfg = SimpleNamespace(github_repo="o/r")
+    targets = {11: [_ft(201, 11)], 12: [_ft(202, 12)]}
+    picks = cond._pick_fill_dispatchable(
+        cfg, {11, 12}, set(), {}, {}, 3,
+        _discover=lambda c, ch: targets.get(ch, []),
+        _open_pr=lambda c, n, ch: False,
+        _skeleton_done=lambda c, ch: ch == 12,  # only 12 is skeleton-done
+    )
+    assert picks == [(202, 12)]  # chapter 11 skipped entirely
 
 
 def test_pick_fill_empty_when_no_chapters_requested():
@@ -40,6 +55,7 @@ def test_pick_fill_spans_chapters_sorted_by_issue():
         cfg, {11, 12}, set(), {}, {}, 3,
         _discover=lambda c, ch: targets.get(ch, []),
         _open_pr=lambda c, n, ch: False,
+        _skeleton_done=lambda c, ch: True,
     )
     assert picks == [(201, 11), (202, 12)]
 
@@ -53,5 +69,6 @@ def test_pick_fill_expired_backoff_is_dispatchable():
         _now_fn=lambda: 1000.0,
         _discover=lambda c, ch: [_ft(108)],
         _open_pr=lambda c, n, ch: False,
+        _skeleton_done=lambda c, ch: True,
     )
     assert picks == [(108, 12)]
