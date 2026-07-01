@@ -113,3 +113,25 @@ def test_skeleton_done_never_raises(tmp_path):
         raise RuntimeError("gh down")
 
     assert chapter_skeleton_done(cfg, 12, _verified=boom) is False
+
+
+# --- Phase 3: direct-sorry leaves only (transitive self-clears) --------------------
+
+
+def test_discover_targets_only_direct_body_sorries(tmp_path):
+    """A decl whose OWN body is sorry-free is never a fill target, even if it
+    calls a still-sorry lemma — transitive sorries self-clear once the leaf is
+    proven and the module rebuilds, so the prover only dispatches direct-sorry
+    leaves and never wastes a fill on a transitively-blocked dependent."""
+    cfg = _cfg(tmp_path)
+    d = cfg.target_path(12)
+    d.mkdir(parents=True)
+    (d / "F.lean").write_text(
+        "theorem leaf : P := by sorry\n"            # direct sorry → target
+        "theorem dependent : Q := by exact leaf\n"  # clean body, uses leaf → NOT
+    )
+    targets = discover_fill_targets(
+        cfg, 12, _verified=lambda c, ch: {9: {"leaf", "dependent"}},
+    )
+    assert len(targets) == 1
+    assert targets[0].decls == ["leaf"]  # only the direct-sorry leaf

@@ -831,7 +831,19 @@ def _add_conductor_subparser(subparsers) -> None:
             "dispatches `marathon fill` for every verified declaration that still "
             "has a `sorry` body, landing proof PRs. The statement-immutability "
             "guard ensures a fill can only fill bodies + add sub-lemmas, never "
-            "change an approved statement. Omit to disable proving (the default)."
+            "change an approved statement. A chapter is only proved once its "
+            "skeleton is done (every statement verified). Omit to disable proving."
+        ),
+    )
+    p_run.add_argument(
+        "--prove-frontier",
+        action="store_true", default=False, dest="prove_frontier",
+        help=(
+            "Autonomous proving: prove EVERY registered chapter whose skeleton "
+            "is done (all statements verified), auto-joining a chapter the moment "
+            "it completes. The hands-off default — no per-chapter flag needed. "
+            "Equivalent to --fill-chapter for every skeleton-done chapter, "
+            "re-evaluated each tick. Composes with the skeleton-done gate."
         ),
     )
     p_run.set_defaults(func=_run_conductor_run)
@@ -922,6 +934,7 @@ def _run_conductor_run(args) -> None:
         reverify=getattr(args, "reverify", True),
         queue_from_github=getattr(args, "queue_from_github", False),
         fill_chapters=set(getattr(args, "fill_chapters", None) or ()),
+        prove_frontier=getattr(args, "prove_frontier", False),
     )
     if rc:
         raise SystemExit(rc)

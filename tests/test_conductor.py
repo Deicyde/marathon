@@ -539,6 +539,24 @@ def test_fill_success_no_requeue_no_iteration(cfg, subprocess_calls, monkeypatch
     assert requeued == []                         # NOT bounced back to review
 
 
+def test_prove_frontier_gates_on_skeleton_done(e2e, monkeypatch):
+    """--prove-frontier makes every registered chapter a proving candidate, but
+    the skeleton-done gate blocks all of them when nothing is verified — so a
+    frontier run over an all-unverified project dispatches no fills and doesn't
+    crash on the extra chapters."""
+    monkeypatch.setattr(
+        "marathon.review.verified_decls.verified_declarations",
+        lambda cfg, chapter: {},  # nothing verified → no chapter is skeleton-done
+    )
+    rc = conductor.run_conductor(
+        repo_dir=e2e.cfg.repo_dir, concurrency=1, once=True, prune=False,
+        max_attempts=3, worktree_parent=e2e.runs_parent,
+        automerge=False, reconcile=False, prove_frontier=True,
+    )
+    assert rc == 0
+    assert e2e.popen.spawned == []  # no fills (and no refines) dispatched
+
+
 # --- worktree guard rails --------------------------------------------------------
 
 

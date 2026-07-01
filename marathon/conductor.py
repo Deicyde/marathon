@@ -1533,6 +1533,7 @@ def run_conductor(
     queue_from_github: bool = False,
     fill_chapters: Optional[set[int]] = None,
     max_fill_attempts: int = 3,
+    prove_frontier: bool = False,
 ) -> int:
     """Run the conductor loop. Returns the final exit code.
 
@@ -1599,6 +1600,14 @@ def run_conductor(
     dispatch_count = 0
     fill_attempts: dict[int, int] = {}         # per-issue fill dispatch counter (capped)
     fill_chapters = set(fill_chapters or ())   # opt-in proving scope (empty ⇒ no fills)
+    if prove_frontier:
+        # Autonomous proving: every registered chapter is a candidate; the
+        # per-tick skeleton-done gate in _pick_fill_dispatchable restricts to
+        # the ones actually done, so a chapter auto-joins the frontier the
+        # moment its last statement is verified. Unions any explicit --fill-chapter.
+        fill_chapters |= set(cfg.chapters or {})
+        print("  fill (proving): --prove-frontier — every skeleton-done chapter "
+              "is proved (auto-joins on completion)", flush=True)
     if fill_chapters:
         print(f"  fill (proving) enabled for chapter(s): {sorted(fill_chapters)} "
               f"(max {max_fill_attempts} attempts/issue)", flush=True)
