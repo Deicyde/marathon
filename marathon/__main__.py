@@ -10,6 +10,7 @@ from marathon.review.cli import review_command
 from marathon.refine import refine_command
 from marathon.skeleton import skeleton_command
 from marathon.fill import add_fill_subparsers
+from marathon.repair import add_repair_subparsers
 from marathon.audit.probes import ProbeKind
 from marathon.probes_aristotle import DEFAULT_MAX_PROBES as _VAC_DEFAULT_MAX
 from marathon.extraction import DEFAULT_K, SOURCE_MODES
@@ -309,6 +310,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # directive so the slash commands can shell out without knowing the
     # focus-directive incantation.
     add_fill_subparsers(subparsers)
+
+    # Repair tree: `marathon repair` — make a non-compiling module build again
+    # via Aristotle (the third Aristotle pipeline; wraps refine with a
+    # build-error directive, lands on main under `marathon/repair-c<N>`).
+    add_repair_subparsers(subparsers)
 
     # Plan tree: `marathon plan {sorries,axiom,repo,textbook}` — the
     # Phase-7 planner intake that fills the target ledger. `textbook`
@@ -3037,6 +3043,14 @@ def main() -> None:
         # async wrappers that build a focus directive and delegate to
         # `refine_command`. The `_verb` default lets the handler distinguish
         # the two without re-parsing args.command.
+        try:
+            asyncio.run(args.func(args))
+        except KeyboardInterrupt:
+            print("\ninterrupted", file=sys.stderr)
+            sys.exit(130)
+    elif args.command == "repair":
+        # `repair` set_defaults(func=_run_repair) — an async wrapper that builds
+        # a build-error focus directive and delegates to `refine_command`.
         try:
             asyncio.run(args.func(args))
         except KeyboardInterrupt:

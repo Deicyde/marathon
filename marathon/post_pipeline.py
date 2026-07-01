@@ -145,6 +145,11 @@ class PipelineConfig:
     # apply: a proof that smuggles an axiom / leaves a nested sorry must be
     # blocked from merge (machine-clean acceptance), never waved through.
     fill_run: bool = False
+    # True when this iteration is a REPAIR run (``marathon repair``): make a
+    # non-compiling module build again, preserving statement meaning. Lands on
+    # main under a ``repair-`` branch; enforcement applies (a repair must
+    # actually compile, and the faithfulness jury guards against weakening).
+    repair_run: bool = False
     # Advisory jury (marathon.jury): Claude-scored proof_integrity +
     # code_quality, no faithfulness. Runs only when True; the verdict
     # line joins the console output + PR body and one JSON line is
@@ -1709,7 +1714,11 @@ def run_post_pipeline(
             else:
                 branch = _branch_name_for_issue(
                     chapter_label, config.auto_pr_review_issue,
-                    kind="proof" if config.fill_run else "refine",
+                    kind=(
+                        "proof" if config.fill_run
+                        else "repair" if config.repair_run
+                        else "refine"
+                    ),
                 )
                 issue_part = (
                     f" iter for #{config.auto_pr_review_issue}"

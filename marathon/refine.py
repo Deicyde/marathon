@@ -1271,6 +1271,7 @@ async def refine_command(args) -> None:
         skeleton_mode=bool(args.skeleton),
         review_rejection_run=review_issue_num is not None,
         fill_run=getattr(args, "fill_run", False),
+        repair_run=getattr(args, "repair_run", False),
         jury=getattr(args, "jury", False),
         jury_log_path=workdir / JURY_LOG_FILENAME,
     )
@@ -1308,8 +1309,13 @@ async def refine_command(args) -> None:
             issue_num=review_issue_num,
             base=pipeline_config.auto_pr_base,
             # A PROVE run lands proofs on the prover branch under a distinct
-            # `proof-` prefix; a refine keeps `refine-` (→ main).
-            kind="proof" if pipeline_config.fill_run else "refine",
+            # `proof-` prefix; a REPAIR run lands build-fixes on main under
+            # `repair-`; a refine keeps `refine-`.
+            kind=(
+                "proof" if pipeline_config.fill_run
+                else "repair" if pipeline_config.repair_run
+                else "refine"
+            ),
         )
         if not ok:
             print(f"  auto-pr: {branch_msg}", flush=True)
