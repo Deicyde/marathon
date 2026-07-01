@@ -205,11 +205,14 @@ async def _run_repair(args) -> None:
     # Mark this a REPAIR run: branch kind `repair-` (→ main) and the
     # faithfulness jury. Not tied to a review issue → chapter-scoped branch.
     args.repair_run = True
-    # A repair may legitimately leave `sorry` bodies (statement compiles, proof
-    # deferred), so run the gate in warn (the [build:OK] automerge gate is what
-    # keeps a still-broken repair off main) and let it iterate a few times to
-    # converge on a green build.
-    args.max_iterations = max(int(getattr(args, "max_iterations", 0) or 0), 3)
+    # Repair is ONE-SHOT (like fill): a single iteration that either goes
+    # green or doesn't — the conductor's max_repair_attempts loop is the
+    # retry mechanism (it re-discovers a still-broken module next tick).
+    # A multi-iteration repair kept "improving" an ALREADY-GREEN file: its
+    # iteration-2 prompt told Aristotle to sledgehammer every def body to
+    # `sorry` — statement-preserving (jury-proof) but destroying good
+    # construction bodies. Never iterate past the win condition.
+    args.max_iterations = 1
     args.skeleton = False
     args.review_rejection = None
     args.update_formalization = getattr(args, "update_formalization", True)
