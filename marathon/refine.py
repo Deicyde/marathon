@@ -1307,6 +1307,9 @@ async def refine_command(args) -> None:
             chapter_label=target_folder.name,
             issue_num=review_issue_num,
             base=pipeline_config.auto_pr_base,
+            # A PROVE run lands proofs on the prover branch under a distinct
+            # `proof-` prefix; a refine keeps `refine-` (→ main).
+            kind="proof" if pipeline_config.fill_run else "refine",
         )
         if not ok:
             print(f"  auto-pr: {branch_msg}", flush=True)

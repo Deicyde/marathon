@@ -117,6 +117,10 @@ QUEUE_FROM_GITHUB_ENV_VAR = "MARATHON_QUEUE_FROM_GITHUB"
 # to origin/<base> (default main) at iteration start anyway; this just
 # has to be a valid start point for `git worktree add -B`.
 WORKTREE_START_POINT = "origin/main"
+# The prover lands Aristotle PROOFS on a SEPARATE branch — main stays in
+# skeleton mode. Proof PRs target this branch and only ever merge into it;
+# the [build:OK] automerge's base-equality guard keeps a proof off main.
+PROVER_BASE_BRANCH = "marathon/proving"
 # The branch the PRIMARY checkout must be on for conductor-side
 # metadata regeneration — the same base the job worktrees branch from.
 # Regenerating anywhere else would derive yaml fields from whatever the
@@ -681,13 +685,45 @@ def _prime_mathlib_cache(
     return True
 
 
-def _has_open_pr_for_issue(cfg: ReviewConfig, issue_num: int, chapter: int) -> bool:
+def _ensure_prover_branch(repo_dir: Path, prover_branch: str) -> None:
+    """Ensure the remote prover branch exists, forked from origin/main.
+
+    Best-effort + idempotent: if ``origin/<prover_branch>`` is already there,
+    do nothing (we do NOT reset it — that would discard landed proofs). If it
+    is absent, create it on the remote pointing at current origin/main so the
+    first fill has a base to branch from. A failure here is logged, never
+    raised — a missing branch just means fills defer until it exists."""
+    try:
+        _git(repo_dir, "fetch", "origin", "main")
+        ls = _git(repo_dir, "ls-remote", "--heads", "origin", prover_branch)
+        if ls.returncode == 0 and (ls.stdout or "").strip():
+            return  # already exists — leave its accumulated proofs intact
+        push = _git(
+            repo_dir, "push", "origin",
+            f"origin/main:refs/heads/{prover_branch}",
+        )
+        if push.returncode == 0:
+            print(f"  fill (proving): created prover branch '{prover_branch}' "
+                  "from origin/main", flush=True)
+        else:
+            print(f"  fill (proving): WARN could not create '{prover_branch}': "
+                  f"{((push.stderr or push.stdout) or '').strip()[:200]}",
+                  flush=True)
+    except Exception as e:  # noqa: BLE001 — never block startup on branch setup
+        print(f"  fill (proving): WARN prover-branch ensure skipped — {e}",
+              flush=True)
+
+
+def _has_open_pr_for_issue(
+    cfg: ReviewConfig, issue_num: int, chapter: int, *, kind: str = "refine"
+) -> bool:
     """True when the issue's per-issue branch already has an OPEN PR — a fill is
-    pending merge, so don't dispatch another. Best-effort: a check failure returns
-    False (better a rare duplicate than a wedged queue)."""
+    pending merge, so don't dispatch another. ``kind`` picks the branch prefix
+    (``proof`` for a fill's prover-branch PR). Best-effort: a check failure
+    returns False (better a rare duplicate than a wedged queue)."""
     from marathon.review.github import gh
 
-    branch = _branch_name_for_issue(f"Chapter{chapter}", issue_num)
+    branch = _branch_name_for_issue(f"Chapter{chapter}", issue_num, kind=kind)
     try:
         cp = gh("pr", "list", "--repo", cfg.github_repo, "--head", branch,
                 "--state", "open", "--json", "number", "--limit", "1", check=False)
@@ -744,7 +780,7 @@ def _pick_fill_dispatchable(
                 continue
             if fill_attempts.get(n, 0) >= max_fill_attempts:
                 continue
-            if open_pr(cfg, n, chapter):
+            if open_pr(cfg, n, chapter, kind="proof"):
                 continue
             out.append((n, chapter))
     return out
@@ -758,6 +794,7 @@ def _dispatch_job(
     kept_worktrees: dict[int, str],
     *,
     fill: bool = False,
+    prover_branch: str = PROVER_BASE_BRANCH,
 ) -> Optional[ConductorJob]:
     """Create the job worktree (or reuse the one a failed attempt kept —
     it still holds the per-issue branch, so a fresh add would trip the
@@ -766,9 +803,16 @@ def _dispatch_job(
     Returns None to DEFER (never crash) when the worktree cannot be
     created — most importantly when git refuses because the per-issue
     branch is checked out in another worktree, which is the
-    double-dispatch guard working as intended."""
+    double-dispatch guard working as intended.
+
+    A FILL job proves on the SEPARATE prover branch: it branches from
+    ``origin/<prover_branch>`` under a ``proof-`` name and its PR targets
+    the prover branch, so proofs never touch ``main``."""
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    branch = _branch_name_for_issue(f"Chapter{chapter}", issue_num)
+    branch = _branch_name_for_issue(
+        f"Chapter{chapter}", issue_num, kind="proof" if fill else "refine"
+    )
+    start_point = f"origin/{prover_branch}" if fill else WORKTREE_START_POINT
 
     reuse = kept_worktrees.get(issue_num)
     if reuse and Path(reuse).is_dir():
@@ -784,7 +828,7 @@ def _dispatch_job(
         runs_parent.mkdir(parents=True, exist_ok=True)
         proc = _git(
             cfg.repo_dir,
-            "worktree", "add", "-B", branch, str(worktree), WORKTREE_START_POINT,
+            "worktree", "add", "-B", branch, str(worktree), start_point,
         )
         if proc.returncode != 0:
             msg = ((proc.stderr or proc.stdout) or "").strip()
@@ -802,7 +846,7 @@ def _dispatch_job(
                 _reap_orphan_worktree(cfg.repo_dir, branch)
                 proc = _git(
                     cfg.repo_dir, "worktree", "add", "-B", branch,
-                    str(worktree), WORKTREE_START_POINT,
+                    str(worktree), start_point,
                 )
         if proc.returncode != 0:
             msg = ((proc.stderr or proc.stdout) or "").strip()
@@ -842,6 +886,11 @@ def _dispatch_job(
             "--issue", str(issue_num),
             "--no-metadata-commit",
             "--build-timeout", "2400",
+            # Proofs land on the SEPARATE prover branch, never main. The
+            # worktree already branched from origin/<prover_branch>; target the
+            # PR at it too so the [build:OK] automerge (base-equality gated)
+            # can only ever merge this proof into the prover branch.
+            "--auto-pr-base", prover_branch,
             # Machine-clean acceptance: enforce the proof gate so a fill whose
             # proof leaves a nested `sorry` or smuggles an axiom (sorryAx / a
             # non-whitelisted axiom) is BLOCKED from opening its PR — the
@@ -1534,6 +1583,7 @@ def run_conductor(
     fill_chapters: Optional[set[int]] = None,
     max_fill_attempts: int = 3,
     prove_frontier: bool = False,
+    prover_branch: str = PROVER_BASE_BRANCH,
 ) -> int:
     """Run the conductor loop. Returns the final exit code.
 
@@ -1624,6 +1674,14 @@ def run_conductor(
                       flush=True)
         except Exception as e:  # noqa: BLE001 — informational only
             print(f"  fill: skeleton-done check skipped — {e}", flush=True)
+    proving_enabled = bool(fill_chapters)
+    if proving_enabled:
+        # Proofs land on a SEPARATE branch (main stays skeleton). Ensure it
+        # exists — forked from origin/main — before any fill branches off it.
+        _ensure_prover_branch(cfg.repo_dir, prover_branch)
+        print(f"  fill (proving): proofs land on '{prover_branch}' only — "
+              "never main. Proving runs only when the refine queue is idle.",
+              flush=True)
     ticks = 0
     last_automerge = float("-inf")  # run the merge orchestrator on tick 1, then ~once/min
     last_reconcile_sha: Optional[str] = None  # reconcile only when HEAD changes
@@ -1659,12 +1717,22 @@ def run_conductor(
             # branch a live refine worktree is pushing to would fail its push.
             if automerge and not _STOP_REQUESTED and _now() - last_automerge > 60:
                 last_automerge = _now()
-                daemon._maybe_automerge(
-                    cfg, True, scope=merge_scope,
-                    exclude_heads=frozenset(
-                        j.branch for j in jobs if j.status == "running"
-                    ),
+                running_heads = frozenset(
+                    j.branch for j in jobs if j.status == "running"
                 )
+                daemon._maybe_automerge(
+                    cfg, True, scope=merge_scope, exclude_heads=running_heads,
+                )
+                # Second pass: land clean proof PRs on the PROVER branch. Its
+                # base-equality guard means this cycle only ever touches PRs
+                # based on the prover branch (proofs) and the main cycle above
+                # only touches base==main (refines) — so a proof can never
+                # reach main. Skipped unless proving is enabled.
+                if proving_enabled:
+                    daemon._maybe_automerge(
+                        cfg, True, scope=merge_scope,
+                        exclude_heads=running_heads, base=prover_branch,
+                    )
             # Auto-reconcile issue signatures to the live code (ADD uncited
             # in-code result-key decls; replace git-proven renames; never drop a
             # stale citation on a guess). Fires only when HEAD MOVED since the
@@ -1742,10 +1810,17 @@ def run_conductor(
                     dispatch_count += 1
                 running = [j for j in jobs if j.status == "running"]
 
-                # Fill-dispatch (opt-in): prove verified-but-`sorry` decls in the
-                # requested chapters with whatever concurrency the refines left.
-                # The statement-immutability guard makes each fill body-only.
-                if fill_chapters:
+                # Fill-dispatch (opt-in): prove verified-but-`sorry` decls on
+                # the prover branch. STRICTLY lower priority than the human
+                # review/refine loop — proving runs ONLY when that queue is
+                # idle: no refine job running AND nothing left to dispatch this
+                # tick. So a proof never competes for a slot with, or delays the
+                # start of, a refine. In-flight one-shot fills finish normally.
+                refine_running = any(
+                    j.status == "running" and not j.fill for j in jobs
+                )
+                refine_pending = bool(picks)  # rejections we just dispatched/deferred
+                if fill_chapters and not refine_running and not refine_pending:
                     slots = n - len(running)
                     fill_picks = (
                         _pick_fill_dispatchable(
@@ -1759,14 +1834,15 @@ def run_conductor(
                     for issue_num, chapter in fill_picks:
                         job = _dispatch_job(
                             cfg, issue_num, chapter, runs_parent,
-                            kept_worktrees, fill=True,
+                            kept_worktrees, fill=True, prover_branch=prover_branch,
                         )
                         if job is None:
                             not_before[issue_num] = _now() + WORKTREE_DEFER_SECONDS
                             continue
                         fill_attempts[issue_num] = fill_attempts.get(issue_num, 0) + 1
                         print(f"--- dispatched FILL #{issue_num} (chapter {chapter}, "
-                              f"attempt {fill_attempts[issue_num]}) ---", flush=True)
+                              f"attempt {fill_attempts[issue_num]}) → {prover_branch} "
+                              "---", flush=True)
                         jobs.append(job)
                         dispatch_count += 1
                     running = [j for j in jobs if j.status == "running"]

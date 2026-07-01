@@ -360,18 +360,21 @@ def _maybe_automerge(
     *,
     exclude_heads: "frozenset[str]" = frozenset(),
     scope: str = "any",
+    base: "str | None" = None,
 ) -> None:
     """Best-effort: land every eligible open PR on the base branch (the merge
-    orchestrator). ``exclude_heads`` protects the head branches of in-flight
-    refines (merging+deleting one would break a running push). Wrapped so a
-    ``gh`` hiccup NEVER crashes the loop — a failed cycle just retries next
-    tick. No-op when disabled."""
+    orchestrator). ``base`` overrides the merge target (default: the config's
+    auto-pr base, else ``main``) — the conductor runs a second cycle with the
+    prover branch as base to land proof PRs there. ``exclude_heads`` protects
+    the head branches of in-flight jobs (merging+deleting one would break a
+    running push). Wrapped so a ``gh`` hiccup NEVER crashes the loop — a failed
+    cycle just retries next tick. No-op when disabled."""
     if not enabled:
         return
     try:
         from marathon.review.automerge import automerge
 
-        automerge(cfg, exclude_heads=exclude_heads, scope=scope)
+        automerge(cfg, exclude_heads=exclude_heads, scope=scope, base=base)
     except Exception as exc:  # noqa: BLE001 — never let merge housekeeping kill the daemon
         print(f"  automerge: WARN — cycle skipped ({exc})", flush=True)
 

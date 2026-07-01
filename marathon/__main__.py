@@ -846,6 +846,14 @@ def _add_conductor_subparser(subparsers) -> None:
             "re-evaluated each tick. Composes with the skeleton-done gate."
         ),
     )
+    p_run.add_argument(
+        "--prover-branch", default="marathon/proving", metavar="BRANCH",
+        help=(
+            "The branch proofs land on (default: marathon/proving). Main stays "
+            "in skeleton mode; every proof PR targets and only ever merges into "
+            "this branch. Forked from origin/main if absent."
+        ),
+    )
     p_run.set_defaults(func=_run_conductor_run)
 
     p_stat = sub.add_parser(
@@ -935,6 +943,7 @@ def _run_conductor_run(args) -> None:
         queue_from_github=getattr(args, "queue_from_github", False),
         fill_chapters=set(getattr(args, "fill_chapters", None) or ()),
         prove_frontier=getattr(args, "prove_frontier", False),
+        prover_branch=getattr(args, "prover_branch", "marathon/proving"),
     )
     if rc:
         raise SystemExit(rc)

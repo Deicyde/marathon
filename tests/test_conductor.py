@@ -557,6 +557,34 @@ def test_prove_frontier_gates_on_skeleton_done(e2e, monkeypatch):
     assert e2e.popen.spawned == []  # no fills (and no refines) dispatched
 
 
+def test_fill_is_gated_off_while_a_refine_is_pending(e2e, monkeypatch):
+    """Proving is strictly lower priority than the human review/refine loop:
+    with a rejection to refine, no fill dispatches this tick — the fill block
+    is short-circuited before discovery even runs."""
+    seed_rejections(e2e.cfg, {22: "2026-06-10T12:00:00-04:00"})
+    monkeypatch.setattr(
+        "marathon.review.verified_decls.verified_declarations",
+        lambda cfg, chapter: {},
+    )
+    # If the priority gate ever leaked, discovery would run — make it explode
+    # so the test fails loudly rather than silently dispatching a fill.
+    def _boom(*a, **k):
+        raise AssertionError("fill discovery ran while a refine was pending")
+
+    monkeypatch.setattr(
+        "marathon.review.fill_discovery.discover_fill_targets", _boom
+    )
+    rc = conductor.run_conductor(
+        repo_dir=e2e.cfg.repo_dir, concurrency=1, once=True, prune=False,
+        max_attempts=3, worktree_parent=e2e.runs_parent,
+        automerge=False, reconcile=False, fill_chapters={14},
+    )
+    assert rc == 0
+    # Exactly the refine ran — a refine cmd (`--review-rejection`), never a fill.
+    assert len(e2e.popen.spawned) == 1
+    assert "--review-rejection" in e2e.popen.spawned[0].cmd
+
+
 # --- worktree guard rails --------------------------------------------------------
 
 

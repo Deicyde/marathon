@@ -570,19 +570,27 @@ def _extra_chapters_in_writes(
     return sorted(found)
 
 
-def _branch_name_for_issue(chapter_label: str, issue_num: Optional[int]) -> str:
+def _branch_name_for_issue(
+    chapter_label: str, issue_num: Optional[int], *, kind: str = "refine"
+) -> str:
     """Return the dedicated marathon branch name for an iteration.
 
     Persistent per-issue when ``issue_num`` is set:
-    ``marathon/refine-c<N>-i<issue>``. Falls back to a chapter-scoped
+    ``marathon/<kind>-c<N>-i<issue>``. Falls back to a chapter-scoped
     name when ``issue_num`` is None (e.g., manual ``marathon refine``
-    not driven by a sub-issue rejection)."""
+    not driven by a sub-issue rejection).
+
+    ``kind`` is ``"refine"`` for the human-review loop (lands on ``main``)
+    and ``"proof"`` for a PROVE run (``marathon fill``, lands on the prover
+    branch). The distinct ``proof-`` prefix keeps proof branches OUT of the
+    refine-requeue regex, so landing a proof never bounces a verified issue
+    back into review."""
     # ``chapter_label`` is e.g. "Chapter14" — extract the integer.
     chap_digits = "".join(ch for ch in chapter_label if ch.isdigit())
     chap = chap_digits or "?"
     if issue_num is not None:
-        return f"marathon/refine-c{chap}-i{issue_num}"
-    return f"marathon/refine-c{chap}"
+        return f"marathon/{kind}-c{chap}-i{issue_num}"
+    return f"marathon/{kind}-c{chap}"
 
 
 def _gh(*args: str, cwd: Optional[Path] = None, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -650,6 +658,7 @@ def prepare_auto_pr_branch(
     chapter_label: str,
     issue_num: Optional[int],
     base: str = "main",
+    kind: str = "refine",
 ) -> tuple[bool, str, str]:
     """Check out the marathon branch for this iteration, resetting to
     ``origin/<base>`` so each iteration's diff is clean.
@@ -662,8 +671,11 @@ def prepare_auto_pr_branch(
     on this branch. Existing branches are hard-reset to
     ``origin/<base>`` (the per-issue-persistent-branch model means we
     only keep the latest iteration on the branch).
-    """
-    branch = _branch_name_for_issue(chapter_label, issue_num)
+
+    ``kind`` selects the branch prefix: ``"refine"`` (→ ``main``) or
+    ``"proof"`` (a fill, → the prover branch). ``base`` is the branch the
+    iteration resets onto and the PR targets — the prover branch for a proof."""
+    branch = _branch_name_for_issue(chapter_label, issue_num, kind=kind)
 
     # Fetch latest base to ensure the reset target is current.
     fetch = subprocess.run(
@@ -1696,7 +1708,8 @@ def run_post_pipeline(
                       "(set --auto-pr-repo or run `gh auth login`)")
             else:
                 branch = _branch_name_for_issue(
-                    chapter_label, config.auto_pr_review_issue
+                    chapter_label, config.auto_pr_review_issue,
+                    kind="proof" if config.fill_run else "refine",
                 )
                 issue_part = (
                     f" iter for #{config.auto_pr_review_issue}"
