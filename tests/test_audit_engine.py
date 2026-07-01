@@ -76,6 +76,15 @@ def fake_lake(monkeypatch):
 
     def install(stdout=GOLDEN_TEXT, returncode=0, stderr="", exc=None):
         monkeypatch.setattr(engine, "_find_lake", lambda: "/fake/lake")
+        # Neutralize the build-targets-first phase: it probes on-disk oleans
+        # (a separate boundary from the subprocess seam these tests mock), and
+        # the fixture package is never built. Treat every module as buildable
+        # so the parse path under test is exercised unchanged. The partition
+        # logic itself is covered by TestPartitionBuildable / TestSkipBroken.
+        monkeypatch.setattr(
+            engine, "partition_buildable",
+            lambda lake, repo, modules, timeout: (list(modules), []),
+        )
         calls: list[tuple[list, dict]] = []
 
         def fake_run(cmd, **kwargs):
@@ -444,6 +453,129 @@ class TestDeriveModules:
         mods, failures = engine.derive_modules(tmp_path, "Foo/Bar.lean")
         assert mods == ["Foo.Bar"]
         assert failures == []
+
+
+# ---------------------------------------------------------------------------
+# Build-targets-first + skip-broken (partition_buildable)
+# ---------------------------------------------------------------------------
+
+class TestPartitionBuildable:
+    """Classification of modules into (buildable, broken) via lake's own
+    per-module exit code — the signal that lets one broken module be
+    skipped instead of failing the whole single-import audit script."""
+
+    @staticmethod
+    def _fake_lake_by_exit(monkeypatch, good):
+        """Patch subprocess so `lake build <targets>` exits 0 iff every
+        target is in *good*, recording each invocation's targets."""
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            # cmd == [lake, "build", *targets]
+            targets = cmd[2:]
+            calls.append(targets)
+            rc = 0 if all(t in good for t in targets) else 1
+            return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
+
+        monkeypatch.setattr(engine.subprocess, "run", fake_run)
+        return calls
+
+    def test_all_good_takes_batch_fast_path(self, monkeypatch):
+        good = {"Q.A", "Q.B"}
+        calls = self._fake_lake_by_exit(monkeypatch, good)
+        buildable, broken = engine.partition_buildable(
+            "/fake/lake", Path("/repo"), ["Q.A", "Q.B"], 5
+        )
+        assert buildable == ["Q.A", "Q.B"]
+        assert broken == []
+        # Healthy case: a single batched build, no per-module fallback.
+        assert calls == [["Q.A", "Q.B"]]
+
+    def test_broken_module_split_out(self, monkeypatch):
+        good = {"P.Good1", "P.Good2"}
+        mods = ["P.Good1", "P.Good2", "P.Broken"]
+        calls = self._fake_lake_by_exit(monkeypatch, good)
+        buildable, broken = engine.partition_buildable(
+            "/fake/lake", Path("/repo"), mods, 5
+        )
+        assert buildable == ["P.Good1", "P.Good2"]
+        assert broken == ["P.Broken"]
+        # Batch failed → per-module fallback probed each module.
+        assert calls[0] == mods
+        assert set(map(tuple, calls[1:])) == {
+            ("P.Good1",), ("P.Good2",), ("P.Broken",)
+        }
+
+    def test_lake_build_ok_reads_exit_code(self, monkeypatch):
+        monkeypatch.setattr(
+            engine.subprocess, "run",
+            lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, "", ""),
+        )
+        assert engine._lake_build_ok("/fake/lake", Path("/r"), ["M"], 5)
+        monkeypatch.setattr(
+            engine.subprocess, "run",
+            lambda cmd, **k: subprocess.CompletedProcess(cmd, 1, "", ""),
+        )
+        assert not engine._lake_build_ok("/fake/lake", Path("/r"), ["M"], 5)
+        # No targets → trivially ok, no subprocess.
+        assert engine._lake_build_ok("/fake/lake", Path("/r"), [], 5)
+
+    def test_lake_build_ok_never_raises(self, monkeypatch):
+        def boom(cmd, **k):
+            raise subprocess.TimeoutExpired(cmd="lake", timeout=5)
+
+        monkeypatch.setattr(engine.subprocess, "run", boom)
+        assert not engine._lake_build_ok("/fake/lake", Path("/r"), ["M"], 5)
+
+
+class TestSkipBrokenIntegration:
+    """run_audit end-to-end with a broken module in the target folder."""
+
+    def test_all_broken_yields_empty_snapshot_without_running_audit(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(engine, "_find_lake", lambda: "/fake/lake")
+        monkeypatch.setattr(
+            engine, "partition_buildable",
+            lambda lake, repo, modules, timeout: ([], list(modules)),
+        )
+        ran: list = []
+
+        def fake_run(cmd, **kwargs):
+            ran.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(engine.subprocess, "run", fake_run)
+        snap = engine.run_audit(FIXTURE_DIR, "AuditFixture", timeout=5)
+        assert snap.decls == []
+        assert snap.modules == []
+        assert any("no modules built successfully" in f for f in snap.failures)
+        assert any("failed to build" in f for f in snap.failures)
+        # The `lake env lean` audit is short-circuited — nothing to audit.
+        assert ran == []
+
+    def test_broken_module_recorded_and_excluded(self, monkeypatch):
+        monkeypatch.setattr(engine, "_find_lake", lambda: "/fake/lake")
+        monkeypatch.setattr(
+            engine, "partition_buildable",
+            lambda lake, repo, modules, timeout: (
+                [m for m in modules if "Deception" not in m],
+                [m for m in modules if "Deception" in m],
+            ),
+        )
+        monkeypatch.setattr(
+            engine.subprocess, "run",
+            lambda cmd, **k: subprocess.CompletedProcess(
+                cmd, 0, stdout=GOLDEN_TEXT, stderr=""
+            ),
+        )
+        snap = engine.run_audit(FIXTURE_DIR, "AuditFixture", timeout=5)
+        assert "AuditFixture.Deception" not in snap.modules
+        assert "AuditFixture.Basic" in snap.modules
+        assert any(
+            "AuditFixture.Deception" in f and "failed to build" in f
+            for f in snap.failures
+        )
 
 
 class TestDeriveTrustedPrefixes:

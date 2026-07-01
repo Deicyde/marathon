@@ -98,6 +98,70 @@ def _find_lake() -> str | None:
     return str(cand) if cand.exists() else None
 
 
+def _lake_build_ok(
+    lake: str, repo: Path, targets: list[str], timeout: int
+) -> bool:
+    """``lake build <targets>`` in *repo*; True iff it exits 0. Never raises.
+
+    Lake's own exit code is the authoritative build signal: it keys off a
+    content-hash trace, not file mtimes, so it (a) treats a module whose
+    source mtime was merely bumped by a ``git checkout`` as up-to-date, and
+    (b) reports a genuine failure even though Lean leaves the previous
+    ``.olean`` in place on a failed rebuild. Probing on-disk oleans instead
+    gets both of those cases wrong (false-broken / false-buildable), which
+    is why classification goes through lake, not the filesystem."""
+    if not targets:
+        return True
+    try:
+        proc = subprocess.run(
+            [lake, "build", *targets],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+        return proc.returncode == 0
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.debug("lake build %s: %s", targets, exc)
+        return False
+
+
+def partition_buildable(
+    lake: str, repo: Path, modules: list[str], timeout: int
+) -> tuple[list[str], list[str]]:
+    """Build *modules* and split them into ``(buildable, broken)``.
+
+    "Build-targets-first": every module is compiled before the single
+    all-imports audit script runs, so that one uncompilable module (an
+    in-progress ``StokesTheorem``, a chapter that broke against a renamed
+    upstream API) cannot take the whole ``lake env lean`` audit down with
+    it — the classic single-bad-leaf failure that leaves every declaration
+    reading as "no audit evidence".
+
+    The healthy case is one batched ``lake build``: if it exits 0 every
+    module built and there is nothing to exclude. Only when the batch fails
+    is each module rebuilt individually to find the culprit(s) — lake's
+    per-module exit code is authoritative (see :func:`_lake_build_ok`).
+    Broken modules are returned separately so the caller records them as
+    honest failures and drops them from the audit import set.
+
+    The buildable set is import-closed under brokenness: a module that
+    imports a broken one cannot itself build, so it too lands in ``broken``
+    — which is exactly why the surviving audit script never loads a stale
+    or inconsistent olean."""
+    if _lake_build_ok(lake, repo, modules, timeout):
+        return sorted(modules), []
+    buildable: list[str] = []
+    broken: list[str] = []
+    for m in modules:
+        if _lake_build_ok(lake, repo, [m], timeout):
+            buildable.append(m)
+        else:
+            broken.append(m)
+    return sorted(buildable), sorted(broken)
+
+
 def derive_modules(
     repo_dir: Path, target_folder: str | Path
 ) -> tuple[list[str], list[str]]:
@@ -455,10 +519,6 @@ def run_audit(
 
     if not modules:
         return snapshot([], [f"no auditable .lean modules under {target_folder}"])
-    try:
-        script = render_audit_script(modules, trusted)
-    except ValueError as exc:  # belt-and-braces: inputs are pre-filtered
-        return snapshot([], [f"could not render audit script: {exc}"])
     lake = _find_lake()
     if lake is None:
         return snapshot(
@@ -466,6 +526,28 @@ def run_audit(
             ["lake not found (no PATH lake, no ~/.elan/bin/lake) — "
              "audit evidence undetermined"],
         )
+
+    # Build-targets-first + skip-broken: compile every module before the
+    # single all-imports audit script runs, and drop any module that fails
+    # to build. Without this, one uncompilable module (a broken orphan)
+    # fails the whole `lake env lean` audit → an empty snapshot → every
+    # decl reads as "no audit evidence" (the StokesTheorem blocker).
+    buildable, broken = partition_buildable(lake, repo, modules, timeout)
+    for m in broken:
+        failures.append(
+            f"module {m} failed to build; excluded from audit "
+            "(its declarations are absent from this snapshot)"
+        )
+    modules = buildable
+    if not modules:
+        return snapshot(
+            [],
+            ["no modules built successfully — audit evidence undetermined"],
+        )
+    try:
+        script = render_audit_script(modules, trusted)
+    except ValueError as exc:  # belt-and-braces: inputs are pre-filtered
+        return snapshot([], [f"could not render audit script: {exc}"])
 
     run_failures: list[str] = []
     stdout = ""
