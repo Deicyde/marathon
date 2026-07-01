@@ -95,25 +95,58 @@ def _read_chapter_sources(cfg: ReviewConfig, chapter: int) -> list[tuple[str, st
     return out
 
 
-def _audit_inventory(cfg: ReviewConfig, chapter: int) -> list[str]:
-    """``["<kind> <name>  [has sorry]", …]`` from the audit snapshot for the
-    chapter's modules, or ``[]`` when no snapshot exists (best-effort — the
-    source already carries the signatures; the inventory is a completeness aid)."""
+def _chapter_inventory(cfg: ReviewConfig, chapter: int) -> list[str]:
+    """``["<kind> <name>  [has sorry]", …]`` for EVERY declaration in the
+    chapter's source — the audit snapshot where a module is covered, UNIONED
+    with a source scan of any module the audit does NOT cover.
+
+    A module that does not currently compile is absent from the audit snapshot
+    (the build-targets-first audit skips broken modules), but it is still in
+    scope for intake — issue generation must never depend on whether the code
+    builds. Without the source-scan union the inventory would silently drop a
+    broken module's declarations, which led Claude to defer whole roadmap lines
+    as "out of inventory scope". Best-effort: a scan failure just yields fewer
+    rows (the full source is fed to the model regardless)."""
+    from marathon.formalization import module_from_file_path
+
+    needle = f"Chapter{chapter}"
+    rows: list[str] = []
+    audited_modules: set[str] = set()
     try:
         from marathon.audit.engine import load_snapshot
 
         snap = load_snapshot(cfg.repo_dir)
     except Exception:  # noqa: BLE001 — no snapshot / signature drift is non-fatal
-        return []
-    if snap is None:
-        return []
-    needle = f"Chapter{chapter}"
-    rows: list[str] = []
-    for d in getattr(snap, "decls", []) or ():
-        if needle not in (getattr(d, "module", "") or ""):
+        snap = None
+    if snap is not None:
+        for d in getattr(snap, "decls", []) or ():
+            mod = getattr(d, "module", "") or ""
+            if needle not in mod:
+                continue
+            audited_modules.add(mod)
+            flag = "  [has sorry]" if getattr(d, "has_sorry", False) else ""
+            rows.append(f"{getattr(d, 'kind', 'decl')} {getattr(d, 'name', '?')}{flag}")
+
+    # Source-only modules: present in the chapter's .lean but absent from the
+    # audit (typically because they don't currently build). List their decls
+    # from a source scan so no roadmap line loses its declarations.
+    from marathon.fill import _extract_decls_from_text, _find_sorries_in_file
+
+    for rel, text in _read_chapter_sources(cfg, chapter):
+        module = module_from_file_path(rel) or ""
+        if module and module in audited_modules:
             continue
-        flag = "  [has sorry]" if getattr(d, "has_sorry", False) else ""
-        rows.append(f"{getattr(d, 'kind', 'decl')} {getattr(d, 'name', '?')}{flag}")
+        try:
+            sorry_names = set(_find_sorries_in_file(cfg.repo_dir / rel))
+        except Exception:  # noqa: BLE001
+            sorry_names = set()
+        short = module.rsplit(".", 1)[-1] if module else rel
+        for name in _extract_decls_from_text(text):
+            flag = "  [has sorry]" if name in sorry_names else ""
+            rows.append(
+                f"decl {name}{flag}  [source only — `{short}` not in audit "
+                "snapshot (may not build); still in scope]"
+            )
     return rows
 
 
@@ -199,7 +232,7 @@ def _build_intake_prompt(
     src_block = "\n\n".join(
         f"### `{rel}`\n\n```lean\n{text}\n```" for rel, text in sources
     ) or "_(the chapter's target folder has no `.lean` files yet)_"
-    inv_block = "\n".join(f"- {row}" for row in inventory) or "_(no audit snapshot)_"
+    inv_block = "\n".join(f"- {row}" for row in inventory) or "_(no declarations found)_"
 
     return f"""# Marathon headless chapter-intake — Chapter {chapter}
 
@@ -213,7 +246,16 @@ everything you need is embedded in this prompt. {informal_directive}
 
 {rubric}
 
-## Declaration inventory (from the audit snapshot)
+## Declaration inventory (completeness aid — NOT the scope)
+
+This lists the chapter's declarations (audit snapshot where a module is
+audited, plus a source scan of modules that aren't). It is a hint for locating
+declarations, **never** a scope boundary. Rows tagged `[source only — … not in
+audit snapshot (may not build)]` come from modules that don't currently
+compile — they are STILL IN SCOPE. Decompose EVERY roadmap line (1..N) even
+when its module is absent or its declarations are missing here; the roadmap and
+the verbatim source below are authoritative, not this list. Never defer a
+roadmap line as "out of inventory scope".
 
 {inv_block}
 
@@ -285,7 +327,7 @@ def run_chapter_intake(
             )
 
     prompt = _build_intake_prompt(
-        chapter, sources, _audit_inventory(cfg, chapter), informal_text, informal_kind
+        chapter, sources, _chapter_inventory(cfg, chapter), informal_text, informal_kind
     )
     try:
         runner_kw = {"model": model, "timeout": timeout}
