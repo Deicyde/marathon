@@ -160,7 +160,14 @@ def popen_factory(monkeypatch):
     class FakePopen:
         def __init__(self, cmd, **kwargs):
             self.cmd = list(cmd)
-            self.issue = int(self.cmd[self.cmd.index("--review-rejection") + 1])
+
+            def _arg(flag):
+                return (self.cmd[self.cmd.index(flag) + 1]
+                        if flag in self.cmd else None)
+
+            # refine → --review-rejection, fill → --issue, repair → neither.
+            raw = _arg("--review-rejection") or _arg("--issue")
+            self.issue = int(raw) if raw else 0
             self.pid = 4000 + len(state.spawned)
             conf = state.script.get(self.issue, {})
             self._polls_left = conf.get("polls", 1)
@@ -583,6 +590,53 @@ def test_fill_is_gated_off_while_a_refine_is_pending(e2e, monkeypatch):
     # Exactly the refine ran — a refine cmd (`--review-rejection`), never a fill.
     assert len(e2e.popen.spawned) == 1
     assert "--review-rejection" in e2e.popen.spawned[0].cmd
+
+
+def test_repair_never_preempts_a_pending_refine(e2e, monkeypatch):
+    """Repair is idle-priority: a pending refine is dispatched BEFORE any repair
+    — the human review loop is never preempted by an autonomous repair."""
+    seed_rejections(e2e.cfg, {22: "2026-06-10T12:00:00-04:00"})
+    monkeypatch.setattr(
+        "marathon.repair.broken_modules",
+        lambda cfg, ch: ["Demo.Chapter14.Broken"] if ch == 14 else [],
+    )
+    monkeypatch.setattr(conductor, "_regenerate_metadata_after_success", lambda c: None)
+    rc = conductor.run_conductor(
+        repo_dir=e2e.cfg.repo_dir, concurrency=1, once=True, prune=False,
+        max_attempts=3, worktree_parent=e2e.runs_parent,
+        automerge=False, reconcile=False, repair_chapters={14},
+    )
+    assert rc == 0
+    cmds = [s.cmd for s in e2e.popen.spawned]
+    first_refine = next(i for i, c in enumerate(cmds) if "--review-rejection" in c)
+    repair_idxs = [i for i, c in enumerate(cmds) if "repair" in c]
+    assert repair_idxs, "a repair should run once the refine queue drains"
+    assert first_refine < repair_idxs[0]  # refine dispatched before any repair
+
+
+def test_repair_dispatches_a_broken_chapter_when_idle(e2e, monkeypatch):
+    """With the refine queue idle and a chapter carrying a broken module, the
+    conductor dispatches `marathon repair` with the broken module(s) → main
+    (only the broken chapter; 15/16 build, so they are skipped)."""
+    monkeypatch.setattr(
+        "marathon.repair.broken_modules",
+        lambda cfg, ch: ["Demo.Chapter14.Broken"] if ch == 14 else [],
+    )
+    monkeypatch.setattr(conductor, "_regenerate_metadata_after_success", lambda c: None)
+    rc = conductor.run_conductor(
+        repo_dir=e2e.cfg.repo_dir, concurrency=1, once=True, prune=False,
+        max_attempts=3, worktree_parent=e2e.runs_parent,
+        automerge=False, reconcile=False, repair_chapters={14, 15, 16},
+    )
+    assert rc == 0
+    repair_cmds = [
+        s.cmd for s in e2e.popen.spawned
+        if "repair" in s.cmd and "--module" in s.cmd
+    ]
+    assert repair_cmds, "the broken chapter 14 should be repaired"
+    for cmd in repair_cmds:
+        assert "Demo.Chapter14.Broken" in cmd          # only the broken chapter
+        assert "--review-rejection" not in cmd and "--issue" not in cmd
 
 
 # --- worktree guard rails --------------------------------------------------------

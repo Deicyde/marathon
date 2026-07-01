@@ -140,3 +140,48 @@ def test_dispatch_fill_routes_to_prover_branch_never_main(tmp_path, monkeypatch)
     assert cmd[i + 1] == "marathon/proving"        # PR targets the prover branch
     assert "--gate" in cmd and cmd[cmd.index("--gate") + 1] == "enforce"
     assert "--issue" in cmd and "170" in cmd
+
+
+# --- repairs branch from main under a repair- name --------------------------------
+
+
+def test_dispatch_repair_routes_to_main_repair_branch(tmp_path, monkeypatch):
+    """A repair job branches from origin/main under `marathon/repair-c<N>`, runs
+    `marathon repair` with the broken modules, and is flagged repair (not fill)."""
+    cfg = _reviewcfg(tmp_path)
+    git_calls = []
+
+    def fake_git(repo_dir, *args):
+        git_calls.append(list(args))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cond, "_git", fake_git)
+    monkeypatch.setattr(cond, "_prime_mathlib_cache", lambda w: None)
+    monkeypatch.setattr(cond, "_mathlib_already_built", lambda w: True)
+    cmds = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            self.cmd = list(cmd)
+            self.pid = 7
+            cmds.append(self.cmd)
+
+    monkeypatch.setattr(cond.subprocess, "Popen", FakePopen)
+
+    job = cond._dispatch_job(
+        cfg, cond.REPAIR_KEY_BASE + 16, 16, tmp_path / "runs", {},
+        repair=True,
+        repair_modules=["A.B.Chapter16.IntegrationManifold", "A.B.Chapter16.StokesTheorem"],
+    )
+    assert job is not None and job.repair is True and job.fill is False
+    assert job.branch == "marathon/repair-c16"
+
+    add = [c for c in git_calls if c[:2] == ["worktree", "add"]][0]
+    assert add[-1] == "origin/main"           # repairs fork from main
+    assert "marathon/repair-c16" in add
+
+    cmd = cmds[0]
+    assert "repair" in cmd
+    assert cmd.count("--module") == 2
+    assert "A.B.Chapter16.IntegrationManifold" in cmd
+    assert "--auto-pr-base" not in cmd        # defaults to main (skeleton)

@@ -121,6 +121,10 @@ WORKTREE_START_POINT = "origin/main"
 # skeleton mode. Proof PRs target this branch and only ever merge into it;
 # the [build:OK] automerge's base-equality guard keeps a proof off main.
 PROVER_BASE_BRANCH = "marathon/proving"
+# Repair jobs are chapter-scoped (no review issue). Key them by
+# ``REPAIR_KEY_BASE + chapter`` in the shared not_before/kept_worktrees dicts so
+# a repair's bookkeeping can never collide with a real issue number.
+REPAIR_KEY_BASE = 1_000_000
 # The branch the PRIMARY checkout must be on for conductor-side
 # metadata regeneration — the same base the job worktrees branch from.
 # Regenerating anywhere else would derive yaml fields from whatever the
@@ -213,6 +217,7 @@ class ConductorJob:
     project_id: Optional[str] = None         # from the workdir refine checkpoint
     aristotle_status: Optional[str] = None   # TaskStatus.value from the checkpoint
     fill: bool = False                       # a PROVE job (marathon fill) vs a refine
+    repair: bool = False                     # a REPAIR job (marathon repair, → main)
     proc: Optional[object] = field(default=None, repr=False, compare=False)
     log_handle: Optional[object] = field(default=None, repr=False, compare=False)
 
@@ -795,6 +800,8 @@ def _dispatch_job(
     *,
     fill: bool = False,
     prover_branch: str = PROVER_BASE_BRANCH,
+    repair: bool = False,
+    repair_modules: Optional[list[str]] = None,
 ) -> Optional[ConductorJob]:
     """Create the job worktree (or reuse the one a failed attempt kept —
     it still holds the per-issue branch, so a fresh add would trip the
@@ -809,10 +816,17 @@ def _dispatch_job(
     ``origin/<prover_branch>`` under a ``proof-`` name and its PR targets
     the prover branch, so proofs never touch ``main``."""
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    branch = _branch_name_for_issue(
-        f"Chapter{chapter}", issue_num, kind="proof" if fill else "refine"
-    )
-    start_point = f"origin/{prover_branch}" if fill else WORKTREE_START_POINT
+    if repair:
+        # Chapter-scoped repair branch (no review issue): marathon/repair-c<N>,
+        # forked from origin/main — a repair makes the skeleton compile.
+        branch = _branch_name_for_issue(f"Chapter{chapter}", None, kind="repair")
+        start_point = WORKTREE_START_POINT
+    elif fill:
+        branch = _branch_name_for_issue(f"Chapter{chapter}", issue_num, kind="proof")
+        start_point = f"origin/{prover_branch}"
+    else:
+        branch = _branch_name_for_issue(f"Chapter{chapter}", issue_num, kind="refine")
+        start_point = WORKTREE_START_POINT
 
     reuse = kept_worktrees.get(issue_num)
     if reuse and Path(reuse).is_dir():
@@ -870,7 +884,24 @@ def _dispatch_job(
     # formalization.yaml is the generalized form of the wall_time merge
     # race, so jobs never commit the yaml; the conductor regenerates it
     # centrally after each success (_regenerate_metadata_after_success).
-    if fill:
+    if repair:
+        # Repair the chapter's non-building modules against the CURRENT code.
+        # The conductor passes the broken set explicitly (a fresh worktree has
+        # no audit snapshot to discover from). `marathon repair` defaults
+        # auto-build/commit/push/pr ON and runs the faithfulness jury; it lands
+        # on main under marathon/repair-c<N>.
+        cmd = [
+            sys.executable, "-m", "marathon", "repair",
+            str(target),
+            "--repo-dir", str(worktree),
+            "--workdir", str(workdir),
+            "--no-metadata-commit",
+            "--build-timeout", "2400",
+        ]
+        for m in (repair_modules or []):
+            cmd += ["--module", m]
+        log_path = workdir / "conductor-repair.log"
+    elif fill:
         # Prove the verified-but-`sorry` declarations cited in this issue. The
         # statement-immutability guard (enforce_frozen_statements, default on)
         # reverts any change to an approved signature, so a fill can only fill
@@ -942,6 +973,7 @@ def _dispatch_job(
         started_ts=now_iso(),
         status="running",
         fill=fill,
+        repair=repair,
         proc=popen,
         log_handle=log_handle,
     )
@@ -1248,7 +1280,11 @@ def _reap_finished(
         # proven statement back into review). Its retries are bounded at
         # dispatch by `max_fill_attempts`; the automerge path lands a clean
         # proof PR. Discharge is confirmed against the audit snapshot elsewhere.
-        if job.fill:
+        if job.fill or job.repair:
+            # Both are AUTONOMOUS jobs with no rejection state to own — a fill
+            # (→ prover branch) and a repair (→ main) are reaped identically:
+            # never touch the review verdict ladder; the automerge + the
+            # in-pipeline gates (build/axiom/faithfulness) decide what lands.
             _reap_fill_job(cfg, job, rc, interrupted, kept_worktrees, not_before)
             continue
         backoff = daemon._handle_refine_exit(
@@ -1584,6 +1620,9 @@ def run_conductor(
     max_fill_attempts: int = 3,
     prove_frontier: bool = False,
     prover_branch: str = PROVER_BASE_BRANCH,
+    repair_chapters: Optional[set[int]] = None,
+    repair_frontier: bool = False,
+    max_repair_attempts: int = 3,
 ) -> int:
     """Run the conductor loop. Returns the final exit code.
 
@@ -1674,6 +1713,16 @@ def run_conductor(
                       flush=True)
         except Exception as e:  # noqa: BLE001 — informational only
             print(f"  fill: skeleton-done check skipped — {e}", flush=True)
+    repair_attempts: dict[int, int] = {}       # per-chapter repair dispatch counter
+    repair_chapters = set(repair_chapters or ())
+    if repair_frontier:
+        # Autonomous repair: every registered chapter is a candidate; discovery
+        # each tick restricts to the ones that actually have a broken module.
+        repair_chapters |= set(cfg.chapters or {})
+    if repair_chapters:
+        print(f"  repair enabled for chapter(s): {sorted(repair_chapters)} "
+              f"(max {max_repair_attempts} attempts/chapter) — broken modules "
+              "auto-fixed to main, gated by build + faithfulness jury", flush=True)
     proving_enabled = bool(fill_chapters)
     if proving_enabled:
         # Proofs land on a SEPARATE branch (main stays skeleton). Ensure it
@@ -1810,17 +1859,67 @@ def run_conductor(
                     dispatch_count += 1
                 running = [j for j in jobs if j.status == "running"]
 
-                # Fill-dispatch (opt-in): prove verified-but-`sorry` decls on
-                # the prover branch. STRICTLY lower priority than the human
-                # review/refine loop — proving runs ONLY when that queue is
-                # idle: no refine job running AND nothing left to dispatch this
-                # tick. So a proof never competes for a slot with, or delays the
-                # start of, a refine. In-flight one-shot fills finish normally.
+                # Idle-priority gate shared by repair + fill: autonomous work
+                # runs ONLY when the human review/refine loop is idle this tick.
                 refine_running = any(
-                    j.status == "running" and not j.fill for j in jobs
+                    j.status == "running" and not j.fill and not j.repair
+                    for j in jobs
                 )
                 refine_pending = bool(picks)  # rejections we just dispatched/deferred
-                if fill_chapters and not refine_running and not refine_pending:
+                repair_running = any(j.status == "running" and j.repair for j in jobs)
+
+                # Repair-dispatch (opt-in): fix a chapter's non-building modules
+                # on main. ABOVE proving (a broken chapter blocks its own review
+                # AND anything downstream), below the human refine loop. One
+                # repair at a time (foundational; edits main); build + the
+                # faithfulness jury gate what merges.
+                if (
+                    repair_chapters and not refine_running
+                    and not refine_pending and not repair_running
+                    and (n - len(running)) > 0
+                ):
+                    from marathon.repair import broken_modules as _broken
+
+                    for rchap in sorted(repair_chapters):
+                        key = REPAIR_KEY_BASE + rchap
+                        if key in not_before and not_before[key] > _now():
+                            continue
+                        if repair_attempts.get(rchap, 0) >= max_repair_attempts:
+                            continue
+                        broken = _broken(cfg, rchap)
+                        if not broken:
+                            continue
+                        job = _dispatch_job(
+                            cfg, key, rchap, runs_parent, kept_worktrees,
+                            repair=True, repair_modules=broken,
+                        )
+                        if job is None:
+                            not_before[key] = _now() + WORKTREE_DEFER_SECONDS
+                            continue
+                        repair_attempts[rchap] = repair_attempts.get(rchap, 0) + 1
+                        print(f"--- dispatched REPAIR chapter {rchap} "
+                              f"({len(broken)} broken module(s): "
+                              f"{', '.join(m.split('.')[-1] for m in broken)}, "
+                              f"attempt {repair_attempts[rchap]}) → main ---",
+                              flush=True)
+                        jobs.append(job)
+                        dispatch_count += 1
+                        break  # one repair per tick
+                    running = [j for j in jobs if j.status == "running"]
+                    repair_running = any(
+                        j.status == "running" and j.repair for j in jobs
+                    )
+
+                # Fill-dispatch (opt-in): prove verified-but-`sorry` decls on
+                # the prover branch. STRICTLY lower priority than the human
+                # review/refine loop AND repair — proving runs ONLY when both
+                # are idle. So a proof never competes for a slot with, or delays
+                # the start of, a refine or repair. In-flight one-shot fills
+                # finish normally.
+                if (
+                    fill_chapters and not refine_running
+                    and not refine_pending and not repair_running
+                ):
                     slots = n - len(running)
                     fill_picks = (
                         _pick_fill_dispatchable(

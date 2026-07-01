@@ -131,9 +131,11 @@ def add_repair_subparsers(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--repo-dir", type=Path, required=True, metavar="PATH",
                    help="Path to the Lean project repo (must be a git repo).")
     grp = p.add_mutually_exclusive_group(required=False)
-    grp.add_argument("--module", type=str, default=None, metavar="NAME",
-                     help="Fully-qualified module to repair "
-                          "(e.g. GeometricAnalysis.LeeSM.Chapter16.IntegrationManifold).")
+    grp.add_argument("--module", type=str, action="append", default=None,
+                     dest="modules", metavar="NAME",
+                     help="Fully-qualified module to repair (repeatable; e.g. "
+                          "GeometricAnalysis.LeeSM.Chapter16.IntegrationManifold). "
+                          "The conductor passes the broken set explicitly.")
     grp.add_argument("--file", type=Path, default=None, metavar="PATH",
                      help="Repo-relative or absolute .lean file to repair.")
     _add_passthrough_refine_flags(p)
@@ -164,8 +166,8 @@ async def _run_repair(args) -> None:
     chapter = _chapter_of_target(args.target)
 
     modules: list[str] = []
-    if args.module:
-        modules = [args.module]
+    if getattr(args, "modules", None):
+        modules = list(args.modules)
     elif args.file is not None:
         fp = args.file if args.file.is_absolute() else (repo_dir / args.file)
         mod = _module_of_file(repo_dir, fp)

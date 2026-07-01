@@ -860,6 +860,27 @@ def _add_conductor_subparser(subparsers) -> None:
             "this branch. Forked from origin/main if absent."
         ),
     )
+    p_run.add_argument(
+        "--repair-chapter",
+        type=int, action="append", default=None, metavar="N", dest="repair_chapters",
+        help=(
+            "Enable autonomous REPAIR for chapter N (repeatable): when the human "
+            "review queue is idle, the conductor dispatches `marathon repair` for "
+            "every module that fails to build, fixing it against the current API "
+            "while preserving statement meaning (build + faithfulness jury gated). "
+            "Repairs land on `main` under `marathon/repair-c<N>`."
+        ),
+    )
+    p_run.add_argument(
+        "--repair-frontier",
+        action="store_true", default=False, dest="repair_frontier",
+        help=(
+            "Autonomous repair across EVERY registered chapter: any module that "
+            "stops building (e.g. a downstream chapter after an upstream API "
+            "change) is auto-repaired. Self-healing; the systematic alternative "
+            "to ad-hoc manual patches."
+        ),
+    )
     p_run.set_defaults(func=_run_conductor_run)
 
     p_stat = sub.add_parser(
@@ -950,6 +971,8 @@ def _run_conductor_run(args) -> None:
         fill_chapters=set(getattr(args, "fill_chapters", None) or ()),
         prove_frontier=getattr(args, "prove_frontier", False),
         prover_branch=getattr(args, "prover_branch", "marathon/proving"),
+        repair_chapters=set(getattr(args, "repair_chapters", None) or ()),
+        repair_frontier=getattr(args, "repair_frontier", False),
     )
     if rc:
         raise SystemExit(rc)
