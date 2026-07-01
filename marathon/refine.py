@@ -1270,6 +1270,7 @@ async def refine_command(args) -> None:
         gate_state_path=workdir / GATE_STATE_FILENAME,
         skeleton_mode=bool(args.skeleton),
         review_rejection_run=review_issue_num is not None,
+        fill_run=getattr(args, "fill_run", False),
         jury=getattr(args, "jury", False),
         jury_log_path=workdir / JURY_LOG_FILENAME,
     )

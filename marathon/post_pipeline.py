@@ -138,6 +138,13 @@ class PipelineConfig:
     # human's explicit ask wins), so ``enforce`` demotes to ``warn``
     # with a printed note.
     review_rejection_run: bool = False
+    # True when this iteration is a PROVE run (``marathon fill``). A fill
+    # reuses ``--review-rejection`` for per-issue branch naming, so it trips
+    # ``review_rejection_run`` — but it is a MACHINE proving run, not a
+    # human-demanded reject-response, so the enforce→warn demotion must NOT
+    # apply: a proof that smuggles an axiom / leaves a nested sorry must be
+    # blocked from merge (machine-clean acceptance), never waved through.
+    fill_run: bool = False
     # Advisory jury (marathon.jury): Claude-scored proof_integrity +
     # code_quality, no faithfulness. Runs only when True; the verdict
     # line joins the console output + PR body and one JSON line is
@@ -1438,10 +1445,17 @@ def run_post_pipeline(
     if gate_posture not in ("off", "warn", "enforce"):
         print(f"  gate: unknown posture {config.gate!r}; treating as warn")
         gate_posture = "warn"
-    if gate_posture == "enforce" and config.review_rejection_run:
+    if (
+        gate_posture == "enforce"
+        and config.review_rejection_run
+        and not config.fill_run
+    ):
         # The PR-#99 lesson: cross-chapter refactors necessarily transit
         # red, and a --review-rejection iteration is the human's
         # explicit ask. Enforcement never blocks human-demanded runs.
+        # A FILL (prove) run is exempt from this demotion — it is
+        # machine-dispatched, and a proof that fails the axiom/sorry gate
+        # must be blocked from merge, not waved through.
         print(
             "  gate: posture demoted enforce → warn for this run "
             "(--review-rejection iterations are human-demanded; "

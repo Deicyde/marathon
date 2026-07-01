@@ -315,6 +315,33 @@ def test_review_rejection_forces_warn_under_enforce(
     assert "BLOCKED" not in console
 
 
+def test_fill_run_is_exempt_from_the_demotion_and_enforces(
+    tmp_path, monkeypatch, capsys
+):
+    """A FILL (prove) run sets review_rejection_run (for branch naming) but
+    is a machine run — enforce must NOT demote to warn, so a failing proof
+    gate BLOCKS the PR (machine-clean acceptance)."""
+    repo, target, workdir = _make_repo(tmp_path)
+    calls: dict = {}
+    _install_boundaries(monkeypatch, calls, build_ok=False)
+    config = _config(
+        workdir, gate="enforce", review_rejection_run=True, fill_run=True,
+        auto_build=True, auto_commit=True, auto_pr=True,
+        auto_pr_review_issue=42,
+    )
+
+    out = _run(config, repo, target)
+
+    # Stays enforce: the FAIL verdict blocks the PR open; commit preserved.
+    assert out["gate_posture"] == "enforce"
+    assert out["gate"].verdict == "fail"
+    assert "pr" not in calls          # the proof was NOT merged
+    assert len(calls["commit"]) == 1  # work preserved locally
+    console = capsys.readouterr().out
+    assert "demoted enforce → warn" not in console
+    assert "BLOCKED by gate" in console
+
+
 # --- jury ---------------------------------------------------------------------
 
 

@@ -831,6 +831,14 @@ def _dispatch_job(
             "--issue", str(issue_num),
             "--no-metadata-commit",
             "--build-timeout", "2400",
+            # Machine-clean acceptance: enforce the proof gate so a fill whose
+            # proof leaves a nested `sorry` or smuggles an axiom (sorryAx / a
+            # non-whitelisted axiom) is BLOCKED from opening its PR — the
+            # cheat/incomplete proof never merges, the decl stays a live
+            # target, and the automerge path only ever lands genuinely-clean
+            # proofs. `fill_run` exempts this from the review-rejection
+            # enforce→warn demotion.
+            "--gate", "enforce",
         ]
         log_path = workdir / "conductor-fill.log"
     else:

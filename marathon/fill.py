@@ -259,6 +259,11 @@ async def _run_fill(args) -> None:
               f"#{args.issue}: {', '.join(decls)}")
 
     args.focus_directive = _build_fill_directive(decls) + _frozen_binding(args.repo_dir, decls)
+    # Mark this as a PROVE run so the pipeline does NOT demote --gate enforce
+    # to warn (fills reuse --review-rejection for branch naming, which would
+    # otherwise trip the human-demanded-run exemption). Machine-clean
+    # acceptance: an axiom-unclean / still-sorry proof is blocked from merge.
+    args.fill_run = True
     # Fill is one-shot: a single iteration that either lands or doesn't.
     # The human re-runs `marathon fill` with sharper context if it
     # didn't land.
@@ -308,6 +313,7 @@ async def _run_fill_file(args) -> None:
     )
     args.max_iterations = 1
     args.skeleton = False
+    args.fill_run = True  # machine-clean acceptance — see _run_fill
     args.review_rejection = getattr(args, "review_rejection", None)
     args.update_formalization = getattr(args, "update_formalization", True)
     args.tex = getattr(args, "tex", None)
