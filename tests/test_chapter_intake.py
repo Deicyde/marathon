@@ -66,9 +66,11 @@ Two first-class results.
 
 
 def _runner(out, code=0, err="", capture=None):
-    def _run(prompt, *, model=None, timeout=None):
+    def _run(prompt, *, model=None, timeout=None, extra_args=()):
         if capture is not None:
             capture["prompt"] = prompt
+            capture["model"] = model
+            capture["extra_args"] = tuple(extra_args)
         return subprocess.CompletedProcess(["claude"], code, out, err)
     return _run
 
@@ -89,6 +91,28 @@ def test_intake_parses_drafts_and_writes_file(tmp_path):
     # headless: the chapter source must be EMBEDDED in the prompt (no file access)
     assert "theorem foo : True := by sorry" in cap["prompt"]
     assert "Chapter 15" in cap["prompt"]
+    # no effort env → no --effort flag (the CLI default effort)
+    assert cap["extra_args"] == ()
+
+
+def test_intake_wires_effort_flag_when_env_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARATHON_INTAKE_EFFORT", "max")
+    cfg = _cfg(tmp_path)
+    _write_chapter(cfg, 15)
+    cap: dict = {}
+    res = run_chapter_intake(cfg, 15, _runner=_runner(_GOOD_DRAFTS, capture=cap))
+    assert res.ok
+    assert cap["extra_args"] == ("--effort", "max")   # passed to claude -p
+    assert "effort=max" in res.model                  # surfaced in the deck job label
+
+
+def test_intake_no_effort_flag_when_env_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("MARATHON_INTAKE_EFFORT", raising=False)
+    cfg = _cfg(tmp_path)
+    _write_chapter(cfg, 15)
+    cap: dict = {}
+    run_chapter_intake(cfg, 15, _runner=_runner(_GOOD_DRAFTS, capture=cap))
+    assert cap["extra_args"] == ()
 
 
 def test_intake_no_sources_returns_error_not_raise(tmp_path):

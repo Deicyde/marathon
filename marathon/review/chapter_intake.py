@@ -36,6 +36,12 @@ from marathon.review.drafts import parse_drafts
 #: ``run_claude``'s default resolution when unset.
 INTAKE_MODEL_ENV = "MARATHON_INTAKE_MODEL"
 
+#: Env override for the intake reasoning EFFORT — passed to ``claude -p`` as
+#: ``--effort <level>`` (e.g. ``max``). Intake-scoped on purpose (a whole-chapter
+#: decomposition warrants a high level; a global effort env would slow every
+#: Claude call). Unset → the CLI's default effort.
+INTAKE_EFFORT_ENV = "MARATHON_INTAKE_EFFORT"
+
 #: Generous ceiling for one intake completion (single-shot, large context).
 INTAKE_TIMEOUT_SECONDS = 1800.0
 
@@ -242,7 +248,8 @@ def run_chapter_intake(
     Never raises: every failure returns an :class:`IntakeResult` with ``error``
     set so the deck can render it. ``_runner`` is injectable for tests."""
     model = model or os.environ.get(INTAKE_MODEL_ENV) or None
-    model_label = model or "(default)"
+    effort = os.environ.get(INTAKE_EFFORT_ENV) or None
+    model_label = (model or "(default)") + (f" · effort={effort}" if effort else "")
     dpath = drafts_path_for(cfg, chapter)
 
     sources = _read_chapter_sources(cfg, chapter)
@@ -281,7 +288,10 @@ def run_chapter_intake(
         chapter, sources, _audit_inventory(cfg, chapter), informal_text, informal_kind
     )
     try:
-        cp = _runner(prompt, model=model, timeout=timeout)
+        runner_kw = {"model": model, "timeout": timeout}
+        if effort:  # only when set → test-injected runners without extra_args are unaffected
+            runner_kw["extra_args"] = ("--effort", effort)
+        cp = _runner(prompt, **runner_kw)
     except Exception as e:  # noqa: BLE001 — surface, never crash the deck thread
         return IntakeResult(chapter, dpath, [], "", model_label,
                             error=f"claude intake call failed: {e}")
