@@ -636,3 +636,39 @@ def test_lean_paths_to_targets_heuristic_without_lakefile(tmp_path):
         repo, ["Demo/Chapter14/Basic.lean", "scripts/gen.lean"]
     )
     assert targets == ["Demo.Chapter14.Basic"]
+
+
+def test_repair_gate_builds_full_target_set_not_just_changed(tmp_path, monkeypatch):
+    """A repair's [build:*] tag must attest its FULL named module set: the
+    gate unions the changed files with extra_build_targets (the #223 partial
+    merge: root-module-only edit earned [build:OK] while siblings stayed red)."""
+    repo, target, workdir = _make_repo(tmp_path)
+    calls: dict = {}
+    _install_boundaries(monkeypatch, calls, build_ok=True)
+    seen: list = []
+
+    def capture_build(repo_dir, timeout, targets=None):
+        seen.append(targets)
+        return BuildResult(ok=True, duration_seconds=1.0)
+
+    monkeypatch.setattr("marathon.post_pipeline.run_lake_build", capture_build)
+    monkeypatch.setattr(
+        "marathon.post_pipeline._changed_lean_targets",
+        lambda repo_dir: ["Chapter16.IntegrationManifold"],  # only the edited root
+    )
+    config = _config(
+        workdir, gate="off", auto_build=True, repair_run=True,
+        extra_build_targets=[
+            "Chapter16.IntegrationManifold",     # dedup: already changed
+            "Chapter16.IntegrationProperties",
+            "Chapter16.StokesTheorem",
+        ],
+    )
+
+    _run(config, repo, target)
+
+    assert seen == [[
+        "Chapter16.IntegrationManifold",
+        "Chapter16.IntegrationProperties",
+        "Chapter16.StokesTheorem",
+    ]]

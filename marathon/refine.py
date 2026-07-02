@@ -1366,6 +1366,7 @@ async def refine_command(args) -> None:
         review_rejection_run=review_issue_num is not None,
         fill_run=getattr(args, "fill_run", False),
         repair_run=getattr(args, "repair_run", False),
+        extra_build_targets=getattr(args, "extra_build_targets", None),
         jury=getattr(args, "jury", False),
         jury_log_path=workdir / JURY_LOG_FILENAME,
     )

@@ -150,6 +150,12 @@ class PipelineConfig:
     # main under a ``repair-`` branch; enforcement applies (a repair must
     # actually compile, and the faithfulness jury guards against weakening).
     repair_run: bool = False
+    # Extra explicit lake targets the build gate must compile IN ADDITION to
+    # the changed files — a repair's SUCCESS CRITERION is its named module
+    # set, not whatever subset the iteration happened to edit. Without this,
+    # a repair that fixed only the root module of three earned [build:OK]
+    # while the two downstream modules stayed red (the #223 partial merge).
+    extra_build_targets: Optional[list[str]] = None
     # Advisory jury (marathon.jury): Claude-scored proof_integrity +
     # code_quality, no faithfulness. Runs only when True; the verdict
     # line joins the console output + PR body and one JSON line is
@@ -1439,6 +1445,12 @@ def run_post_pipeline(
                     "  build: no changed lib sources — building the target "
                     f"chapter's {len(changed_targets)} module(s) explicitly"
                 )
+        # A run with a declared success-criterion target set (repair: the
+        # named broken modules) must compile ALL of it — an edit to a subset
+        # must not earn a tag the full set doesn't deserve.
+        for extra in config.extra_build_targets or ():
+            if extra not in changed_targets and _LEAN_TARGET_RE.match(extra):
+                changed_targets.append(extra)
         b = run_lake_build(
             repo_dir, config.build_timeout, targets=changed_targets or None
         )

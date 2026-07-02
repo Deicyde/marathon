@@ -225,6 +225,11 @@ async def _run_repair(args) -> None:
     # Mark this a REPAIR run: branch kind `repair-` (→ main) and the
     # faithfulness jury. Not tied to a review issue → chapter-scoped branch.
     args.repair_run = True
+    # The repair's SUCCESS CRITERION is the full named module set: the build
+    # gate must compile all of it, not just the files Aristotle edited — an
+    # edit to the root module alone must not earn [build:OK] while its
+    # downstream siblings stay red (the #223 partial merge).
+    args.extra_build_targets = list(modules)
     # Repair is ONE-SHOT (like fill): a single iteration that either goes
     # green or doesn't — the conductor's max_repair_attempts loop is the
     # retry mechanism (it re-discovers a still-broken module next tick).
