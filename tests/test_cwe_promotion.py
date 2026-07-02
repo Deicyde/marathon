@@ -20,7 +20,7 @@ from marathon.post_pipeline import BuildResult, PipelineConfig
 from marathon.state import RefineState
 
 
-def _drive(monkeypatch, tmp_path, *, probe_ok: bool):
+def _drive(monkeypatch, tmp_path, *, probe_ok: bool, changed=("Chapter1.A",)):
     """Run _run_refine_attempt with a CWE task; return (status, calls)."""
     calls: dict = {}
     repo = tmp_path / "repo"
@@ -41,7 +41,7 @@ def _drive(monkeypatch, tmp_path, *, probe_ok: bool):
                         (True, True, [], []))
     monkeypatch.setattr(refine, "save_refine_state", lambda p, s: None)
     monkeypatch.setattr("marathon.post_pipeline._changed_lean_targets",
-                        lambda repo_dir: ["Chapter1.A"])
+                        lambda repo_dir: list(changed))
 
     def fake_probe_build(repo_dir, timeout, targets=None):
         calls.setdefault("probe", []).append(targets)
@@ -95,3 +95,14 @@ def test_red_probe_keeps_retry_ladder(monkeypatch, tmp_path):
     status, calls = _drive(monkeypatch, tmp_path, probe_ok=False)
     assert status == TaskStatus.COMPLETE_WITH_ERRORS  # not promoted
     assert "pipeline" not in calls                    # no commit/PR of red work
+
+
+def test_no_lean_change_is_never_promoted(monkeypatch, tmp_path):
+    """A COMPLETE_WITH_ERRORS result that extracted ZERO Lean changes is a
+    no-op — it must NOT be promoted (never probe-built, never landed). This is
+    the a730a7ab defect: a no-op landed [build:OK] via the whole-chapter
+    fallback and re-queued the issue with the note unsatisfied."""
+    status, calls = _drive(monkeypatch, tmp_path, probe_ok=True, changed=[])
+    assert status == TaskStatus.COMPLETE_WITH_ERRORS   # NOT promoted
+    assert "probe" not in calls                        # never even built
+    assert "pipeline" not in calls                     # nothing landed

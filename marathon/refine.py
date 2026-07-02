@@ -916,25 +916,33 @@ async def _run_refine_attempt(
         state.output_path is not None
         and task.status == TaskStatus.COMPLETE_WITH_ERRORS
     ):
-        from marathon.post_pipeline import (
-            _changed_lean_targets,
-            _target_lean_modules,
-            run_lake_build,
-        )
+        from marathon.post_pipeline import _changed_lean_targets, run_lake_build
 
-        probe_targets = _changed_lean_targets(repo_dir) or _target_lean_modules(
-            repo_dir, repo_dir / Path(*expected_path.parts)
-        )
-        if probe_targets:
+        # ONLY the files this attempt actually changed. NOT a whole-chapter
+        # fallback: a refine that changed NO Lean code did nothing, and the
+        # chapter still builds — so a fallback build would be trivially green
+        # and PROMOTE A NO-OP. That lands a [build:OK] PR carrying zero Lean
+        # change, which re-queues the issue with the reject note UNSATISFIED →
+        # the human re-rejects the same note forever (the "regression"
+        # treadmill: it was never a regression, it was a no-op landing).
+        changed = _changed_lean_targets(repo_dir)
+        if not changed:
             print(
-                f"  {task.status.value}: probing the extracted output with a "
-                f"chapter-scoped build ({len(probe_targets)} target(s)) — "
-                "the chapter's build state is the verdict, not the "
-                "self-report",
+                f"  {task.status.value}: extracted NO Lean changes — NOT "
+                "promoting (a no-op must never land as success). Keeping the "
+                "retry ladder; an honest stall is correct when Aristotle "
+                "could not do the task.",
+                flush=True,
+            )
+        else:
+            print(
+                f"  {task.status.value}: probing the {len(changed)} CHANGED "
+                "target(s) — the build state of what changed is the verdict, "
+                "not the self-report",
                 flush=True,
             )
             probe = run_lake_build(
-                repo_dir, pipeline_config.build_timeout, targets=probe_targets
+                repo_dir, pipeline_config.build_timeout, targets=changed
             )
             if probe.ok:
                 print(
@@ -945,7 +953,7 @@ async def _run_refine_attempt(
                 effective_status = TaskStatus.COMPLETE
                 state.note = (
                     (state.note + "; " if state.note else "")
-                    + "promoted COMPLETE_WITH_ERRORS: chapter-scoped build probe green"
+                    + "promoted COMPLETE_WITH_ERRORS: changed-target build probe green"
                 )
                 save_refine_state(state_path, state)
             else:
