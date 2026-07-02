@@ -1411,6 +1411,10 @@ async def refine_command(args) -> None:
                 else "repair" if pipeline_config.repair_run
                 else "refine"
             ),
+            # A repair CONTINUES its open branch head (a [build:FAIL] round's
+            # partial progress lives on the un-merged PR); resetting to
+            # origin/<base> would wipe it and the rounds would oscillate.
+            continue_remote_branch=pipeline_config.repair_run,
         )
         if not ok:
             print(f"  auto-pr: {branch_msg}", flush=True)

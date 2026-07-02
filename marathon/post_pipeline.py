@@ -670,6 +670,7 @@ def prepare_auto_pr_branch(
     issue_num: Optional[int],
     base: str = "main",
     kind: str = "refine",
+    continue_remote_branch: bool = False,
 ) -> tuple[bool, str, str]:
     """Check out the marathon branch for this iteration, resetting to
     ``origin/<base>`` so each iteration's diff is clean.
@@ -761,9 +762,29 @@ def prepare_auto_pr_branch(
                 f"{(commit.stderr or commit.stdout).strip()[:200]}"
             )
 
-    # Create-or-reset to origin/<base>.
+    # Create-or-reset. Default target: origin/<base> (each iteration's diff
+    # is clean — the per-issue-persistent-branch model keeps only the latest
+    # iteration). REPAIR runs CONTINUE the branch's own remote head instead:
+    # a [build:FAIL] repair round parks partial progress on the open PR, and
+    # resetting to origin/<base> here silently WIPED it — the dispatch had
+    # stacked the worktree on origin/<branch>, then this reset threw the
+    # stack away, so consecutive rounds oscillated between fixing one module
+    # and re-breaking the other (PR #227). ``continue_remote_branch`` makes
+    # the reset target the stacked head when it exists.
+    reset_target = f"origin/{base}"
+    if continue_remote_branch:
+        branch_fetch = subprocess.run(
+            ["git", "fetch", "origin", branch],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
+        )
+        probe = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"origin/{branch}"],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
+        )
+        if branch_fetch.returncode == 0 and probe.returncode == 0:
+            reset_target = f"origin/{branch}"
     checkout = subprocess.run(
-        ["git", "checkout", "-B", branch, f"origin/{base}"],
+        ["git", "checkout", "-B", branch, reset_target],
         cwd=str(repo_dir), capture_output=True, text=True, check=False,
     )
     if checkout.returncode != 0:
@@ -776,7 +797,7 @@ def prepare_auto_pr_branch(
             )
         return False, branch, f"git checkout -B {branch} failed: {stderr[:200]}"
 
-    return True, branch, f"on {branch} (reset to origin/{base})"
+    return True, branch, f"on {branch} (reset to {reset_target})"
 
 
 # ---------------------------------------------------------------------------

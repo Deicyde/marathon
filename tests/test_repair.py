@@ -102,3 +102,37 @@ def test_repair_proceeds_when_any_module_is_broken(monkeypatch, tmp_path):
     )
     asyncio.run(repair._run_repair(args))
     assert "unknown identifier foo" in called["directive"]
+
+
+def test_prepare_branch_continues_remote_for_repairs(monkeypatch, tmp_path):
+    """continue_remote_branch=True resets onto origin/<branch> when it exists
+    (stacked partial progress preserved); plain runs reset onto origin/<base>."""
+    from marathon.post_pipeline import prepare_auto_pr_branch
+
+    calls = []
+
+    def fake_run(cmd, cwd=None, capture_output=True, text=True, check=False):
+        from types import SimpleNamespace
+        calls.append(list(cmd))
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr("marathon.post_pipeline.subprocess.run", fake_run)
+
+    ok, branch, msg = prepare_auto_pr_branch(
+        tmp_path, "Chapter16", None, base="main", kind="repair",
+        continue_remote_branch=True,
+    )
+    assert ok and branch == "marathon/repair-c16"
+    checkout = [c for c in calls if c[:2] == ["git", "checkout"]][0]
+    assert checkout[-1] == "origin/marathon/repair-c16"   # stacked head
+    assert "reset to origin/marathon/repair-c16" in msg
+
+    calls.clear()
+    ok, branch, msg = prepare_auto_pr_branch(
+        tmp_path, "Chapter15", 170, base="main", kind="refine",
+    )
+    assert ok
+    checkout = [c for c in calls if c[:2] == ["git", "checkout"]][0]
+    assert checkout[-1] == "origin/main"                  # refine unchanged
