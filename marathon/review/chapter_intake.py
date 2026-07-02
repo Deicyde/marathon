@@ -338,9 +338,13 @@ def run_chapter_intake(
         return IntakeResult(chapter, dpath, [], "", model_label,
                             error=f"claude intake call failed: {e}")
     if cp.returncode != 0:
+        # claude -p reports many failures (context overflow, auth, model
+        # errors) on STDOUT with an empty stderr — surface whichever end
+        # carries the message, or the UI shows a useless "exited 1:".
+        detail = (cp.stderr or "").strip() or (cp.stdout or "").strip()[-400:]
         return IntakeResult(
             chapter, dpath, [], (cp.stdout or ""), model_label,
-            error=f"claude exited {cp.returncode}: {(cp.stderr or '').strip()[:300]}",
+            error=f"claude exited {cp.returncode}: {detail[:400]}",
         )
 
     raw = (cp.stdout or "").strip()
