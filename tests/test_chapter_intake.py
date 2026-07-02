@@ -66,11 +66,12 @@ Two first-class results.
 
 
 def _runner(out, code=0, err="", capture=None):
-    def _run(prompt, *, model=None, timeout=None, extra_args=()):
+    def _run(prompt, *, model=None, timeout=None, extra_args=(), env_overrides=None):
         if capture is not None:
             capture["prompt"] = prompt
             capture["model"] = model
             capture["extra_args"] = tuple(extra_args)
+            capture["env_overrides"] = env_overrides
         return subprocess.CompletedProcess(["claude"], code, out, err)
     return _run
 
@@ -143,7 +144,7 @@ def test_intake_runner_exception_is_caught(tmp_path):
     cfg = _cfg(tmp_path)
     _write_chapter(cfg, 15)
 
-    def _boom(prompt, *, model=None, timeout=None):
+    def _boom(prompt, *, model=None, timeout=None, extra_args=(), env_overrides=None):
         raise OSError("claude vanished")
 
     res = run_chapter_intake(cfg, 15, _runner=_boom)
@@ -222,3 +223,23 @@ def test_intake_tracker_missing_section_is_error_not_raise(tmp_path, monkeypatch
     assert not res.ok
     assert "tracker roadmap" in (res.error or "") and "Chapter 15" in (res.error or "")
     assert not drafts_path_for(cfg, 15).is_file()  # nothing written
+
+
+def test_intake_raises_output_token_cap(tmp_path, monkeypatch):
+    """The intake lifts CLAUDE_CODE_MAX_OUTPUT_TOKENS so a 10-draft, max-effort
+    decomposition doesn't die on the 32k default (the Chapter 16 failure)."""
+    cfg = _cfg(tmp_path)
+    _write_chapter(cfg, 15)
+    monkeypatch.delenv("MARATHON_INTAKE_MAX_OUTPUT_TOKENS", raising=False)
+    cap = {}
+    run_chapter_intake(cfg, 15, _runner=_runner(_GOOD_DRAFTS, capture=cap))
+    assert cap["env_overrides"] == {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000"}
+
+
+def test_intake_output_token_cap_env_override(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    _write_chapter(cfg, 15)
+    monkeypatch.setenv("MARATHON_INTAKE_MAX_OUTPUT_TOKENS", "96000")
+    cap = {}
+    run_chapter_intake(cfg, 15, _runner=_runner(_GOOD_DRAFTS, capture=cap))
+    assert cap["env_overrides"] == {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "96000"}

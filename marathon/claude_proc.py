@@ -148,6 +148,7 @@ def run_claude(
     model: Optional[str] = None,
     timeout: Optional[float] = None,
     extra_args: Sequence[str] = (),
+    env_overrides: Optional[dict] = None,
 ) -> subprocess.CompletedProcess:
     """Run one ``claude -p`` completion under the cross-process limiter.
 
@@ -177,6 +178,15 @@ def run_claude(
     ]
 
     env = os.environ.copy()
+    # Per-call env (e.g. CLAUDE_CODE_MAX_OUTPUT_TOKENS for a large-output
+    # call). None values delete the key.
+    for key, val in (env_overrides or {}).items():
+        if val is None:
+            env.pop(key, None)
+        else:
+            env[key] = str(val)
+    # Scrub LAST so no override (accidental or otherwise) can re-introduce
+    # the key into the child — the single-Max-session invariant.
     env.pop("ANTHROPIC_API_KEY", None)
 
     slot_fd = _acquire_slot(

@@ -42,6 +42,15 @@ INTAKE_MODEL_ENV = "MARATHON_INTAKE_MODEL"
 #: Claude call). Unset → the CLI's default effort.
 INTAKE_EFFORT_ENV = "MARATHON_INTAKE_EFFORT"
 
+#: Env override for the intake's output-token ceiling. A whole-chapter
+#: decomposition (10+ sub-issue drafts) plus ``--effort max`` THINKING —
+#: which counts against the output budget — routinely exceeds Claude Code's
+#: 32000-token default and dies with "response exceeded the … output token
+#: maximum" (seen on Chapter 16: 4 modules of source). Raise it for the
+#: intake only (via CLAUDE_CODE_MAX_OUTPUT_TOKENS in the child env).
+INTAKE_MAX_OUTPUT_TOKENS_ENV = "MARATHON_INTAKE_MAX_OUTPUT_TOKENS"
+INTAKE_MAX_OUTPUT_TOKENS_DEFAULT = "64000"
+
 #: Generous ceiling for one intake completion (single-shot, large context).
 INTAKE_TIMEOUT_SECONDS = 1800.0
 
@@ -333,6 +342,11 @@ def run_chapter_intake(
         runner_kw = {"model": model, "timeout": timeout}
         if effort:  # only when set → test-injected runners without extra_args are unaffected
             runner_kw["extra_args"] = ("--effort", effort)
+        max_out = os.environ.get(
+            INTAKE_MAX_OUTPUT_TOKENS_ENV, INTAKE_MAX_OUTPUT_TOKENS_DEFAULT
+        )
+        if max_out:  # conditional-add mirrors extra_args (test runners unaffected)
+            runner_kw["env_overrides"] = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": max_out}
         cp = _runner(prompt, **runner_kw)
     except Exception as e:  # noqa: BLE001 — surface, never crash the deck thread
         return IntakeResult(chapter, dpath, [], "", model_label,

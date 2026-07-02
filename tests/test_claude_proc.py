@@ -145,6 +145,21 @@ def test_api_key_scrubbed_but_rest_of_env_kept(monkeypatch):
     assert env["MARATHON_TEST_SENTINEL"] == "still-here"
 
 
+def test_env_overrides_applied_to_child_env(monkeypatch):
+    calls: list = []
+    _install_fake_claude(monkeypatch, calls=calls)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
+
+    run_claude("p", env_overrides={
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
+        "ANTHROPIC_API_KEY": "sneaky",   # overrides can't re-introduce the key
+    })
+
+    env = calls[0][1]["env"]
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "64000"
+    assert "ANTHROPIC_API_KEY" not in env  # scrub wins (overrides applied after)
+
+
 def test_extra_args_appended_after_shared_flags(monkeypatch):
     calls: list = []
     _install_fake_claude(monkeypatch, calls=calls)
