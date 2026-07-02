@@ -765,6 +765,23 @@
   }
 
   // Render the current declaration card. Pure read render (no side effects).
+  // The per-decl LOCK control on a review card: shows the current lock state
+  // and toggles it. A LOCKED decl's signature is hard-frozen — no refine can
+  // change it (locking implies keep). Unlocked = soft (rewritable).
+  function declLockControl(card) {
+    var locked = !!card.locked;
+    return el("button", {
+      class: "decl-lock-ctl" + (locked ? " is-locked" : ""),
+      type: "button",
+      title: locked
+        ? "Locked — this signature is hard-frozen; no refine can change it. Click to unlock."
+        : "Click to LOCK — hard-freeze this signature so no refine can change it (implies keep).",
+      onclick: (function (n, cur) {
+        return function (ev) { ev.stopPropagation(); toggleDeclLock(n, !cur); };
+      })(card.name, locked),
+    }, [locked ? "🔒 locked" : "🔓 lock"]);
+  }
+
   function renderDeclCard(card) {
     var article = el("article", { class: "card decl-card", id: "active-card" });
     article.appendChild(subdeckHeader());
@@ -788,6 +805,7 @@
                + "it stays verified — no need to re-review." },
           ["✓ kept from last review"]) : null,
         verdictTag(card),
+        declLockControl(card),
       ])
     );
 
@@ -1249,11 +1267,24 @@
     postDeclLock(state.issue, name, locked)
       .then(function (resp) {
         if (resp && resp.summary && state.subdeck) state.subdeck.summary = resp.summary;
+        // Reflect the new lock state on the local card copy so re-renders and
+        // a later ship summary agree with the backend.
+        var card = findDecl(name);
+        if (card) card.locked = locked;
+        if (state.currentDecl && state.currentDecl.name === name)
+          state.currentDecl.locked = locked;
       })
       .catch(function () { /* toast already shown by postJSON */ })
       .then(function () {
         state.busy = false;
-        if (state.showSummary) renderSummaryCard();
+        if (state.showSummary) {
+          renderSummaryCard();
+        } else if (state.currentDecl && state.currentDecl.name === name) {
+          stage().innerHTML = "";
+          stage().appendChild(renderDeclCard(state.currentDecl));
+          mountAutoApprovedPanel();
+          setActionsEnabled(true);
+        }
       });
   }
 

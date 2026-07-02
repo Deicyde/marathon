@@ -493,3 +493,37 @@ def test_sync_tracker_noop_when_all_synced(tmp_path, monkeypatch):
     monkeypatch.setattr(tr, "gh", FakeGh())
     ok, _msg = tr.sync_tracker_to_verified(cfg, tmp_dir=tmp_path)
     assert ok is False  # nothing to flip (already in sync)
+
+
+# --- cmd_lock: pre-proving statement freeze ----------------------------------
+
+def test_cmd_lock_freezes_explicit_and_chapter_issues(tmp_path, monkeypatch, capsys):
+    import marathon.review.approved_statements as aps
+    import marathon.review.verified_decls as vd
+
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(review_mod, "load_config", lambda: cfg)
+    captured: list = []
+    monkeypatch.setattr(
+        aps, "capture_on_verify",
+        lambda cfg, num: (captured.append(num) or [f"decl_of_{num}"]),
+    )
+    # chapter 14 has two verified sub-issues (30, 31)
+    monkeypatch.setattr(
+        vd, "verified_declarations",
+        lambda cfg, ch: {30: {"a"}, 31: {"b"}} if ch == 14 else {},
+    )
+
+    args = SimpleNamespace(issue=[15], chapter=[14], all_verified=False)
+    review_mod.cmd_lock(args)
+
+    assert sorted(captured) == [15, 30, 31]           # explicit + chapter-verified
+    out = capsys.readouterr().out
+    assert "LOCKED 3 declaration(s) across 3 issue(s)" in out
+
+
+def test_cmd_lock_nothing_to_lock(tmp_path, monkeypatch, capsys):
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(review_mod, "load_config", lambda: cfg)
+    review_mod.cmd_lock(SimpleNamespace(issue=None, chapter=None, all_verified=False))
+    assert "nothing to lock" in capsys.readouterr().out

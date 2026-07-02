@@ -270,6 +270,35 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
     )
     p_sync.set_defaults(func=_cmd_sync)
 
+    p_lock = cv_sub.add_parser(
+        "lock",
+        help=(
+            "Hard-freeze declaration STATEMENTS into the approved-statements "
+            "manifest — do BEFORE proving/sorry-filling so no fill/refine/"
+            "repair can change a signature (bodies still fill)."
+        ),
+        description=(
+            "Freeze the cited declarations of the target sub-issue(s) into "
+            "`.marathon/review/approved_statements.json`. The hard guard then "
+            "reverts any fill/refine/repair that changes a frozen signature "
+            "before it commits. Statement-only — proof bodies still fill. "
+            "Idempotent; re-running re-captures the CURRENT signatures."
+        ),
+    )
+    p_lock.add_argument(
+        "--issue", type=int, action="append", default=None, metavar="N",
+        help="Sub-issue to lock (repeatable).",
+    )
+    p_lock.add_argument(
+        "--chapter", type=int, action="append", default=None, metavar="N",
+        help="Lock every VERIFIED sub-issue in this chapter (repeatable).",
+    )
+    p_lock.add_argument(
+        "--all-verified", action="store_true", dest="all_verified",
+        help="Lock every verified sub-issue across all registered chapters.",
+    )
+    p_lock.set_defaults(func=r.cmd_lock)
+
     p_v = cv_sub.add_parser(
         "verify",
         help=(

@@ -316,6 +316,19 @@ html, body {
 }
 .keep-row-locked .mono { font-weight: 600; }
 
+/* --- per-decl card lock control (in the decl header) --- */
+.decl-lock-ctl {
+  margin-left: 0.4rem; padding: 0.12rem 0.5rem; font-size: 0.72rem;
+  border: 1px solid var(--line); border-radius: 999px; cursor: pointer;
+  background: transparent; color: var(--muted); white-space: nowrap;
+}
+.decl-lock-ctl:hover { border-color: var(--muted); }
+.decl-lock-ctl.is-locked {
+  color: var(--warn, #b26b00); border-color: var(--warn, #b26b00);
+  background: color-mix(in srgb, var(--warn, #b26b00) 12%, transparent);
+  font-weight: 600;
+}
+
 /* --- per-declaration panels (an issue bundles several decls) --- */
 .card-title-main { font-size: 1.05rem; font-weight: 600; color: var(--ink); }
 .decls-count {

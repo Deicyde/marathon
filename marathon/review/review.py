@@ -369,6 +369,53 @@ def cmd_audit_chapter(args) -> None:
     print(f"  pointer prompt_chars: {result.prompt_chars} / 5000")
 
 
+# --- lock (pre-proving statement freeze) -------------------------------------
+
+
+def cmd_lock(args) -> None:
+    """Hard-freeze the STATEMENTS of declarations into the approved-statements
+    manifest, so no subsequent fill/refine/repair can change a signature — the
+    guarantee to establish BEFORE the proving / sorry-filling stage (Aristotle
+    fills bodies, never re-types a locked statement).
+
+    Targets: ``--issue N`` (repeatable), ``--chapter N`` (all its verified
+    sub-issues, repeatable), and/or ``--all-verified`` (every registered
+    chapter's verified sub-issues). Reuses ``capture_on_verify`` per issue."""
+    from marathon.review.approved_statements import capture_on_verify
+    from marathon.review.verified_decls import verified_declarations
+
+    cfg = load_config()
+    issues: set[int] = set(getattr(args, "issue", None) or [])
+    chapters = (
+        list(cfg.chapters or {}) if getattr(args, "all_verified", False)
+        else list(getattr(args, "chapter", None) or [])
+    )
+    for ch in chapters:
+        try:
+            issues |= {int(k) for k in verified_declarations(cfg, ch)}
+        except Exception as e:  # noqa: BLE001
+            print(f"  chapter {ch}: could not list verified sub-issues ({e})")
+    if not issues:
+        print("nothing to lock — pass --issue N, --chapter N, or --all-verified")
+        return
+    total = 0
+    for num in sorted(issues):
+        try:
+            frozen = capture_on_verify(cfg, num)
+        except Exception as e:  # noqa: BLE001
+            print(f"  #{num}: lock failed ({e})")
+            continue
+        total += len(frozen)
+        tail = f" — {', '.join(frozen)}" if frozen else " (no cited decls resolved)"
+        print(f"  #{num}: froze {len(frozen)} declaration(s){tail}")
+    print(
+        f"\nLOCKED {total} declaration(s) across {len(issues)} issue(s) into "
+        f"{cfg.repo_dir / '.marathon/review/approved_statements.json'}. A "
+        "fill/refine/repair that changes a frozen signature is now reverted "
+        "before commit."
+    )
+
+
 # --- verify ------------------------------------------------------------------
 
 
