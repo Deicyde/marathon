@@ -108,6 +108,9 @@ def test_dispatch_fill_routes_to_prover_branch_never_main(tmp_path, monkeypatch)
 
     def fake_git(repo_dir, *args):
         git_calls.append(list(args))
+        if args[:2] == ("rev-parse", "--verify"):
+            # No open repair branch on the remote — a fresh cycle.
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(cond, "_git", fake_git)
@@ -153,6 +156,9 @@ def test_dispatch_repair_routes_to_main_repair_branch(tmp_path, monkeypatch):
 
     def fake_git(repo_dir, *args):
         git_calls.append(list(args))
+        if args[:2] == ("rev-parse", "--verify"):
+            # No open repair branch on the remote — a fresh cycle.
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(cond, "_git", fake_git)
@@ -237,3 +243,66 @@ def test_tex_args_tolerates_old_config():
     """A cfg without tex_path (older ReviewConfig) yields [] — never a
     blocked dispatch."""
     assert cond._tex_args(SimpleNamespace(), 16) == []
+
+
+def test_repair_retry_continues_open_branch(tmp_path, monkeypatch):
+    """A repair retry stacks on the branch's remote head when it exists (an
+    open [build:FAIL] PR holds prior partial progress); a fresh cycle forks
+    origin/main."""
+    cfg = _reviewcfg(tmp_path)
+    git_calls = []
+
+    def fake_git(repo_dir, *args):
+        git_calls.append(list(args))
+        if args[:2] == ("rev-parse", "--verify"):
+            return SimpleNamespace(returncode=0, stdout="abc\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cond, "_git", fake_git)
+    monkeypatch.setattr(cond, "_prime_mathlib_cache", lambda w: None)
+    monkeypatch.setattr(cond, "_mathlib_already_built", lambda w: True)
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            self.cmd = list(cmd)
+            self.pid = 9
+
+    monkeypatch.setattr(cond.subprocess, "Popen", FakePopen)
+
+    job = cond._dispatch_job(
+        cfg, cond.REPAIR_KEY_BASE + 16, 16, tmp_path / "runs", {},
+        repair=True, repair_modules=["A.Chapter16.M"],
+    )
+    assert job is not None
+    add = [c for c in git_calls if c[:2] == ["worktree", "add"]][0]
+    assert add[-1] == "origin/marathon/repair-c16"   # stacked, not origin/main
+
+
+def test_repair_fresh_cycle_forks_main(tmp_path, monkeypatch):
+    cfg = _reviewcfg(tmp_path)
+    git_calls = []
+
+    def fake_git(repo_dir, *args):
+        git_calls.append(list(args))
+        if args[:2] == ("rev-parse", "--verify"):
+            return SimpleNamespace(returncode=1, stdout="", stderr="")  # no branch
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cond, "_git", fake_git)
+    monkeypatch.setattr(cond, "_prime_mathlib_cache", lambda w: None)
+    monkeypatch.setattr(cond, "_mathlib_already_built", lambda w: True)
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            self.cmd = list(cmd)
+            self.pid = 9
+
+    monkeypatch.setattr(cond.subprocess, "Popen", FakePopen)
+
+    job = cond._dispatch_job(
+        cfg, cond.REPAIR_KEY_BASE + 16, 16, tmp_path / "runs", {},
+        repair=True, repair_modules=["A.Chapter16.M"],
+    )
+    assert job is not None
+    add = [c for c in git_calls if c[:2] == ["worktree", "add"]][0]
+    assert add[-1] == "origin/main"

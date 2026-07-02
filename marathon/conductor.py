@@ -833,10 +833,23 @@ def _dispatch_job(
     the prover branch, so proofs never touch ``main``."""
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     if repair:
-        # Chapter-scoped repair branch (no review issue): marathon/repair-c<N>,
-        # forked from origin/main — a repair makes the skeleton compile.
+        # Chapter-scoped repair branch (no review issue): marathon/repair-c<N>.
+        # A retry CONTINUES the branch's remote head when it exists — a
+        # [build:FAIL] repair round leaves its partial progress on the open
+        # (automerge-refused) PR, and the next round must stack on it rather
+        # than re-derive from origin/main (paying Aristotle twice for the
+        # same fix). Fresh cycles (no remote branch — the last PR merged and
+        # deleted it) fork from origin/main as before.
         branch = _branch_name_for_issue(f"Chapter{chapter}", None, kind="repair")
         start_point = WORKTREE_START_POINT
+        _git(cfg.repo_dir, "fetch", "origin", branch)
+        probe = _git(cfg.repo_dir, "rev-parse", "--verify", "--quiet",
+                     f"origin/{branch}")
+        if probe.returncode == 0:
+            start_point = f"origin/{branch}"
+            print(f"--- repair c{chapter}: continuing open branch "
+                  f"origin/{branch} (stacking on prior partial fix) ---",
+                  flush=True)
     elif fill:
         branch = _branch_name_for_issue(f"Chapter{chapter}", issue_num, kind="proof")
         start_point = f"origin/{prover_branch}"
