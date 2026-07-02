@@ -125,6 +125,22 @@ PROVER_BASE_BRANCH = "marathon/proving"
 # ``REPAIR_KEY_BASE + chapter`` in the shared not_before/kept_worktrees dicts so
 # a repair's bookkeeping can never collide with a real issue number.
 REPAIR_KEY_BASE = 1_000_000
+
+
+def _tex_args(cfg, chapter: int) -> list[str]:
+    """``["--tex", <path>]`` for the chapter's informal source, or ``[]``.
+
+    Every dispatched refine/fill/repair carries the chapter's ``.tex`` when
+    ``tex_dir`` is configured, so Aristotle tracks the informal textbook —
+    the original marathon design philosophy. The tex rides ONLY in the
+    Aristotle bundle (Claude never sees it); a missing file just omits the
+    flag. Best-effort: config without ``tex_path`` (older ReviewConfig) or
+    any error yields ``[]``, never a blocked dispatch."""
+    try:
+        tex = cfg.tex_path(chapter)
+    except Exception:  # noqa: BLE001
+        return []
+    return ["--tex", str(tex)] if tex else []
 # The branch the PRIMARY checkout must be on for conductor-side
 # metadata regeneration — the same base the job worktrees branch from.
 # Regenerating anywhere else would derive yaml fields from whatever the
@@ -901,6 +917,7 @@ def _dispatch_job(
         for m in (repair_modules or []):
             cmd += ["--module", m]
         log_path = workdir / "conductor-repair.log"
+        cmd += _tex_args(cfg, chapter)
     elif fill:
         # Prove the verified-but-`sorry` declarations cited in this issue. The
         # statement-immutability guard (enforce_frozen_statements, default on)
@@ -932,6 +949,7 @@ def _dispatch_job(
             "--gate", "enforce",
         ]
         log_path = workdir / "conductor-fill.log"
+        cmd += _tex_args(cfg, chapter)
     else:
         cmd = [
             sys.executable, "-m", "marathon", "refine",
@@ -943,6 +961,7 @@ def _dispatch_job(
             *daemon.DEFAULT_REFINE_ARGS,
         ]
         log_path = workdir / "conductor-refine.log"
+        cmd += _tex_args(cfg, chapter)
     log_handle = log_path.open("ab")
     try:
         popen = subprocess.Popen(cmd, stdout=log_handle, stderr=subprocess.STDOUT)

@@ -189,6 +189,11 @@ def _add_passthrough_refine_flags(p: argparse.ArgumentParser) -> None:
     auto-build + auto-commit + auto-pr on by default since the fill
     primitives are meant for one-shot landings."""
     p.add_argument("--workdir", type=Path, default=None, metavar="DIR")
+    p.add_argument("--tex", type=Path, default=None, metavar="PATH",
+                   help="Informal .tex source to include in the Aristotle "
+                        "bundle (never given to Claude — the copyright "
+                        "firewall). The conductor passes the chapter's "
+                        "source automatically when `tex_dir` is configured.")
     p.add_argument("--max-retries", type=int, default=2, metavar="N")
     p.add_argument("--polling-interval", type=int, default=60, metavar="SECONDS")
     p.add_argument("--build-timeout", type=int, default=1800, metavar="SECONDS")

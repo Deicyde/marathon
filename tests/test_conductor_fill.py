@@ -185,3 +185,55 @@ def test_dispatch_repair_routes_to_main_repair_branch(tmp_path, monkeypatch):
     assert cmd.count("--module") == 2
     assert "A.B.Chapter16.IntegrationManifold" in cmd
     assert "--auto-pr-base" not in cmd        # defaults to main (skeleton)
+
+
+# --- informal-source (--tex) threading ---------------------------------------
+
+
+def test_dispatch_passes_tex_when_configured(tmp_path, monkeypatch):
+    """With tex_dir configured and the chapter's source present, every
+    dispatched job carries --tex <path> (the Aristotle bundle tracks the
+    informal textbook; Claude never sees it)."""
+    texdir = tmp_path / "LeeSM-LaTeX"
+    texdir.mkdir()
+    (texdir / "c16.tex").write_text("\\chapter{Integration on Manifolds}")
+
+    import dataclasses
+
+    cfg = dataclasses.replace(_reviewcfg(tmp_path), tex_dir=texdir)  # real field
+
+    monkeypatch.setattr(cond, "_git", lambda repo, *a: SimpleNamespace(
+        returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(cond, "_prime_mathlib_cache", lambda w: None)
+    monkeypatch.setattr(cond, "_mathlib_already_built", lambda w: True)
+    cmds = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            self.cmd = list(cmd)
+            self.pid = 8
+            cmds.append(self.cmd)
+
+    monkeypatch.setattr(cond.subprocess, "Popen", FakePopen)
+
+    job = cond._dispatch_job(
+        cfg, cond.REPAIR_KEY_BASE + 16, 16, tmp_path / "runs", {},
+        repair=True, repair_modules=["A.Chapter16.M"],
+    )
+    assert job is not None
+    cmd = cmds[0]
+    assert "--tex" in cmd
+    assert cmd[cmd.index("--tex") + 1] == str(texdir / "c16.tex")
+
+    # Chapter without a source file → no --tex (pre-tex behavior).
+    job2 = cond._dispatch_job(
+        cfg, cond.REPAIR_KEY_BASE + 15, 15, tmp_path / "runs", {},
+        repair=True, repair_modules=["A.Chapter15.M"],
+    )
+    assert job2 is not None and "--tex" not in cmds[1]
+
+
+def test_tex_args_tolerates_old_config():
+    """A cfg without tex_path (older ReviewConfig) yields [] — never a
+    blocked dispatch."""
+    assert cond._tex_args(SimpleNamespace(), 16) == []

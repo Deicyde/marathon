@@ -124,6 +124,16 @@ class ReviewConfig:
     # ``Mathlib_4_30/``). Paths are repo-relative POSIX paths.
     extra_writable_paths: list[Path] = field(default_factory=list)
 
+    # Directory of per-chapter informal (.tex) sources + the filename
+    # pattern within it. When set, the conductor passes the chapter's
+    # source to every dispatched refine/fill/repair via ``--tex``, so the
+    # Aristotle bundle carries the informal textbook to track — the
+    # original marathon design philosophy. COPYRIGHT FIREWALL: the tex
+    # rides ONLY in the Aristotle submission; Claude (Hermes/intake) is
+    # never given its contents (see ``marathon.refine`` module docstring).
+    tex_dir: Optional[Path] = None
+    tex_pattern: str = "c{chapter:02d}.tex"
+
     # Review support directory paths — derived from repo_dir.
     @property
     def review_dir(self) -> Path:
@@ -163,6 +173,15 @@ class ReviewConfig:
 
     def target_path(self, chapter: int) -> Path:
         return self.repo_dir / self.target_path_template.format(chapter=chapter)
+
+    def tex_path(self, chapter: int) -> Optional[Path]:
+        """The chapter's informal ``.tex`` source, or ``None`` when
+        ``tex_dir`` is unset or the file doesn't exist (dispatches then
+        simply omit ``--tex`` — the pre-tex behavior)."""
+        if self.tex_dir is None:
+            return None
+        cand = self.tex_dir / self.tex_pattern.format(chapter=chapter)
+        return cand if cand.is_file() else None
 
     def tracker_section(self, chapter: int) -> str:
         return self.tracker_section_pattern.format(chapter=chapter)
@@ -239,6 +258,18 @@ def load_config(repo_dir: Optional[Path] = None) -> ReviewConfig:
         # POSIX path tuples for tar-member comparison.
         extra_writable_paths.append(Path(p.lstrip("/").rstrip("/")))
 
+    tex_dir_raw = data.get("tex_dir")
+    tex_dir: Optional[Path] = None
+    if tex_dir_raw is not None:
+        if not isinstance(tex_dir_raw, str):
+            sys.exit(f"{config_path}: `tex_dir` must be a path string")
+        tex_dir = Path(tex_dir_raw).expanduser()
+        if not tex_dir.is_absolute():
+            tex_dir = repo_dir / tex_dir
+    tex_pattern = data.get("tex_pattern", "c{chapter:02d}.tex")
+    if not isinstance(tex_pattern, str):
+        sys.exit(f"{config_path}: `tex_pattern` must be a string")
+
     return ReviewConfig(
         repo_dir=repo_dir,
         config_path=config_path,
@@ -249,6 +280,8 @@ def load_config(repo_dir: Optional[Path] = None) -> ReviewConfig:
         labels=labels,
         chapters=chapters,
         extra_writable_paths=extra_writable_paths,
+        tex_dir=tex_dir,
+        tex_pattern=tex_pattern,
     )
 
 
