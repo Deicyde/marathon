@@ -288,6 +288,56 @@ def capture_on_verify(cfg: ReviewConfig, issue_num: int) -> list[str]:
     return frozen
 
 
+def capture_kept_on_reject(
+    cfg: ReviewConfig,
+    issue_num: int,
+    *,
+    kept: "list[str]",
+    rejected: "list[str]",
+) -> "tuple[list[str], list[str]]":
+    """Per-declaration freeze at a REJECT ship: FREEZE every KEPT decl's current
+    signature into the manifest, and UNFREEZE every REJECTED (fix) decl so the
+    refine may legitimately change it.
+
+    Without this, decls the human kept while an issue is still being refined are
+    protected only by the reject note's KEEP prompt text — which a sibling-decl
+    refine silently ignores when it rewrites the shared chapter file, forcing the
+    human to re-reject the same notes (the "regression" treadmill). Freezing them
+    into the manifest makes the hard guard (:func:`guard_touched_files`) restore
+    any touched kept signature before commit, so regression becomes structurally
+    impossible, not just discouraged.
+
+    Best-effort: returns ``(frozen, unfrozen)``; never raises — a capture failure
+    must never block the ship (the note's soft KEEP list still applies)."""
+    try:
+        chapter = cfg.chapter_of_issue(issue_num)
+    except Exception:  # noqa: BLE001
+        chapter = None
+    src = _chapter_source_text(cfg, chapter) if chapter is not None else ""
+    ts = datetime.now().astimezone().isoformat(timespec="seconds")
+
+    manifest = load_manifest(cfg.repo_dir)
+    unfrozen: list[str] = []
+    # UNFREEZE the rejected decls FIRST: a decl the human now wants changed must
+    # not be reverted by the guard, even if a prior keep froze it.
+    for name in rejected:
+        if manifest.pop(name, None) is not None:
+            unfrozen.append(name)
+    frozen: list[str] = []
+    for name in kept:
+        sig = extract_signature(src, name) if src else None
+        if sig is None:
+            continue  # can't resolve the current signature → leave it to soft KEEP
+        manifest[name] = ApprovedStatement(
+            decl_name=name, signature=sig, issue=issue_num,
+            chapter=chapter, verified_ts=ts,
+        )
+        frozen.append(name)
+    if frozen or unfrozen:
+        save_manifest(cfg.repo_dir, manifest)
+    return frozen, unfrozen
+
+
 # --- the hard guard (A2) ---------------------------------------------------
 
 @dataclass

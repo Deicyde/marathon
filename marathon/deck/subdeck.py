@@ -688,6 +688,27 @@ def ship_issue(
 
     if summary["rejected"] or missing:
         note = compose_ship_note(issue_num, composed_summary, missing)
+        # HARD-FREEZE the kept decls (and UNFREEZE the rejected ones) so the
+        # refine this reject dispatches — and any sibling-decl refine in the
+        # same chapter — cannot silently regress a decl the human kept. Without
+        # this, kept decls have only the note's soft KEEP prompt, which a whole-
+        # file rewrite ignores → the human re-rejects the same note forever.
+        try:
+            from marathon.review.approved_statements import capture_kept_on_reject
+
+            frozen, unfrozen = capture_kept_on_reject(
+                cfg, issue_num,
+                kept=kept,
+                rejected=[r.get("name") for r in summary["rejected"] if r.get("name")],
+            )
+            if frozen or unfrozen:
+                print(
+                    f"  freeze: hard-froze {len(frozen)} kept decl(s), "
+                    f"unfroze {len(unfrozen)} rejected decl(s) for #{issue_num}",
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001 — freeze is a hardening, never a blocker
+            print(f"  freeze: skipped ({exc})", flush=True)
         apply_verdict(cfg, issue_num, "reject", note=note)
         outcome = "shipped"
         n_fix = len(summary["rejected"])

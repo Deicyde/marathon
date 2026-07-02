@@ -211,3 +211,62 @@ def test_guard_body_only_fill_is_not_reverted(tmp_path):
 def test_guard_empty_manifest_is_noop(tmp_path):
     cfg = _cfg(tmp_path)
     assert guard_touched_files(cfg.repo_dir, "HEAD", ["x.lean"]) == []
+
+
+# --- per-declaration freeze at reject-ship (the freeze-gap fix) ---------------
+
+def test_capture_kept_on_reject_freezes_kept_unfreezes_rejected(tmp_path, monkeypatch):
+    from marathon.review.approved_statements import capture_kept_on_reject
+
+    cfg = _cfg(tmp_path)
+    d = cfg.target_path(15)
+    d.mkdir(parents=True)
+    (d / "H.lean").write_text(
+        "def keepA (hyp : T) : U := by sorry\n"
+        "theorem keepB (hyp : T) : P hyp := by sorry\n"
+        "theorem fixMe (hyp : T) : Q hyp := by sorry\n"
+    )
+    monkeypatch.setattr(ReviewConfig, "chapter_of_issue", lambda self, n: 15)
+
+    frozen, unfrozen = capture_kept_on_reject(
+        cfg, 170, kept=["keepA", "keepB"], rejected=["fixMe"],
+    )
+    assert sorted(frozen) == ["keepA", "keepB"]
+    assert unfrozen == []                       # fixMe wasn't frozen before
+    man = load_manifest(cfg.repo_dir)
+    assert man["keepA"].signature == "def keepA (hyp : T) : U"
+    assert man["keepB"].signature == "theorem keepB (hyp : T) : P hyp"
+    assert "fixMe" not in man                   # a rejected decl is never frozen
+    assert man["keepA"].issue == 170
+
+
+def test_capture_kept_on_reject_unfreezes_a_previously_kept_decl(tmp_path, monkeypatch):
+    """The human keeps X (freezing it), then on a later re-review REJECTS X —
+    X must be UNFROZEN so the refine can change it (not reverted by the guard)."""
+    from marathon.review.approved_statements import capture_kept_on_reject
+
+    cfg = _cfg(tmp_path)
+    d = cfg.target_path(15)
+    d.mkdir(parents=True)
+    (d / "H.lean").write_text("def X (a : T) : U := by sorry\n")
+    monkeypatch.setattr(ReviewConfig, "chapter_of_issue", lambda self, n: 15)
+
+    # First review: keep X → frozen.
+    capture_kept_on_reject(cfg, 170, kept=["X"], rejected=[])
+    assert "X" in load_manifest(cfg.repo_dir)
+
+    # Re-review: reject X → unfrozen.
+    frozen, unfrozen = capture_kept_on_reject(cfg, 170, kept=[], rejected=["X"])
+    assert unfrozen == ["X"] and frozen == []
+    assert "X" not in load_manifest(cfg.repo_dir)
+
+
+def test_capture_kept_on_reject_never_raises(tmp_path, monkeypatch):
+    from marathon.review.approved_statements import capture_kept_on_reject
+
+    cfg = _cfg(tmp_path)  # no source, chapter lookup will fail
+    def boom(self, n):
+        raise RuntimeError("no chapter")
+    monkeypatch.setattr(ReviewConfig, "chapter_of_issue", boom)
+    # Missing source → nothing frozen, but no exception.
+    assert capture_kept_on_reject(cfg, 1, kept=["Y"], rejected=[]) == ([], [])

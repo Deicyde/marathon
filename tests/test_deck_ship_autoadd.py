@@ -100,3 +100,47 @@ def test_ship_with_no_surfaced_decls_writes_nothing(tmp_path, monkeypatch):
     assert refresh_calls == []  # refresh never invoked
     assert res["added_to_issue"] == []
     assert res["outcome"] == "verified"
+
+
+def test_ship_reject_hard_freezes_kept_decls(tmp_path, monkeypatch):
+    """A REJECT ship freezes the KEPT decls + unfreezes the FIXED ones — the
+    freeze-gap fix, wired into ship_issue."""
+    import marathon.review.approved_statements as aps
+
+    cfg = _cfg(tmp_path)
+    _install_common_patches(monkeypatch, [])
+    monkeypatch.setattr(
+        subdeck, "build_subdeck", lambda c, i, **k: _fake_subdeck(rejected=True)
+    )
+    captured: dict = {}
+
+    def spy(cfg, issue, *, kept, rejected):
+        captured.update(issue=issue, kept=list(kept), rejected=list(rejected))
+        return (list(kept), [])
+
+    monkeypatch.setattr(aps, "capture_kept_on_reject", spy)
+
+    res = subdeck.ship_issue(cfg, 30)
+
+    assert res.get("ok", True) and captured["issue"] == 30
+    assert "N.Foo" in captured["kept"] and "N.SurfKeep" in captured["kept"]
+    assert captured["rejected"] == ["N.SurfReject"]  # only the FIX decl unfrozen
+
+
+def test_ship_verify_does_not_call_reject_freeze(tmp_path, monkeypatch):
+    """An all-verified ship goes through record_verification (issue-level
+    capture), NOT the per-decl reject-freeze path."""
+    import marathon.review.approved_statements as aps
+
+    cfg = _cfg(tmp_path)
+    _install_common_patches(monkeypatch, [])
+    monkeypatch.setattr(
+        subdeck, "build_subdeck", lambda c, i, **k: _fake_subdeck(rejected=False)
+    )
+    called = {"n": 0}
+    monkeypatch.setattr(
+        aps, "capture_kept_on_reject",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or ([], []),
+    )
+    subdeck.ship_issue(cfg, 30)
+    assert called["n"] == 0
