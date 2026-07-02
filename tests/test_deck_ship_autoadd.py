@@ -24,7 +24,7 @@ def _cfg(tmp_path) -> ReviewConfig:
     )
 
 
-def _fake_subdeck(rejected: bool) -> dict:
+def _fake_subdeck(rejected: bool, locked: list = None) -> dict:
     """A complete subdeck: a normal verified decl, a surfaced+kept decl, and
     (optionally) a surfaced+rejected decl."""
     cards = [
@@ -33,6 +33,7 @@ def _fake_subdeck(rejected: bool) -> dict:
     ]
     summary = {
         "kept": ["N.Foo", "N.SurfKeep"],
+        "locked": locked or [],
         "rejected": [],
         "deferred": [],
     }
@@ -102,15 +103,16 @@ def test_ship_with_no_surfaced_decls_writes_nothing(tmp_path, monkeypatch):
     assert res["outcome"] == "verified"
 
 
-def test_ship_reject_hard_freezes_kept_decls(tmp_path, monkeypatch):
-    """A REJECT ship freezes the KEPT decls + unfreezes the FIXED ones — the
-    freeze-gap fix, wired into ship_issue."""
+def test_ship_reject_freezes_only_locked_decls(tmp_path, monkeypatch):
+    """A REJECT ship hard-freezes ONLY the LOCKED decls (opt-in), not every
+    kept decl — soft-kept decls stay rewritable. The FIXED decl is unfrozen."""
     import marathon.review.approved_statements as aps
 
     cfg = _cfg(tmp_path)
     _install_common_patches(monkeypatch, [])
     monkeypatch.setattr(
-        subdeck, "build_subdeck", lambda c, i, **k: _fake_subdeck(rejected=True)
+        subdeck, "build_subdeck",
+        lambda c, i, **k: _fake_subdeck(rejected=True, locked=["N.Foo"]),
     )
     captured: dict = {}
 
@@ -119,12 +121,31 @@ def test_ship_reject_hard_freezes_kept_decls(tmp_path, monkeypatch):
         return (list(kept), [])
 
     monkeypatch.setattr(aps, "capture_kept_on_reject", spy)
+    subdeck.ship_issue(cfg, 30)
 
-    res = subdeck.ship_issue(cfg, 30)
+    assert captured["issue"] == 30
+    assert captured["kept"] == ["N.Foo"]              # ONLY the locked decl
+    assert "N.SurfKeep" not in captured["kept"]       # soft-kept → not frozen
+    assert captured["rejected"] == ["N.SurfReject"]
 
-    assert res.get("ok", True) and captured["issue"] == 30
-    assert "N.Foo" in captured["kept"] and "N.SurfKeep" in captured["kept"]
-    assert captured["rejected"] == ["N.SurfReject"]  # only the FIX decl unfrozen
+
+def test_ship_reject_with_no_locks_freezes_nothing(tmp_path, monkeypatch):
+    """Default (no decl locked): nothing is hard-frozen — every kept decl stays
+    rewritable."""
+    import marathon.review.approved_statements as aps
+
+    cfg = _cfg(tmp_path)
+    _install_common_patches(monkeypatch, [])
+    monkeypatch.setattr(
+        subdeck, "build_subdeck", lambda c, i, **k: _fake_subdeck(rejected=True)
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        aps, "capture_kept_on_reject",
+        lambda cfg, issue, *, kept, rejected: captured.update(kept=list(kept)) or ([], []),
+    )
+    subdeck.ship_issue(cfg, 30)
+    assert captured["kept"] == []                     # opt-in: nothing frozen
 
 
 def test_ship_verify_does_not_call_reject_freeze(tmp_path, monkeypatch):

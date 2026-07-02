@@ -441,7 +441,7 @@ class DeckHandler(BaseHTTPRequestHandler):
     # feature), ``/api/decl-verdict`` is LOCAL-only. A path not here is a 404
     # with no side effect.
     _POST_ROUTES = (
-        "/api/verdict", "/api/decl-verdict", "/api/missing", "/api/ship",
+        "/api/verdict", "/api/decl-verdict", "/api/decl-lock", "/api/missing", "/api/ship",
         "/api/refresh-issue", "/api/drop-citation", "/api/requeue",
         "/api/add-chapter", "/api/chapter-intake-status", "/api/approve-chapter",
     )
@@ -464,6 +464,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                     self._api_verdict()
                 elif parsed.path == "/api/decl-verdict":
                     self._api_decl_verdict()
+                elif parsed.path == "/api/decl-lock":
+                    self._api_decl_lock()
                 elif parsed.path == "/api/missing":
                     self._api_missing()
                 elif parsed.path == "/api/refresh-issue":
@@ -782,6 +784,51 @@ class DeckHandler(BaseHTTPRequestHandler):
             # it is OUTSIDE progress/complete/summary (see _informal_slot).
             "informal": subdeck.get("informal"),
             "next_decl": next_unreviewed_card(subdeck),
+        })
+
+    def _api_decl_lock(self) -> None:
+        """Toggle the opt-in HARD-FREEZE lock on one declaration — LOCAL ONLY
+        (POST /api/decl-lock). Token-guarded; writes only the subdeck sidecar.
+        A locked decl's signature is frozen at reject-ship so no sibling-decl
+        refine can change it; unlocked verified decls stay rewritable. Body:
+        ``{issue, decl, locked: bool}``."""
+        data = self._read_guarded_body()
+        if data is None:
+            return  # the guard already sent the 4xx (origin / body / token)
+
+        issue_raw = data.get("issue")
+        decl = data.get("decl")
+        locked = bool(data.get("locked"))
+        try:
+            issue_num = int(issue_raw)
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad or missing issue {issue_raw!r}"
+            )
+        if not decl or not isinstance(decl, str):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad or missing decl {decl!r}"
+            )
+        if self._demo:
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "decl-lock is not available in demo mode"
+            )
+
+        from marathon.deck.subdeck import build_subdeck, set_decl_lock
+
+        try:
+            set_decl_lock(self.cfg, issue_num, decl, locked)
+        except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
+            return self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, f"decl-lock failed: {exc}"
+            )
+
+        subdeck = build_subdeck(self.cfg, issue_num)
+        self._send_json({
+            "ok": True,
+            "decl": decl,
+            "locked": locked,
+            "summary": subdeck["summary"],
         })
 
     def _api_missing(self) -> None:

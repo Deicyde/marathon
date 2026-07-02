@@ -794,3 +794,35 @@ def test_ship_with_missing_only_routes_to_aristotle(tmp_path, monkeypatch):
     assert "function-multiplication case: f • A is smooth" in note
     # the missing note is consumed at ship (the kept verdicts persist; missing not)
     assert subdeck.build_subdeck(cfg, 22)["missing"] is None
+
+
+# --- opt-in hard-freeze lock -------------------------------------------------
+
+
+def test_set_decl_lock_sets_and_clears(tmp_path):
+    cfg = make_cfg(tmp_path)
+    subdeck.record_decl_verdict(cfg, 30, "Demo.Chapter14.Foo", "verify")
+
+    subdeck.set_decl_lock(cfg, 30, "Demo.Chapter14.Foo", True)
+    assert subdeck.issue_verdicts(cfg, 30)["Demo.Chapter14.Foo"]["locked"] is True
+
+    subdeck.set_decl_lock(cfg, 30, "Demo.Chapter14.Foo", False)
+    assert "locked" not in subdeck.issue_verdicts(cfg, 30)["Demo.Chapter14.Foo"]
+
+
+def test_set_decl_lock_on_unreviewed_implies_verify(tmp_path):
+    cfg = make_cfg(tmp_path)
+    subdeck.set_decl_lock(cfg, 30, "Demo.Chapter14.New", True)
+    rec = subdeck.issue_verdicts(cfg, 30)["Demo.Chapter14.New"]
+    assert rec["verdict"] == "verify" and rec["locked"] is True
+
+
+def test_lock_carries_over_a_reverify_but_drops_on_reject(tmp_path):
+    cfg = make_cfg(tmp_path)
+    subdeck.set_decl_lock(cfg, 30, "Demo.Chapter14.Foo", True)
+    # re-verify → lock preserved
+    subdeck.record_decl_verdict(cfg, 30, "Demo.Chapter14.Foo", "verify")
+    assert subdeck.issue_verdicts(cfg, 30)["Demo.Chapter14.Foo"].get("locked") is True
+    # reject (human now wants it changed) → lock dropped
+    subdeck.record_decl_verdict(cfg, 30, "Demo.Chapter14.Foo", "reject", note="fix")
+    assert "locked" not in subdeck.issue_verdicts(cfg, 30)["Demo.Chapter14.Foo"]

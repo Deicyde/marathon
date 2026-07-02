@@ -175,13 +175,49 @@ def record_decl_verdict(
 
     store = _load_store(cfg)
     decls = store.setdefault(str(issue_num), {})
-    decls[decl] = {
+    prev = decls.get(decl) or {}
+    entry = {
         "verdict": verdict,
         "note": str(note) if note is not None else None,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
+    # The hard-freeze LOCK is a modifier on a verify: carry it over on a
+    # re-verify, but DROP it when the verdict changes to reject/defer (a decl
+    # the human now wants changed must not be frozen).
+    if verdict == "verify" and prev.get("locked"):
+        entry["locked"] = True
+    decls[decl] = entry
     _save_store(cfg, store)
-    return decls[decl]
+    return entry
+
+
+def set_decl_lock(
+    cfg: "ReviewConfig", issue_num: int, decl: str, locked: bool
+) -> dict:
+    """Toggle the HARD-FREEZE lock on a declaration (opt-in, per-decl).
+
+    A LOCKED decl's signature is frozen into the approved-statements manifest at
+    reject-ship, so no sibling-decl refine can change it (the hard guard reverts
+    any attempt). An UNLOCKED (soft) verified decl stays rewritable — Aristotle
+    may re-type it and the change re-surfaces for review. Locking implies KEEP,
+    so an unreviewed decl is recorded ``verify`` when first locked. LOCAL ONLY —
+    the sidecar; the freeze is realized at :func:`ship_issue`."""
+    store = _load_store(cfg)
+    decls = store.setdefault(str(issue_num), {})
+    entry = decls.get(decl)
+    if entry is None or entry.get("verdict") not in ("verify", "reject", "defer"):
+        entry = {
+            "verdict": "verify",
+            "note": None,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        decls[decl] = entry
+    if locked:
+        entry["locked"] = True
+    else:
+        entry.pop("locked", None)
+    _save_store(cfg, store)
+    return entry
 
 
 def record_missing(
@@ -303,6 +339,7 @@ def _decl_card(view, record: Optional[dict], carry: Optional[str] = None) -> dic
     stored = (record or {}).get("verdict")
     card["verdict"] = _VERDICT_WIRE.get(stored, stored)
     card["note"] = (record or {}).get("note")
+    card["locked"] = bool((record or {}).get("locked"))
     card["carried_over"] = carry == "carried_over"
     card["changed_since_review"] = carry == "changed"
     return card
@@ -488,6 +525,7 @@ def build_subdeck(
     complete = total > 0 and reviewed == total
 
     kept: list[str] = []
+    locked: list[str] = []
     rejected: list[dict] = []
     deferred: list[str] = []
     # The summary follows the RECONCILED decl order (kept cited + surfaced),
@@ -498,6 +536,8 @@ def build_subdeck(
         verdict = (rec or {}).get("verdict")
         if verdict == "verify":
             kept.append(view.name)
+            if (rec or {}).get("locked"):
+                locked.append(view.name)  # opt-in HARD freeze; kept ⊇ locked
         elif verdict == "reject":
             rejected.append({"name": view.name, "note": (rec or {}).get("note")})
         elif verdict == "defer":
@@ -512,7 +552,8 @@ def build_subdeck(
         "auto_approved": auto_approved,
         "progress": {"reviewed": reviewed, "total": total},
         "complete": complete,
-        "summary": {"kept": kept, "rejected": rejected, "deferred": deferred},
+        "summary": {"kept": kept, "locked": locked,
+                    "rejected": rejected, "deferred": deferred},
         # The leading informal-approval card's data: the issue's ONE top-level
         # informal statement (### Informal Statement) + the human's single
         # approval verdict, or None when there is no informal text. One approval
@@ -688,22 +729,23 @@ def ship_issue(
 
     if summary["rejected"] or missing:
         note = compose_ship_note(issue_num, composed_summary, missing)
-        # HARD-FREEZE the kept decls (and UNFREEZE the rejected ones) so the
-        # refine this reject dispatches — and any sibling-decl refine in the
-        # same chapter — cannot silently regress a decl the human kept. Without
-        # this, kept decls have only the note's soft KEEP prompt, which a whole-
-        # file rewrite ignores → the human re-rejects the same note forever.
+        # HARD-FREEZE only the LOCKED decls (opt-in) — a sibling-decl refine
+        # cannot change their signature. Soft-kept (verified, unlocked) decls
+        # stay REWRITABLE: Aristotle may re-type them when a fix legitimately
+        # cascades, and any such change re-surfaces for review (fingerprint
+        # mismatch) rather than being reverted. Rejected decls are unfrozen so
+        # the refine may change them.
         try:
             from marathon.review.approved_statements import capture_kept_on_reject
 
             frozen, unfrozen = capture_kept_on_reject(
                 cfg, issue_num,
-                kept=kept,
+                kept=list(summary.get("locked", [])),
                 rejected=[r.get("name") for r in summary["rejected"] if r.get("name")],
             )
             if frozen or unfrozen:
                 print(
-                    f"  freeze: hard-froze {len(frozen)} kept decl(s), "
+                    f"  freeze: hard-froze {len(frozen)} LOCKED decl(s), "
                     f"unfroze {len(unfrozen)} rejected decl(s) for #{issue_num}",
                     flush=True,
                 )

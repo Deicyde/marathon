@@ -173,6 +173,13 @@
     return postJSON("/api/decl-verdict", body);
   }
 
+  // postDeclLock — LOCAL-ONLY. Toggles the opt-in HARD-FREEZE lock on a
+  // declaration. A locked decl's signature is frozen at reject-ship so no
+  // sibling-decl refine can change it; unlocked (soft) decls stay rewritable.
+  function postDeclLock(issue, decl, locked) {
+    return postJSON("/api/decl-lock", { issue: issue, decl: decl, locked: !!locked });
+  }
+
   // postShip — THE ONLY IRREVERSIBLE CALL. Composes the per-issue outcome
   // from the subdeck and either merges the PR (all verified) or dispatches
   // Aristotle with the composed note (any rejected). Reached ONLY from
@@ -1233,6 +1240,23 @@
     setActionsEnabled(true);
   }
 
+  // Toggle the opt-in hard-freeze lock on a KEPT decl, from the ship summary.
+  // LOCAL-ONLY; updates the local summary from the authoritative response and
+  // re-renders the summary card so the lock badge reflects the new state.
+  function toggleDeclLock(name, locked) {
+    if (state.busy) return;
+    state.busy = true;
+    postDeclLock(state.issue, name, locked)
+      .then(function (resp) {
+        if (resp && resp.summary && state.subdeck) state.subdeck.summary = resp.summary;
+      })
+      .catch(function () { /* toast already shown by postJSON */ })
+      .then(function () {
+        state.busy = false;
+        if (state.showSummary) renderSummaryCard();
+      });
+  }
+
   // === per-declaration verdict flow (LOCAL ONLY) ===========================
 
   // The entry points to a LOCAL per-decl verdict. Each is a deliberate user
@@ -1377,14 +1401,38 @@
     var keepSec = el("section", { class: "summary-sec summary-keep" }, [
       el("h3", { class: "sec-title", text: "KEEP (" + keepCount + ") — verified, unchanged" }),
     ]);
+    // Locked decls (opt-in hard freeze). Only meaningful on a reject ship,
+    // where a refine will run and could otherwise re-type a kept decl.
+    var lockedSet = {};
+    ((summary.locked) || []).forEach(function (n) { lockedSet[n] = true; });
     if (keepCount) {
+      // One-line explainer: soft by default; lock the few that must never change.
+      if (anyAristotle) {
+        keepSec.appendChild(el("p", { class: "keep-lock-note" }, [
+          "These stay verified. Aristotle may re-type an unlocked one if a fix "
+          + "needs it (it comes back for your review). ",
+          el("strong", { text: "Lock" }),
+          " the few whose statement must never change — the refine then "
+          + "cannot touch their signature.",
+        ]));
+      }
       var keepList = el("ul", { class: "summary-list" });
       kept.forEach(function (name) {
-        keepList.appendChild(el("li", { class: "summary-row keep-row" }, [
+        var isLocked = !!lockedSet[name];
+        var row = el("li", { class: "summary-row keep-row" + (isLocked ? " keep-row-locked" : "") }, [
           el("span", { class: "mono", text: name }),
+          anyAristotle ? el("button", {
+            class: "btn btn-tiny lock-toggle" + (isLocked ? " is-locked" : ""),
+            type: "button",
+            title: isLocked
+              ? "Locked — this signature is hard-frozen; a refine cannot change it. Click to unlock."
+              : "Soft-kept — a refine may re-type it. Click to LOCK (hard-freeze the signature).",
+            onclick: (function (n, cur) { return function () { toggleDeclLock(n, !cur); }; })(name, isLocked),
+          }, [isLocked ? "🔒 locked" : "🔓 lock"]) : null,
           el("button", { class: "btn btn-tiny revisit-decl", type: "button",
             onclick: (function (n) { return function () { revisitDecl(n); }; })(name) }, ["revisit"]),
-        ]));
+        ]);
+        keepList.appendChild(row);
       });
       autoApproved.forEach(function (c) {
         keepList.appendChild(el("li", { class: "summary-row keep-row keep-row-api" }, [

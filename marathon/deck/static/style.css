@@ -300,6 +300,22 @@ html, body {
 .deferred-list { margin-top: 0.6rem; }
 .revisit-decl { white-space: nowrap; }
 
+/* --- opt-in hard-freeze lock (ship summary KEEP rows) --- */
+.keep-lock-note {
+  margin: 0.2rem 0 0.55rem; font-size: 0.78rem; color: var(--muted);
+  line-height: 1.45;
+}
+.keep-row .lock-toggle {
+  white-space: nowrap; margin-left: auto; border-color: var(--line);
+  color: var(--muted); background: transparent;
+}
+.keep-row .lock-toggle.is-locked {
+  color: var(--warn, #b26b00); border-color: var(--warn, #b26b00);
+  background: color-mix(in srgb, var(--warn, #b26b00) 12%, transparent);
+  font-weight: 600;
+}
+.keep-row-locked .mono { font-weight: 600; }
+
 /* --- per-declaration panels (an issue bundles several decls) --- */
 .card-title-main { font-size: 1.05rem; font-weight: 600; color: var(--ink); }
 .decls-count {
