@@ -56,14 +56,19 @@ def broken_modules(cfg: ReviewConfig, chapter: int) -> list[str]:
     return sorted(out)
 
 
+#: Sentinel prefix for a module whose harvest build succeeded — the
+#: already-green early-exit keys off it.
+_ALREADY_BUILDS = "(this module currently builds"
+
+
 def _module_build_errors(repo_dir: Path, module: str, timeout: int = 1800) -> str:
-    """Run ``lake build <module>`` and return its error tail (empty-ish note when
-    it actually builds — the snapshot was stale)."""
+    """Run ``lake build <module>`` and return its error tail (an
+    ``_ALREADY_BUILDS`` note when it actually builds — the snapshot was stale)."""
     from marathon.post_pipeline import run_lake_build
 
     res = run_lake_build(repo_dir, timeout, targets=[module])
     if res.ok:
-        return "(this module currently builds — the audit snapshot was stale)"
+        return _ALREADY_BUILDS + " — the audit snapshot was stale)"
     return (res.log_tail or "(no build log captured)").strip()
 
 
@@ -200,6 +205,21 @@ async def _run_repair(args) -> None:
         (m, _module_build_errors(repo_dir, m, getattr(args, "build_timeout", 1800)))
         for m in modules
     ]
+
+    # Nothing to repair → exit success WITHOUT calling Aristotle. The
+    # conductor discovers repair targets from the audit snapshot, which goes
+    # stale the moment a repair PR merges (the snapshot only refreshes on
+    # `marathon audit run`) — so the tick after a landed repair can re-dispatch
+    # the same, now-green chapter. The harvest build above is the ground
+    # truth; when EVERY module already builds, dispatching Aristotle would be
+    # pure spend on a no-op (and an invitation to fiddle with green code).
+    if all(err.startswith(_ALREADY_BUILDS) for _, err in module_errors):
+        print(
+            f"  repair: all {len(module_errors)} module(s) already build — "
+            "the audit snapshot is stale, nothing to repair. Exiting success; "
+            "re-run `marathon audit run` to refresh discovery."
+        )
+        return
 
     args.focus_directive = _build_repair_directive(module_errors)
     # Mark this a REPAIR run: branch kind `repair-` (→ main) and the
