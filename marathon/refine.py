@@ -902,9 +902,63 @@ async def _run_refine_attempt(
 
     save_refine_state(state_path, state)
 
+    # Aristotle's self-report is NOT the verdict — the chapter's own build
+    # state is (the same ruling the scoped bundle and the gate fallback
+    # enforce). In skeleton mode Aristotle counts its own undischarged goals
+    # as "errors", so COMPLETE_WITH_ERRORS routinely flags a perfectly good
+    # green skeleton (#170: a note-compliant, locally-green result was
+    # discarded across 8 straight tasks). Probe the extracted output with the
+    # gate's own chapter-scoped build; GREEN promotes the attempt to success
+    # (the post-pipeline then judges it for real — statement guard, build,
+    # gate, jury); red keeps the normal retry ladder.
+    effective_status = task.status
     if (
         state.output_path is not None
-        and task.status == TaskStatus.COMPLETE
+        and task.status == TaskStatus.COMPLETE_WITH_ERRORS
+    ):
+        from marathon.post_pipeline import (
+            _changed_lean_targets,
+            _target_lean_modules,
+            run_lake_build,
+        )
+
+        probe_targets = _changed_lean_targets(repo_dir) or _target_lean_modules(
+            repo_dir, repo_dir / Path(*expected_path.parts)
+        )
+        if probe_targets:
+            print(
+                f"  {task.status.value}: probing the extracted output with a "
+                f"chapter-scoped build ({len(probe_targets)} target(s)) — "
+                "the chapter's build state is the verdict, not the "
+                "self-report",
+                flush=True,
+            )
+            probe = run_lake_build(
+                repo_dir, pipeline_config.build_timeout, targets=probe_targets
+            )
+            if probe.ok:
+                print(
+                    "  probe: GREEN — promoting COMPLETE_WITH_ERRORS to the "
+                    "success path (post-pipeline judges the result)",
+                    flush=True,
+                )
+                effective_status = TaskStatus.COMPLETE
+                state.note = (
+                    (state.note + "; " if state.note else "")
+                    + "promoted COMPLETE_WITH_ERRORS: chapter-scoped build probe green"
+                )
+                save_refine_state(state_path, state)
+            else:
+                tail = (probe.log_tail or "").strip().splitlines()
+                print(
+                    "  probe: red — keeping the retry ladder"
+                    + (f" ({tail[-1][:160]})" if tail else ""),
+                    flush=True,
+                )
+
+    if (
+        state.output_path is not None
+        and effective_status == TaskStatus.COMPLETE
         and pipeline_config.has_any()
     ):
         pipeline_result = run_post_pipeline(
@@ -935,7 +989,7 @@ async def _run_refine_attempt(
                 "worktree but did not land. Preserving the worktree for retry."
             )
 
-    return task.status
+    return effective_status
 
 
 async def _run_iteration(
