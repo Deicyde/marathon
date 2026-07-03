@@ -419,6 +419,35 @@ def cmd_lock(args) -> None:
 # --- verify ------------------------------------------------------------------
 
 
+def _ensure_verified_label(cfg: "ReviewConfig", num: int) -> bool:
+    """Add ``review:verified`` (and drop ``review:rejected``), CONFIRMING the
+    add landed on GitHub. Retries once and prints a LOUD warning if it still
+    isn't present — the deck's verified-status keys off this label, so a silent
+    write failure re-surfaces the issue. Never raises: a persistent failure is a
+    visible WARN, not an abort (the local verdict + T2 already landed)."""
+    # Drop a stale rejected label best-effort (it may not be present — a never-
+    # rejected issue like #23 has none, and that must not block the add).
+    gh("issue", "edit", str(num), "--repo", cfg.github_repo,
+       "--remove-label", cfg.labels.rejected, check=False)
+    for _ in (1, 2):
+        gh("issue", "edit", str(num), "--repo", cfg.github_repo,
+           "--add-label", cfg.labels.verified, check=False)
+        try:
+            cp = gh("issue", "view", str(num), "--repo", cfg.github_repo,
+                    "--json", "labels", check=True)
+            names = [lbl.get("name") for lbl in json.loads(cp.stdout).get("labels", [])]
+            if cfg.labels.verified in names:
+                return True
+        except (RuntimeError, ValueError, KeyError, OSError):
+            pass
+    print(
+        f"  ⚠ label: could NOT confirm '{cfg.labels.verified}' on #{num} after "
+        "2 attempts — the deck will re-surface it. Add it manually: "
+        f"gh issue edit {num} --add-label '{cfg.labels.verified}'"
+    )
+    return False
+
+
 def cmd_verify(args) -> None:
     cfg = load_config()
     num = args.issue_num
@@ -438,14 +467,13 @@ def cmd_verify(args) -> None:
 
     print(f"Marking #{num} as VERIFIED...")
     gh("issue", "comment", str(num), "--repo", cfg.github_repo, "--body", comment)
-    # If previously rejected, drop that label.
-    gh(
-        "issue", "edit", str(num),
-        "--repo", cfg.github_repo,
-        "--add-label", cfg.labels.verified,
-        "--remove-label", cfg.labels.rejected,
-        check=False,
-    )
+    # Add the verified label + drop any rejected one, CONFIRMING it landed. The
+    # deck's "already verified" status keys off this label, so a SILENT failure
+    # here (the old `check=False` that swallowed a transient gh error) leaves the
+    # issue verified-locally (T2 ledger, tracker flipped) but UNLABELED → the
+    # deck re-surfaces it for review with no explanation, and the human
+    # re-verifies into the same silent failure (the #23/#24 re-surfacing bug).
+    _ensure_verified_label(cfg, num)
     # Clear any prior rejection queue entry for this issue. Idempotent
     # if there was no prior rejection. This also fires capture_on_verify
     # (freezes the verified statements into the approved-statements
