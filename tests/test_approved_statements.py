@@ -132,6 +132,65 @@ def test_capture_on_verify_no_body_is_noop(tmp_path, monkeypatch):
     assert not manifest_path(cfg.repo_dir).exists()
 
 
+def test_capture_on_verify_prunes_dropped_citation(tmp_path, monkeypatch):
+    """The re-open-loop fix: a decl this issue froze once but no longer cites
+    (a namespace-qualified duplicate, or a decl removed by a later refactor)
+    must be PRUNED from the manifest on re-verify — otherwise
+    verified_staleness flags it "removed/renamed" forever. Here `Ns.foo` was
+    frozen alongside `foo`, but the issue body now cites only `foo`."""
+    cfg = _cfg(tmp_path)
+    # Pre-seed the manifest as an EARLIER verify left it: both the bare and the
+    # namespace-qualified spelling frozen under issue 42.
+    save_manifest(cfg.repo_dir, {
+        "foo": ApprovedStatement("foo", "theorem foo : True", 42, 12),
+        "Ns.foo": ApprovedStatement("Ns.foo", "theorem Ns.foo : True", 42, 12),
+        # an unrelated issue's entry must survive the prune untouched.
+        "other": ApprovedStatement("other", "theorem other : True", 99, 12),
+    })
+    d = cfg.target_path(12)
+    d.mkdir(parents=True)
+    (d / "F.lean").write_text("theorem foo : True := by trivial\n")
+    monkeypatch.setattr(ReviewConfig, "chapter_of_issue", lambda self, n: 12)
+    monkeypatch.setattr(
+        ghmod, "issue_body",
+        lambda num, repo: "### Lean signatures\n```lean\ntheorem foo : True\n```\n",
+    )
+
+    frozen = capture_on_verify(cfg, 42)
+    assert frozen == ["foo"]
+    man = load_manifest(cfg.repo_dir)
+    assert "Ns.foo" not in man          # pruned — no longer cited by #42
+    assert man["foo"].issue == 42       # still frozen
+    assert man["other"].issue == 99     # a different issue's entry is untouched
+
+
+def test_capture_on_verify_prune_retains_cited_but_unresolvable(tmp_path, monkeypatch):
+    """A decl still CITED but whose signature can't be resolved this round
+    (absent from source and from the body block) is retained, not pruned —
+    pruning is keyed on the citation set, not on resolvability."""
+    cfg = _cfg(tmp_path)
+    save_manifest(cfg.repo_dir, {
+        "foo": ApprovedStatement("foo", "theorem foo : True", 42, 12),
+        "bar": ApprovedStatement("bar", "theorem bar : True", 42, 12),
+    })
+    d = cfg.target_path(12)
+    d.mkdir(parents=True)
+    (d / "F.lean").write_text("theorem foo : True := by trivial\n")
+    monkeypatch.setattr(ReviewConfig, "chapter_of_issue", lambda self, n: 12)
+    # Body cites BOTH foo (resolvable) and bar (name-only bullet, not resolvable).
+    monkeypatch.setattr(
+        ghmod, "issue_body",
+        lambda num, repo: (
+            "### Lean signatures\n```lean\ntheorem foo : True\n```\n\n"
+            "### Lean declarations\n\n- [F.lean:1](http://x) — `bar`\n"
+        ),
+    )
+    capture_on_verify(cfg, 42)
+    man = load_manifest(cfg.repo_dir)
+    assert "bar" in man   # still cited → retained despite being unresolvable
+    assert "foo" in man
+
+
 # --- the hard guard (A2): adversarial ---------------------------------------
 
 def _git_init(repo):

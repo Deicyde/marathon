@@ -53,10 +53,16 @@ def verified_staleness(cfg: ReviewConfig, issue_num: int) -> tuple[bool, list[st
       A name-only ``### Lean declarations`` citation that capture could never
       have frozen is NOT a new card — flagging it would re-open an unchanged
       verified issue forever.
-    * **changed statement** — a manifest decl still present in code whose
-      current normalized signature differs from the frozen one.
-    * **removed/renamed** — a manifest decl no longer in the current carded
-      set, OR no longer found in code.
+    * **changed statement** — a manifest decl still carded whose current
+      normalized signature — resolved the SAME way capture froze it, chapter
+      source first then the issue's own ```lean block — differs from the frozen
+      one.
+    * **removed/renamed** — a manifest decl no longer in the current carded set,
+      OR (still carded but) resolvable from NEITHER a trustworthy source NOR the
+      body block. A decl that is still defined by its ```lean block is NOT
+      "removed" merely because its bare name is absent from source under a
+      namespace-qualified spelling — that is the audit's concern, and flagging
+      it re-opened the issue forever (#45).
 
     CONSERVATIVE — never false-flag:
 
@@ -64,17 +70,15 @@ def verified_staleness(cfg: ReviewConfig, issue_num: int) -> tuple[bool, list[st
       e.g. capture failed at verify, or a pre-manifest verify), return
       ``(False, [])``: there is no frozen baseline to diff against.
     * If the issue body can't be fetched, return ``(False, [])``.
-    * For a "changed statement" check, a decl whose CURRENT signature can't be
-      read from source (decl absent → ``extract_signature`` returns None) is
-      NOT flagged as changed here — absence is handled by the removed/renamed
-      branch, which requires the decl to ALSO have dropped from the carded set
-      OR be genuinely gone from code. A transient empty/unreadable source
-      therefore yields no signature for ANY decl, so we additionally guard:
-      when the whole chapter source comes back empty — OR a PARTIAL read failed
-      (one ``.lean`` file unreadable while siblings succeed) — we treat every
-      frozen decl as still-present-unchanged (no source-derived flags), because
-      such a source is indistinguishable from a read failure and must never
-      re-open everything.
+    * A frozen decl whose CURRENT signature can't be read from source falls back
+      to the issue's own ```lean block before any removal is concluded (the same
+      resolution capture used), so a body-defined decl is compared, not flagged.
+    * A transient empty/unreadable source yields no signature for any decl, so we
+      guard: when the whole chapter source comes back empty — OR a PARTIAL read
+      failed (one ``.lean`` file unreadable while siblings succeed) — we suppress
+      every source-derived flag (a decl only resolvable from the untrustworthy
+      source is treated as still-present-unchanged), because such a source is
+      indistinguishable from a read failure and must never re-open everything.
     """
     from marathon.review.approved_statements import (
         _chapter_source_read,
@@ -122,18 +126,21 @@ def verified_staleness(cfg: ReviewConfig, issue_num: int) -> tuple[bool, list[st
 
     reasons: list[str] = []
 
-    # new card: a current carded decl that THIS issue never froze. Only count it
-    # if capture COULD have frozen it — i.e. it is FREEZABLE exactly as
-    # capture_on_verify resolves a signature: present in chapter source
-    # (extract_signature(src, name) is not None) OR defined by a ```lean
-    # signature block in the body (extract_signature(body_lean, name) is not
-    # None). A name-only `### Lean declarations` citation that is neither is
-    # carded but was never freezable → absent from the manifest by design, NOT
-    # a re-open trigger. (When the source read is untrustworthy we cannot rule
-    # out in-source freezability, so we treat any carded-but-unfrozen decl with
-    # a body signature OR fall back to body-only freezability.)
+    # new card: a current carded decl that is UNREVIEWED — frozen by NO issue —
+    # and that capture COULD freeze (FREEZABLE exactly as capture_on_verify
+    # resolves a signature: present in chapter source OR defined by a ```lean
+    # signature block in the body). Two exclusions matter:
+    #   * a decl already frozen by ANY issue (``name in manifest``) is shared,
+    #     already-reviewed content — a base type like ``DifferentialForm`` cited
+    #     by a downstream issue but owned by the issue that introduced it. The
+    #     manifest is keyed by decl name with a single owner, so such a decl is
+    #     absent from THIS issue's ``frozen`` subset yet is not new; flagging it
+    #     re-opened the downstream issue forever (#24).
+    #   * a name-only `### Lean declarations` citation that is in neither source
+    #     nor a body block was never freezable → absent from the manifest by
+    #     design, NOT a re-open trigger.
     for name in sorted(current):
-        if name in frozen:
+        if name in manifest:
             continue
         in_source = have_src and extract_signature(src, name) is not None
         in_body = extract_signature(body_lean, name) is not None
@@ -141,21 +148,32 @@ def verified_staleness(cfg: ReviewConfig, issue_num: int) -> tuple[bool, list[st
             reasons.append(f"new card: {name}")
 
     for name in sorted(frozen):
-        in_cards = name in current
-        cur_sig = extract_signature(src, name) if have_src else None
-        if not in_cards:
+        if name not in current:
             # No longer carded → removed/renamed regardless of source state.
             reasons.append(f"removed/renamed: {name}")
             continue
-        # Still carded. Only consult source if we have a trustworthy source.
-        if not have_src:
-            continue
+        # Still carded. Resolve its CURRENT signature the SAME way
+        # capture_on_verify froze it: chapter source first, then the issue's own
+        # ```lean block (body_lean). A decl defined only in the body block — a
+        # signature-only citation, or one whose in-source name is
+        # namespace-qualified differently from the carded bare name — was frozen
+        # FROM body_lean; comparing it against source alone reads it as "removed
+        # from code" though nothing about the reviewed statement changed, and the
+        # issue re-opens forever (#45). Code-existence of a cited decl is the
+        # audit's job, not this staleness diff's.
+        cur_sig = extract_signature(src, name) if have_src else None
         if cur_sig is None:
-            # Carded but absent from code → genuinely gone (removed/renamed).
-            reasons.append(f"removed/renamed: {name}")
+            cur_sig = extract_signature(body_lean, name)  # capture's fallback
+        if cur_sig is not None:
+            if cur_sig != frozen[name].signature:
+                reasons.append(f"changed statement: {name}")
             continue
-        if cur_sig != frozen[name].signature:
-            reasons.append(f"changed statement: {name}")
+        # Resolvable from NEITHER a trustworthy source NOR the body block: the
+        # reviewed signature is genuinely gone (e.g. a name-only citation whose
+        # decl vanished). Flag only when the source read is trustworthy — an
+        # empty/partial read must never manufacture a removal.
+        if have_src:
+            reasons.append(f"removed/renamed: {name}")
 
     return (bool(reasons), reasons)
 

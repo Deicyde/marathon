@@ -147,6 +147,33 @@ def test_staleness_name_bullet_in_source_is_stale_new_card(tmp_path, monkeypatch
     assert reasons == ["new card: ManifoldOrientation.toPointwiseOrientation"]
 
 
+def test_staleness_shared_decl_frozen_by_other_issue_is_not_new_card(tmp_path, monkeypatch):
+    """FIX (the #24 loop): a decl carded by this issue but already frozen by a
+    DIFFERENT issue is shared, already-reviewed content (e.g. a base type
+    `DifferentialForm` owned by the issue that introduced it, referenced by a
+    downstream issue). The manifest is keyed by decl name with a single owner,
+    so it is absent from THIS issue's frozen subset — but it is NOT a new card,
+    and flagging it re-opened the downstream issue forever."""
+    cfg = make_cfg(tmp_path)
+    foo = "theorem foo : True := by trivial"
+    shared = "def Base : Nat := 0"
+    write_source(cfg, body=f"{foo}\n{shared}\n")
+    # Issue 22 froze `foo`; issue 99 (another issue) already froze `Base`.
+    save_manifest(cfg.repo_dir, {
+        "foo": ApprovedStatement("foo", "theorem foo : True", 22, 14),
+        "Base": ApprovedStatement("Base", "def Base : Nat", 99, 14),
+    })
+    # Issue 22's body now also cites the shared `Base` by name.
+    patch_body(
+        monkeypatch,
+        issue_body_with_name_bullet(["foo"], {"foo": foo}, ["Base"]),
+    )
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert not stale
+    assert reasons == []
+
+
 def test_staleness_name_only_bullet_not_freezable_is_not_stale(tmp_path, monkeypatch):
     """FIX 1: a decl cited by NAME ONLY in `### Lean declarations` — NOT in
     source and with NO ```lean block defining it — was never freezable, so
@@ -239,10 +266,17 @@ def test_staleness_detects_removed_when_dropped_from_cards(tmp_path, monkeypatch
     assert "new card: baz" in reasons
 
 
-def test_staleness_detects_removed_when_gone_from_code(tmp_path, monkeypatch):
+def test_staleness_body_defined_decl_absent_from_source_is_not_stale(tmp_path, monkeypatch):
+    """FIX (the #45 loop): a decl still carded via its ```lean block whose bare
+    name is NOT in source — because the in-source decl is namespace-qualified,
+    or the citation is signature-only — was frozen by capture FROM the body
+    block. It must be compared against the body block, NOT flagged
+    "removed from code", else the issue re-opens on every reconcile forever.
+    Code-existence of a cited decl is the audit's concern, not this diff's."""
     cfg = make_cfg(tmp_path)
-    # Still carded, but the decl no longer exists in the source → removed/renamed.
-    write_source(cfg, body="theorem unrelated : True := by trivial\n")
+    # Source has the decl only under a namespace-qualified spelling; the bare
+    # `foo` the card cites resolves nowhere in source.
+    write_source(cfg, body="theorem Ns.foo : True := by sorry\n")
     freeze(cfg, 22, {"foo": "theorem foo : True"})
     patch_body(
         monkeypatch,
@@ -250,8 +284,73 @@ def test_staleness_detects_removed_when_gone_from_code(tmp_path, monkeypatch):
     )
 
     stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert not stale
+    assert reasons == []
+
+
+def test_staleness_changed_statement_via_body_block(tmp_path, monkeypatch):
+    """The changed-statement check still fires for a body-defined decl: the
+    body block now states `: False` where the manifest froze `: True`."""
+    cfg = make_cfg(tmp_path)
+    write_source(cfg, body="theorem Ns.foo : True := by sorry\n")  # bare foo absent
+    freeze(cfg, 22, {"foo": "theorem foo : True"})
+    patch_body(
+        monkeypatch,
+        issue_body_for(["foo"], {"foo": "theorem foo : False := by sorry"}),
+    )
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert stale
+    assert reasons == ["changed statement: foo"]
+
+
+def test_staleness_detects_removed_name_only_gone_from_code(tmp_path, monkeypatch):
+    """Genuine removal is still caught: a decl carded by NAME ONLY (no ```lean
+    block) that is absent from a trustworthy source resolves nowhere → the
+    reviewed signature is genuinely gone → removed/renamed."""
+    cfg = make_cfg(tmp_path)
+    write_source(cfg, body="theorem unrelated : True := by trivial\n")
+    freeze(cfg, 22, {"foo": "theorem foo : True"})
+    patch_body(
+        monkeypatch,
+        issue_body_with_name_bullet([], {}, ["foo"]),
+    )
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
     assert stale
     assert reasons == ["removed/renamed: foo"]
+
+
+def test_reverify_loop_closes_after_recapture_prunes(tmp_path, monkeypatch):
+    """End-to-end loop closure (BUG #1: #23/#44/#95/#97). A dirty manifest — a
+    stale bare `foo` lingering beside the still-cited `Ns.foo` — makes
+    verified_staleness flag `removed/renamed: foo` on every reconcile tick,
+    endlessly re-opening the verified issue. A single re-verify
+    (capture_on_verify) PRUNES the uncited bare entry, after which staleness
+    reports not-stale: the loop converges instead of flapping forever."""
+    from marathon.review.approved_statements import capture_on_verify, load_manifest
+
+    cfg = make_cfg(tmp_path)
+    # Source defines only the namespace-qualified decl.
+    write_source(cfg, body="theorem Ns.foo : True := by sorry\n")
+    # Dirty manifest as an earlier verify left it: bare `foo` lingers uncited.
+    freeze(cfg, 22, {"foo": "theorem foo : True", "Ns.foo": "theorem Ns.foo : True"})
+    body = issue_body_for(["Ns.foo"], {"Ns.foo": "theorem Ns.foo : True := by sorry"})
+    patch_body(monkeypatch, body)
+
+    # Before re-verify: the stale bare `foo` re-opens the issue.
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert stale
+    assert reasons == ["removed/renamed: foo"]
+
+    # A single re-verify prunes the uncited bare `foo`.
+    capture_on_verify(cfg, 22)
+    assert "foo" not in load_manifest(cfg.repo_dir)
+
+    # After: not stale — the loop has converged.
+    stale2, reasons2 = reverify.verified_staleness(cfg, 22)
+    assert not stale2
+    assert reasons2 == []
 
 
 def test_staleness_not_stale_when_current_equals_manifest(tmp_path, monkeypatch):

@@ -283,7 +283,24 @@ def capture_on_verify(cfg: ReviewConfig, issue_num: int) -> list[str]:
             chapter=chapter, verified_ts=ts,
         )
         frozen.append(name)
-    if frozen:
+
+    # PRUNE stale ownership: drop any manifest entry THIS issue previously froze
+    # that the issue no longer cites. Without this, a decl that dropped out of
+    # the citations — a namespace-qualified duplicate carded once then removed,
+    # or a decl deleted by a later refactor — lingers under this issue forever,
+    # and reverify.verified_staleness flags it "removed/renamed" on every
+    # reconcile tick, re-opening the issue endlessly (the infinite re-verify
+    # loop). ``decls`` is the FULL current cited set (freezable or not), so a
+    # decl still cited but merely unresolvable this round is retained, not
+    # pruned. Only entries owned by ``issue_num`` are touched.
+    pruned: list[str] = [
+        name for name, st in list(manifest.items())
+        if st.issue == issue_num and name not in decls
+    ]
+    for name in pruned:
+        del manifest[name]
+
+    if frozen or pruned:
         save_manifest(cfg.repo_dir, manifest)
     return frozen
 
