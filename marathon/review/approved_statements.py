@@ -284,18 +284,30 @@ def capture_on_verify(cfg: ReviewConfig, issue_num: int) -> list[str]:
         )
         frozen.append(name)
 
-    # PRUNE stale ownership: drop any manifest entry THIS issue previously froze
-    # that the issue no longer cites. Without this, a decl that dropped out of
-    # the citations — a namespace-qualified duplicate carded once then removed,
-    # or a decl deleted by a later refactor — lingers under this issue forever,
-    # and reverify.verified_staleness flags it "removed/renamed" on every
-    # reconcile tick, re-opening the issue endlessly (the infinite re-verify
-    # loop). ``decls`` is the FULL current cited set (freezable or not), so a
-    # decl still cited but merely unresolvable this round is retained, not
-    # pruned. Only entries owned by ``issue_num`` are touched.
+    # PRUNE orphaned ownership: drop any manifest entry THIS issue previously
+    # froze that the issue no longer cites AND that no longer resolves in the
+    # chapter source (or the issue's own ```lean block) under its exact name.
+    # These orphans — a namespace-qualified duplicate carded once then removed
+    # (bare ``fiberEquiv`` beside the live
+    # ``ContMDiffVectorBundleHomOverM.fiberEquiv``), or a decl deleted by a later
+    # refactor — otherwise linger under this issue forever, and
+    # reverify.verified_staleness flags them "removed/renamed" on every reconcile
+    # tick, re-opening the issue endlessly (the infinite re-verify loop).
+    #
+    # The resolves-gate is deliberate: an entry whose decl is STILL present under
+    # that exact name is one the hard guard (:func:`guard_touched_files`) can
+    # protect, so we must NOT unfreeze it merely because the citation set was
+    # reshuffled — pruning it would silently let a later fill change a verified
+    # signature. A still-present decl causes no false re-open anyway:
+    # verified_staleness resolves it and, unchanged, reports not-stale. Only
+    # entries owned by ``issue_num`` are touched.
+    def _resolves(name: str) -> bool:
+        return bool(src and extract_signature(src, name) is not None) or \
+            extract_signature(issue_lean, name) is not None
+
     pruned: list[str] = [
         name for name, st in list(manifest.items())
-        if st.issue == issue_num and name not in decls
+        if st.issue == issue_num and name not in decls and not _resolves(name)
     ]
     for name in pruned:
         del manifest[name]

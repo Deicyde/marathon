@@ -120,27 +120,34 @@ def verified_staleness(cfg: ReviewConfig, issue_num: int) -> tuple[bool, list[st
     # untrustworthy: a frozen decl living in the unread file reads as
     # removed/changed though the source is fine. In either case we have no
     # reliable evidence ANY frozen decl changed or vanished, so we suppress the
-    # source-derived checks (changed / removed-from-code) and only run the
-    # body-only "new card" + "dropped-from-cards" checks below.
+    # source-derived checks (a decl resolvable only from the untrustworthy source
+    # is treated as still-present-unchanged); the body-block "new card" and
+    # body-defined "changed statement" checks still run against the reliable body.
     have_src = bool(src.strip()) and not src_read_failed
 
     reasons: list[str] = []
 
-    # new card: a current carded decl that is UNREVIEWED — frozen by NO issue —
-    # and that capture COULD freeze (FREEZABLE exactly as capture_on_verify
-    # resolves a signature: present in chapter source OR defined by a ```lean
-    # signature block in the body). Two exclusions matter:
-    #   * a decl already frozen by ANY issue (``name in manifest``) is shared,
+    # new card: a current carded decl that is UNREVIEWED and that capture COULD
+    # freeze (FREEZABLE exactly as capture_on_verify resolves a signature:
+    # present in chapter source OR defined by a ```lean signature block in the
+    # body). Two exclusions matter:
+    #   * a decl already frozen by an issue in the SAME CHAPTER is shared,
     #     already-reviewed content — a base type like ``DifferentialForm`` cited
-    #     by a downstream issue but owned by the issue that introduced it. The
-    #     manifest is keyed by decl name with a single owner, so such a decl is
-    #     absent from THIS issue's ``frozen`` subset yet is not new; flagging it
-    #     re-opened the downstream issue forever (#24).
+    #     by a downstream issue but owned by the issue that introduced it (#24).
+    #     The manifest is keyed by decl name with a single owner, so such a decl
+    #     is absent from THIS issue's ``frozen`` subset yet is not new. This is
+    #     scoped to the SAME chapter on purpose: the manifest key is the BARE
+    #     decl name, so a global ``name in manifest`` test would alias a
+    #     genuinely-new chapter-14 ``foo`` to an unrelated chapter-11 ``foo`` and
+    #     let the new statement slip in unreviewed. A same-named decl in a
+    #     different chapter is a distinct entity → still a new card.
     #   * a name-only `### Lean declarations` citation that is in neither source
     #     nor a body block was never freezable → absent from the manifest by
     #     design, NOT a re-open trigger.
     for name in sorted(current):
-        if name in manifest:
+        already = manifest.get(name)
+        if (already is not None and already.chapter is not None
+                and chapter is not None and already.chapter == chapter):
             continue
         in_source = have_src and extract_signature(src, name) is not None
         in_body = extract_signature(body_lean, name) is not None
@@ -148,11 +155,7 @@ def verified_staleness(cfg: ReviewConfig, issue_num: int) -> tuple[bool, list[st
             reasons.append(f"new card: {name}")
 
     for name in sorted(frozen):
-        if name not in current:
-            # No longer carded → removed/renamed regardless of source state.
-            reasons.append(f"removed/renamed: {name}")
-            continue
-        # Still carded. Resolve its CURRENT signature the SAME way
+        # Resolve the frozen decl's CURRENT signature the SAME way
         # capture_on_verify froze it: chapter source first, then the issue's own
         # ```lean block (body_lean). A decl defined only in the body block — a
         # signature-only citation, or one whose in-source name is
@@ -165,13 +168,20 @@ def verified_staleness(cfg: ReviewConfig, issue_num: int) -> tuple[bool, list[st
         if cur_sig is None:
             cur_sig = extract_signature(body_lean, name)  # capture's fallback
         if cur_sig is not None:
+            # The reviewed statement still exists. Re-open ONLY if it CHANGED.
+            # Whether the issue still *cards* it is irrelevant: a
+            # dropped-but-still-present statement is not a reviewable-content
+            # change. Flagging a mere card-set shrink re-opened verified issues
+            # on every reconcile — and pairing that flag with capture's prune
+            # could silently unfreeze a still-in-source guarded signature.
             if cur_sig != frozen[name].signature:
                 reasons.append(f"changed statement: {name}")
             continue
         # Resolvable from NEITHER a trustworthy source NOR the body block: the
-        # reviewed signature is genuinely gone (e.g. a name-only citation whose
-        # decl vanished). Flag only when the source read is trustworthy — an
-        # empty/partial read must never manufacture a removal.
+        # reviewed signature is genuinely gone (a decl deleted by a refactor, or
+        # a name-only citation whose decl vanished). Flag only when the source
+        # read is trustworthy — an empty/partial read must never manufacture a
+        # removal.
         if have_src:
             reasons.append(f"removed/renamed: {name}")
 

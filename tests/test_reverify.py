@@ -174,6 +174,32 @@ def test_staleness_shared_decl_frozen_by_other_issue_is_not_new_card(tmp_path, m
     assert reasons == []
 
 
+def test_staleness_cross_chapter_name_collision_is_still_new_card(tmp_path, monkeypatch):
+    """Adversarial-review regression (Finding A): the shared-decl suppression is
+    scoped to the SAME chapter. A genuinely-new, unreviewed decl in THIS issue's
+    chapter whose bare name merely collides with an unrelated decl frozen in a
+    DIFFERENT chapter must STILL be flagged a new card — a global `name in
+    manifest` test would alias them and let the new statement slip in unreviewed."""
+    cfg = make_cfg(tmp_path)  # issue 22 is chapter 14
+    foo = "theorem foo : True := by trivial"
+    collide = "def collide : Nat := 0"
+    write_source(cfg, body=f"{foo}\n{collide}\n")  # `collide` is a real chapter-14 decl
+    # 22 froze `foo` (ch14); a DIFFERENT decl named `collide` was frozen by issue
+    # 88 in a DIFFERENT chapter (11). The bare names alias in the manifest.
+    save_manifest(cfg.repo_dir, {
+        "foo": ApprovedStatement("foo", "theorem foo : True", 22, 14),
+        "collide": ApprovedStatement("collide", "def collide : String", 88, 11),
+    })
+    patch_body(
+        monkeypatch,
+        issue_body_with_name_bullet(["foo"], {"foo": foo}, ["collide"]),
+    )
+
+    stale, reasons = reverify.verified_staleness(cfg, 22)
+    assert stale
+    assert reasons == ["new card: collide"]  # different chapter → genuinely new
+
+
 def test_staleness_name_only_bullet_not_freezable_is_not_stale(tmp_path, monkeypatch):
     """FIX 1: a decl cited by NAME ONLY in `### Lean declarations` — NOT in
     source and with NO ```lean block defining it — was never freezable, so
@@ -249,10 +275,14 @@ def test_staleness_detects_changed_signature(tmp_path, monkeypatch):
     assert reasons == ["changed statement: foo"]
 
 
-def test_staleness_detects_removed_when_dropped_from_cards(tmp_path, monkeypatch):
+def test_staleness_dropped_but_present_decl_is_not_removed(tmp_path, monkeypatch):
+    """A frozen decl the issue stopped carding, but which is STILL in source
+    unchanged, is NOT "removed/renamed" — a dropped-but-present statement is not
+    a reviewable-content change. Flagging it re-opened verified issues on every
+    reconcile, and pairing that flag with capture's prune risked unfreezing a
+    still-guarded signature. Only the genuinely-new `baz` re-opens here."""
     cfg = make_cfg(tmp_path)
-    # `foo` still in code, but the issue body no longer cites it → removed/renamed.
-    write_source(cfg, body="theorem foo : True := by trivial\n")
+    write_source(cfg, body="theorem foo : True := by trivial\n")  # foo still present
     freeze(cfg, 22, {"foo": "theorem foo : True"})
     patch_body(
         monkeypatch,
@@ -261,9 +291,7 @@ def test_staleness_detects_removed_when_dropped_from_cards(tmp_path, monkeypatch
 
     stale, reasons = reverify.verified_staleness(cfg, 22)
     assert stale
-    # `baz` is a new card AND `foo` was removed from the cards.
-    assert "removed/renamed: foo" in reasons
-    assert "new card: baz" in reasons
+    assert reasons == ["new card: baz"]  # foo NOT flagged — still present, unchanged
 
 
 def test_staleness_body_defined_decl_absent_from_source_is_not_stale(tmp_path, monkeypatch):

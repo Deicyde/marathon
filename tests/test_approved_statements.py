@@ -164,6 +164,37 @@ def test_capture_on_verify_prunes_dropped_citation(tmp_path, monkeypatch):
     assert man["other"].issue == 99     # a different issue's entry is untouched
 
 
+def test_capture_on_verify_prune_keeps_still_in_source_dropped_decl(tmp_path, monkeypatch):
+    """Adversarial-review regression (Finding B): the prune only drops ORPHANS —
+    entries no longer cited AND no longer in source under their exact name. A
+    decl the issue stopped citing but that is STILL in source stays frozen, so
+    the hard guard keeps protecting its signature; only the genuinely-gone
+    `Ns.gone` is pruned. Without the source gate, a citation reshuffle could
+    silently unfreeze a still-guarded signature."""
+    cfg = _cfg(tmp_path)
+    save_manifest(cfg.repo_dir, {
+        "keep_me": ApprovedStatement("keep_me", "theorem keep_me : True", 42, 12),
+        "Ns.gone": ApprovedStatement("Ns.gone", "theorem Ns.gone : True", 42, 12),
+    })
+    d = cfg.target_path(12)
+    d.mkdir(parents=True)
+    # `keep_me` is still in source (bare); `Ns.gone` is gone. `fix_me` is new.
+    (d / "F.lean").write_text(
+        "theorem keep_me : True := by trivial\ntheorem fix_me : True := by sorry\n"
+    )
+    monkeypatch.setattr(ReviewConfig, "chapter_of_issue", lambda self, n: 12)
+    # The body now cites only `fix_me` — neither keep_me nor Ns.gone.
+    monkeypatch.setattr(
+        ghmod, "issue_body",
+        lambda num, repo: "### Lean signatures\n```lean\ntheorem fix_me : True\n```\n",
+    )
+    capture_on_verify(cfg, 42)
+    man = load_manifest(cfg.repo_dir)
+    assert "keep_me" in man       # still in source → retained, guard still protects it
+    assert "Ns.gone" not in man   # genuinely gone → pruned
+    assert "fix_me" in man        # newly frozen
+
+
 def test_capture_on_verify_prune_retains_cited_but_unresolvable(tmp_path, monkeypatch):
     """A decl still CITED but whose signature can't be resolved this round
     (absent from source and from the body block) is retained, not pruned —
