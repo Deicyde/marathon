@@ -61,11 +61,48 @@ def broken_modules(cfg: ReviewConfig, chapter: int) -> list[str]:
 _ALREADY_BUILDS = "(this module currently builds"
 
 
+def _module_artifacts(repo_dir: Path, module: str) -> "list[Path]":
+    """The cached lake build artifacts for ``module`` (dotted name → path). Their
+    presence is what lets ``lake build`` skip a module; deleting them forces a
+    genuine re-elaboration."""
+    rel = module.replace(".", "/")
+    lib = repo_dir / ".lake" / "build" / "lib" / "lean"
+    ir = repo_dir / ".lake" / "build" / "ir"
+    return [
+        lib / f"{rel}.olean", lib / f"{rel}.olean.hash",
+        lib / f"{rel}.ilean", lib / f"{rel}.ilean.hash",
+        lib / f"{rel}.trace",
+        ir / f"{rel}.c", ir / f"{rel}.c.hash", ir / f"{rel}.setup.json",
+    ]
+
+
+def _invalidate_module(repo_dir: Path, module: str) -> None:
+    """Delete ``module``'s cached lake build artifacts (best-effort) so the next
+    ``lake build`` MUST re-elaborate its source from scratch."""
+    for p in _module_artifacts(repo_dir, module):
+        try:
+            p.unlink()
+        except OSError:
+            pass  # absent / unremovable — the build will still be honest for it
+
+
 def _module_build_errors(repo_dir: Path, module: str, timeout: int = 1800) -> str:
-    """Run ``lake build <module>`` and return its error tail (an
-    ``_ALREADY_BUILDS`` note when it actually builds — the snapshot was stale)."""
+    """Force a fresh ``lake build`` of ``module`` and return its error tail (an
+    ``_ALREADY_BUILDS`` note when it genuinely re-elaborates clean).
+
+    A bare ``lake build`` trusts a trace-valid ``.olean`` and reports a FALSE
+    green when that olean is stale: a conductor repair runs in a worktree whose
+    ``.lake`` cache carried over a leftover olean for a module that no longer
+    compiles against the current upstream API, so the module read as "already
+    builds" and the repair no-op'd forever (Chapter16 ``StokesTheorem`` — five
+    consecutive no-op runs while a fresh ``lake env lean`` failed). The audit got
+    the honest answer only because it happened to run in a clean checkout with no
+    stale olean. We reproduce that honesty deterministically: delete the module's
+    cached artifacts first, so lake re-elaborates the source against the current
+    dependencies and a genuine failure surfaces."""
     from marathon.post_pipeline import run_lake_build
 
+    _invalidate_module(repo_dir, module)
     res = run_lake_build(repo_dir, timeout, targets=[module])
     if res.ok:
         return _ALREADY_BUILDS + " — the audit snapshot was stale)"

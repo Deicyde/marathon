@@ -52,6 +52,50 @@ def test_chapter_of_target():
     assert repair._chapter_of_target(Path("foo/bar")) is None
 
 
+def test_invalidate_module_removes_cached_artifacts(tmp_path):
+    """`_invalidate_module` deletes every cached lake artifact for the module so
+    the next `lake build` cannot short-circuit on a stale olean."""
+    module = "GeometricAnalysis.LeeSM.Chapter16.StokesTheorem"
+    arts = repair._module_artifacts(tmp_path, module)
+    for p in arts:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("stale")
+    # sanity: the olean and lake's content-hash trace are among them
+    names = {p.name for p in arts}
+    assert "StokesTheorem.olean" in names and "StokesTheorem.trace" in names
+    repair._invalidate_module(tmp_path, module)
+    assert not any(p.exists() for p in arts)
+
+
+def test_invalidate_module_never_raises_when_absent(tmp_path):
+    """Best-effort: invalidating a module with no cached artifacts is a no-op."""
+    repair._invalidate_module(tmp_path, "A.B.C")  # must not raise
+
+
+def test_module_build_errors_forces_fresh_build_not_stale_olean(monkeypatch, tmp_path):
+    """The diagnostic build must delete the stale olean BEFORE building, so a
+    module that fails a fresh elaboration is reported broken rather than passed
+    on its leftover trace-valid olean (the StokesTheorem false-OK)."""
+    module = "GeometricAnalysis.LeeSM.Chapter16.StokesTheorem"
+    olean = repair._module_artifacts(tmp_path, module)[0]
+    olean.parent.mkdir(parents=True, exist_ok=True)
+    olean.write_text("stale-but-trace-valid")
+
+    seen = {}
+
+    def fake_build(repo_dir, timeout, targets=None):
+        from types import SimpleNamespace
+        # capture whether the stale olean was invalidated before the build ran
+        seen["olean_present_at_build"] = olean.exists()
+        return SimpleNamespace(ok=False, log_tail="error: unknown identifier `IsOrientedAtlasChart`")
+
+    monkeypatch.setattr("marathon.post_pipeline.run_lake_build", fake_build)
+    out = repair._module_build_errors(tmp_path, module, timeout=60)
+    assert seen["olean_present_at_build"] is False        # invalidated first
+    assert "unknown identifier" in out                    # real error surfaced
+    assert not out.startswith(repair._ALREADY_BUILDS)     # NOT a false green
+
+
 def test_repair_exits_early_when_everything_already_builds(monkeypatch, tmp_path, capsys):
     """Stale-snapshot re-dispatch: when the harvest build shows every module
     already green, the repair exits success WITHOUT calling Aristotle."""
