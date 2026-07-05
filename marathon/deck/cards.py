@@ -380,6 +380,7 @@ class _DeckContext:
     # build. An issue citing one references code that does not compile → its own
     # decls are absent from the snapshot, so it must not read as a ready card.
     broken_module_decls: "set[str]" = field(default_factory=set)
+    issue_chapter: dict = field(default_factory=dict)  # {issue_num: chapter}
 
 
 def _load_context(
@@ -406,6 +407,11 @@ def _load_context(
         target_deps_by_decl=target_deps_by_decl,
         repo_dir=cfg.repo_dir,
         broken_module_decls=_failed_module_decls(cfg.repo_dir, snapshot),
+        issue_chapter={
+            n: ch
+            for ch, reg in (getattr(cfg, "chapters", None) or {}).items()
+            for (n, *_rest) in (getattr(reg, "entries", None) or [])
+        },
     )
 
 
@@ -725,12 +731,31 @@ def _predecessor_issues(
     for decl in own_decls:
         dep_decls.update(ctx.target_deps_by_decl.get(decl, ()))
 
+    # A decl the issue OWNS is not an external dependency. The kernel cone of a
+    # card's decls includes those decls themselves, and decl→issue ownership maps
+    # a decl to every issue that CITES it — so without this, a card's own decl
+    # cited by a DOWNSTREAM issue (e.g. #170 defines `hypersurfaceInducedOrientation`,
+    # which Stokes #244 references) makes that downstream issue a BACKWARDS
+    # predecessor, wrongly blocking the upstream card behind its own dependents.
+    dep_decls -= own_decls
+
     in_queue = set(issue_nums)
+    a_chapter = ctx.issue_chapter.get(num)
     preds: set[int] = set()
     for dep_decl in dep_decls:
         for owner in decl_to_issues.get(dep_decl, ()):
-            if owner != num and owner in in_queue:
-                preds.add(owner)
+            if owner == num or owner not in in_queue:
+                continue
+            # A genuine dependency-predecessor never lives in a LATER chapter:
+            # cross-chapter dependencies flow FORWARD (a later chapter uses an
+            # earlier one), so a later-chapter issue that merely CITES an upstream
+            # decl is a downstream dependent, not a predecessor — dropping it kills
+            # the backwards #244→#170/#171 edges. Only compared when both chapters
+            # are known, so a missing chapter never silently drops a real edge.
+            o_chapter = ctx.issue_chapter.get(owner)
+            if a_chapter is not None and o_chapter is not None and o_chapter > a_chapter:
+                continue
+            preds.add(owner)
     return sorted(preds)
 
 

@@ -256,6 +256,79 @@ def test_built_decl_sharing_name_with_broken_module_not_blocked(tmp_path, monkey
     assert card.ready is True      # not falsely blocked
 
 
+def _two_chapter_cfg(tmp_path, chapters) -> ReviewConfig:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    return ReviewConfig(
+        repo_dir=repo, config_path=repo / ".marathon/review/config.toml",
+        github_repo=REPO_SLUG, parent_issue=1,
+        target_path_template="Demo/Chapter{chapter}",
+        tracker_section_pattern="### Chapter {chapter}:", labels=ReviewLabels(),
+        chapters=chapters,
+    )
+
+
+def _snap(decls) -> AuditSnapshot:
+    return AuditSnapshot(
+        repo_dir="/repo", modules=["Demo"], toolchain="x", lean_version="4",
+        package_revs={}, trusted_prefixes=["Mathlib", "Init"],
+        created_at="2026-06-14T00:00:00+00:00", decls=list(decls), failures=[],
+    )
+
+
+def test_predecessor_drops_later_chapter_citer(tmp_path, monkeypatch):
+    """#171←#244 regression: a LATER-chapter issue that merely CITES an upstream
+    decl is not a predecessor (deps flow forward). #40 (ch15) depends on `Shared`
+    (defined by #22, ch15); #99 (ch16) also cites `Shared`. #40's only
+    predecessor is #22 — never the downstream #99."""
+    cfg = _two_chapter_cfg(tmp_path, {
+        14: ChapterRegistry(chapter=14, entries=[]),
+        15: ChapterRegistry(chapter=15, entries=[(22, "Shared"), (40, "Dependent")]),
+        16: ChapterRegistry(chapter=16, entries=[(99, "Downstream")]),
+    })
+    install_snapshot(cfg, _snap([
+        _decl("Demo.Chapter15.Shared", kind="def", value_pp="x"),
+        _decl("Demo.Chapter15.Dependent", cone=["Demo.Chapter15.Shared"]),
+        _decl("Demo.Chapter16.Downstream", cone=["Demo.Chapter15.Shared"]),
+    ]))
+    patch_bulk(monkeypatch, {
+        22: {"title": "#22", "state": "OPEN",
+             "body": "```lean\ndef Shared : T := ?\n```", "labels": set()},
+        40: {"title": "#40", "state": "OPEN",
+             "body": "```lean\ndef Dependent : T := ?\n```", "labels": set()},
+        99: {"title": "#99", "state": "OPEN",  # cites Shared as an upstream ref
+             "body": "```lean\ndef Downstream : T := ?\n```\n"
+                     "### Lean declarations\n- Shared\n", "labels": set()},
+    })
+    by = {c.id: c for c in cards.build_queue(cfg, chapter=None).cards}
+    assert "#22" in (by[40].blocked_reason or "")    # depends on its definer
+    assert "#99" not in (by[40].blocked_reason or "")  # NOT the downstream citer
+
+
+def test_predecessor_ignores_own_decl_cited_downstream(tmp_path, monkeypatch):
+    """#170←#244 regression: an issue that DEFINES a decl is not blocked behind a
+    SAME-chapter issue that merely cites it. #22 defines `Foo` (its `Baz` cones
+    onto `Foo`); #40 (same chapter) cites `Foo`. #22 stays ready."""
+    cfg = _two_chapter_cfg(tmp_path, {
+        15: ChapterRegistry(chapter=15, entries=[(22, "Foo"), (40, "Other")]),
+    })
+    install_snapshot(cfg, _snap([
+        _decl("Demo.Chapter15.Foo", kind="def", value_pp="x"),
+        _decl("Demo.Chapter15.Baz", cone=["Demo.Chapter15.Foo"]),   # #22's own, cones onto Foo
+        _decl("Demo.Chapter15.Other", kind="def", value_pp="x"),
+    ]))
+    patch_bulk(monkeypatch, {
+        22: {"title": "#22", "state": "OPEN",
+             "body": "```lean\ndef Foo : T := ?\ndef Baz : T := ?\n```", "labels": set()},
+        40: {"title": "#40", "state": "OPEN",  # cites #22's Foo as an upstream ref
+             "body": "```lean\ndef Other : T := ?\n```\n"
+                     "### Lean declarations\n- Foo\n", "labels": set()},
+    })
+    card = next(c for c in cards.build_queue(cfg, chapter=15).cards if c.id == 22)
+    assert card.ready is True                # NOT blocked behind its own dependent #40
+    assert card.blocked_reason is None
+
+
 def test_dep_predecessor_resolved_makes_card_ready(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path)
     snapshot = make_snapshot([
