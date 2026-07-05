@@ -436,6 +436,13 @@
   // chip across every card. The text is LaTeX-bearing; render AFTER it is in the
   // DOM, and degrade to raw LaTeX (never blank) when the math renderer is offline.
   function informalBlock(card) {
+    // No per-decl informal rendering is generated in the review workflow (the
+    // spec_auditor pipeline that fills it is not run), so rather than show an
+    // empty "(no informal rendering available)" box on every card, render
+    // nothing when there is no text. If the rendering is ever populated it
+    // appears automatically (with its LLM/verified flag).
+    var txt = card.informal_rendering;
+    if (!txt) return null;
     var wrap = el("div", { class: "informal" });
     if (card.informal_is_llm && informalApproved()) {
       wrap.appendChild(
@@ -449,13 +456,6 @@
           "⚠️ LLM-rendered — verify against the source",
         ])
       );
-    }
-    var txt = card.informal_rendering;
-    if (!txt) {
-      wrap.appendChild(
-        el("p", { class: "informal-empty", text: "(no informal rendering available)" })
-      );
-      return wrap;
     }
     var math = el("div", { class: "informal-text" });
     math.dataset.latexSource = txt;
@@ -918,7 +918,10 @@
       );
     }
 
-    panel.appendChild(el("section", { class: "sec-informal" }, [informalBlock(card)]));
+    var informal = informalBlock(card);
+    if (informal) {
+      panel.appendChild(el("section", { class: "sec-informal" }, [informal]));
+    }
     panel.appendChild(
       el("section", { class: "sec-evidence" }, [
         el("h3", { class: "sec-title", text: "Evidence" }),
