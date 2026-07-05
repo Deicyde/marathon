@@ -130,11 +130,36 @@
   // unwraps the {ok:false,...} convention. It is the shared transport for
   // BOTH the local decl-verdict and the irreversible ship — but note the
   // two have very different consequences (see the two named callers below).
-  function postJSON(url, body) {
+  // Re-read the session token from a FRESH page load (the meta tag / global the
+  // server injects). The token is minted per deck process, so after a deck
+  // restart the in-memory SESSION_TOKEN goes stale; this refetches the live one
+  // without a full reload. Resolves to the new token, or "" if none is available
+  // (e.g. the fetch hit an oauth login page).
+  function refreshSessionToken() {
+    return fetch("/", { credentials: "same-origin", headers: { Accept: "text/html" } })
+      .then(function (r) { return r.ok ? r.text() : ""; })
+      .then(function (html) {
+        var m = html.match(/name="marathon-session-token"\s+content="([^"]+)"/);
+        var tok = m ? m[1] : "";
+        if (tok && tok.indexOf("__MARATHON_SESSION_TOKEN__") === -1) {
+          SESSION_TOKEN = tok;
+          return tok;
+        }
+        return "";
+      })
+      .catch(function () { return ""; });
+  }
+
+  function postJSON(url, body, _retried) {
+    if (!SESSION_TOKEN && !_retried) {
+      // No token in-page yet — try to fetch one, then proceed.
+      return refreshSessionToken().then(function (tok) {
+        if (!tok) return Promise.reject(new Error("no session token — refusing to POST"));
+        return postJSON(url, body, true);
+      });
+    }
     if (!SESSION_TOKEN) {
-      return Promise.reject(
-        new Error("no session token — refusing to POST")
-      );
+      return Promise.reject(new Error("no session token — refusing to POST"));
     }
     var payload = {};
     Object.keys(body || {}).forEach(function (k) { payload[k] = body[k]; });
@@ -153,6 +178,17 @@
       body: JSON.stringify(payload),
     }).then(function (r) {
       return r.json().then(function (data) {
+        // A STALE per-process token (deck was restarted since this page loaded)
+        // 403s here. Refresh the token from a fresh page load and retry ONCE, so
+        // a deck restart is transparent instead of a dead-end "invalid session
+        // token". The _retried guard prevents an infinite loop.
+        if (r.status === 403 && !_retried && data &&
+            /session token/i.test(data.message || data.error || "")) {
+          return refreshSessionToken().then(function (tok) {
+            if (tok) return postJSON(url, body, true);
+            throw new Error((data && data.message) || "invalid session token");
+          });
+        }
         if (!r.ok || (data && data.ok === false)) {
           throw new Error(
             (data && (data.message || data.reason || data.error)) ||
