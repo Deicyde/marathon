@@ -187,6 +187,75 @@ def test_blocked_card_carries_blocked_reason_below_floor(tmp_path, monkeypatch):
     assert "below the machine-audit floor" in card.blocked_reason
 
 
+def _cfg_one_issue(tmp_path, issue, label) -> ReviewConfig:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    return ReviewConfig(
+        repo_dir=repo, config_path=repo / ".marathon/review/config.toml",
+        github_repo=REPO_SLUG, parent_issue=1,
+        target_path_template="Demo/Chapter{chapter}",
+        tracker_section_pattern="### Chapter {chapter}:", labels=ReviewLabels(),
+        chapters={14: ChapterRegistry(chapter=14, entries=[(issue, label)])},
+    )
+
+
+def _snap_with_failure(cfg, decls, failed_module) -> AuditSnapshot:
+    return AuditSnapshot(
+        repo_dir=str(cfg.repo_dir), modules=["Demo.Chapter14"],
+        toolchain="x", lean_version="4", package_revs={},
+        trusted_prefixes=["Mathlib", "Init"], created_at="2026-06-14T00:00:00+00:00",
+        decls=list(decls),
+        failures=[f"module {failed_module} failed to build; excluded from audit"],
+    )
+
+
+def test_build_broken_issue_floored_and_blocked(tmp_path, monkeypatch):
+    """The #244 Stokes case: an issue whose module fails to build must NOT read
+    as a ready T1 card by inheriting the tier of an upstream decl it merely
+    references. It is floored to '-' and blocked with a build-failure reason."""
+    cfg = _cfg_one_issue(tmp_path, 25, "Broken Thm")
+    # the failed module's SOURCE exists (it just won't compile).
+    src = cfg.repo_dir / "Demo/Chapter14/Broken.lean"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("theorem BrokenThm : True := by exact upstreamRef\n")
+    # Upstream is built (resolvable, T1); the Broken module is a FAILURE, so
+    # BrokenThm is ABSENT from the snapshot — exactly #244's shape.
+    install_snapshot(cfg, _snap_with_failure(
+        cfg, [_decl("Demo.Chapter14.Upstream")], "Demo.Chapter14.Broken"))
+    patch_bulk(monkeypatch, {25: {
+        "title": "#25 Stokes-like", "state": "OPEN",
+        "body": "### Lean signatures\n```lean\ntheorem BrokenThm : True\n```\n"
+                "### Lean declarations\n- Upstream\n",
+        "labels": set(),
+    }})
+    card = next(c for c in cards.build_queue(cfg, chapter=14).cards if c.id == 25)
+    assert card.tier == "-"                       # NOT T1 inherited from Upstream
+    assert card.ready is False
+    assert "fails to build" in (card.blocked_reason or "")
+    assert "BrokenThm" in (card.blocked_reason or "")
+
+
+def test_built_decl_sharing_name_with_broken_module_not_blocked(tmp_path, monkeypatch):
+    """False-positive guard: a card citing a BUILT decl whose bare name collides
+    with a decl in a failed module is NOT blocked — build-broken requires the
+    cited decl to be genuinely ABSENT from the snapshot."""
+    cfg = _cfg_one_issue(tmp_path, 26, "Shared")
+    src = cfg.repo_dir / "Demo/Chapter14/Broken.lean"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("theorem Shared : True := sorry\n")   # broken module ALSO has `Shared`
+    # but the issue's `Shared` is the BUILT one (present in the snapshot).
+    install_snapshot(cfg, _snap_with_failure(
+        cfg, [_decl("Demo.Chapter14.Shared")], "Demo.Chapter14.Broken"))
+    patch_bulk(monkeypatch, {26: {
+        "title": "#26 Shared", "state": "OPEN",
+        "body": "### Lean signatures\n```lean\ndef Shared : T := ?\n```",
+        "labels": set(),
+    }})
+    card = next(c for c in cards.build_queue(cfg, chapter=14).cards if c.id == 26)
+    assert card.tier != "-"        # resolves to the built decl → not floored
+    assert card.ready is True      # not falsely blocked
+
+
 def test_dep_predecessor_resolved_makes_card_ready(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path)
     snapshot = make_snapshot([

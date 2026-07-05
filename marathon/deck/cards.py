@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -375,6 +375,11 @@ class _DeckContext:
     issue_meta: dict  # {issue_num: {title, body, labels, ...}} (may be {})
     verdict_status: dict  # {issue_num: status str}  ('verified'/'rejected'/...)
     target_deps_by_decl: dict  # {decl_name: set[decl_name]} planner edges
+    repo_dir: object = None  # Path — for reading failed modules' source
+    # Bare decl names defined in modules the last audit recorded as FAILING to
+    # build. An issue citing one references code that does not compile → its own
+    # decls are absent from the snapshot, so it must not read as a ready card.
+    broken_module_decls: "set[str]" = field(default_factory=set)
 
 
 def _load_context(
@@ -399,7 +404,59 @@ def _load_context(
         issue_meta=issue_meta,
         verdict_status=verdict_status,
         target_deps_by_decl=target_deps_by_decl,
+        repo_dir=cfg.repo_dir,
+        broken_module_decls=_failed_module_decls(cfg.repo_dir, snapshot),
     )
+
+
+#: Matches the audit snapshot's build-failure entries: ``module <M> failed to
+#: build; …`` (see :func:`marathon.audit.engine.run_audit`).
+_FAILED_MODULE_RE = re.compile(r"module\s+(\S+)\s+failed to build")
+
+
+def _failed_module_decls(repo_dir, snapshot) -> "set[str]":
+    """Bare decl names defined in modules the last audit recorded as FAILING to
+    build. Their declarations are excluded from the snapshot, so an issue that
+    cites one references a module that does not compile — its own statements have
+    no audit evidence and it is not reviewable until the module is repaired.
+
+    Read straight from source: the failed module's ``.lean`` file exists even
+    though it will not build, and its declaration keywords are still parseable.
+    Best-effort — an unreadable file just contributes nothing."""
+    if snapshot is None or repo_dir is None:
+        return set()
+    from marathon.review.approved_statements import _DECL_RE
+
+    out: set[str] = set()
+    for f in getattr(snapshot, "failures", None) or ():
+        m = _FAILED_MODULE_RE.search(f or "")
+        if not m:
+            continue
+        rel = m.group(1).replace(".", "/") + ".lean"
+        try:
+            text = (Path(repo_dir) / rel).read_text()
+        except OSError:
+            continue
+        for dm in _DECL_RE.finditer(text):
+            out.add(dm.group("name").split(".")[-1])  # bare suffix
+    return out
+
+
+def _issue_build_broken(ctx: _DeckContext, num: int) -> Optional[str]:
+    """The first decl issue ``num`` cites that belongs to a module the audit
+    recorded as FAILING to build (defined there, absent from the snapshot), or
+    ``None``. Such an issue references code that does not compile, so its own
+    statement carries no audit evidence — it must not surface as a ready card
+    (the misleading "Stokes shows T1/ready because its one resolvable citation is
+    an upstream Ch15 decl" case). Requires a genuine snapshot absence too, so a
+    coincidental bare-name collision with a BUILT decl never blocks."""
+    broken = getattr(ctx, "broken_module_decls", None)
+    if not broken:
+        return None
+    for c in _decls_for_issue(ctx, num):
+        if c.split(".")[-1] in broken and _resolve_to_snapshot(ctx, c) is None:
+            return c
+    return None
 
 
 def _tiers_by_decl(cfg: "ReviewConfig", snapshot) -> dict:
@@ -591,6 +648,13 @@ def _issue_tier(
     from marathon.audit.trust import TIER_ORDER
 
     cited = _decls_for_issue(ctx, num)
+    # A build-broken issue (its module failed to build → its own decls are
+    # absent from the snapshot) must NOT inherit a tier from the one upstream
+    # citation that happens to resolve. Floor it to '-' (no evidence) and headline
+    # the broken decl, so the readiness gate holds it out of the queue.
+    broken_decl = _issue_build_broken(ctx, num)
+    if broken_decl is not None:
+        return "-", [], broken_decl
     if not ctx.tiers_by_decl:
         # No snapshot: honest '-' tier, but keep a headline decl from the
         # body so the card still names what it is about.
@@ -734,6 +798,12 @@ def _readiness(
 
     if ctx.snapshot is None:
         return False, "no audit snapshot — run `marathon audit run` to gate it"
+    broken_decl = _issue_build_broken(ctx, num)
+    if broken_decl is not None:
+        return False, (
+            f"module for `{broken_decl}` fails to build — no audit evidence for "
+            "this card's own declarations yet; repair the module first"
+        )
     if tier == "-":
         return False, "no audit evidence for this card's declarations"
     if TIER_ORDER.index(tier) < TIER_ORDER.index(READY_TIER_FLOOR):
