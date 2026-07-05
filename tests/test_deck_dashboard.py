@@ -88,8 +88,8 @@ def test_conductor_status_no_snapshot_degrades(tmp_path, monkeypatch):
     monkeypatch.setattr("marathon.conductor.load_jobs_snapshot", lambda repo_dir: None)
     d = dash.conductor_status(_cfg(tmp_path))
     assert d == {"alive": False, "pid": None, "repo": "o/r", "concurrency": None,
-                 "updated_ts": None, "running": 0, "jobs": [], "queued": [],
-                 "landings": []}
+                 "updated_ts": None, "running": 0, "prover_enabled": None,
+                 "jobs": [], "queued": [], "landings": []}
 
 
 # --- issues_overview -------------------------------------------------------

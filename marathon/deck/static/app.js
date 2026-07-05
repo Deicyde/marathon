@@ -2345,6 +2345,34 @@
   }
 
   // --- Status tab: the conductor (global orchestrator) + jobs + landings ---
+  // The prover on/off switch — writes the control file the conductor polls each
+  // tick (POST /api/prover-toggle). Enabling starts leaves-first sorry-filling on
+  // the prover branch; main stays skeleton.
+  function proverToggle(d) {
+    var enabled = d.prover_enabled === true;
+    var unknown = d.prover_enabled == null;
+    var input = el("input", { type: "checkbox" });
+    input.checked = enabled;
+    input.addEventListener("change", function () {
+      var want = input.checked;
+      input.disabled = true;
+      postJSON("/api/prover-toggle", { enabled: want })
+        .then(function () { renderStatusTab(); })
+        .catch(function (e) {
+          input.checked = !want;
+          input.disabled = false;
+          alert("prover toggle failed: " + (e && e.message ? e.message : e));
+        });
+    });
+    return el("label", {
+      class: "prover-toggle",
+      title: "Prove verified statements leaves-first (API lemmas → up to Stokes) "
+           + "on the prover branch. main stays skeleton; Aristotle does the proving.",
+    }, [input, el("span", {
+      text: unknown ? "prover: unknown" : (enabled ? "prover: ON" : "prover: OFF"),
+    })]);
+  }
+
   function renderStatusTab() {
     if (state.activeTab !== "status") return; // a stale poll after a switch
     getJSON("/api/conductor-status").then(function (d) {
@@ -2367,6 +2395,7 @@
             text: d.pid == null ? "—" : String(d.pid) })]),
           el("div", { text: "concurrency " + (d.concurrency == null ? "—" : d.concurrency) }),
           el("div", { text: d.updated_ts ? ("updated " + fmtTs(d.updated_ts)) : "" }),
+          proverToggle(d),
         ]),
       ]));
       host.appendChild(el("div", { class: "stat-row dash-section" }, [

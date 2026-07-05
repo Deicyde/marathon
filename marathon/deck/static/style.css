@@ -499,6 +499,9 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .cond-title { font-weight: 700; }
 .cond-meta { color: var(--muted); font-size: 0.8rem; margin-left: auto; text-align: right; }
 .cond-meta .mono { font-family: var(--mono); }
+.prover-toggle { display: inline-flex; align-items: center; gap: 0.35rem;
+  cursor: pointer; margin-top: 0.25rem; justify-content: flex-end; }
+.prover-toggle input { cursor: pointer; }
 
 /* --- job rows (conductor jobs) --- */
 .job-row, .land-row { display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 0.7rem; border: 1px solid var(--line); border-radius: 9px; margin-bottom: 0.4rem; background: var(--panel); font-size: 0.86rem; }

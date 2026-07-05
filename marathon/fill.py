@@ -225,6 +225,10 @@ def _add_passthrough_refine_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--gate", choices=("off", "warn", "enforce"), default="warn")
     p.add_argument("--gate-override", type=str, default=None, metavar="REASON")
     p.add_argument("--jury", action="store_true", default=False)
+    # Live steering (the orchestrator's "maybe steer" role): run the Hermes
+    # watcher alongside Aristotle so Claude can nudge a proof that goes
+    # off-course. Forwarded to refine, which reads args.live_steering.
+    p.add_argument("--live-steering", action="store_true", default=False)
 
 
 # ---------------------------------------------------------------------------

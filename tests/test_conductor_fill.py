@@ -62,6 +62,29 @@ class _FakeSnap:
         return self._b
 
 
+def test_prover_control_file_roundtrip(tmp_path):
+    """The deck's prover toggle: absent → no override (None); written → the
+    boolean; stored in the self-ignoring runtime dir so it never leaks."""
+    assert cond.read_prover_control(tmp_path) is None      # absent → honor default
+    cond.set_prover_enabled(tmp_path, True)
+    assert cond.read_prover_control(tmp_path) is True
+    cond.set_prover_enabled(tmp_path, False)
+    assert cond.read_prover_control(tmp_path) is False
+    assert (tmp_path / ".marathon" / "conductor" / ".gitignore").read_text() == "*\n"
+
+
+def test_read_prover_control_tolerates_malformed(tmp_path):
+    import json
+    p = cond.prover_control_path(tmp_path)
+    p.parent.mkdir(parents=True)
+    p.write_text("not json at all")
+    assert cond.read_prover_control(tmp_path) is None       # unparseable → no override
+    p.write_text(json.dumps({"enabled": "yes"}))            # wrong type
+    assert cond.read_prover_control(tmp_path) is None
+    p.write_text(json.dumps({"other": 1}))                  # missing key
+    assert cond.read_prover_control(tmp_path) is None
+
+
 def test_pick_fill_orders_leaves_first_over_dependency_dag():
     """With an audit snapshot the picker returns fills LEAVES-FIRST over the
     dependency DAG — even when that inverts issue-number order. Here Root(#101)

@@ -185,6 +185,17 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
         )
         jobs.append(job)
 
+    # The prover toggle's state: the conductor publishes its EFFECTIVE proving
+    # state into the snapshot each tick; fall back to the deck-written control
+    # file (a conductor that predates this field, or none yet running).
+    prover_enabled = snap.get("prover_enabled")
+    if prover_enabled is None:
+        try:
+            from marathon.conductor import read_prover_control
+            prover_enabled = read_prover_control(Path(cfg.repo_dir))
+        except Exception:  # noqa: BLE001
+            prover_enabled = None
+
     return {
         "alive": alive,
         "pid": pid,
@@ -192,6 +203,7 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
         "concurrency": snap.get("concurrency"),
         "updated_ts": snap.get("updated_ts"),
         "running": sum(1 for j in jobs if j["status"] == "running"),
+        "prover_enabled": prover_enabled,
         "jobs": jobs,
         "queued": _pending_queue(cfg, jobs, snap.get("concurrency")),
         "landings": _recent_landings(cfg, limit=8),

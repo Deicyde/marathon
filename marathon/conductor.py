@@ -988,6 +988,15 @@ def _dispatch_job(
             # proofs. `fill_run` exempts this from the review-rejection
             # enforce→warn demotion.
             "--gate", "enforce",
+            # The orchestrator's two jobs on a proof (Aristotle does the
+            # proving): CHECK FAITHFULNESS — the proof-integrity jury flags a
+            # compile-but-cheat proof (vacuous body, orphan-class-as-axiom, a
+            # PUnit placeholder) that the statement-immutability guard + the
+            # axiom gate don't catch — and STEER — the Hermes watcher nudges
+            # Aristotle when a proof goes off-course. Both run on Claude (the
+            # orchestrator), never Aristotle.
+            "--jury",
+            "--live-steering",
         ]
         log_path = workdir / "conductor-fill.log"
         cmd += _tex_args(cfg, chapter)
@@ -1485,11 +1494,51 @@ def jobs_snapshot_path(repo_dir: Path) -> Path:
     return Path(repo_dir) / JOBS_SNAPSHOT_RELPATH
 
 
+#: The deck's web toggle for proving — a control file the conductor polls each
+#: tick. Lives in the self-ignoring .marathon/conductor/ runtime dir so it never
+#: leaks into an Aristotle bundle or dirties `git status`.
+PROVER_CONTROL_RELPATH = Path(".marathon/conductor/prover-control.json")
+
+
+def prover_control_path(repo_dir: Path) -> Path:
+    return Path(repo_dir) / PROVER_CONTROL_RELPATH
+
+
+def read_prover_control(repo_dir: Path) -> Optional[bool]:
+    """The deck's prover override: ``True``/``False`` when the web app has set
+    one, else ``None`` (no override → honor the conductor's startup default).
+    Never raises — an unreadable/malformed control file reads as no override."""
+    try:
+        data = json.loads(prover_control_path(repo_dir).read_text())
+        val = data.get("enabled")
+        return val if isinstance(val, bool) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def set_prover_enabled(repo_dir: Path, enabled: bool) -> None:
+    """Write the prover override (atomic tmp+rename; self-ignoring runtime dir) —
+    the deck's channel to enable/disable proving on a SEPARATE conductor process,
+    honored within one tick (``TICK_SECONDS``)."""
+    path = prover_control_path(repo_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    gitignore = path.parent / ".gitignore"
+    if not gitignore.is_file():
+        gitignore.write_text("*\n")
+    payload = {"enabled": bool(enabled), "updated_ts": now_iso(), "updated_by": "deck"}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n")
+    tmp.replace(path)
+
+
 def write_jobs_snapshot(
-    repo_dir: Path, jobs: list[ConductorJob], concurrency: int
+    repo_dir: Path, jobs: list[ConductorJob], concurrency: int,
+    prover_enabled: Optional[bool] = None,
 ) -> None:
     """Atomic-ish write (tmp + rename, like review.state.save_state) so
-    ``marathon conductor status`` never reads a torn snapshot."""
+    ``marathon conductor status`` never reads a torn snapshot. ``prover_enabled``
+    publishes the conductor's EFFECTIVE proving state (startup default overlaid
+    with the deck toggle) so the deck can render the toggle in its true state."""
     path = jobs_snapshot_path(repo_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Self-ignoring runtime dir (same convention as .marathon/review's
@@ -1506,6 +1555,7 @@ def write_jobs_snapshot(
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "updated_ts": now_iso(),
         "concurrency": concurrency,
+        "prover_enabled": prover_enabled,
         "jobs": [job.to_json() for job in jobs],
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -1748,21 +1798,27 @@ def run_conductor(
     warned_unknown: set[int] = set()
     dispatch_count = 0
     fill_attempts: dict[int, int] = {}         # per-issue fill dispatch counter (capped)
-    fill_chapters = set(fill_chapters or ())   # opt-in proving scope (empty ⇒ no fills)
-    if prove_frontier:
-        # Autonomous proving: every registered chapter is a candidate; the
-        # per-tick skeleton-done gate in _pick_fill_dispatchable restricts to
-        # the ones actually done, so a chapter auto-joins the frontier the
-        # moment its last statement is verified. Unions any explicit --fill-chapter.
-        fill_chapters |= set(cfg.chapters or {})
-        print("  fill (proving): --prove-frontier — every skeleton-done chapter "
-              "is proved (auto-joins on completion)", flush=True)
-    if fill_chapters:
-        print(f"  fill (proving) enabled for chapter(s): {sorted(fill_chapters)} "
-              f"(max {max_fill_attempts} attempts/issue)", flush=True)
-        # Note which requested chapters are still churning: a chapter is only
-        # proved once its skeleton is done (every statement verified), so an
-        # operator who names a not-yet-done chapter sees why it's idle.
+    # Proving scope + default. ``fill_chapters`` is the candidate set the picker
+    # considers each tick (restricted to skeleton-done chapters there);
+    # ``proving_default`` is what to do absent a deck override: ON when the
+    # operator asked (--prove-frontier / --fill-chapter), else OFF but ENABLEABLE
+    # from the web app. To let the toggle turn proving on even without a startup
+    # flag, the scope defaults to every registered chapter (the skeleton-done
+    # gate keeps churning chapters out); an explicit --fill-chapter narrows it.
+    explicit_fill = set(fill_chapters or ())
+    if explicit_fill and not prove_frontier:
+        fill_chapters = explicit_fill
+    else:
+        fill_chapters = set(cfg.chapters or {}) | explicit_fill
+    proving_default = bool(prove_frontier or explicit_fill)
+    if fill_chapters and proving_default:
+        print(f"  fill (proving): scope = chapter(s) {sorted(fill_chapters)}; "
+              f"ON by default (max {max_fill_attempts} attempts/issue)", flush=True)
+        # A chapter is only proved once its skeleton is done (every statement
+        # verified), so note which candidates are still churning. This hits gh,
+        # so it runs ONLY when proving is on at startup — when proving is off
+        # (deck-enableable), the per-tick picker's own skeleton-done gate covers
+        # it and startup stays gh-free.
         try:
             from marathon.review.fill_discovery import chapter_skeleton_done
             waiting = sorted(c for c in fill_chapters
@@ -1773,6 +1829,9 @@ def run_conductor(
                       flush=True)
         except Exception as e:  # noqa: BLE001 — informational only
             print(f"  fill: skeleton-done check skipped — {e}", flush=True)
+    elif fill_chapters:
+        print(f"  fill (proving): available for chapter(s) "
+              f"{sorted(fill_chapters)} — OFF; enable from the deck", flush=True)
     repair_attempts: dict[int, int] = {}       # per-chapter repair dispatch counter
     repair_chapters = set(repair_chapters or ())
     if repair_frontier:
@@ -1783,14 +1842,10 @@ def run_conductor(
         print(f"  repair enabled for chapter(s): {sorted(repair_chapters)} "
               f"(max {max_repair_attempts} attempts/chapter) — broken modules "
               "auto-fixed to main, gated by build + faithfulness jury", flush=True)
-    proving_enabled = bool(fill_chapters)
-    if proving_enabled:
-        # Proofs land on a SEPARATE branch (main stays skeleton). Ensure it
-        # exists — forked from origin/main — before any fill branches off it.
-        _ensure_prover_branch(cfg.repo_dir, prover_branch)
-        print(f"  fill (proving): proofs land on '{prover_branch}' only — "
-              "never main. Proving runs only when the refine queue is idle.",
-              flush=True)
+    # Proofs land on a SEPARATE branch (main stays skeleton). It is ensured
+    # LAZILY — the first tick proving is actually enabled (by default or via the
+    # deck toggle) — so a conductor that never proves never creates the branch.
+    prover_branch_ready = False
     ticks = 0
     last_automerge = float("-inf")  # run the merge orchestrator on tick 1, then ~once/min
     last_reconcile_sha: Optional[str] = None  # reconcile only when HEAD changes
@@ -1814,6 +1869,20 @@ def run_conductor(
 
         while True:
             ticks += 1
+            # Poll the deck's prover toggle (a control file); absent an override,
+            # honor the startup default. Ensure the proving branch the first time
+            # proving is actually enabled (so a never-proving conductor never
+            # creates it).
+            _prover_override = read_prover_control(cfg.repo_dir)
+            prover_enabled_now = (
+                proving_default if _prover_override is None else _prover_override
+            )
+            if prover_enabled_now and fill_chapters and not prover_branch_ready:
+                _ensure_prover_branch(cfg.repo_dir, prover_branch)
+                prover_branch_ready = True
+                print(f"  fill (proving): ENABLED — proofs land on "
+                      f"'{prover_branch}' only, never main; runs only when the "
+                      "refine queue is idle.", flush=True)
             _reap_finished(
                 cfg, jobs, not_before, kept_worktrees, max_attempts,
                 land=land, reconcile=reconcile,
@@ -1836,8 +1905,9 @@ def run_conductor(
                 # base-equality guard means this cycle only ever touches PRs
                 # based on the prover branch (proofs) and the main cycle above
                 # only touches base==main (refines) — so a proof can never
-                # reach main. Skipped unless proving is enabled.
-                if proving_enabled:
+                # reach main. Runs once the prover branch is live, so in-flight
+                # proof PRs still land even if the deck toggles proving off.
+                if prover_branch_ready:
                     daemon._maybe_automerge(
                         cfg, True, scope=merge_scope,
                         exclude_heads=running_heads, base=prover_branch,
@@ -1977,7 +2047,7 @@ def run_conductor(
                 # the start of, a refine or repair. In-flight one-shot fills
                 # finish normally.
                 if (
-                    fill_chapters and not refine_running
+                    fill_chapters and prover_enabled_now and not refine_running
                     and not refine_pending and not repair_running
                 ):
                     slots = n - len(running)
@@ -2006,7 +2076,7 @@ def run_conductor(
                         dispatch_count += 1
                     running = [j for j in jobs if j.status == "running"]
 
-            write_jobs_snapshot(cfg.repo_dir, jobs, n)
+            write_jobs_snapshot(cfg.repo_dir, jobs, n, prover_enabled=prover_enabled_now)
 
             if _STOP_REQUESTED:
                 if not running:

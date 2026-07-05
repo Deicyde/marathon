@@ -444,6 +444,7 @@ class DeckHandler(BaseHTTPRequestHandler):
         "/api/verdict", "/api/decl-verdict", "/api/decl-lock", "/api/missing", "/api/ship",
         "/api/refresh-issue", "/api/drop-citation", "/api/requeue",
         "/api/add-chapter", "/api/chapter-intake-status", "/api/approve-chapter",
+        "/api/prover-toggle",
     )
 
     def do_POST(self) -> None:  # noqa: N802 (stdlib handler name)
@@ -480,6 +481,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                     self._api_chapter_intake_status()
                 elif parsed.path == "/api/approve-chapter":
                     self._api_approve_chapter()
+                elif parsed.path == "/api/prover-toggle":
+                    self._api_prover_toggle()
                 else:  # /api/ship
                     self._api_ship()
         except BrokenPipeError:
@@ -1047,6 +1050,40 @@ class DeckHandler(BaseHTTPRequestHandler):
         self._send_json(
             {"ok": True, "requeued": True, "issue": issue_num,
              "message": f"#{issue_num} re-queued — the conductor will retry it"}
+        )
+
+    def _api_prover_toggle(self) -> None:
+        """Enable/disable the DAG prover (POST /api/prover-toggle). Flips the
+        control file a SEPARATELY-running conductor polls each tick, so the web
+        app turns proving on/off without managing the conductor process. Proofs
+        still land only on the prover branch, never main. Token-gated like every
+        POST. Body: ``{"enabled": bool}``."""
+        data = self._read_guarded_body()
+        if data is None:
+            return  # the guard already sent the 4xx (origin / body / token)
+        enabled = data.get("enabled")
+        if not isinstance(enabled, bool):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                f"'enabled' must be a boolean, got {enabled!r}",
+            )
+        if self._demo:
+            return self._send_json(
+                {"ok": False, "prover_enabled": False,
+                 "message": "the prover toggle is not available in demo mode"}
+            )
+        try:
+            from marathon import conductor
+            conductor.set_prover_enabled(self.cfg.repo_dir, enabled)
+        except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
+            return self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, f"prover toggle failed: {exc}"
+            )
+        self._send_json(
+            {"ok": True, "prover_enabled": enabled,
+             "message": f"proving {'enabled' if enabled else 'disabled'} — the "
+                        "conductor applies it within a tick (proofs land on the "
+                        "prover branch only)"}
         )
 
     # --- helpers ----------------------------------------------------------
