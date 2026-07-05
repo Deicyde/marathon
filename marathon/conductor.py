@@ -755,6 +755,22 @@ def _has_open_pr_for_issue(
         return False
 
 
+#: Sentinel: `_pick_fill_dispatchable(..., _snapshot=_UNSET)` loads the real
+#: audit snapshot; a test injects a fake (or ``None`` to force issue-order).
+_UNSET = object()
+
+
+def _load_audit_snapshot(cfg: ReviewConfig):
+    """The latest audit snapshot, or ``None`` if absent/unreadable. Never raises
+    — the fill ordering degrades to issue-number order without it."""
+    try:
+        from marathon.audit.engine import load_snapshot
+
+        return load_snapshot(cfg.repo_dir)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _pick_fill_dispatchable(
     cfg: ReviewConfig,
     fill_chapters: set[int],
@@ -767,19 +783,29 @@ def _pick_fill_dispatchable(
     _discover=None,
     _open_pr=None,
     _skeleton_done=None,
+    _snapshot=_UNSET,
 ) -> list[tuple[int, int]]:
     """``[(issue, chapter), …]`` fills to dispatch this tick: verified-but-``sorry``
     issues in ``fill_chapters``, excluding those already running, backed off,
-    attempt-capped, or with an open PR (a fill already pending merge). Sorted by
-    issue number. Discovery is naturally idempotent — once a fill's PR merges the
-    decl is no longer ``sorry`` and drops out — so the only loop risk is a fill
-    that lands nothing, which ``max_fill_attempts`` bounds.
+    attempt-capped, or with an open PR (a fill already pending merge). Discovery
+    is naturally idempotent — once a fill's PR merges the decl is no longer
+    ``sorry`` and drops out — so the only loop risk is a fill that lands nothing,
+    which ``max_fill_attempts`` bounds.
 
     A chapter is skipped entirely until its skeleton is done (every registered
     issue verified) — proving while statements still churn wastes proofs on
-    signatures that may still change under re-review."""
+    signatures that may still change under re-review.
+
+    ORDER: the dispatchable targets across ALL chapters are ordered LEAVES-FIRST
+    over the cross-chapter dependency DAG (:func:`marathon.prover.dag.order_targets`)
+    — foundational API lemmas before the theorems that rest on them, up to the
+    root (eventually Stokes). The order is recomputed every tick against the
+    current snapshot, so as leaves prove clean the next layer surfaces. With no
+    audit snapshot the order falls back to chapter-then-issue-number, so the
+    queue can never wedge on a dependency the snapshot cannot see."""
     if not fill_chapters:
         return []
+    from marathon.prover.dag import order_targets
     from marathon.review.fill_discovery import (
         chapter_skeleton_done,
         discover_fill_targets,
@@ -789,7 +815,7 @@ def _pick_fill_dispatchable(
     skeleton_done = _skeleton_done or chapter_skeleton_done
     open_pr = _open_pr or _has_open_pr_for_issue
     now = _now_fn()
-    out: list[tuple[int, int]] = []
+    dispatchable: list = []  # FillTargets, gathered across chapters
     for chapter in sorted(fill_chapters):
         if not skeleton_done(cfg, chapter):
             continue
@@ -803,8 +829,10 @@ def _pick_fill_dispatchable(
                 continue
             if open_pr(cfg, n, chapter, kind="proof"):
                 continue
-            out.append((n, chapter))
-    return out
+            dispatchable.append(t)
+    snapshot = _load_audit_snapshot(cfg) if _snapshot is _UNSET else _snapshot
+    ordered = order_targets(dispatchable, snapshot)
+    return [(t.issue, t.chapter) for t in ordered]
 
 
 def _dispatch_job(

@@ -48,6 +48,40 @@ def test_pick_fill_empty_when_no_chapters_requested():
     assert cond._pick_fill_dispatchable(cfg, set(), set(), {}, {}, 3) == []
 
 
+class _FakeDecl:
+    def __init__(self, name, cone):
+        self.name, self.kind, self.cone, self.axioms, self.has_sorry = \
+            name, "theorem", cone, [], True
+
+
+class _FakeSnap:
+    def __init__(self, decls):
+        self._b = {d.name: d for d in decls}
+
+    def by_name(self):
+        return self._b
+
+
+def test_pick_fill_orders_leaves_first_over_dependency_dag():
+    """With an audit snapshot the picker returns fills LEAVES-FIRST over the
+    dependency DAG — even when that inverts issue-number order. Here Root(#101)
+    cones onto Leaf(#202), so Leaf must dispatch first despite its higher number."""
+    cfg = SimpleNamespace(github_repo="o/r")
+    snap = _FakeSnap([_FakeDecl("Leaf", []), _FakeDecl("Root", ["Leaf"])])
+    targets = {12: [FillTarget(101, 12, ["Root"]), FillTarget(202, 12, ["Leaf"])]}
+    common = dict(
+        _discover=lambda c, ch: targets.get(ch, []),
+        _open_pr=lambda c, n, ch, **kw: False,
+        _skeleton_done=lambda c, ch: True,
+    )
+    picks = cond._pick_fill_dispatchable(cfg, {12}, set(), {}, {}, 3, _snapshot=snap, **common)
+    assert picks == [(202, 12), (101, 12)]   # Leaf before Root — DAG order
+
+    # Without a snapshot, it falls back to discovery's issue-number order.
+    fallback = cond._pick_fill_dispatchable(cfg, {12}, set(), {}, {}, 3, _snapshot=None, **common)
+    assert fallback == [(101, 12), (202, 12)]
+
+
 def test_pick_fill_spans_chapters_sorted_by_issue():
     cfg = SimpleNamespace(github_repo="o/r")
     targets = {11: [_ft(201, 11)], 12: [_ft(202, 12)]}
