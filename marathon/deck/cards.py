@@ -1516,23 +1516,33 @@ def _surface_namespace_decls(
         return []
 
     namespaces = _namespace_prefixes(sorted(cited_resolved))
-    if not namespaces:
-        return []
 
-    # Candidate names: a DIRECT member of one of the issue's namespaces, not
-    # already cited here AND not cited by any OTHER chapter issue (so a sibling
-    # result's decls never surface in). Deterministic order.
+    # Candidate names: not already cited here AND not cited by any OTHER chapter
+    # issue (so a sibling result's decls never surface in). Two recovery shapes:
+    #   (a) RENAME — a DIRECT member of one of the issue's cited namespaces
+    #       (``<ns>.<leaf>``), e.g. a stale ``Foo.IsSmooth`` → renamed
+    #       ``Bar.IsSmooth``.
+    #   (b) SPLIT — a decl named ``<cited>_<suffix>``, e.g. a top-level
+    #       ``Prop_16_1`` split into ``Prop_16_1_preserving`` /
+    #       ``Prop_16_1_reversing``. The namespace scan misses these (they share a
+    #       NAME prefix, not a namespace), so a split result would otherwise leave
+    #       the issue with zero reviewable cards.
+    # The result-key docstring filter below keeps BOTH shapes tight (only decls
+    # whose docstring references THIS issue's textbook result survive).
+    # Deterministic order.
     candidates: list[str] = []
     seen: set[str] = set()
     for name in sorted(ctx.tiers_by_decl):
         if name in cited_resolved or name in seen or name in exclude_names:
             continue
-        for ns in namespaces:
-            prefix = ns + "."
-            if name.startswith(prefix) and "." not in name[len(prefix):]:
-                candidates.append(name)
-                seen.add(name)
-                break
+        in_namespace = any(
+            name.startswith(ns + ".") and "." not in name[len(ns) + 1:]
+            for ns in namespaces
+        )
+        is_split_child = any(name.startswith(c + "_") for c in cited_resolved)
+        if in_namespace or is_split_child:
+            candidates.append(name)
+            seen.add(name)
 
     # Keep only candidates whose OWN DOCSTRING references the issue's textbook
     # result (e.g. "Proposition 12.19(b)") — the signal that a decl is ANOTHER

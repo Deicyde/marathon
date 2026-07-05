@@ -200,6 +200,58 @@ def test_surfacing_uses_docstring_result_key(tmp_path, monkeypatch):
     assert "Demo.Chapter14.Tf.helper" not in surfaced
 
 
+# A source file where a top-level result was SPLIT into two named theorems (both
+# docstrings cite 14.5), beside an unrelated Prop_14_5_* plumbing decl (no 14.5).
+_SPLIT_SRC = """\
+import Mathlib
+
+/-- Proposition 14.5 (orientation-preserving case). Lee, Proposition 14.5. -/
+theorem Prop_14_5_preserving : True := trivial
+
+/-- Proposition 14.5 (orientation-reversing case). Lee, Proposition 14.5. -/
+theorem Prop_14_5_reversing : True := trivial
+
+/-- Unrelated plumbing sharing the name prefix — no textbook result. -/
+theorem Prop_14_5_unrelated_helper : True := trivial
+
+/-- A sibling result owned by another issue. -/
+theorem SiblingResult : True := trivial
+"""
+
+
+def test_surfacing_recovers_a_split_result(tmp_path, monkeypatch):
+    """Split recovery (the #236 Prop_16_1 case): an issue whose ONLY citation
+    went stale because the result was SPLIT (Prop_14_5 → Prop_14_5_preserving /
+    _reversing) surfaces the split children as cards, instead of leaving the
+    subdeck with zero reviewable cards. The docstring result-key filter still
+    excludes a same-prefix plumbing decl, and a sibling issue's decl never
+    surfaces."""
+    from marathon.deck.subdeck import build_subdeck
+
+    cfg = _cfg_two_issues(tmp_path)
+    (cfg.repo_dir / "Demo" / "Chapter14").mkdir(parents=True, exist_ok=True)
+    (cfg.repo_dir / "Demo" / "Chapter14" / "Split.lean").write_text(_SPLIT_SRC)
+    install_snapshot(cfg, make_snapshot([
+        _decl("Prop_14_5_preserving", module="Demo.Chapter14"),
+        _decl("Prop_14_5_reversing", module="Demo.Chapter14"),
+        _decl("Prop_14_5_unrelated_helper", module="Demo.Chapter14"),
+        _decl("SiblingResult", module="Demo.Chapter14"),
+    ], cfg.repo_dir))
+    patch_bulk(monkeypatch, {
+        22: {"title": "Proposition 14.5 — diffeomorphism invariance", "state": "OPEN",
+             "labels": set(), "body": _bundle_body("Prop_14_5")},   # STALE citation
+        23: {"title": "Ch14 sibling", "state": "OPEN", "labels": set(),
+             "body": _bundle_body("SiblingResult")},
+    })
+    sd = build_subdeck(cfg, 22)
+    surfaced = set(sd["reconcile"]["surfaced"])
+    assert surfaced == {"Prop_14_5_preserving", "Prop_14_5_reversing"}  # the split
+    assert sd["reconcile"]["dropped"] == ["Prop_14_5"]                  # stale dropped
+    assert "Prop_14_5_unrelated_helper" not in surfaced   # docstring lacks 14.5
+    assert "SiblingResult" not in surfaced                # owned by issue 23
+    assert {c["name"] for c in sd["cards"]} == {"Prop_14_5_preserving", "Prop_14_5_reversing"}
+
+
 def test_repo_scan_finds_decl_absent_from_snapshot(tmp_path):
     cfg = make_cfg(tmp_path)
     _write_source(cfg)

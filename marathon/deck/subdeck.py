@@ -448,11 +448,14 @@ def build_subdeck(
     stale_citations = [{"name": v.name} for v in stale_views]
     dropped_names = [v.name for v in stale_views]
 
-    # Surface decls present in the code under the cited decls' namespaces but
-    # not cited by the body (so the deck shows the whole result). The surfacing
-    # is scoped to the KEPT (in-code) cited decls' namespaces and never
-    # re-surfaces a decl the body already cites. PURE — writes nothing.
-    cited_names = [v.name for v in cited_in_code]
+    # Surface decls present in the code but not cited by the body (so the deck
+    # shows the whole result). Pass ALL cited names — in-code AND stale: the
+    # in-code ones seed RENAME recovery (namespace members), while a STALE
+    # citation's name seeds SPLIT recovery (its ``<name>_<suffix>`` children,
+    # e.g. Prop_16_1 → Prop_16_1_preserving/_reversing) — otherwise a split
+    # result whose only citation went stale is left with ZERO reviewable cards.
+    # Never re-surfaces a decl the body already cites. PURE — writes nothing.
+    cited_names = [v.name for v in detail.decls]
     surfaced_views = surfaced_decls_for_issue(cfg, issue_num, cited_names)
     # Defensive: never surface a name that is already a kept cited card.
     _kept_names = {v.name for v in cited_in_code}
