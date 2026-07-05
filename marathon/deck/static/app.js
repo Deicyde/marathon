@@ -1256,6 +1256,30 @@
     var sd = state.subdeck;
     var deferred = (sd.cards || []).filter(function (c) { return c.verdict === "deferred"; });
     stage().innerHTML = "";
+    // No deferred cards AND we got here (no unreviewed card, not complete) means
+    // there are NO reviewable cards at all: every cited decl is missing from the
+    // current code (a stale citation — often a decl that was renamed or SPLIT
+    // under a different name, e.g. Prop_16_1 → Prop_16_1_preserving/_reversing, or
+    // genuinely removed). Show that plainly instead of a bogus "0 deferred".
+    if (deferred.length === 0) {
+      var stale = (sd.stale_citations || []).map(function (c) { return c.name || c; });
+      var msg = "This issue has no declarations to review — none of its cited "
+        + "declarations are in the current code"
+        + (stale.length ? " (" + stale.join(", ") + ")" : "")
+        + ". The result was likely renamed or split under a different name, or "
+        + "removed. Reconcile the citation(s) below — drop a genuinely-removed "
+        + "one, or update the issue to cite the real decl(s) — before it can ship.";
+      var noCard = el("article", { class: "card card-message" }, [
+        el("h2", { class: "msg-title", text: "No reviewable declarations" }),
+        el("p", { class: "msg-body", text: msg }),
+        el("div", { class: "msg-actions" }, [
+          el("button", { class: "btn", type: "button", onclick: backToQueue }, ["Back to queue"]),
+        ]),
+      ]);
+      stage().appendChild(noCard);
+      setActionsEnabled(false);
+      return;
+    }
     var card = el("article", { class: "card card-message" }, [
       el("h2", { class: "msg-title", text: "Deferred declarations remain" }),
       el("p", { class: "msg-body", text:
