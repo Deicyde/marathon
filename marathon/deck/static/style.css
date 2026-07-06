@@ -92,8 +92,11 @@ html, body {
 .mono { font-family: var(--mono); }
 .statement-pp {
   background: #0b0e14; border: 1px solid var(--line); border-radius: 10px;
-  padding: 0.75rem 0.9rem; font-size: 0.85rem; line-height: 1.5; overflow-x: auto;
-  white-space: pre; margin: 0;
+  padding: 0.75rem 0.9rem; font-size: 0.85rem; line-height: 1.6; margin: 0;
+  /* Pretty-printed multi-line type: preserve the per-binder line breaks and wrap
+     an over-long single binder rather than scrolling it off-screen. */
+  white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal;
+  overflow-x: hidden; tab-size: 2;
 }
 
 /* --- declaration source block (the human-readable face) --- */

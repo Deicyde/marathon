@@ -435,6 +435,30 @@
   // card (`informalApproved`), the warning is replaced by a "verified by you"
   // chip across every card. The text is LaTeX-bearing; render AFTER it is in the
   // DOM, and degrade to raw LaTeX (never blank) when the math renderer is offline.
+  // Pretty-print a pinned-pp Lean type. The audit stores the elaborated type as
+  // ONE long line (`{E} → [inst] → (I) → … → T`); render each binder / hypothesis
+  // on its own line by breaking at TOP-LEVEL function arrows only. Depth-tracking
+  // keeps an arrow INSIDE a binder type (`(f : A → B)`) in place, and requiring a
+  // trailing space keeps decorated arrows like `→ₗ[ℝ]` / `→+` intact.
+  function prettyLeanType(s) {
+    if (!s) return s;
+    var OPEN = "([{⟨⦃";   // ( [ { ⟨ ⦃
+    var CLOSE = ")]}⟩⦄";  // ) ] } ⟩ ⦄
+    var out = "";
+    var depth = 0;
+    for (var i = 0; i < s.length; i++) {
+      var ch = s[i];
+      if (OPEN.indexOf(ch) >= 0) depth++;
+      else if (CLOSE.indexOf(ch) >= 0) depth = Math.max(0, depth - 1);
+      out += ch;
+      if (depth === 0 && ch === "→" && s[i + 1] === " ") {
+        out += "\n";
+        i++; // consume the space after the arrow so the next line starts clean
+      }
+    }
+    return out;
+  }
+
   function informalBlock(card) {
     // No per-decl informal rendering is generated in the review workflow (the
     // spec_auditor pipeline that fills it is not run), so rather than show an
@@ -912,7 +936,7 @@
         el("section", { class: "statement" }, [
           el("details", { class: "elab-type" }, [
             el("summary", { text: "Elaborated type (what is actually proven)" }),
-            el("pre", { class: "mono statement-pp" }, [card.statement_pp]),
+            el("pre", { class: "mono statement-pp" }, [prettyLeanType(card.statement_pp)]),
           ]),
         ])
       );
