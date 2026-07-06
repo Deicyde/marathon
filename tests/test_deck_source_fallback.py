@@ -251,6 +251,13 @@ def test_surfacing_recovers_a_split_result(tmp_path, monkeypatch):
     assert "SiblingResult" not in surfaced                # owned by issue 23
     assert {c["name"] for c in sd["cards"]} == {"Prop_14_5_preserving", "Prop_14_5_reversing"}
 
+    # The QUEUE card must also reflect the surfaced tier (not '-'), so a
+    # split-recovered issue surfaces as a ready card, not a dead '-' card.
+    from marathon.deck.cards import build_queue
+    card22 = next(c for c in build_queue(cfg, chapter=14).cards if c.id == 22)
+    assert card22.tier == "T1"      # from the surfaced split decls, not '-'
+    assert card22.ready is True
+
 
 def test_repo_scan_finds_decl_absent_from_snapshot(tmp_path):
     cfg = make_cfg(tmp_path)

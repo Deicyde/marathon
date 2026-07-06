@@ -904,6 +904,56 @@ def _landed_today_count(cfg: "ReviewConfig") -> int:
 # ---------------------------------------------------------------------------
 
 
+def _gating_deps(deps: "dict[int, list[int]]") -> "dict[int, list[int]]":
+    """The predecessors that genuinely GATE each card — ``deps`` with CYCLIC
+    edges removed. A predecessor ``p`` gates ``num`` only if ``num`` is NOT
+    (transitively) a dependency of ``p``: a mutual/cyclic dependency (e.g.
+    #237↔#243, two issues citing different parts of the same structure) can never
+    be resolved by ordering, so it must not gate either card — each still gates
+    on its predecessors OUTSIDE the cycle. Ordering keeps the full ``deps`` (and
+    places cycle remnants deterministically); only readiness gating is broken."""
+    def reachable(start: int) -> set:
+        seen: set = set()
+        stack = list(deps.get(start, ()))
+        while stack:
+            n = stack.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            stack.extend(deps.get(n, ()))
+        return seen
+
+    return {
+        num: [p for p in preds if num not in reachable(p)]
+        for num, preds in deps.items()
+    }
+
+
+def _surfaced_issue_tier(
+    cfg: "ReviewConfig", ctx: _DeckContext, num: int
+) -> "tuple[Optional[str], Optional[str]]":
+    """``(tier, headline_decl)`` from the SURFACED (rename/split-recovered) decls
+    of an issue whose cited decls are all stale (``_issue_tier`` → '-'), or
+    ``(None, None)``. Lets the QUEUE card reflect the same reconciled set the
+    subdeck reviews — e.g. #236 cites a stale ``Prop_16_1`` but the split
+    ``Prop_16_1_preserving``/``_reversing`` surface as T1, so the card should read
+    T1/ready, not '-'. Best-effort; only invoked on a '-' card so the extra
+    surfacing pass is rare."""
+    from marathon.audit.trust import TIER_ORDER
+    try:
+        surfaced = surfaced_decls_for_issue(cfg, num, _decls_for_issue(ctx, num))
+    except Exception:  # noqa: BLE001
+        return None, None
+    matched = [
+        (v.name, ctx.tiers_by_decl[v.name].tier)
+        for v in surfaced if v.name in ctx.tiers_by_decl
+    ]
+    if not matched:
+        return None, None
+    worst = min(matched, key=lambda m: TIER_ORDER.index(m[1]))
+    return worst[1], worst[0]
+
+
 def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
     """Assemble the dep-ordered card queue for ``chapter`` (or every
     registered chapter when None), plus the status-pane counters.
@@ -924,11 +974,19 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
         for num in issue_nums
     }
     ordered = _topo_order(issue_nums, {n: set(d) for n, d in deps.items()})
+    gating = _gating_deps(deps)  # cyclic edges dropped for readiness only
 
     cards: list[CardSummary] = []
     for num in ordered:
         tier, qualifiers, decl = _issue_tier(ctx, num)
-        ready, blocked_reason = _readiness(ctx, num, tier, deps[num])
+        if tier == "-":
+            # All cited decls stale/absent → reflect the reconciled (surfaced)
+            # set the subdeck reviews, so a split/rename-recovered issue (#236)
+            # surfaces in the queue instead of reading '-'/not-ready.
+            s_tier, s_decl = _surfaced_issue_tier(cfg, ctx, num)
+            if s_tier is not None:
+                tier, decl = s_tier, s_decl
+        ready, blocked_reason = _readiness(ctx, num, tier, gating[num])
         meta = ctx.issue_meta.get(num) or {}
         cards.append(CardSummary(
             id=num,

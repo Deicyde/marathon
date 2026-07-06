@@ -209,6 +209,28 @@ def _snap_with_failure(cfg, decls, failed_module) -> AuditSnapshot:
     )
 
 
+def test_gating_deps_breaks_cycles_keeps_outside_edges():
+    """A mutual/cyclic dependency (#237↔#243) can't be resolved by ordering, so
+    it must not gate either card — but each still gates on predecessors OUTSIDE
+    the cycle. Non-cyclic edges are untouched."""
+    from marathon.deck.cards import _gating_deps
+    deps = {238: [], 237: [238, 243], 243: [238, 237], 239: [238]}
+    g = _gating_deps(deps)
+    assert set(g[237]) == {238}   # cyclic 243 dropped, outside 238 kept
+    assert set(g[243]) == {238}   # cyclic 237 dropped, outside 238 kept
+    assert g[239] == [238]        # non-cyclic edge unchanged
+    assert g[238] == []
+
+
+def test_gating_deps_breaks_a_longer_cycle():
+    """Cycles of length > 2 are broken too (transitive reachability)."""
+    from marathon.deck.cards import _gating_deps
+    deps = {1: [2], 2: [3], 3: [1], 4: [1]}  # 1->2->3->1 cycle; 4 depends on 1
+    g = _gating_deps(deps)
+    assert all(len(g[n]) == 0 for n in (1, 2, 3))  # every intra-cycle edge dropped
+    assert g[4] == [1]                              # 4 is not in the cycle
+
+
 def test_build_broken_issue_floored_and_blocked(tmp_path, monkeypatch):
     """The #244 Stokes case: an issue whose module fails to build must NOT read
     as a ready T1 card by inheriting the tier of an upstream decl it merely
