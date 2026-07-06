@@ -62,6 +62,51 @@ class _FakeSnap:
         return self._b
 
 
+def test_auto_audit_gates_on_throttle_and_head_move(tmp_path, monkeypatch):
+    """Auto re-audit fires only when main MOVED since the last audit AND the
+    throttle window has passed — so a downstream break surfaces, without
+    re-auditing on every tick."""
+    import marathon.deck.refresh as refresh_mod
+    cfg = SimpleNamespace(repo_dir=tmp_path,
+                          target_path_template="GA/LeeSM/Chapter{chapter}")
+    calls = []
+    monkeypatch.setattr(cond.subprocess, "Popen",
+                        lambda *a, **k: calls.append(list(a[0])))
+    monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda r: False)
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda r: "newhead123")
+    I = cond.AUTO_AUDIT_MIN_INTERVAL_SECONDS
+
+    # throttled (within the interval of last_time) → no audit
+    h, t = cond._maybe_auto_audit(cfg, "old", last_time=100.0, _now_fn=lambda: 100.0 + I / 2)
+    assert (h, t) == ("old", 100.0) and not calls
+
+    # HEAD unmoved → no audit even past the throttle
+    h, t = cond._maybe_auto_audit(cfg, "newhead123", last_time=0.0, _now_fn=lambda: 1e12)
+    assert h == "newhead123" and not calls
+
+    # HEAD moved + clean + throttle ok → spawn `marathon audit run --target …`
+    h, t = cond._maybe_auto_audit(cfg, "old", last_time=0.0, _now_fn=lambda: 1e12)
+    assert h == "newhead123" and t == 1e12
+    assert len(calls) == 1
+    assert "audit" in calls[0] and "run" in calls[0] and "GA/LeeSM" in calls[0]
+
+
+def test_auto_audit_skips_while_operator_editing(tmp_path, monkeypatch):
+    """Never race the operator: skip the auto-audit while the checkout has
+    uncommitted Lean work (but still reset the throttle)."""
+    import marathon.deck.refresh as refresh_mod
+    cfg = SimpleNamespace(repo_dir=tmp_path,
+                          target_path_template="GA/LeeSM/Chapter{chapter}")
+    calls = []
+    monkeypatch.setattr(cond.subprocess, "Popen", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda r: "newhead")
+    monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda r: True)  # mid-edit
+    h, t = cond._maybe_auto_audit(cfg, "old", last_time=0.0, _now_fn=lambda: 1e12)
+    assert h == "old"        # not audited
+    assert t == 1e12         # throttle reset so we retry next window
+    assert not calls         # no subprocess spawned
+
+
 def test_prover_control_file_roundtrip(tmp_path):
     """The deck's prover toggle: absent → no override (None); written → the
     boolean; stored in the self-ignoring runtime dir so it never leaks."""

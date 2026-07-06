@@ -1623,6 +1623,92 @@ def print_status(repo_dir: Path) -> int:
 # --- Main loop ----------------------------------------------------------------------
 
 
+#: Minimum spacing between auto re-audits — an audit is a full (incremental)
+#: build, so this bounds the cost while keeping the snapshot near-fresh.
+AUTO_AUDIT_MIN_INTERVAL_SECONDS = 900.0
+
+
+def _audit_target_folder(cfg: ReviewConfig) -> Optional[str]:
+    """The folder ``marathon audit run`` should target — the parent of the
+    per-chapter path template (e.g. ``GeometricAnalysis/LeeSM`` for a template
+    ``GeometricAnalysis/LeeSM/Chapter{chapter}``). ``None`` if not derivable."""
+    tmpl = getattr(cfg, "target_path_template", None)
+    if not tmpl:
+        return None
+    try:
+        return str(Path(tmpl.format(chapter=1)).parent)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _has_uncommitted_lean(repo_dir: Path) -> bool:
+    """True if the checkout has uncommitted ``.lean`` changes (operator mid-edit)
+    — or we cannot tell. Used to SKIP an auto-audit that would otherwise race the
+    operator's build or audit their half-finished work."""
+    try:
+        cp = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=str(repo_dir),
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return True
+    if cp.returncode != 0:
+        return True
+    return any(
+        ln[3:].endswith(".lean") for ln in cp.stdout.splitlines() if ln.strip()
+    )
+
+
+def _maybe_auto_audit(
+    cfg: ReviewConfig, last_head: Optional[str], last_time: float, *, _now_fn=_now,
+) -> "tuple[Optional[str], float]":
+    """Auto-refresh the audit snapshot when main has MOVED since our last audit
+    and the tree is clean. Returns the updated ``(audited_head, last_time)``.
+
+    WHY: the snapshot is the source of truth for review-queue readiness and
+    repair discovery, but it only refreshes on an explicit ``marathon audit
+    run``. So a change that lands upstream — most acutely a FROZEN decl's
+    signature changing (e.g. Chapter 15 bundling ``hypersurfaceInducedOrientation``
+    into an ``IsSmoothHypersurface`` arg) — can silently break a DOWNSTREAM
+    consumer chapter (StokesTheorem), while the stale snapshot still reports it
+    green. The break then hides: the review queue shows phantom-ready cards and
+    the repair's own stale-olean check no-ops. Re-auditing on every landed change
+    keeps the snapshot honest so a downstream break surfaces immediately.
+
+    Non-blocking: spawns a detached ``marathon audit run`` (the snapshot updates
+    when it finishes; the tick continues). Throttled by
+    :data:`AUTO_AUDIT_MIN_INTERVAL_SECONDS`, and skipped while the operator has
+    uncommitted Lean work. Best-effort — never raises."""
+    now = _now_fn()
+    if now - last_time < AUTO_AUDIT_MIN_INTERVAL_SECONDS:
+        return last_head, last_time
+    from marathon.deck.refresh import head_sha
+
+    cur = head_sha(cfg.repo_dir)
+    if cur is None or cur == last_head:
+        return last_head, last_time  # HEAD unmoved / unknown — nothing to refresh
+    if _has_uncommitted_lean(cfg.repo_dir):
+        return last_head, now  # operator mid-edit — skip, but reset the throttle
+    target = _audit_target_folder(cfg)
+    if target is None:
+        return last_head, now
+    try:
+        log_path = jobs_snapshot_path(cfg.repo_dir).parent / "auto-audit.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "ab") as fh:
+            subprocess.Popen(
+                [sys.executable, "-m", "marathon", "audit", "run",
+                 "--target", target, "--repo-dir", str(cfg.repo_dir)],
+                stdout=fh, stderr=fh, cwd=str(cfg.repo_dir), start_new_session=True,
+            )
+        print(f"  audit: main moved to {cur[:8]} — auto-refreshing the snapshot "
+              f"(target {target}) so a downstream break surfaces", flush=True)
+        return cur, now
+    except Exception as e:  # noqa: BLE001 — a refresh failure must not crash a tick
+        print(f"  audit: auto-refresh skipped ({e})", flush=True)
+        return last_head, now
+
+
 def _maybe_reconcile_signatures(
     cfg: ReviewConfig, last_sha: Optional[str], *, exclude_issues: "frozenset[int]"
 ) -> Optional[str]:
@@ -1849,6 +1935,12 @@ def run_conductor(
     ticks = 0
     last_automerge = float("-inf")  # run the merge orchestrator on tick 1, then ~once/min
     last_reconcile_sha: Optional[str] = None  # reconcile only when HEAD changes
+    # Auto re-audit tracking: the HEAD our last audit covered (init to the
+    # current HEAD so we don't audit at startup — only after a change lands) and
+    # the throttle clock.
+    from marathon.deck.refresh import head_sha as _head_sha
+    last_audit_head: Optional[str] = _head_sha(cfg.repo_dir)
+    last_audit_time = float("-inf")
     last_tracker_sync = float("-inf")  # tracker safety-net cadence (~once/2min)
     last_merge_reconcile = float("-inf")  # merged-but-rejected re-review heal (~once/min)
     last_reopen_check = float("-inf")  # stale-verified re-open cadence (~once/2min)
@@ -1924,6 +2016,15 @@ def run_conductor(
                     exclude_issues=frozenset(
                         j.issue_num for j in jobs if j.status == "running"
                     ),
+                )
+            # Keep the audit snapshot honest: when main has moved (a change
+            # landed) and the tree is clean, auto-refresh it so a DOWNSTREAM
+            # break — e.g. a frozen upstream signature change breaking a consumer
+            # chapter — surfaces in the queue + repair discovery instead of hiding
+            # behind a stale snapshot. Throttled, non-blocking, best-effort.
+            if not _STOP_REQUESTED:
+                last_audit_head, last_audit_time = _maybe_auto_audit(
+                    cfg, last_audit_head, last_audit_time,
                 )
             # Tracker safety-net: keep the parent tracker's emojis in sync with
             # the review:verified labels (a verify normally flips its own line;
