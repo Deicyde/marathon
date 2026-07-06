@@ -263,9 +263,22 @@ def _tier_from(
         evidence.append(
             "T1 blocked: axioms beyond whitelist: " + ", ".join(dirty)
         )
-    if decl.tags:
+    # Deception tags are all derived from the decl's VALUE (body). While the decl
+    # still carries a `sorry` (skeleton mode — the body is an intentional stub, or
+    # a dependency is), a body-deception tag reflects the INCOMPLETE body, not the
+    # statement: e.g. `def f (x) := sorry` false-flags `ignores_params` because
+    # `sorry` is a closed term that references no parameter. Statement review must
+    # not be gated on that — the body deception is re-checked once the sorry is
+    # discharged (has_sorry False), the same way sorryAx is "accounted, not
+    # failed" above. Only a COMPLETE (sorry-free) body that is deceptive floors.
+    if decl.tags and not decl.has_sorry:
         blocked = True
         evidence.append("T1 blocked: deception tags: " + ";".join(decl.tags))
+    elif decl.tags:
+        evidence.append(
+            "deception tags on a still-`sorry` (skeleton) body — not gating the "
+            "statement: " + ";".join(decl.tags)
+        )
     if blocked:
         return TierResult(decl_name, tier, qualifiers, evidence)
     if SORRY_AXIOM in decl.axioms:

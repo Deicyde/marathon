@@ -144,6 +144,22 @@ def test_deception_tag_blocks_t1(ledger):
     assert any("deception tags" in line for line in result.evidence)
 
 
+def test_body_deception_tag_does_not_block_a_still_sorry_decl(ledger):
+    """Skeleton-mode regression (the empty-Ch16-queue bug): a body-deception tag
+    like `ignores_params` false-fires on a `sorry` stub (`def f (x) := sorry`
+    ignores its params because `sorry` is a closed term). While the decl still
+    has a sorry it must NOT gate the STATEMENT below the review floor — the body
+    deception is re-checked once the sorry is discharged."""
+    sorried = mk_snapshot([mk_decl(tags=["ignores_params"], has_sorry=True,
+                                    axioms=["sorryAx"])])
+    result = compute_tier("Foo.bar", sorried, ledger)
+    assert result.tier == "T1"                       # statement is reviewable
+    assert any("still-`sorry`" in line for line in result.evidence)
+    # …but the SAME tag on a COMPLETE (sorry-free) body still floors it.
+    complete = mk_snapshot([mk_decl(tags=["ignores_params"], has_sorry=False)])
+    assert compute_tier("Foo.bar", complete, ledger).tier == "T0"
+
+
 def test_clean_decl_is_t1_and_sorry_is_accounted_not_failed(ledger):
     whitelisted = mk_snapshot([
         mk_decl(axioms=["propext", "Classical.choice", "Quot.sound"]),
