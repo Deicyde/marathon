@@ -46,12 +46,17 @@ def gh(
     *args: str,
     check: bool = True,
     capture: bool = True,
+    timeout: Optional[float] = None,
 ) -> subprocess.CompletedProcess:
     """Invoke ``gh`` with the given arguments.
 
     Captures stdout+stderr by default. Raises ``RuntimeError`` on
     non-zero exit when ``check`` is True. Matches the helper used by
     the previously-bundled scripts so behavior is preserved exactly.
+
+    ``timeout`` (seconds) bounds the subprocess; on expiry ``subprocess.run``
+    raises ``subprocess.TimeoutExpired`` — callers on a request-handler path
+    should catch it. ``None`` (default) preserves the original unbounded call.
 
     If a per-request actor token is bound (see :func:`actor_github_token`),
     it is injected as ``GH_TOKEN`` so the call authenticates as that
@@ -65,6 +70,7 @@ def gh(
         text=True,
         check=False,
         env=env,
+        timeout=timeout,
     )
     if check and cp.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args)} failed: {cp.stderr.strip()}")
@@ -206,8 +212,9 @@ def list_rejected_issues(cfg) -> "Optional[list[int]]":
             "issue", "list", "--repo", cfg.github_repo,
             "--label", cfg.labels.rejected, "--state", "open",
             "--json", "number", "--limit", "300", check=False,
+            timeout=20,
         )
-    except OSError:  # gh binary missing/unrunnable
+    except (OSError, subprocess.TimeoutExpired):  # gh missing/unrunnable or hung
         return None
     if cp.returncode != 0:
         return None

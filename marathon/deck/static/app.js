@@ -1138,6 +1138,55 @@
 
   // === issue picker (the queue is ISSUE-level) =============================
 
+  // The "⚠ N need attention" card shown on the swipe stage when the ready queue
+  // is drained but rejected issues are STRANDED (their fix never landed, or their
+  // tracking was reverted by a git reset — see dashboard.stuck_issues). Without
+  // this they only appear in the Issues tab, which the swipe reviewer never
+  // opens, so a rejection silently vanishes. Each row offers a one-click
+  // re-queue; the note is re-issued (recovered from GitHub for an orphan).
+  function showStuckAttentionCard(stuck, repo) {
+    stage().innerHTML = "";
+    var rows = stuck.map(function (it) {
+      var kids = [
+        ghLink(repo, "issues", it.num, "#" + it.num, "issue-id"),
+        el("span", {
+          class: "issue-title",
+          title: it.note_preview || "",
+          text: it.note_preview || "(rejected — the fix never landed)",
+        }),
+      ];
+      if (it.attempts) {
+        kids.push(el("span", { class: "issue-tier", text: it.attempts + " tries" }));
+      }
+      kids.push(el("button", {
+        class: "btn btn-tiny issue-requeue",
+        type: "button",
+        title: "Re-queue this rejection — the conductor retries it for Aristotle",
+        onclick: (function (id) {
+          return function (ev) { requeueIssue(id, ev.currentTarget, refreshQueue); };
+        })(it.num),
+      }, ["Re-queue"]));
+      return el("div", { class: "issue-row stuck-row" }, kids);
+    });
+    var n = stuck.length;
+    var card = el("article", { class: "card card-message" }, [
+      el("h2", { class: "msg-title",
+                 text: "⚠ " + n + " issue" + (n > 1 ? "s" : "") + " need attention" }),
+      el("p", { class: "msg-body",
+                text: "Rejected, but the fix never landed — the conductor can't "
+                    + "reach them. Re-queue to retry, or open Issues for detail." }),
+      el("div", { class: "stuck-attention-list" }, rows),
+      el("div", { class: "msg-actions" }, [
+        el("button", { class: "btn", type: "button",
+                       onclick: function () { switchTab("issues"); } }, ["See all in Issues"]),
+        el("button", { class: "btn btn-primary", type: "button",
+                       onclick: refreshQueue }, ["Refresh"]),
+      ]),
+    ]);
+    stage().appendChild(card);
+    setActionsEnabled(false);
+  }
+
   // Open the subdeck for the first ready issue, or show "all caught up".
   function openFirstReadyIssue() {
     var ready = readyIssues();
@@ -1153,6 +1202,22 @@
             : "No ready issues in this view.",
         actions: [{ label: "Refresh", kind: "btn-primary", onClick: refreshQueue }],
       });
+      // Upgrade to the attention card if rejected issues are stranded — else a
+      // reviewer with an empty queue never learns they exist. Best-effort: a
+      // fetch failure leaves the plain "all caught up" card. Guard on state.issue
+      // so we never clobber a card the user has since navigated to.
+      getJSON("/api/stuck")
+        .then(function (d) {
+          var stuck = (d && d.issues) || [];
+          // Only paint if we're STILL on the drained Review stage — the fetch
+          // is async, so the user may have opened an issue or switched tabs
+          // (and re-queued from the Issues tab) meanwhile; don't render a stale
+          // card into a backgrounded stage.
+          if (stuck.length && state.issue == null && state.activeTab === "review") {
+            showStuckAttentionCard(stuck, d.repo);
+          }
+        })
+        .catch(function () {});
       return;
     }
     openIssue(ready[0].id);
@@ -2677,14 +2742,15 @@
 
   // Re-issue a parked issue's stored rejection note (one-click) — mirrors the
   // dropCitation token-POST pattern: disable + spinner, POST, toast + re-render
-  // on success, toast + re-enable on failure.
-  function requeueIssue(issue, btn) {
+  // on success, toast + re-enable on failure. `after` runs on success (default:
+  // re-render the Issues tab); the swipe attention card passes refreshQueue.
+  function requeueIssue(issue, btn, after) {
     if (btn) { btn.disabled = true; btn.textContent = "re-queuing…"; }
     postRequeue(issue)
       .then(function (res) {
         if (res && res.requeued) {
           flashToast("Re-queued #" + issue + " — the conductor will retry it");
-          renderIssuesTab();
+          (after || renderIssuesTab)();
         } else {
           flashToast((res && res.message) || "Not re-queued");
           if (btn) { btn.disabled = false; btn.textContent = "Re-queue"; }

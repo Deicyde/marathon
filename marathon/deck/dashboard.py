@@ -435,6 +435,35 @@ def _issue_status(
     return "pending"
 
 
+def _orphan_note_previews(cfg) -> "dict[int, str]":
+    """Best-effort human preview for an ORPHANED rejection, from the LOCAL
+    deck-subdecks store (``deck-subdecks.json`` — survives a git reset since it
+    is untracked; no gh). Lists the declarations the human sent back to fix so a
+    surfaced orphan is not a bare number. ``{}`` when nothing is recorded."""
+    try:
+        from marathon.deck.subdeck import _load_store
+
+        store = _load_store(cfg)
+    except Exception:  # noqa: BLE001 — no store → no previews
+        return {}
+    out: "dict[int, str]" = {}
+    for num_s, decls in store.items():
+        try:
+            num = int(num_s)
+        except (TypeError, ValueError):
+            continue
+        fix = sorted(
+            d for d, rec in decls.items()
+            # Skip reserved store keys (``__informal__`` / ``__missing__``) —
+            # they are not Lean declarations and would read oddly in the preview.
+            if not d.startswith("__") and (rec or {}).get("verdict") == "reject"
+        )
+        if fix:
+            names = ", ".join(fix[:6]) + ("…" if len(fix) > 6 else "")
+            out[num] = f"{len(fix)} declaration(s) sent back to fix: {names}"
+    return out
+
+
 def stuck_issues(cfg) -> "list[dict]":
     """Issues parked OUTSIDE both the review feed and the refine queue — the
     conductor won't retry them and they're not in the swipe queue, so a human
@@ -442,15 +471,25 @@ def stuck_issues(cfg) -> "list[dict]":
 
       * ``status == "stalled"`` — the conductor exhausted its retry budget; OR
       * ``status == "rejected"`` with ``needs_iteration() == False`` — already
-        iterated, no fix landed (the silently-stranded case the #170 bug caused).
+        iterated, no fix landed (the silently-stranded case the #170 bug caused);
+        OR
+      * ORPHANED — carries the GitHub ``review:rejected`` label but has NO live
+        ``state.json`` entry. This happens when the git-TRACKED ``state.json`` is
+        reverted by a hard reset / checkout (deck-subdecks.json, being untracked,
+        survives — so the split is real): the conductor keys off ``state.json``
+        and never refines it, while the swipe queue reads the label and hides it.
+        GitHub is the durable truth, so we surface it and let a one-click
+        re-queue re-record it (the note is recovered from the issue's reject
+        comment at re-queue time). Degrades to state.json-only when gh is down.
 
-    Pure read of ``state.json`` (no gh). Each row carries the STORED rejection
-    note so the deck can show it and offer a one-click re-queue (which re-issues
-    that exact note via ``record_rejection`` → ``needs_iteration`` True)."""
+    Each row carries a rejection-note preview so the deck can show it and offer a
+    one-click re-queue (which re-issues that note via ``record_rejection`` →
+    ``needs_iteration`` True)."""
     from marathon.review.state import load_state
 
+    state = load_state(cfg)
     out: "list[dict]" = []
-    for num, s in sorted(load_state(cfg).issues.items()):
+    for num, s in sorted(state.issues.items()):
         stuck = s.status == "stalled" or (
             s.status == "rejected" and not s.needs_iteration())
         if not stuck:
@@ -464,6 +503,31 @@ def stuck_issues(cfg) -> "list[dict]":
             "has_note": bool(note),
             "note_preview": (note[:240] + "…") if len(note) > 240 else note,
         })
+
+    # Orphaned rejections: labeled review:rejected on GitHub but with no local
+    # state entry at all. A live entry (any status — rejected/verified/stalled)
+    # means the issue is already tracked, so we skip it; only a genuinely absent
+    # entry is an orphan the conductor can't reach.
+    from marathon.review.github import list_rejected_issues
+
+    rejected = list_rejected_issues(cfg)  # one gh call; None on failure
+    if rejected:
+        previews = _orphan_note_previews(cfg)
+        for num in sorted(rejected):
+            if num in state.issues:
+                continue  # already tracked (in `out` if stuck, else in-flight)
+            out.append({
+                "num": num,
+                "status": "rejected",
+                "verdict_ts": None,
+                "attempts": 0,
+                # The note is recoverable from the GitHub reject comment at
+                # re-queue time even though state.json lost it.
+                "has_note": True,
+                "orphaned": True,
+                "note_preview": previews.get(num, ""),
+            })
+    out.sort(key=lambda r: r["num"])
     return out
 
 

@@ -995,9 +995,10 @@ class DeckHandler(BaseHTTPRequestHandler):
         carries its stored rejection note so the deck can offer a one-click
         re-queue. Empty in demo mode."""
         if self._demo:
-            return self._send_json({"issues": []})
+            return self._send_json({"issues": [], "repo": None})
         from marathon.deck.dashboard import stuck_issues
-        self._send_json({"issues": stuck_issues(self.cfg)})
+        self._send_json({"issues": stuck_issues(self.cfg),
+                         "repo": self.cfg.github_repo})
 
     def _api_requeue(self) -> None:
         """One-click RE-QUEUE of a parked rejection (POST /api/requeue) — re-issues
@@ -1026,21 +1027,51 @@ class DeckHandler(BaseHTTPRequestHandler):
         from marathon.review.state import load_state, record_rejection
 
         st = load_state(self.cfg).issues.get(issue_num)
-        if st is None or not (st.notes or "").strip():
-            return self._send_error_json(
-                HTTPStatus.BAD_REQUEST,
-                f"#{issue_num}: no stored rejection note to re-queue"
+        if st is not None:
+            # A LIVE entry (any status): it needs a usable stored note AND a
+            # parked status. A live entry with no note — e.g. a locally VERIFIED
+            # issue still carrying a stale review:rejected label — is NOT an
+            # orphan; refuse rather than silently re-reject a settled verdict.
+            # (Orphan is defined as `st is None`, symmetric with stuck_issues.)
+            if not (st.notes or "").strip():
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    f"#{issue_num}: no stored rejection note to re-queue"
+                )
+            is_stuck = st.status == "stalled" or (
+                st.status == "rejected" and not st.needs_iteration())
+            if not is_stuck:
+                return self._send_error_json(
+                    HTTPStatus.CONFLICT,
+                    f"#{issue_num} is not parked (status {st.status}) — "
+                    "nothing to re-queue"
+                )
+            note = st.notes
+        else:
+            # ORPHANED rejection — NO local state entry at all, because the
+            # git-tracked state.json was reverted (e.g. a hard reset) while the
+            # GitHub review:rejected label + reject comment survived. GitHub is
+            # the durable truth: confirm the label and recover the verbatim note
+            # from the issue's reject comment, then re-record.
+            from marathon.review.github import (
+                fetch_reject_note, list_rejected_issues,
             )
-        is_stuck = st.status == "stalled" or (
-            st.status == "rejected" and not st.needs_iteration())
-        if not is_stuck:
-            return self._send_error_json(
-                HTTPStatus.CONFLICT,
-                f"#{issue_num} is not parked (status {st.status}) — "
-                "nothing to re-queue"
-            )
+
+            rejected = list_rejected_issues(self.cfg)
+            if not rejected or issue_num not in rejected:
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    f"#{issue_num}: no stored rejection note to re-queue"
+                )
+            note, _ts = fetch_reject_note(issue_num, self.cfg.github_repo)
+            if not (note or "").strip():
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    f"#{issue_num}: rejected on GitHub but its reject note "
+                    "could not be recovered — re-reject it in the deck"
+                )
         try:
-            record_rejection(self.cfg, issue_num, st.notes)
+            record_rejection(self.cfg, issue_num, note)
             from marathon.review.review import _ensure_conductor
             _ensure_conductor(self.cfg)
         except Exception as exc:  # noqa: BLE001 — surface, never crash the loop

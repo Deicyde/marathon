@@ -540,6 +540,16 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .stuck-block .stuck-row { border-color: #d2992255; }
 .issue-requeue { margin-left: auto; flex: none; }
 
+/* attention card on the swipe stage (empty queue but stranded rejections) */
+.stuck-attention-list {
+  text-align: left;
+  max-width: 34rem;
+  margin: 1rem auto 0;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.stuck-attention-list .stuck-row { border-color: #d2992255; }
+
 /* --- history timeline --- */
 .hist-row { display: flex; align-items: baseline; gap: 0.6rem; padding: 0.45rem 0.7rem; border-left: 2px solid var(--line); margin-left: 0.3rem; font-size: 0.86rem; }
 .hist-ts { color: var(--muted); font-size: 0.74rem; font-family: var(--mono); min-width: 8.5rem; flex: none; }
