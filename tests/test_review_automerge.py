@@ -182,7 +182,8 @@ def _install_gh(monkeypatch, prs, *, merge_rc=0, methods=None):
         "mergeCommitAllowed": False,
         "rebaseMergeAllowed": False,
     }
-    calls = {"merged": [], "list": 0, "method_flags": [], "unlabeled": []}
+    calls = {"merged": [], "list": 0, "method_flags": [], "unlabeled": [],
+             "comments": []}
 
     def fake_gh(*args, check=True, capture=True):
         if args[:2] == ("repo", "view"):
@@ -199,6 +200,11 @@ def _install_gh(monkeypatch, prs, *, merge_rc=0, methods=None):
         if args[:2] == ("issue", "edit"):
             # capture the re-queue relabel: (issue, --remove-label, <label>)
             calls["unlabeled"].append(int(args[2]))
+            return _cp()
+        if args[:2] == ("issue", "comment"):
+            # capture the recovery comment: (issue, ..., --body, <body>)
+            calls["comments"].append(
+                (int(args[2]), args[list(args).index("--body") + 1]))
             return _cp()
         raise AssertionError(f"unexpected gh call: {args}")
 
@@ -323,6 +329,27 @@ def test_automerge_requeues_a_refined_issue(monkeypatch):
     assert calls["unlabeled"] == [93]      # review:rejected removed from #93
     assert requeued == [93]                # local state cleared for #93
     assert "re-queued #93 for re-review" in res[0].reason
+    # The RECOVERY comment closes the notification loop: names the merged PR
+    # and supersedes any dangling "Auto-refine stalled" comment (2026-07-07).
+    assert len(calls["comments"]) == 1
+    n, body = calls["comments"][0]
+    assert n == 93
+    assert "recovered" in body.lower() and "PR #109" in body
+
+
+def test_requeue_landed_false_posts_no_recovery_comment(monkeypatch):
+    # The no-PR-landed caller (a refine that produced no diff → nothing merged)
+    # must NOT post the "Aristotle's fix ... landed" recovery comment — that
+    # would be a public lie. It still relabels + clears state.
+    import marathon.review.state as state_mod
+    monkeypatch.setattr(state_mod, "requeue_for_rereview", lambda cfg, i: True)
+    cfg = SimpleNamespace(github_repo="o/r",
+                          labels=SimpleNamespace(rejected="review:rejected"))
+    calls = _install_gh(monkeypatch, [])
+    n = am._requeue_refined_issue(cfg, "marathon/refine-c12-i93", landed=False)
+    assert n == 93
+    assert calls["unlabeled"] == [93]        # still re-queued
+    assert calls["comments"] == []           # but NO false "fix landed" comment
 
 
 def test_automerge_non_refine_pr_does_not_requeue(monkeypatch):

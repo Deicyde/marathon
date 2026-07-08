@@ -84,7 +84,11 @@ from typing import Optional
 
 import marathon.review.daemon as daemon
 from marathon.post_pipeline import _branch_name_for_issue
-from marathon.refine import EXIT_AUTO_PR_BRANCH_ABORT, REFINE_STATE_FILENAME
+from marathon.refine import (
+    EXIT_AUTO_PR_BRANCH_ABORT,
+    EXIT_CONFIG_ERROR,
+    REFINE_STATE_FILENAME,
+)
 from marathon.review.config import ReviewConfig, load_config
 from marathon.review.state import (
     load_state,
@@ -230,6 +234,8 @@ class ConductorJob:
     status: str = "running"                  # running | succeeded | failed |
                                              # stalled | interrupted
     exit_code: Optional[int] = None
+    error: Optional[str] = None              # log tail of a FAILED job (for the
+                                             # snapshot/deck + the stall comment)
     project_id: Optional[str] = None         # from the workdir refine checkpoint
     aristotle_status: Optional[str] = None   # TaskStatus.value from the checkpoint
     fill: bool = False                       # a PROVE job (marathon fill) vs a refine
@@ -539,12 +545,130 @@ def _remove_worktree(repo_dir: Path, worktree: Path) -> None:
         )
 
 
+#: Marker file a dispatch drops inside the job's worktree so a LATER conductor
+#: process can tell the worktree belongs to a still-running job. The jobs.json
+#: snapshot alone can't carry this across a restart: the new conductor's first
+#: ``write_jobs_snapshot`` full-rewrites it with only its own (empty) job list.
+WORKTREE_PID_MARKER = Path(".marathon") / "conductor" / "refine.pid"
+
+#: ``{worktree_path_str: pid}`` for jobs a PREVIOUS conductor process left
+#: running (populated once at startup from the pre-restart jobs snapshot).
+#: Consulted by the reap guard alongside the pid marker; liveness is
+#: re-checked at use so a finished job's entry never blocks a reap for long.
+_INHERITED_RUNNING: dict[str, int] = {}
+
+
+def _write_worktree_pid_marker(worktree: Path, pid: int) -> None:
+    """Drop the live-job marker into ``worktree`` (best-effort). Uses the
+    same self-ignoring convention as ``write_jobs_snapshot`` so the marker
+    neither dirties ``git status`` nor leaks into Aristotle bundles."""
+    try:
+        marker = worktree / WORKTREE_PID_MARKER
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        gitignore = marker.parent / ".gitignore"
+        if not gitignore.is_file():
+            gitignore.write_text("*\n")
+        marker.write_text(f"{pid}\n")
+    except OSError as e:
+        print(f"  warning: could not write pid marker in {worktree} ({e})",
+              flush=True)
+
+
+def _pid_is_job_for(pid: int, worktree: str) -> bool:
+    """True iff ``pid`` is alive AND is genuinely a marathon job running in
+    ``worktree`` — i.e. its command line references the worktree's unique
+    ``wt-i<issue>-<ts>`` basename (present via the refine's target path and
+    ``--repo-dir``). The basename identity check is what makes the liveness
+    test robust to PID REUSE: a bare ``os.kill(pid, 0)`` treats a recycled pid
+    (a different same-user process that inherited the number) as "the job is
+    alive", which would refuse the reap forever and re-open the #96 defer-loop
+    wedge. Basename (not full path) avoids macOS /private symlink normalization
+    mismatches between git's worktree list and the dispatch cmd."""
+    if not daemon.process_alive(pid):
+        return False
+    name = Path(worktree).name
+    try:
+        cp = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Can't introspect the cmdline — fall back to bare liveness (better to
+        # defer a reap than destroy a possibly-live job).
+        return True
+    return name in (cp.stdout or "")
+
+
+def _clear_worktree_pid_marker(worktree: str) -> None:
+    """Delete the live-job marker once the conductor OBSERVES the job exit
+    (failed/interrupted branches keep the worktree for debugging, so the
+    marker would otherwise linger holding a dead — reusable — pid). The
+    success path removes the whole worktree, so it needs no explicit clear."""
+    try:
+        (Path(worktree) / WORKTREE_PID_MARKER).unlink(missing_ok=True)
+    except OSError:
+        pass
+    _INHERITED_RUNNING.pop(str(worktree), None)
+
+
+def _worktree_live_pid(worktree: str) -> Optional[int]:
+    """The pid of a LIVE job still using ``worktree``, or None.
+
+    Two sources, each verified as a genuine job-for-this-worktree (see
+    :func:`_pid_is_job_for` — pid-reuse-safe): the pid marker the dispatch
+    dropped into the worktree (survives snapshot rewrites), and the
+    inherited-running map captured from the pre-restart jobs snapshot at
+    startup (covers worktrees dispatched by an older conductor that predates
+    the marker). A dead/stale/reused pid is pruned from the inherited map so
+    a one-time miss never lingers."""
+    try:
+        pid = int((Path(worktree) / WORKTREE_PID_MARKER).read_text().strip())
+        if _pid_is_job_for(pid, worktree):
+            return pid
+    except (OSError, ValueError):
+        pass
+    pid = _INHERITED_RUNNING.get(worktree)
+    if pid is not None:
+        if _pid_is_job_for(pid, worktree):
+            return pid
+        _INHERITED_RUNNING.pop(worktree, None)  # its job exited — stop tracking
+    return None
+
+
+def _inherit_running_worktrees(repo_dir: Path) -> dict[str, int]:
+    """``{worktree: pid}`` of still-alive jobs recorded by a PREVIOUS
+    conductor's snapshot. Called once at startup, BEFORE the first
+    ``write_jobs_snapshot`` erases those rows: a pkill'd conductor's
+    refine children survive it (their own process group), and reaping
+    their worktrees mid-run destroys a fully billed Aristotle iteration
+    (the 2026-07-07 #171 incident — 29.2m of Aristotle into a gutted
+    directory, then a 3h39m re-run)."""
+    out: dict[str, int] = {}
+    snap = load_jobs_snapshot(repo_dir)
+    for raw in (snap or {}).get("jobs", []):
+        pid, worktree = raw.get("pid"), raw.get("worktree")
+        if raw.get("status") != "running" or not pid or not worktree:
+            continue
+        try:
+            alive = daemon.process_alive(int(pid))
+        except (TypeError, ValueError):
+            continue
+        if alive:
+            out[str(worktree)] = int(pid)
+    return out
+
+
 def _reap_orphan_worktree(repo_dir: Path, branch: str) -> bool:
     """Reap a worktree left holding ``branch`` by a FAILED refine of a PREVIOUS
     conductor run. ``kept_worktrees`` (the reuse map) is in-memory, so a conductor
     restart loses track of such a worktree; a fresh ``git worktree add -B`` then
-    trips git's branch guard and the issue wedges in a defer loop forever. Safe to
-    reap: same-issue dispatch is single-flight, so no LIVE job is using it.
+    trips git's branch guard and the issue wedges in a defer loop forever.
+
+    GUARDED: single-flight only holds within one conductor process — a refine
+    dispatched by a killed conductor keeps running (it has its own process
+    group), so before removing anything we check for a live job via the pid
+    marker / inherited snapshot rows. A live worktree is NEVER reaped; the
+    caller defers the dispatch instead (the job's own exit frees the branch).
     Returns True if a worktree (or stale metadata) was cleaned."""
     cp = _git(repo_dir, "worktree", "list", "--porcelain")
     if cp.returncode != 0:
@@ -560,6 +684,14 @@ def _reap_orphan_worktree(repo_dir: Path, branch: str) -> bool:
     if path is None:
         _git(repo_dir, "worktree", "prune")  # only stale metadata held the branch
         return True
+    live_pid = _worktree_live_pid(path)
+    if live_pid is not None:
+        print(
+            f"  NOT reaping {path}: a live job (pid {live_pid}) from a previous "
+            "conductor is still using it — deferring this dispatch until it "
+            "exits", flush=True,
+        )
+        return False
     print(f"  reaping orphan worktree for {branch}: {path}", flush=True)
     _remove_worktree(repo_dir, Path(path))
     _git(repo_dir, "worktree", "prune")
@@ -575,6 +707,19 @@ def prune_worktrees(repo_dir: Path, runs_parent: Path) -> None:
     if runs_parent.is_dir():
         for child in sorted(runs_parent.iterdir()):
             if not (child.is_dir() and child.name.startswith("wt-")):
+                continue
+            # NEVER prune a worktree with a LIVE job — a --prune after a
+            # pkill -9 (which _remove_worktree's own warning suggests) would
+            # otherwise force-remove the directory of a still-running, fully
+            # billed refine, the exact 2026-07-07 destruction the reap guard
+            # was built to prevent. Same liveness source as _reap_orphan_worktree.
+            live_pid = _worktree_live_pid(str(child))
+            if live_pid is not None:
+                print(
+                    f"  --prune SKIP {child}: a live job (pid {live_pid}) is "
+                    "still using it",
+                    flush=True,
+                )
                 continue
             proc = _git(repo_dir, "worktree", "remove", "--force", str(child))
             if proc.returncode == 0:
@@ -907,18 +1052,21 @@ def _dispatch_job(
             if "already checked out" in lower or "already used by worktree" in lower:
                 # A leftover worktree from a previous run still holds this issue's
                 # branch (kept_worktrees is in-memory, so a conductor restart
-                # orphans it). No LIVE job uses it (same-issue dispatch is
-                # single-flight), so reap it and retry the add ONCE — otherwise
-                # the issue wedges in a defer loop forever (the #96 failure mode).
+                # orphans it). Reap it and retry the add ONCE — otherwise the
+                # issue wedges in a defer loop forever (the #96 failure mode).
+                # UNLESS a live job from a previous conductor is still using it
+                # (the reap guard says so): then we defer this dispatch and let
+                # the running job finish — reaping under it destroys a billed
+                # Aristotle run (the 2026-07-07 #171 incident).
                 print(
                     f"--- #{issue_num}: branch {branch} held by a leftover "
                     "worktree; reaping it and retrying the add ---", flush=True,
                 )
-                _reap_orphan_worktree(cfg.repo_dir, branch)
-                proc = _git(
-                    cfg.repo_dir, "worktree", "add", "-B", branch,
-                    str(worktree), start_point,
-                )
+                if _reap_orphan_worktree(cfg.repo_dir, branch):
+                    proc = _git(
+                        cfg.repo_dir, "worktree", "add", "-B", branch,
+                        str(worktree), start_point,
+                    )
         if proc.returncode != 0:
             msg = ((proc.stderr or proc.stdout) or "").strip()
             print(
@@ -1023,6 +1171,10 @@ def _dispatch_job(
         print(f"--- deferring #{issue_num}: could not spawn refine ({e}) ---")
         return None
     kept_worktrees.pop(issue_num, None)
+    # Live-job marker: lets a FUTURE conductor process (after a restart) tell
+    # this worktree is in use, so its reap guard defers instead of destroying
+    # a running (billed) job.
+    _write_worktree_pid_marker(worktree, popen.pid)
     print(
         f"\n--- dispatched #{issue_num} (chapter {chapter}): pid={popen.pid} "
         f"branch={branch} ---"
@@ -1246,7 +1398,10 @@ def _requeue_if_no_pr_landed(cfg: ReviewConfig, job: ConductorJob) -> None:
         return
     st = load_state(cfg).issues.get(job.issue_num)
     if st is not None and getattr(st, "status", None) == "rejected":
-        n = _requeue_refined_issue(cfg, branch)
+        # landed=False: NOTHING merged here (no diff → no PR). A 'fix landed'
+        # recovery comment would be a public lie — this only re-surfaces the
+        # unchanged issue for re-review.
+        n = _requeue_refined_issue(cfg, branch, landed=False)
         if n is not None:
             print(f"--- #{n} refine exited clean but landed no PR — requeued for "
                   f"re-review (was stuck 'rejected') ---", flush=True)
@@ -1289,6 +1444,7 @@ def _reap_fill_job(
     # dispatch-time attempt cap). No rejection-state mutation.
     job.status = "failed"
     kept_worktrees[job.issue_num] = job.worktree
+    _clear_worktree_pid_marker(job.worktree)  # process gone → drop the marker
     not_before[job.issue_num] = _now() + FILL_RETRY_BACKOFF_SECONDS
     print(
         f"    fill #{job.issue_num} exited {rc}; worktree kept, backing off "
@@ -1301,6 +1457,29 @@ def _reap_fill_job(
             f"`gh auth setup-git`; retries will keep failing until fixed.",
             flush=True,
         )
+
+
+#: Per-issue dispatch backoff after a CONFIG-error exit (missing API key etc.).
+#: Long on purpose: the environment won't fix itself, and the attempt-free
+#: config path would otherwise re-dispatch (and fast-fail) every tick.
+CONFIG_ERROR_BACKOFF_SECONDS = 3600.0
+
+
+def _job_log_tail(job: ConductorJob, max_lines: int = 12) -> Optional[str]:
+    """Last non-empty lines of the job's conductor-*.log (best-effort) —
+    captured into ``job.error`` so the snapshot/deck and the stall comment
+    are self-diagnosing instead of pointing at a log file on the host."""
+    try:
+        logs = sorted(Path(job.workdir).glob("conductor-*.log"))
+        if not logs:
+            return None
+        lines = [
+            line for line in logs[-1].read_text(errors="replace").splitlines()
+            if line.strip()
+        ]
+        return "\n".join(lines[-max_lines:]) or None
+    except OSError:
+        return None
 
 
 def _reap_finished(
@@ -1342,6 +1521,8 @@ def _reap_finished(
         # Mirror the daemon exactly: a non-zero exit after a stop signal
         # reflects the kill (user pausing work), not a refine failure.
         interrupted = _STOP_REQUESTED and rc != 0
+        if rc != 0 and not interrupted:
+            job.error = _job_log_tail(job)
         # A FILL (prove) job acts on a VERIFIED issue whose rejection state it
         # does NOT own, so it must NEVER run the refine exit ladder
         # (record_iteration / record_failed_attempt / record_stall /
@@ -1358,13 +1539,16 @@ def _reap_finished(
             continue
         backoff = daemon._handle_refine_exit(
             cfg, job.issue_num, rc, max_attempts=max_attempts,
-            interrupted=interrupted,
+            interrupted=interrupted, failure_detail=job.error,
         )
         if backoff:
             not_before[job.issue_num] = _now() + backoff
         if interrupted:
             job.status = "interrupted"
             kept_worktrees[job.issue_num] = job.worktree
+            # The job process is gone; drop its live-job marker so a later
+            # conductor's reap guard doesn't mistake a reused pid for it.
+            _clear_worktree_pid_marker(job.worktree)
             print(f"    worktree kept (interrupted): {job.worktree}", flush=True)
         elif rc == 0:
             job.status = "succeeded"
@@ -1394,6 +1578,10 @@ def _reap_finished(
                 else "failed"
             )
             kept_worktrees[job.issue_num] = job.worktree
+            # The job process is gone; drop its live-job marker so a later
+            # conductor's reap guard doesn't mistake a reused pid for it (the
+            # marker's whole purpose is protecting a LIVE job).
+            _clear_worktree_pid_marker(job.worktree)
             print(
                 f"    worktree kept for debugging (#{job.issue_num} "
                 f"{job.status}, exit {rc}): {job.worktree}",
@@ -1412,6 +1600,20 @@ def _reap_finished(
                     f"⚠️  refine #{job.issue_num} aborted on a GIT AUTH "
                     f"failure — run `gh auth setup-git`; retries will keep "
                     f"failing until this is fixed.",
+                    flush=True,
+                )
+            # Config error (missing API key etc.): the exit ladder burned no
+            # attempt (by design), so back this issue off HERE — otherwise the
+            # loop would re-dispatch a doomed job every tick until the
+            # operator fixes the environment.
+            if rc == EXIT_CONFIG_ERROR:
+                not_before[job.issue_num] = _now() + CONFIG_ERROR_BACKOFF_SECONDS
+                print(
+                    f"⚠️  refine #{job.issue_num} aborted on a CONFIGURATION "
+                    f"error (e.g. ARISTOTLE_API_KEY unset) — no attempt "
+                    f"burned; this issue backed off "
+                    f"{int(CONFIG_ERROR_BACKOFF_SECONDS)}s. Fix the "
+                    f"environment and restart the conductor.",
                     flush=True,
                 )
     return reaped
@@ -1531,14 +1733,33 @@ def set_prover_enabled(repo_dir: Path, enabled: bool) -> None:
     tmp.replace(path)
 
 
+def _dispatch_env_error() -> Optional[str]:
+    """A human-readable reason refine/fill/repair dispatch is impossible in
+    this environment, or None. Checked once at conductor startup (a process
+    env never changes underneath it): dispatching without the Aristotle key
+    burns doomed subprocesses and, before EXIT_CONFIG_ERROR existed, whole
+    attempt budgets."""
+    if not os.environ.get("ARISTOTLE_API_KEY"):
+        return (
+            "ARISTOTLE_API_KEY is not set — refine/fill/repair dispatch is "
+            "DISABLED (automerge/reconcile still run). Export the key and "
+            "restart the conductor."
+        )
+    return None
+
+
 def write_jobs_snapshot(
     repo_dir: Path, jobs: list[ConductorJob], concurrency: int,
     prover_enabled: Optional[bool] = None,
+    degraded: Optional[str] = None,
 ) -> None:
     """Atomic-ish write (tmp + rename, like review.state.save_state) so
     ``marathon conductor status`` never reads a torn snapshot. ``prover_enabled``
     publishes the conductor's EFFECTIVE proving state (startup default overlaid
-    with the deck toggle) so the deck can render the toggle in its true state."""
+    with the deck toggle) so the deck can render the toggle in its true state.
+    ``degraded`` publishes a dispatch-disabling environment problem (e.g. no
+    Aristotle key) so the deck can show a red banner instead of a healthy
+    'conductor running' chip."""
     path = jobs_snapshot_path(repo_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Self-ignoring runtime dir (same convention as .marathon/review's
@@ -1556,6 +1777,7 @@ def write_jobs_snapshot(
         "updated_ts": now_iso(),
         "concurrency": concurrency,
         "prover_enabled": prover_enabled,
+        "degraded": degraded,
         "jobs": [job.to_json() for job in jobs],
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -1878,6 +2100,28 @@ def run_conductor(
         flush=True,
     )
 
+    # Environment preflight: a conductor with no Aristotle key must NOT
+    # dispatch — every refine would instantly exit EXIT_CONFIG_ERROR. Before
+    # this gate existed, a keyless relaunch burned both #171's and #238's full
+    # attempt budgets in 12 minutes and posted bogus public 'stalled' comments
+    # (2026-07-07). The conductor still runs its keyless-safe passes
+    # (automerge, reconcile, reap, snapshot); the deck shows the reason.
+    dispatch_env_error = _dispatch_env_error()
+    if dispatch_env_error is not None:
+        print(f"⚠️  DEGRADED: {dispatch_env_error}", flush=True)
+
+    # Capture still-alive jobs from a PREVIOUS conductor's snapshot BEFORE the
+    # first write_jobs_snapshot erases those rows — the reap guard consults
+    # this map so a restart never destroys a running (billed) refine.
+    _INHERITED_RUNNING.clear()
+    _INHERITED_RUNNING.update(_inherit_running_worktrees(cfg.repo_dir))
+    for wt, pid in _INHERITED_RUNNING.items():
+        print(
+            f"  inherited live job from a previous conductor: pid {pid} in "
+            f"{wt} — worktree protected from reaping until it exits",
+            flush=True,
+        )
+
     jobs: list[ConductorJob] = []
     not_before: dict[int, float] = {}
     kept_worktrees: dict[int, str] = {}
@@ -2071,7 +2315,12 @@ def run_conductor(
             running = [j for j in jobs if j.status == "running"]
 
             picks: list[tuple[int, int]] = []
-            if not _STOP_REQUESTED:
+            # DEGRADED mode: with a broken dispatch environment (no Aristotle
+            # key), dispatching would only burn doomed subprocesses — skip the
+            # whole dispatch phase but keep the keyless-safe passes (reap,
+            # automerge, reconcile, snapshot) running. The reason is published
+            # in the jobs snapshot so the deck can show it.
+            if not _STOP_REQUESTED and dispatch_env_error is None:
                 picks = _pick_dispatchable(
                     cfg, jobs, not_before, _now(), n - len(running),
                     warned_unknown,
@@ -2177,7 +2426,9 @@ def run_conductor(
                         dispatch_count += 1
                     running = [j for j in jobs if j.status == "running"]
 
-            write_jobs_snapshot(cfg.repo_dir, jobs, n, prover_enabled=prover_enabled_now)
+            write_jobs_snapshot(cfg.repo_dir, jobs, n,
+                                prover_enabled=prover_enabled_now,
+                                degraded=dispatch_env_error)
 
             if _STOP_REQUESTED:
                 if not running:
@@ -2216,7 +2467,7 @@ def run_conductor(
                 TICK_SECONDS if (running or picks) else daemon.POLL_INTERVAL_SECONDS
             )
     finally:
-        write_jobs_snapshot(cfg.repo_dir, jobs, n)
+        write_jobs_snapshot(cfg.repo_dir, jobs, n, degraded=dispatch_env_error)
         release_conductor_lock(cfg)
         print(
             f"\n=== conductor done {datetime.now().isoformat()} "

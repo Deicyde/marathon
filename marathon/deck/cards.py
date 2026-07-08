@@ -817,7 +817,8 @@ def _readiness(
     if status == "rejected":
         return False, "rejected — in the refine queue"
     if status == "stalled":
-        return False, "rejected — refinement stalled (re-reject to re-queue)"
+        return False, ("rejected — refinement stalled (one-click Re-queue on "
+                       "the ⚠ needs-attention card / Issues tab)")
     if status == "deferred":
         return False, "deferred"
 

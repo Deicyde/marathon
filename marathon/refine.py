@@ -50,6 +50,7 @@ from marathon.post_pipeline import (
     run_post_pipeline,
 )
 from marathon.skeleton import (
+    EXIT_CONFIG_ERROR,  # re-exported: sibling of the EXIT_* codes below
     LOG_FILENAME,
     _ensure_api_key,
     _extract_solution,
@@ -87,6 +88,11 @@ EXIT_AUTO_PR_BRANCH_ABORT = 12
 #: which silently strands the rejection forever (``needs_iteration`` → False). This
 #: is the iteration-failure twin of EXIT_AUTO_PR_BRANCH_ABORT.
 EXIT_ITERATION_FAILED = 13
+
+#: EXIT_CONFIG_ERROR = 14 lives in marathon.skeleton (next to _ensure_api_key,
+#: which raises it) and is re-exported above: an environment failure detected
+#: BEFORE any Aristotle work. The conductor treats it as attempt-free — see
+#: daemon._handle_refine_exit.
 
 
 def _load_additional_writable_paths(

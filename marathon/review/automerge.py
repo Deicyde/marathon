@@ -287,13 +287,24 @@ def _repo_merge_method(repo: str) -> Optional[str]:
     return None
 
 
-def _requeue_refined_issue(cfg: "ReviewConfig", head: Optional[str]) -> Optional[int]:
+def _requeue_refined_issue(
+    cfg: "ReviewConfig", head: Optional[str], pr_num: Optional[int] = None,
+    *, landed: bool = True,
+) -> Optional[int]:
     """If ``head`` is a refine branch (``marathon/refine-c<N>-i<M>``), re-queue
-    issue ``M`` for re-review now that Aristotle's fix has merged: remove the
-    ``review:rejected`` GitHub label AND clear the local verdict state, so the
-    issue reads as unreviewed and the deck surfaces it as a ready card again.
-    Returns the issue number it re-queued, or None. Best-effort — a failure here
-    never fails the merge (the fix already landed)."""
+    issue ``M`` for re-review: remove the ``review:rejected`` GitHub label AND
+    clear the local verdict state, so the issue reads as unreviewed and the
+    deck surfaces it as a ready card again. Returns the issue number it
+    re-queued, or None. Best-effort — a failure here never fails the merge.
+
+    ``landed`` (default True — Aristotle's fix actually MERGED) posts a
+    RECOVERY comment that closes the notification loop and supersedes any
+    dangling 'Auto-refine stalled' comment (the 2026-07-07 perceived outage:
+    every recovery step was GitHub-silent while the stall comment stayed the
+    newest signal for hours). Pass ``landed=False`` from the no-PR-landed
+    caller (a refine that exited clean with no diff → nothing merged): a
+    'fix landed' comment there would be a public LIE — that path re-queues for
+    re-review of UNCHANGED code, so it posts nothing (the deck surfaces it)."""
     m = _REFINE_BRANCH_RE.match(head or "")
     if not m:
         return None
@@ -310,6 +321,22 @@ def _requeue_refined_issue(cfg: "ReviewConfig", head: Optional[str]) -> Optional
         requeue_for_rereview(cfg, issue)
     except Exception:  # noqa: BLE001
         pass
+    if landed:
+        try:
+            merged_in = f" (merged in PR #{pr_num})" if pr_num is not None else ""
+            gh(
+                "issue", "comment", str(issue), "--repo", cfg.github_repo,
+                "--body",
+                (
+                    f"♻️ **Auto-refine recovered** — Aristotle's fix for this "
+                    f"rejection landed{merged_in}. The issue is back in the "
+                    f"deck's review queue for re-review. (Any earlier "
+                    f"\"Auto-refine stalled\" comment above is superseded.)"
+                ),
+                check=False,
+            )
+        except Exception:  # noqa: BLE001 — the comment is best-effort, never gates
+            pass
     return issue
 
 
@@ -394,7 +421,7 @@ def automerge(
             method = _repo_merge_method(repo) or "--merge"
         merged, detail = _merge_pr(repo, num, method)
         if merged:
-            requeued = _requeue_refined_issue(cfg, head)
+            requeued = _requeue_refined_issue(cfg, head, pr_num=num)
             if requeued is not None:
                 detail += f"; re-queued #{requeued} for re-review"
         results.append(AutoMergeResult(

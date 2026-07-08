@@ -204,6 +204,10 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
         "updated_ts": snap.get("updated_ts"),
         "running": sum(1 for j in jobs if j["status"] == "running"),
         "prover_enabled": prover_enabled,
+        # A dispatch-disabling environment problem the conductor published
+        # (e.g. no Aristotle key) — the deck must NOT render a green
+        # "conductor running" chip over a conductor that can't dispatch.
+        "degraded": snap.get("degraded"),
         "jobs": jobs,
         "queued": _pending_queue(cfg, jobs, snap.get("concurrency")),
         "landings": _recent_landings(cfg, limit=8),
@@ -435,6 +439,47 @@ def _issue_status(
     return "pending"
 
 
+def _open_refine_prs(cfg) -> "dict[int, dict]":
+    """``{issue_num: {"pr": n, "build": "OK"|"FAIL"|None}}`` for OPEN marathon
+    refine PRs (one bounded gh call; ``{}`` on any failure). Lets the stuck
+    surface say "fix PR #260 is open [build:FAIL held]" instead of the false
+    "the fix never landed — the conductor can't reach them": a build-FAIL-held
+    PR means the pipeline DID produce a fix and automerge is (correctly)
+    refusing it — re-queuing spends a fresh billed run, so the reviewer should
+    know one exists before clicking."""
+    from marathon.review.github import gh
+
+    try:
+        cp = gh(
+            "pr", "list", "--repo", cfg.github_repo, "--state", "open",
+            "--json", "number,headRefName,title", "--limit", "100",
+            check=False, timeout=20,
+        )
+    except Exception:  # noqa: BLE001 — gh missing/hung → no annotation
+        return {}
+    if cp.returncode != 0:
+        return {}
+    out: "dict[int, dict]" = {}
+    try:
+        for pr in json.loads(cp.stdout or "[]"):
+            m = re.match(r"marathon/refine-c\d+-i(\d+)$",
+                         pr.get("headRefName") or "")
+            if not m:
+                continue
+            title = pr.get("title") or ""
+            # NOTE: the title tag is what the conductor STAMPS; automerge
+            # itself re-derives the tag from the head commit before merging (a
+            # human can rename a title), so this is an informational hint for
+            # the deck, not a merge gate. TIMEOUT is held like FAIL.
+            build = ("OK" if "[build:OK]" in title
+                     else "FAIL" if "[build:FAIL]" in title
+                     else "TIMEOUT" if "[build:TIMEOUT]" in title else None)
+            out[int(m.group(1))] = {"pr": pr.get("number"), "build": build}
+    except (ValueError, TypeError, KeyError):
+        return {}
+    return out
+
+
 def _orphan_note_previews(cfg) -> "dict[int, str]":
     """Best-effort human preview for an ORPHANED rejection, from the LOCAL
     deck-subdecks store (``deck-subdecks.json`` — survives a git reset since it
@@ -528,6 +573,19 @@ def stuck_issues(cfg) -> "list[dict]":
                 "note_preview": previews.get(num, ""),
             })
     out.sort(key=lambda r: r["num"])
+
+    # Annotate rows that ALREADY have an open fix PR (one bounded gh call,
+    # only when something is stuck): "stalled" + an open [build:FAIL] PR means
+    # the pipeline produced a fix and automerge is correctly holding it — the
+    # deck must not claim "the fix never landed", and Re-queue should warn
+    # (a re-queue spends a fresh billed Aristotle run).
+    if out:
+        prs = _open_refine_prs(cfg)
+        for row in out:
+            info = prs.get(row["num"])
+            if info:
+                row["fix_pr"] = info["pr"]
+                row["fix_pr_build"] = info["build"]
     return out
 
 

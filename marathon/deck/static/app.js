@@ -1144,6 +1144,29 @@
   // this they only appear in the Issues tab, which the swipe reviewer never
   // opens, so a rejection silently vanishes. Each row offers a one-click
   // re-queue; the note is re-issued (recovered from GitHub for an orphan).
+  // One stuck row's status text + whether re-queue should confirm first. A
+  // stuck issue with an OPEN fix PR is not "the fix never landed" — the
+  // pipeline produced one and automerge is (correctly) holding it red; a
+  // re-queue spends a fresh billed Aristotle run, so ask before firing.
+  function stuckRowText(it) {
+    if (it.fix_pr != null) {
+      var held = it.fix_pr_build === "OK" ? " [build:OK — merging shortly]"
+               : (it.fix_pr_build === "FAIL" || it.fix_pr_build === "TIMEOUT")
+                   ? " [build:" + it.fix_pr_build + " — held by automerge]" : "";
+      return "fix PR #" + it.fix_pr + " already open" + held;
+    }
+    return it.note_preview || "(rejected — no fix landed yet)";
+  }
+
+  function confirmRequeue(it) {
+    if (it.fix_pr == null) return true;
+    return window.confirm(
+      "#" + it.num + " already has an open fix PR #" + it.fix_pr +
+      (it.fix_pr_build ? " [build:" + it.fix_pr_build + "]" : "") +
+      ".\nRe-queuing starts a NEW billed Aristotle run alongside it. Continue?"
+    );
+  }
+
   function showStuckAttentionCard(stuck, repo) {
     stage().innerHTML = "";
     var rows = stuck.map(function (it) {
@@ -1152,9 +1175,12 @@
         el("span", {
           class: "issue-title",
           title: it.note_preview || "",
-          text: it.note_preview || "(rejected — the fix never landed)",
+          text: stuckRowText(it),
         }),
       ];
+      if (it.fix_pr != null) {
+        kids.push(ghLink(repo, "pull", it.fix_pr, "PR #" + it.fix_pr, "issue-tier"));
+      }
       if (it.attempts) {
         kids.push(el("span", { class: "issue-tier", text: it.attempts + " tries" }));
       }
@@ -1162,9 +1188,12 @@
         class: "btn btn-tiny issue-requeue",
         type: "button",
         title: "Re-queue this rejection — the conductor retries it for Aristotle",
-        onclick: (function (id) {
-          return function (ev) { requeueIssue(id, ev.currentTarget, refreshQueue); };
-        })(it.num),
+        onclick: (function (row) {
+          return function (ev) {
+            if (!confirmRequeue(row)) return;
+            requeueIssue(row.num, ev.currentTarget, refreshQueue);
+          };
+        })(it),
       }, ["Re-queue"]));
       return el("div", { class: "issue-row stuck-row" }, kids);
     });
@@ -2533,13 +2562,19 @@
       if (!host) return;
       host.innerHTML = "";
       var up = !!d.alive;
-      host.appendChild(el("div", { class: "cond-banner" }, [
-        el("span", { class: "cond-dot " + (up ? "up" : "down") }),
+      // DEGRADED beats "running": a conductor with a broken dispatch env
+      // (e.g. no Aristotle key) is alive but can't refine — a green chip
+      // here hid exactly that during the 2026-07-07 incident.
+      var degraded = up && d.degraded;
+      host.appendChild(el("div", { class: "cond-banner" + (degraded ? " cond-degraded" : "") }, [
+        el("span", { class: "cond-dot " + (degraded ? "degraded" : (up ? "up" : "down")) }),
         el("div", {}, [
           el("div", { class: "cond-title",
-            text: up ? "conductor running" : "conductor stopped" }),
+            text: degraded ? "conductor DEGRADED — not dispatching"
+                : up ? "conductor running" : "conductor stopped" }),
           el("div", { class: "dash-empty",
-            text: up ? "dispatches refines + auto-merges PRs across all chapters"
+            text: degraded ? String(d.degraded)
+                : up ? "dispatches refines + auto-merges PRs across all chapters"
                      : "no live orchestrator — rejecting an issue starts one" }),
         ]),
         el("div", { class: "cond-meta" }, [
@@ -2776,8 +2811,11 @@
           ghLink(repo, "issues", it.num, "#" + it.num, "issue-id"),
           statusBadge(it.status),
           el("span", { class: "issue-title", title: it.note_preview || "",
-                       text: it.note_preview || "(no stored note)" }),
+                       text: it.fix_pr != null ? stuckRowText(it)
+                           : (it.note_preview || "(no stored note)") }),
         ];
+        if (it.fix_pr != null)
+          kids.push(ghLink(repo, "pull", it.fix_pr, "PR #" + it.fix_pr, "issue-tier"));
         if (it.attempts) kids.push(el("span", { class: "issue-tier",
                                                 text: it.attempts + " tries" }));
         kids.push(el("button", {
@@ -2786,9 +2824,12 @@
           title: it.has_note
             ? "Re-issue this rejection's stored note — re-queues it for Aristotle"
             : "No stored note to re-queue — use the CLI",
-          onclick: (function (id) {
-            return function (ev) { requeueIssue(id, ev.currentTarget); };
-          })(it.num),
+          onclick: (function (row) {
+            return function (ev) {
+              if (!confirmRequeue(row)) return;
+              requeueIssue(row.num, ev.currentTarget);
+            };
+          })(it),
         }, ["Re-queue"]));
         return el("div", { class: "issue-row stuck-row" }, kids);
       });

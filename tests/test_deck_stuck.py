@@ -8,6 +8,7 @@ import json
 
 import pytest
 
+from marathon.deck.dashboard import _open_refine_prs as _real_open_refine_prs
 from marathon.deck.dashboard import stuck_issues
 from marathon.review import github as gh_mod
 from marathon.review.state import (
@@ -19,10 +20,13 @@ from tests.test_conductor import make_cfg
 
 @pytest.fixture(autouse=True)
 def _offline_gh(monkeypatch):
-    """stuck_issues now consults GitHub (list_rejected_issues) to recover
-    orphaned rejections. Keep the state-based unit tests OFFLINE by default;
-    the orphan tests re-patch with an explicit rejected set."""
+    """stuck_issues now consults GitHub (list_rejected_issues + the open
+    fix-PR lookup) to recover orphaned rejections and annotate rows. Keep the
+    state-based unit tests OFFLINE by default; individual tests re-patch."""
+    from marathon.deck import dashboard as dash_mod
+
     monkeypatch.setattr(gh_mod, "list_rejected_issues", lambda cfg: None)
+    monkeypatch.setattr(dash_mod, "_open_refine_prs", lambda cfg: {})
 
 
 def test_stuck_issues_lists_stalled_and_parked_only(tmp_path):
@@ -114,6 +118,52 @@ def test_stuck_issues_orphan_and_stalled_coexist_sorted(tmp_path, monkeypatch):
 
     nums = [r["num"] for r in stuck_issues(cfg)]
     assert nums == [171, 200]                         # merged + sorted by num
+
+
+def test_stuck_rows_annotated_with_open_fix_pr(tmp_path, monkeypatch):
+    # A stalled issue with an OPEN [build:FAIL] refine PR: the row must carry
+    # the PR so the deck says "fix PR open, held" instead of the false "the
+    # fix never landed" — and the frontend can confirm before a billed
+    # re-queue. An issue with no open PR stays unannotated.
+    from marathon.deck import dashboard as dash_mod
+
+    cfg = make_cfg(tmp_path)
+    record_rejection(cfg, 238, "fix it")
+    record_stall(cfg, 238)
+    record_rejection(cfg, 300, "other")
+    record_stall(cfg, 300)
+    monkeypatch.setattr(
+        dash_mod, "_open_refine_prs",
+        lambda cfg: {238: {"pr": 260, "build": "FAIL"}},
+    )
+
+    by = {r["num"]: r for r in stuck_issues(cfg)}
+    assert by[238]["fix_pr"] == 260 and by[238]["fix_pr_build"] == "FAIL"
+    assert "fix_pr" not in by[300]
+
+
+def test_open_refine_prs_parses_heads_and_build_tags(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from marathon.review import github as real_gh
+
+    def fake_gh(*args, check=True, capture=True, timeout=None):
+        assert args[:2] == ("pr", "list")
+        return SimpleNamespace(returncode=0, stdout=json.dumps([
+            {"number": 260, "headRefName": "marathon/refine-c16-i238",
+             "title": "marathon: Chapter16 iter for #238 [build:FAIL]"},
+            {"number": 264, "headRefName": "marathon/refine-c15-i171",
+             "title": "marathon: Chapter15 iter for #171 [build:OK]"},
+            {"number": 263, "headRefName": "chore/register-ch16",
+             "title": "registry"},                       # not a refine head
+        ]))
+
+    monkeypatch.setattr(real_gh, "gh", fake_gh)
+    cfg = make_cfg(tmp_path)
+    # the autouse fixture stubs the module attribute — call the REAL function
+    got = _real_open_refine_prs(cfg)
+    assert got == {238: {"pr": 260, "build": "FAIL"},
+                   171: {"pr": 264, "build": "OK"}}
 
 
 def test_stuck_issues_degrades_when_gh_unavailable(tmp_path):

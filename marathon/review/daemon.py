@@ -246,7 +246,18 @@ def _backoff_seconds(attempts: int) -> int:
     return min(2 ** attempts * BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS)
 
 
-def _notify_stall(cfg: ReviewConfig, issue_num: int, attempts: int) -> None:
+#: Embedded marker so a later RECOVERY pass (automerge's requeue-for-rereview)
+#: can find and follow up the stall comment instead of leaving it dangling as
+#: the issue's newest signal forever (the 2026-07-07 perceived-outage bug).
+STALL_COMMENT_MARKER = "<!-- marathon-stall -->"
+
+
+def _notify_stall(
+    cfg: ReviewConfig,
+    issue_num: int,
+    attempts: int,
+    failure_detail: Optional[str] = None,
+) -> None:
     """Post a one-time comment on the GitHub issue telling the human the
     rejection stalled and how to re-queue it.
 
@@ -255,14 +266,27 @@ def _notify_stall(cfg: ReviewConfig, issue_num: int, attempts: int) -> None:
     the same verdict. Best-effort by design — a notification failure
     (gh missing, network down, auth expired) is printed and swallowed,
     never allowed to crash the daemon; the "stalled" state in
-    state.json is the durable record either way."""
+    state.json is the durable record either way.
+
+    ``failure_detail`` (optional) is the last attempt's log tail so the
+    comment is self-diagnosing instead of "check the daemon log"."""
+    detail = ""
+    if failure_detail and failure_detail.strip():
+        detail = (
+            "\n\nLast attempt's log tail:\n```\n"
+            + failure_detail.strip()[-1500:]
+            + "\n```"
+        )
     body = (
+        f"{STALL_COMMENT_MARKER}\n"
         f"**Auto-refine stalled.** The review daemon failed to dispatch a "
         f"refine iteration for this rejection {attempts} times in a row and "
-        f"has stopped retrying it.\n\n"
-        f"Check the daemon log for the underlying error. Re-rejecting this "
-        f"issue (`marathon review reject {issue_num} ...`) resets the "
-        f"attempt counter and re-queues it."
+        f"has stopped retrying it.{detail}\n\n"
+        f"To re-queue it: open the deck — a stalled issue surfaces on the "
+        f"**⚠ needs attention** card in the review queue with a one-click "
+        f"**Re-queue** (also in the Issues tab's Stalled section). CLI "
+        f"fallback: re-rejecting (`marathon review reject {issue_num} ...`) "
+        f"resets the attempt counter and re-queues it."
     )
     cmd = [
         "gh", "issue", "comment", str(issue_num),
@@ -291,6 +315,7 @@ def _handle_refine_exit(
     *,
     max_attempts: int,
     interrupted: bool,
+    failure_detail: Optional[str] = None,
 ) -> int:
     """Apply the post-refine state transition for ``issue_num``; return
     the backoff (seconds) to sleep before the next dispatch (0 ⇒ none).
@@ -327,6 +352,25 @@ def _handle_refine_exit(
         record_iteration(cfg, issue_num)
         return 0
 
+    # A CONFIGURATION failure (e.g. ARISTOTLE_API_KEY unset) aborted the
+    # refine before any Aristotle work. That is an OPERATOR problem, not this
+    # rejection's: burn no attempt, post nothing, leave the issue queued —
+    # once the environment is fixed it re-dispatches untouched. The caller
+    # (conductor) is responsible for not spinning on it (env preflight +
+    # long per-issue backoff). This is what turned the 2026-07-07 keyless
+    # relaunch into two bogus public 'stalled' verdicts.
+    from marathon.skeleton import EXIT_CONFIG_ERROR
+
+    if exit_code == EXIT_CONFIG_ERROR:
+        print(
+            f"--- iteration for #{issue_num} aborted on a CONFIGURATION "
+            f"error (exit {exit_code}) — NOT counted as an attempt. Fix the "
+            "environment (e.g. export ARISTOTLE_API_KEY); the issue stays "
+            "queued and re-dispatches once it is fixed.",
+            flush=True,
+        )
+        return 0
+
     entry = record_failed_attempt(cfg, issue_num)
     if entry is None:
         # The entry vanished mid-iteration (e.g. a concurrent `verify`
@@ -341,7 +385,8 @@ def _handle_refine_exit(
             "notification; re-reject the issue to re-queue.",
             flush=True,
         )
-        _notify_stall(cfg, issue_num, entry.attempts)
+        _notify_stall(cfg, issue_num, entry.attempts,
+                      failure_detail=failure_detail)
         return 0
 
     backoff = _backoff_seconds(entry.attempts)
@@ -404,6 +449,20 @@ def run_daemon(
     ``main`` without the human babysitting a merge.
     """
     cfg = load_config()
+
+    # Environment preflight: without the Aristotle key every dispatched refine
+    # exits EXIT_CONFIG_ERROR, which the exit ladder (correctly) treats as
+    # attempt-free — but that means this loop would HOT-SPIN forever, dispatch
+    # → instant fail → re-pick, with no backoff or stall. Refuse to start
+    # instead (mirrors the conductor's dispatch gate). ``os`` is imported at
+    # module scope.
+    if not os.environ.get("ARISTOTLE_API_KEY"):
+        print(
+            "ARISTOTLE_API_KEY is not set — refusing to start the refine "
+            "daemon (every dispatch would fast-fail in a hot loop). Export "
+            "the key and re-run."
+        )
+        return 1
 
     if not acquire_lock(cfg, chapter):
         print(f"another refine daemon is already active for chapter {chapter}; exiting")

@@ -179,6 +179,45 @@ def test_backoff_is_capped():
     assert daemon._backoff_seconds(100) == daemon.BACKOFF_CAP_SECONDS
 
 
+def test_config_error_exit_burns_no_attempt_and_posts_nothing(cfg, gh_calls):
+    """EXIT_CONFIG_ERROR (e.g. ARISTOTLE_API_KEY unset) is an OPERATOR
+    problem: no attempt burned, no stall, no notification — the issue
+    stays queued untouched for when the environment is fixed. (The
+    2026-07-07 keyless conductor burned both issues' full budgets and
+    posted two bogus public 'stalled' comments through this path.)"""
+    from marathon.skeleton import EXIT_CONFIG_ERROR
+
+    record_rejection(cfg, ISSUE, "notes")
+    for _ in range(5):  # would stall THRICE over under the old ladder
+        backoff = daemon._handle_refine_exit(
+            cfg, ISSUE, EXIT_CONFIG_ERROR, max_attempts=3, interrupted=False
+        )
+        assert backoff == 0
+    entry = load_state(cfg).issues[ISSUE]
+    assert entry.status == "rejected"          # never stalled
+    assert entry.attempts == 0                 # nothing burned
+    assert entry.last_iteration_ts is None     # not consumed either
+    assert [n for n, _ in pending_rejections_needing_iteration(cfg, CHAPTER)] == [ISSUE]
+    assert gh_calls == []                      # no bogus public comment
+
+
+def test_stall_comment_carries_marker_and_failure_detail(cfg, gh_calls):
+    """The stall comment embeds the recovery marker (so a later merge can
+    follow it up) and the failing attempt's log tail (self-diagnosing)."""
+    record_rejection(cfg, ISSUE, "notes")
+    for _ in range(2):
+        daemon._handle_refine_exit(cfg, ISSUE, 1, max_attempts=3, interrupted=False)
+    daemon._handle_refine_exit(
+        cfg, ISSUE, 1, max_attempts=3, interrupted=False,
+        failure_detail="error: unknown identifier 'foo'\nBuild FAIL",
+    )
+    assert len(gh_calls) == 1
+    body = gh_calls[0][gh_calls[0].index("--body") + 1]
+    assert daemon.STALL_COMMENT_MARKER in body
+    assert "unknown identifier 'foo'" in body
+    assert "Re-queue" in body                  # points at the deck's one-click path
+
+
 def test_max_attempts_stalls_and_notifies_once(cfg, gh_calls):
     record_rejection(cfg, ISSUE, "notes")
     for _ in range(2):

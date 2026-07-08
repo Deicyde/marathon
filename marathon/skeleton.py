@@ -79,13 +79,26 @@ def _read_prompt_template() -> str:
     return prompt_path.read_text()
 
 
+#: Exit code for an ENVIRONMENT/CONFIGURATION failure detected before any
+#: Aristotle work (e.g. ARISTOTLE_API_KEY unset). Distinguished so the
+#: conductor's exit ladder can tell "the environment is broken — fix it and
+#: everything re-dispatches" from a genuine iteration failure: config errors
+#: must never burn retry attempts or stall an issue (the 2026-07-07 incident:
+#: a keyless conductor fast-failed 3 attempts per issue and posted bogus
+#: 'Auto-refine stalled' comments). Sibling of refine.py's
+#: EXIT_AUTO_PR_BRANCH_ABORT=12 / EXIT_ITERATION_FAILED=13.
+EXIT_CONFIG_ERROR = 14
+
+
 def _ensure_api_key() -> str:
     key = os.environ.get("ARISTOTLE_API_KEY")
     if not key:
-        sys.exit(
+        print(
             "ARISTOTLE_API_KEY not set. Add `export ARISTOTLE_API_KEY=arstl_...` "
-            "to ~/.zshrc and re-source."
+            "to ~/.zshrc and re-source.",
+            file=sys.stderr,
         )
+        sys.exit(EXIT_CONFIG_ERROR)
     aristotlelib.set_api_key(key)
     return key
 

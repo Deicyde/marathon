@@ -60,8 +60,8 @@ def _patch_gh(monkeypatch, prs_json):
 def _capture_requeue(monkeypatch):
     requeued = []
     monkeypatch.setattr(amod, "_requeue_refined_issue",
-                        lambda cfg, branch: requeued.append(branch) or
-                        int(branch.rsplit("-i", 1)[1]))
+                        lambda cfg, branch, *a, **k: requeued.append((branch, k))
+                        or int(branch.rsplit("-i", 1)[1]))
     return requeued
 
 
@@ -72,7 +72,8 @@ def test_no_pr_and_still_rejected_requeues(monkeypatch):
                         lambda c: SimpleNamespace(issues={98: SimpleNamespace(status="rejected")}))
     requeued = _capture_requeue(monkeypatch)
     cond._requeue_if_no_pr_landed(cfg, _job())
-    assert requeued == ["marathon/refine-c12-i98"]
+    # re-queued, and CRUCIALLY landed=False so no false "fix landed" comment
+    assert requeued == [("marathon/refine-c12-i98", {"landed": False})]
 
 
 def test_pr_exists_does_not_requeue(monkeypatch):

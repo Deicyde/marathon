@@ -89,6 +89,7 @@ def test_conductor_status_no_snapshot_degrades(tmp_path, monkeypatch):
     d = dash.conductor_status(_cfg(tmp_path))
     assert d == {"alive": False, "pid": None, "repo": "o/r", "concurrency": None,
                  "updated_ts": None, "running": 0, "prover_enabled": None,
+                 "degraded": None,
                  "jobs": [], "queued": [], "landings": []}
 
 
