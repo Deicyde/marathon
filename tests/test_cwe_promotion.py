@@ -9,10 +9,9 @@ red keeps the retry ladder (post-pipeline skipped). The #170 failure mode:
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 from types import SimpleNamespace
 
-import pytest
 from aristotlelib import TaskStatus
 
 import marathon.refine as refine

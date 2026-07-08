@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 
 import marathon.deck.subdeck as subdeck
 from marathon.review.config import ChapterRegistry, ReviewConfig, ReviewLabels

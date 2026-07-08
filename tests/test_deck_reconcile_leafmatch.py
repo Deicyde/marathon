@@ -192,7 +192,6 @@ def test_verified_issue_flags_rename_no_write(tmp_path, monkeypatch):
     """A VERIFIED issue is never silently rewritten: the proposed rename lands in
     ``flagged_renames`` with ``updated=False`` and NO ``gh issue edit`` (we
     monkeypatch the edit to raise — it must never be called)."""
-    from marathon.review import state as state_mod
     from marathon.review.state import ReviewState, IssueState, save_state
 
     cited = "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial"

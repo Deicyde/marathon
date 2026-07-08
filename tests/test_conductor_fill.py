@@ -178,7 +178,6 @@ def test_pick_fill_expired_backoff_is_dispatchable():
 
 # --- proofs land on the prover branch, never main ---------------------------------
 
-from pathlib import Path  # noqa: E402
 
 from marathon.post_pipeline import _branch_name_for_issue  # noqa: E402
 from marathon.review.config import ReviewConfig, ReviewLabels  # noqa: E402

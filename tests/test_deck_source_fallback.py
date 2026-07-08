@@ -22,7 +22,6 @@ real ``.lean`` files written under a tmp_path repo. No network/lake/Aristotle.
 
 from __future__ import annotations
 
-from dataclasses import replace
 
 import marathon.deck.cards as cards
 from marathon.audit.records import AuditSnapshot, DeclAudit

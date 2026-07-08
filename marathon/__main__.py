@@ -2688,7 +2688,6 @@ def _run_formalization_update(args) -> None:
 
 
 def _run_formalization_backfill_wall_time(args) -> None:
-    import aristotlelib
     from marathon.skeleton import _ensure_api_key
     from marathon.formalization import (
         backfill_wall_time, format_wall_time, update_formalization,

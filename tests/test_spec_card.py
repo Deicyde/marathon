@@ -22,7 +22,6 @@ from marathon.audit.lean_template import DEFAULT_TRUSTED_PREFIXES
 from marathon.audit.records import AuditSnapshot, DeclAudit
 from marathon.audit.spec_card import (
     DELTA_CLASSES,
-    SemanticDelta,
     SpecCard,
     semantic_delta,
 )

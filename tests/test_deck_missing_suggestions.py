@@ -15,7 +15,6 @@ network / lake / Aristotle.
 
 from __future__ import annotations
 
-import json
 
 from marathon.review.config import ChapterRegistry
 from marathon.deck.cards import missing_suggestions_for_issue

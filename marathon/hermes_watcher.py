@@ -41,7 +41,6 @@ from aristotlelib import (
     Event,
     EventType,
     Project,
-    TaskStatus,
 )
 
 from marathon.aristotle_runtime import (

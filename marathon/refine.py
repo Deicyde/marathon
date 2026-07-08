@@ -49,8 +49,8 @@ from marathon.post_pipeline import (
     append_promptlog_url,
     run_post_pipeline,
 )
-from marathon.skeleton import (
-    EXIT_CONFIG_ERROR,  # re-exported: sibling of the EXIT_* codes below
+from marathon.skeleton import (  # noqa: F401 — EXIT_CONFIG_ERROR re-exported
+    EXIT_CONFIG_ERROR,
     LOG_FILENAME,
     _ensure_api_key,
     _extract_solution,

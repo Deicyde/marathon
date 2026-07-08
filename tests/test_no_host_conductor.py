@@ -1,7 +1,6 @@
 """MARATHON_NO_HOST_CONDUCTOR: a reject records state but spawns no conductor."""
 from __future__ import annotations
 
-import pytest
 
 import marathon.review.review as review
 

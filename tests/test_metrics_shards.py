@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
 
 import marathon.metrics as metrics
 import marathon.post_pipeline as pp

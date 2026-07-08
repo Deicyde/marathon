@@ -21,8 +21,6 @@ No subprocesses, no network, no Lean toolchain.
 from __future__ import annotations
 
 from marathon.audit.kernel import (
-    Kernel,
-    KernelMember,
     compute_kernel,
     kernel_size_metric,
 )

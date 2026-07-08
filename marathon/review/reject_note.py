@@ -3,11 +3,9 @@ instruction the deck composes at ship (:func:`marathon.deck.subdeck.compose_ship
 and Aristotle receives verbatim.
 
 ONE definition of the section headers, imported by BOTH the composer AND the
-parser the reject-note SATISFACTION check uses
-(:mod:`marathon.review.satisfaction`) — so a header edit can never silently
-desync the two (the design review's header-coupling fix). The parser matches on
-the stable header PREFIX, not the full sentence, so wording tweaks don't break
-parsing.
+parser — so a header edit can never silently desync the two (the design
+review's header-coupling fix). The parser matches on the stable header PREFIX,
+not the full sentence, so wording tweaks don't break parsing.
 """
 
 from __future__ import annotations
@@ -78,8 +76,7 @@ class ParsedRejectNote:
     ``keep`` — decl names to leave exactly as written; ``fix`` — ``(decl,
     note)`` pairs the human rejected; ``add`` — free-text "what is still
     missing" lines (NOT decl names). ``parse_ok`` is False for an unstructured /
-    legacy note (no recognised section header) — the satisfaction check then
-    falls back to today's one-shot behaviour."""
+    legacy note (no recognised section header)."""
 
     keep: list[str] = field(default_factory=list)
     fix: list[tuple[str, str]] = field(default_factory=list)
