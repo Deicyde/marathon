@@ -282,9 +282,6 @@ def _build_parser() -> argparse.ArgumentParser:
     # PROVE loop itself is `marathon conductor run --fill-chapter N`.
     _add_prover_subparser(subparsers)
 
-    # Landing tree: `marathon landing run/status/promote` — the Phase-4
-    # serial landing queue onto marathon/next (see marathon.landing).
-    _add_landing_subparser(subparsers)
 
     # Audit tree: `marathon audit run/diff/show` — the Phase-5
     # elaborator-grade audit engine (see marathon.audit.engine).
@@ -757,17 +754,6 @@ def _add_conductor_subparser(subparsers) -> None:
         ),
     )
     p_run.add_argument(
-        "--land", choices=("next",), default=None,
-        help=(
-            "Phase-4 opt-in: after each successful job, enqueue its "
-            "commits onto the marathon/next landing queue (processed "
-            "by `marathon landing run`: cherry-pick + lake build + "
-            "gate, then a plain push). Default: off — today's "
-            "per-issue --auto-pr flow is unchanged until the landing "
-            "stack has soaked."
-        ),
-    )
-    p_run.add_argument(
         "--no-automerge",
         dest="automerge",
         action="store_false",
@@ -962,7 +948,6 @@ def _run_conductor_run(args) -> None:
             else DEFAULT_MAX_ATTEMPTS
         ),
         worktree_parent=args.worktree_parent,
-        land=args.land,
         automerge=getattr(args, "automerge", True),
         merge_scope=getattr(args, "merge_scope", "any"),
         reconcile=getattr(args, "reconcile", True),
@@ -1103,113 +1088,6 @@ def _run_deck(args) -> None:
     )
     if rc:
         raise SystemExit(rc)
-
-
-def _add_landing_subparser(subparsers) -> None:
-    """Adds `marathon landing run/status/promote` — the Phase-4 landing
-    queue (see ``marathon.landing``): a serial FIFO that cherry-picks
-    each successful job onto the ``marathon/next`` integration branch
-    behind a hard `lake build` + machine-gate check (enforce semantics,
-    no override), bounces failures with a circuit-broken GitHub
-    notification instead of blocking, and only ever promotes into the
-    base branch via an explicit fast-forward-only command."""
-    p_land = subparsers.add_parser(
-        "landing",
-        help=(
-            "Serial landing queue onto the marathon/next integration "
-            "branch (Phase 4): cherry-pick + build + gate, then push."
-        ),
-        description=(
-            "Run or inspect the landing queue. `run` pops queued "
-            "requests oldest-first and lands each onto marathon/next "
-            "in a dedicated worktree (cherry-pick, lake build, machine "
-            "gate with enforce semantics, plain push — never force). "
-            "Failures bounce: clean abort, a report under "
-            ".marathon/landing/bounces/, and at most one deduplicated "
-            "GitHub comment; only push rejections re-queue (once). "
-            "`promote` fast-forwards the base branch to "
-            "origin/marathon/next and refuses on divergence. `status` "
-            "prints queue depth, recent landings/bounces, and the lock "
-            "holder. Requests are enqueued by `marathon conductor run "
-            "--land next` (or marathon.landing.enqueue_landing)."
-        ),
-    )
-    sub = p_land.add_subparsers(dest="landing_command", required=True)
-
-    p_run = sub.add_parser(
-        "run",
-        help="Process the landing queue (or one drain pass with --once).",
-    )
-    p_run.add_argument(
-        "--repo-dir", type=Path, default=None, metavar="PATH",
-        help=(
-            "Consumer repo root (must contain .marathon/review/"
-            "config.toml). Default: walk up from the current directory."
-        ),
-    )
-    p_run.add_argument(
-        "--once", action="store_true",
-        help="Drain the queue then exit instead of polling forever.",
-    )
-    p_run.add_argument(
-        "--worktree-parent", type=Path, default=None, metavar="DIR",
-        help=(
-            "Parent directory for the landing worktree. MUST be outside "
-            "the repo (in-repo worktrees leak into Aristotle bundles). "
-            "Default: ~/Desktop/marathon-runs/landing/<repo-name>/."
-        ),
-    )
-    p_run.add_argument(
-        "--base", default="main", metavar="BRANCH",
-        help=(
-            "Base branch marathon/next is created from when it does not "
-            "exist yet, and the promotion target. Default: main."
-        ),
-    )
-    p_run.add_argument(
-        "--build-timeout", type=int, default=1800, metavar="SECONDS",
-        help=(
-            "Wall-clock timeout for the landing `lake build` (default: "
-            "1800 = 30 minutes, the daemon's build budget). A timeout "
-            "bounces the landing."
-        ),
-    )
-    p_run.set_defaults(func=_run_landing_run)
-
-    p_stat = sub.add_parser(
-        "status",
-        help="Print queue depth + ages, recent landings/bounces, lock holder.",
-    )
-    p_stat.add_argument(
-        "--repo-dir", type=Path, default=None, metavar="PATH",
-        help="Consumer repo root. Default: walk up from the current directory.",
-    )
-    p_stat.add_argument(
-        "--worktree-parent", type=Path, default=None, metavar="DIR",
-        help=(
-            "Landing worktree parent (to locate the tracked "
-            "landings.jsonl riding marathon/next). Default: "
-            "~/Desktop/marathon-runs/landing/<repo-name>/."
-        ),
-    )
-    p_stat.set_defaults(func=_run_landing_status)
-
-    p_prom = sub.add_parser(
-        "promote",
-        help=(
-            "Fast-forward-only merge of marathon/next into the base "
-            "branch (refuses on divergence)."
-        ),
-    )
-    p_prom.add_argument(
-        "--repo-dir", type=Path, default=None, metavar="PATH",
-        help="Consumer repo root. Default: walk up from the current directory.",
-    )
-    p_prom.add_argument(
-        "--base", default="main", metavar="BRANCH",
-        help="Branch to fast-forward to origin/marathon/next. Default: main.",
-    )
-    p_prom.set_defaults(func=_run_landing_promote)
 
 
 def _add_audit_subparser(subparsers) -> None:
@@ -2480,40 +2358,6 @@ def _run_audit_vacuity_probe(args) -> None:
     )
 
 
-def _run_landing_run(args) -> None:
-    from marathon.landing import run_landing
-
-    rc = run_landing(
-        repo_dir=args.repo_dir.resolve() if args.repo_dir else None,
-        once=args.once,
-        worktree_parent=args.worktree_parent,
-        base=args.base,
-        build_timeout=args.build_timeout,
-    )
-    if rc:
-        raise SystemExit(rc)
-
-
-def _run_landing_status(args) -> None:
-    from marathon.landing import print_landing_status
-    from marathon.review.config import find_repo_dir
-
-    repo_dir: Path = args.repo_dir.resolve() if args.repo_dir else find_repo_dir()
-    rc = print_landing_status(repo_dir, worktree_parent=args.worktree_parent)
-    if rc:
-        raise SystemExit(rc)
-
-
-def _run_landing_promote(args) -> None:
-    from marathon.landing import promote
-
-    rc = promote(
-        args.repo_dir.resolve() if args.repo_dir else None, base=args.base
-    )
-    if rc:
-        raise SystemExit(rc)
-
-
 def _run_conductor_status(args) -> None:
     from marathon.conductor import print_status
     from marathon.review.config import find_repo_dir
@@ -3016,16 +2860,6 @@ def main() -> None:
         # Dispatch via the subparser's set_defaults(func=…) handler — a
         # short-lived read-only proving-progress query.
         args.func(args)
-    elif args.command == "landing":
-        # Dispatch via the subparser's set_defaults(func=…) handler. A
-        # Ctrl-C mid-landing is safe: every attempt starts by realigning
-        # the worktree to origin/marathon/next, and the popped request's
-        # work is re-derivable from the per-issue branch/PR.
-        try:
-            args.func(args)
-        except KeyboardInterrupt:
-            print("\ninterrupted", file=sys.stderr)
-            sys.exit(130)
     elif args.command == "audit":
         # Dispatch via the subparser's set_defaults(func=…) handler. All
         # subcommands are short-lived synchronous calls; `run`'s lake

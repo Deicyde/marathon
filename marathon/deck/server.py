@@ -1194,37 +1194,18 @@ def _count_running(cfg: "ReviewConfig") -> int:
 
 
 def _status_landings(cfg: "ReviewConfig", limit: int = 10) -> list[dict]:
-    from marathon.landing import LANDINGS_RELPATH
-
-    path = Path(cfg.repo_dir) / LANDINGS_RELPATH
-    if not path.is_file():
-        return []
-    rows: list[dict] = []
-    try:
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except (ValueError, TypeError):
-                continue
-    except OSError:
-        return []
-    return rows[-limit:]
+    """The opt-in landing-queue record this read is gone (deleted feature). The
+    real merged-PR landings are on the Status tab via conductor_status; this
+    lightweight poll field is now always empty (it always was — the queue was
+    default-off)."""
+    return []
 
 
 def _status_bounces(cfg: "ReviewConfig", limit: int = 5) -> list[str]:
-    from marathon.landing import BOUNCES_RELPATH
-
-    bdir = Path(cfg.repo_dir) / BOUNCES_RELPATH
-    if not bdir.is_dir():
-        return []
-    try:
-        reports = sorted(p.name for p in bdir.glob("*.md"))
-    except OSError:
-        return []
-    return reports[-limit:]
+    """Landing-queue bounce reports — the queue is deleted, so always empty.
+    (A refine that fails to build never leaves the per-issue --auto-pr flow;
+    its failure shows as a stalled issue, not a landing bounce.)"""
+    return []
 
 
 # ---------------------------------------------------------------------------

@@ -739,10 +739,11 @@ def test_post_verdict_cross_origin_refused(running_server):
 
 
 def test_status_emits_from_runtime_files(tmp_path, monkeypatch):
-    """The status pane reads conductor jobs.json + landing landings.jsonl
-    purely from disk."""
+    """The status poll blob reads conductor jobs.json purely from disk. (The
+    landing queue — landings.jsonl / bounces — was deleted; the poll blob's
+    landings/bounces are now always empty. Real merged-PR landings live on the
+    Status tab via conductor_status._recent_landings.)"""
     cfg = make_cfg(tmp_path)
-    # Fabricate a conductor jobs.json with one running job.
     from marathon.conductor import ConductorJob, write_jobs_snapshot
 
     job = ConductorJob(
@@ -754,30 +755,18 @@ def test_status_emits_from_runtime_files(tmp_path, monkeypatch):
     )
     write_jobs_snapshot(cfg.repo_dir, [job], concurrency=2)
 
-    # Fabricate two landings (one today).
-    from marathon.landing import LANDINGS_RELPATH
-
-    lpath = cfg.repo_dir / LANDINGS_RELPATH
-    lpath.parent.mkdir(parents=True, exist_ok=True)
-    today = __import__("datetime").datetime.now(
-        __import__("datetime").timezone.utc
-    ).strftime("%Y-%m-%d")
-    lpath.write_text(
-        json.dumps({"issue": 21, "ts": f"{today}T02:00:00+00:00"}) + "\n"
-        + json.dumps({"issue": 20, "ts": "2020-01-01T00:00:00+00:00"}) + "\n"
-    )
-
     status = deck_server.collect_status(cfg)
     assert status["building"] == 1
     assert len(status["jobs"]) == 1
     assert status["jobs"][0]["issue_num"] == 23
     assert status["jobs"][0]["aristotle_status"] == "RUNNING"
-    assert len(status["landings"]) == 2
+    assert status["landings"] == [] and status["bounces"] == []
 
-    # And the queue's landed_today counter only counts today's landing.
+    # landed_today is 0 now (its landing-queue source is gone; merged-PR count
+    # is a follow-up). The queue still builds + counts building jobs.
     patch_bulk(monkeypatch, _bodies_for({22: "Foo", 23: "Bar", 24: "Baz"}))
     queue = cards.build_queue(cfg, chapter=14)
-    assert queue.landed_today == 1
+    assert queue.landed_today == 0
     assert queue.building == 1
 
 

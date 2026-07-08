@@ -372,10 +372,9 @@ def _swr(key: str, ttl: float, fetch):
 
 def _recent_landings(cfg: "ReviewConfig", limit: int = 8) -> list[dict]:
     """Recently LANDED issues — an issue's Aristotle fix MERGED onto main (a
-    merged ``marathon/refine-c*-i*`` PR; the opt-in ``--land next`` queue folded
-    in). Newest-first, capped. Stale-while-revalidate cached ~60s per repo, so a
-    slow ``gh`` never blocks the Status poll into a 502. Pure read; ``[]`` on
-    failure."""
+    merged ``marathon/refine-c*-i*`` PR). Newest-first, capped.
+    Stale-while-revalidate cached ~60s per repo, so a slow ``gh`` never blocks
+    the Status poll into a 502. Pure read; ``[]`` on failure."""
     def _compute() -> list[dict]:
         out: list[dict] = []
         for pr in _merged_prs(cfg, max(limit * 3, 20)):
@@ -383,21 +382,6 @@ def _recent_landings(cfg: "ReviewConfig", limit: int = 8) -> list[dict]:
             if m:
                 out.append({"issue": int(m.group(1)), "pr": pr.get("number"),
                             "ts": pr.get("merged_at")})
-        try:
-            from marathon.landing import LANDINGS_RELPATH
-
-            path = Path(cfg.repo_dir) / LANDINGS_RELPATH
-            if path.is_file():
-                for line in path.read_text().splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        out.append(json.loads(line))
-                    except (ValueError, TypeError):
-                        continue
-        except Exception:  # noqa: BLE001
-            pass
         out.sort(key=lambda r: r.get("ts") or "", reverse=True)
         return out
 

@@ -874,30 +874,11 @@ def _building_count(cfg: "ReviewConfig") -> int:
 
 
 def _landed_today_count(cfg: "ReviewConfig") -> int:
-    """Successful landings recorded today (UTC), from the landing record
-    JSONL. Read purely; 0 when there is no landing record."""
-    from marathon.landing import LANDINGS_RELPATH
-
-    path = Path(cfg.repo_dir) / LANDINGS_RELPATH
-    if not path.is_file():
-        return 0
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    count = 0
-    try:
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except (ValueError, TypeError):
-                continue
-            ts = str(row.get("ts", ""))
-            if ts.startswith(today):
-                count += 1
-    except OSError:
-        return 0
-    return count
+    """The 'landed today' queue stat. The opt-in landing-queue JSONL this used
+    to read is gone (default-off feature, deleted); computing this from merged
+    refine PRs is a deck-signals follow-up. The Status tab's 'Recent landings'
+    already shows the real merged-PR landings, so this returns 0 for now."""
+    return 0
 
 
 # ---------------------------------------------------------------------------
