@@ -417,8 +417,6 @@ def test_import_all_is_idempotent(tmp_path):
         "issues": 2,
         "verdict_events": 2,
         "decl_verdicts": 0,  # v2 table; import_all never writes it
-        "targets": 0,  # v3 tables; import_all never writes them
-        "target_deps": 0,
         "chapters": 1,
         "wall_time": 2,
         "prompt_log": 2,

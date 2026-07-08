@@ -374,7 +374,6 @@ class _DeckContext:
     tiers_by_decl: dict  # {decl_name: TierResult}
     issue_meta: dict  # {issue_num: {title, body, labels, ...}} (may be {})
     verdict_status: dict  # {issue_num: status str}  ('verified'/'rejected'/...)
-    target_deps_by_decl: dict  # {decl_name: set[decl_name]} planner edges
     repo_dir: object = None  # Path — for reading failed modules' source
     # Bare decl names defined in modules the last audit recorded as FAILING to
     # build. An issue citing one references code that does not compile → its own
@@ -386,8 +385,8 @@ class _DeckContext:
 def _load_context(
     cfg: "ReviewConfig", issue_nums: list[int]
 ) -> _DeckContext:
-    """Read the snapshot, tiers, issue metadata, verdict statuses, and any
-    planner dep edges for ``issue_nums`` — all read-only, all degrading."""
+    """Read the snapshot, tiers, issue metadata, and verdict statuses for
+    ``issue_nums`` — all read-only, all degrading."""
     # Local imports: keep this module importable on a checkout whose audit
     # / ledger deps are lazy (mirrors the review CLI's audit↔review
     # boundary discipline).
@@ -398,13 +397,11 @@ def _load_context(
     tiers_by_decl = _tiers_by_decl(cfg, snapshot)
     issue_meta = fetch_issues_bulk(issue_nums, cfg.github_repo) or {}
     verdict_status = _verdict_status(cfg, issue_meta)
-    target_deps_by_decl = _planner_deps_by_decl(cfg)
     return _DeckContext(
         snapshot=snapshot,
         tiers_by_decl=tiers_by_decl,
         issue_meta=issue_meta,
         verdict_status=verdict_status,
-        target_deps_by_decl=target_deps_by_decl,
         repo_dir=cfg.repo_dir,
         broken_module_decls=_failed_module_decls(cfg.repo_dir, snapshot),
         issue_chapter={
@@ -527,43 +524,6 @@ def _verdict_status(cfg: "ReviewConfig", issue_meta: Optional[dict] = None) -> d
     return out
 
 
-def _planner_deps_by_decl(cfg: "ReviewConfig") -> dict:
-    """``{decl_name: {decl_name, ...}}`` from the planner's ``target_deps``
-    DAG (a target depends on the targets it must land after), keyed by the
-    target's ``lean_decl`` so it composes with the issue↔decl map. Empty
-    when no planner targets exist (today's GeometricAnalysis state) — pure
-    read, fully degrading."""
-    from marathon.ledger import Ledger
-
-    try:
-        ledger = Ledger.for_review_config(cfg)
-        targets = ledger.all_targets()
-        edges = ledger.all_target_deps()
-    except Exception:  # noqa: BLE001 — no planner ledger → no extra deps
-        return {}
-    by_id = {t.id: t for t in targets if t.id is not None}
-    out: dict[str, set] = {}
-    for target_id, dep_id in edges:
-        target = by_id.get(target_id)
-        dep = by_id.get(dep_id)
-        if target is None or dep is None:
-            continue
-        td = target.lean_decl or target.name
-        dd = dep.lean_decl or dep.name
-        if td and dd:
-            out.setdefault(td, set()).add(dd)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Issue ↔ decl resolution (reusing the single committed parser)
-# ---------------------------------------------------------------------------
-
-
-#: A line carries the LLM-rendered "verification pending" marker when it
-#: mentions both halves (matches both textual variants the project emits —
-#: spec_auditor's "LLM-rendered, verification pending" and the coreviewer's
-#: "LLM-rendered from common knowledge; verification pending").
 def _is_llm_marker_line(line: str) -> bool:
     return "LLM-rendered" in line and "verification pending" in line
 
@@ -727,9 +687,6 @@ def _predecessor_issues(
             kernel = compute_kernel(decl, ctx.snapshot)
             dep_decls.update(m.name for m in kernel.members)
             dep_decls.update(kernel.local_lemmas)
-    # (b) planner edges.
-    for decl in own_decls:
-        dep_decls.update(ctx.target_deps_by_decl.get(decl, ()))
 
     # A decl the issue OWNS is not an external dependency. The kernel cone of a
     # card's decls includes those decls themselves, and decl→issue ownership maps
