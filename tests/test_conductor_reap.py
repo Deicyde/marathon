@@ -122,23 +122,66 @@ def test_reap_guard_refuses_inherited_running_row(monkeypatch, tmp_path):
     assert conductor._reap_orphan_worktree(tmp_path, "marathon/refine-c12-i96") is False
 
 
-def test_inherit_running_worktrees_filters_by_status_and_liveness(tmp_path):
+def _job(**kw):
+    base = dict(issue_num=7, chapter=15, target="Demo/Chapter15",
+               worktree="/wt/x", workdir="/wd/x",
+               branch="marathon/refine-c15-i7", pid=1, status="running")
+    base.update(kw)
+    return conductor.ConductorJob(**base)
+
+
+def test_adopt_inherited_jobs_filters_by_status_and_liveness(tmp_path):
     import subprocess
     dead = subprocess.Popen(["true"])
     dead.wait()
-    snap_dir = tmp_path / ".marathon" / "conductor"
-    snap_dir.mkdir(parents=True)
-    (snap_dir / "jobs.json").write_text(json.dumps({
-        "schema_version": 1,
-        "jobs": [
-            {"status": "running", "pid": os.getpid(), "worktree": "/wt/alive"},
-            {"status": "running", "pid": dead.pid, "worktree": "/wt/dead"},
-            {"status": "succeeded", "pid": os.getpid(), "worktree": "/wt/done"},
-            {"status": "running", "pid": None, "worktree": "/wt/nopid"},
-        ],
-    }))
-    got = conductor._inherit_running_worktrees(tmp_path)
-    assert got == {"/wt/alive": os.getpid()}
+    conductor.write_jobs_snapshot(tmp_path, [
+        _job(issue_num=1, pid=os.getpid(), worktree="/wt/alive"),
+        _job(issue_num=2, pid=dead.pid, worktree="/wt/dead"),
+        _job(issue_num=3, pid=os.getpid(), worktree="/wt/done", status="succeeded"),
+    ], 1)
+    adopted = conductor._adopt_inherited_jobs(tmp_path)
+    # only the alive RUNNING job is adopted, as a tracked job with no proc handle
+    assert [j.issue_num for j in adopted] == [1]
+    assert adopted[0].proc is None and adopted[0].pid == os.getpid()
+    # and the reap/prune guard map is populated from it
+    assert conductor._INHERITED_RUNNING == {"/wt/alive": os.getpid()}
+
+
+def test_reap_adopted_job_with_pr_marks_iterated(monkeypatch, tmp_path):
+    # An adopted refine that finished WITH a PR → record_iteration (so it isn't
+    # re-dispatched) + worktree removed; automerge lands the PR separately.
+    import marathon.conductor as c
+    calls = {"iterated": [], "removed": []}
+    monkeypatch.setattr(c, "_branch_pr_exists", lambda cfg, b: True)
+    monkeypatch.setattr(c, "record_iteration",
+                        lambda cfg, n: calls["iterated"].append(n))
+    monkeypatch.setattr(c, "_remove_worktree",
+                        lambda repo, w: calls["removed"].append(str(w)))
+    monkeypatch.setattr(c, "_regenerate_metadata_after_success", lambda cfg: None)
+    job = _job(issue_num=42, worktree=str(tmp_path / "wt-i42"))
+    c._reap_adopted_job(SimpleNamespace(repo_dir=tmp_path), job, {}, reconcile=True)
+    assert job.status == "succeeded"
+    assert calls["iterated"] == [42]
+    assert calls["removed"] == [str(tmp_path / "wt-i42")]
+
+
+def test_reap_adopted_job_without_pr_requeues(monkeypatch, tmp_path):
+    # An adopted refine that finished with NO PR → keep worktree + run the
+    # no-PR requeue path; NEVER record_iteration (would wrongly consume it).
+    import marathon.conductor as c
+    calls = {"iterated": 0, "requeued": []}
+    monkeypatch.setattr(c, "_branch_pr_exists", lambda cfg, b: False)
+    monkeypatch.setattr(c, "record_iteration",
+                        lambda cfg, n: calls.__setitem__("iterated", calls["iterated"] + 1))
+    monkeypatch.setattr(c, "_requeue_if_no_pr_landed",
+                        lambda cfg, job: calls["requeued"].append(job.issue_num))
+    kept: dict = {}
+    job = _job(issue_num=42, worktree=str(tmp_path / "wt-i42"))
+    c._reap_adopted_job(SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True)
+    assert job.status == "failed"
+    assert calls["iterated"] == 0
+    assert calls["requeued"] == [42]
+    assert kept == {42: str(tmp_path / "wt-i42")}
 
 
 def test_pid_marker_write_is_self_ignoring(tmp_path):

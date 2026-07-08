@@ -93,6 +93,7 @@ from marathon.review.config import ReviewConfig, load_config
 from marathon.review.state import (
     load_state,
     pending_rejections_needing_iteration,
+    record_iteration,
 )
 from marathon.state import load_refine_state, now_iso
 
@@ -635,26 +636,38 @@ def _worktree_live_pid(worktree: str) -> Optional[int]:
     return None
 
 
-def _inherit_running_worktrees(repo_dir: Path) -> dict[str, int]:
-    """``{worktree: pid}`` of still-alive jobs recorded by a PREVIOUS
-    conductor's snapshot. Called once at startup, BEFORE the first
-    ``write_jobs_snapshot`` erases those rows: a pkill'd conductor's
-    refine children survive it (their own process group), and reaping
-    their worktrees mid-run destroys a fully billed Aristotle iteration
-    (the 2026-07-07 #171 incident — 29.2m of Aristotle into a gutted
-    directory, then a 3h39m re-run)."""
-    out: dict[str, int] = {}
+def _adopt_inherited_jobs(repo_dir: Path) -> list["ConductorJob"]:
+    """ConductorJobs for still-alive refines a PREVIOUS conductor left running,
+    reconstructed from its jobs snapshot at startup — BEFORE the first
+    ``write_jobs_snapshot`` erases those rows (a pkill'd conductor's refine
+    children survive it in their own process group).
+
+    ADOPTING them as tracked jobs (``proc is None`` — we didn't spawn them, so
+    they're polled via the pid) does two things a bare worktree-protection map
+    can't: ``_pick_dispatchable`` sees the issue/target as busy and won't
+    RE-DISPATCH a duplicate billed run while the inherited refine finishes; and
+    ``_reap_finished`` handles the inherited job's completion (mark iterated if
+    it opened a PR, else requeue-if-no-PR) instead of leaving a re-dispatch
+    race. Without this, a mid-refine restart protected the worktree from
+    destruction but still burned a wasteful duplicate run when it finished.
+
+    Also (re)populates ``_INHERITED_RUNNING`` so the reap/prune guards protect
+    these worktrees even on the (now unreachable via dispatch) collision path."""
+    _INHERITED_RUNNING.clear()
+    out: list["ConductorJob"] = []
     snap = load_jobs_snapshot(repo_dir)
     for raw in (snap or {}).get("jobs", []):
         pid, worktree = raw.get("pid"), raw.get("worktree")
         if raw.get("status") != "running" or not pid or not worktree:
             continue
         try:
-            alive = daemon.process_alive(int(pid))
+            if not daemon.process_alive(int(pid)):
+                continue
         except (TypeError, ValueError):
             continue
-        if alive:
-            out[str(worktree)] = int(pid)
+        job = ConductorJob.from_json(raw)   # proc/log_handle are runtime-only → None
+        out.append(job)
+        _INHERITED_RUNNING[str(worktree)] = int(pid)
     return out
 
 
@@ -1371,6 +1384,65 @@ def _enqueue_landing_after_success(cfg: ReviewConfig, job: ConductorJob) -> None
         )
 
 
+def _branch_pr_exists(cfg: ReviewConfig, branch: str) -> Optional[bool]:
+    """True/False whether ANY PR (open or merged) exists for ``branch``, or
+    None if the check couldn't run (gh missing/errored). Shared by the no-PR
+    requeue and the adopted-job completion path."""
+    from marathon.review.github import gh
+
+    try:
+        cp = gh("pr", "list", "--repo", cfg.github_repo, "--head", branch,
+                "--state", "all", "--json", "number", "--limit", "1", check=False)
+        if cp.returncode != 0:
+            return None
+        return bool(json.loads(cp.stdout or "[]"))
+    except Exception as exc:  # noqa: BLE001 — a check failure must not crash a reap
+        print(f"  PR check for {branch} failed ({exc}); skipping", flush=True)
+        return None
+
+
+def _reap_adopted_job(
+    cfg: ReviewConfig, job: ConductorJob, kept_worktrees: dict[int, str],
+    *, reconcile: bool,
+) -> None:
+    """An ADOPTED refine (inherited from a previous conductor, no proc handle)
+    has exited. We can't read its exit code, so decide by PR presence on its
+    branch: a PR means the refine SUCCEEDED (it built + opened it) → mark the
+    issue iterated so it isn't re-dispatched (automerge lands the PR → requeue);
+    no PR + still rejected → the no-diff case, requeue for re-review; a genuine
+    failure (no PR, gh unavailable) leaves it rejected to retry fresh next tick.
+    A fill/repair is autonomous (no rejection state) → just clean up."""
+    job.finished_ts = now_iso()
+    _clear_worktree_pid_marker(job.worktree)
+    if job.fill or job.repair:
+        job.status = "succeeded"
+        _remove_worktree(cfg.repo_dir, Path(job.worktree))
+        print(f"    adopted autonomous job #{job.issue_num} finished; cleaned up",
+              flush=True)
+        return
+    has_pr = _branch_pr_exists(cfg, job.branch) if job.branch else None
+    if has_pr:
+        job.status = "succeeded"
+        record_iteration(cfg, job.issue_num)  # iterated → not re-dispatched
+        _remove_worktree(cfg.repo_dir, Path(job.worktree))
+        _regenerate_metadata_after_success(cfg)
+        print(f"--- adopted #{job.issue_num} refine (prior conductor) finished "
+              f"with a PR on {job.branch}; marked iterated, automerge will land "
+              "it ---", flush=True)
+    else:
+        # No PR (or gh down): keep the worktree; requeue-if-no-PR handles the
+        # no-diff stuck case; a real failure stays rejected to retry fresh.
+        job.status = "failed"
+        kept_worktrees[job.issue_num] = job.worktree
+        if reconcile:
+            try:
+                _requeue_if_no_pr_landed(cfg, job)
+            except Exception as exc:  # noqa: BLE001 — never crash a reap
+                print(f"  adopted no-PR requeue check failed: {exc}", flush=True)
+        print(f"--- adopted #{job.issue_num} refine finished with NO PR "
+              f"(kept worktree) ---", flush=True)
+
+
 def _requeue_if_no_pr_landed(cfg: ReviewConfig, job: ConductorJob) -> None:
     """A per-issue refine that exits clean but opened NO PR (typically because
     Aristotle produced no diff) leaves its issue stuck 'rejected' — iterated, but
@@ -1382,20 +1454,12 @@ def _requeue_if_no_pr_landed(cfg: ReviewConfig, job: ConductorJob) -> None:
     if not branch:
         return
     from marathon.review.automerge import _REFINE_BRANCH_RE, _requeue_refined_issue
-    from marathon.review.github import gh
 
     if not _REFINE_BRANCH_RE.match(branch):
         return
-    try:
-        cp = gh("pr", "list", "--repo", cfg.github_repo, "--head", branch,
-                "--state", "all", "--json", "number", "--limit", "1", check=False)
-        if cp.returncode != 0:
-            return
-        if json.loads(cp.stdout or "[]"):
-            return  # a PR exists — let the normal merge → requeue path handle it
-    except Exception as exc:  # noqa: BLE001 — a check failure must not crash a reap
-        print(f"  no-PR check for {branch} failed ({exc}); skipping", flush=True)
-        return
+    exists = _branch_pr_exists(cfg, branch)
+    if exists is None or exists:
+        return  # gh error (skip), or a PR exists (normal merge → requeue path)
     st = load_state(cfg).issues.get(job.issue_num)
     if st is not None and getattr(st, "status", None) == "rejected":
         # landed=False: NOTHING merged here (no diff → no PR). A 'fix landed'
@@ -1502,7 +1566,17 @@ def _reap_finished(
     Returns the number of jobs reaped this tick."""
     reaped = 0
     for job in jobs:
-        if job.status != "running" or job.proc is None:
+        if job.status != "running":
+            continue
+        if job.proc is None:
+            # ADOPTED job (inherited from a previous conductor — we didn't
+            # spawn it, so there's no Popen to poll). Track it via the pid; on
+            # exit handle it without an exit code (we can't read one).
+            if job.pid is not None and daemon.process_alive(job.pid):
+                _refresh_job_runtime(job)
+                continue
+            reaped += 1
+            _reap_adopted_job(cfg, job, kept_worktrees, reconcile=reconcile)
             continue
         rc = job.proc.poll()
         if rc is None:
@@ -2110,19 +2184,20 @@ def run_conductor(
     if dispatch_env_error is not None:
         print(f"⚠️  DEGRADED: {dispatch_env_error}", flush=True)
 
-    # Capture still-alive jobs from a PREVIOUS conductor's snapshot BEFORE the
-    # first write_jobs_snapshot erases those rows — the reap guard consults
-    # this map so a restart never destroys a running (billed) refine.
-    _INHERITED_RUNNING.clear()
-    _INHERITED_RUNNING.update(_inherit_running_worktrees(cfg.repo_dir))
-    for wt, pid in _INHERITED_RUNNING.items():
+    # ADOPT still-alive refines from a PREVIOUS conductor's snapshot BEFORE the
+    # first write_jobs_snapshot erases those rows. Tracking them as running jobs
+    # (proc=None) means we neither reap their worktree (destruction) nor
+    # re-dispatch their issue (a wasteful duplicate billed run) — a mid-refine
+    # restart is now fully clean.
+    jobs: list[ConductorJob] = _adopt_inherited_jobs(cfg.repo_dir)
+    for j in jobs:
         print(
-            f"  inherited live job from a previous conductor: pid {pid} in "
-            f"{wt} — worktree protected from reaping until it exits",
+            f"  adopted live job from a previous conductor: #{j.issue_num} "
+            f"pid {j.pid} in {j.worktree} — tracked (not reaped, not "
+            "re-dispatched) until it exits",
             flush=True,
         )
 
-    jobs: list[ConductorJob] = []
     not_before: dict[int, float] = {}
     kept_worktrees: dict[int, str] = {}
     warned_unknown: set[int] = set()
