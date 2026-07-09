@@ -64,6 +64,28 @@ def test_scope_of_downstream_chapter_includes_upstream(tmp_path):
     assert excluded == []
 
 
+def test_scope_can_include_prompt_cited_context_without_downstream(tmp_path):
+    """A rejection note may point at an upstream helper not imported yet. Ship
+    that file as read-only context without reopening the downstream floodgate."""
+    repo = _mk_repo(tmp_path)
+    (repo / "Demo" / "Chapter1").mkdir(parents=True)
+    (repo / "Demo" / "Chapter1" / "BoundarySmooth.lean").write_text(
+        "import Demo.Chapter14.Alt\ndef boundarySmooth : Nat := alt14\n"
+    )
+
+    allowed, excluded = mc.target_scope(
+        repo,
+        repo / "Demo" / "Chapter15",
+        extra_seed_modules={"Demo.Chapter1.BoundarySmooth"},
+    )
+
+    assert "Demo.Chapter1.BoundarySmooth" in allowed
+    assert "Demo.Chapter14.Alt" in allowed          # context file's upstream dep
+    assert "Demo.Chapter16.Stokes" not in allowed   # downstream still excluded
+    assert "Demo/Chapter1/BoundarySmooth.lean" not in excluded
+    assert "Demo/Chapter16/Stokes.lean" in excluded
+
+
 def test_closure_ignores_external_imports(tmp_path):
     repo = _mk_repo(tmp_path)
     mmap = mc.local_module_map(repo)
@@ -91,6 +113,36 @@ def test_submission_dir_scoped_to_target(tmp_path):
     assert (staged / "Demo" / "Chapter14" / "Alt.lean").is_file()
     assert (staged / "Demo.lean").is_file()
     assert (staged / "lakefile.toml").is_file()      # scaffolding always ships
+    assert not (staged / "Demo" / "Chapter16" / "Stokes.lean").exists()
+    assert not (staged / "Demo" / "Chapter16" / "Orphan.lean").exists()
+
+
+def test_submission_dir_includes_prompt_cited_context(tmp_path):
+    """Regression for #171-like focused rejections: if the prompt says "look
+    at BoundarySmooth.lean", the scoped Aristotle bundle must contain it."""
+    from marathon.refine import _build_refine_submission_dir
+
+    repo = _mk_repo(tmp_path)
+    (repo / "Demo" / "Chapter1").mkdir(parents=True)
+    cited = repo / "Demo" / "Chapter1" / "BoundarySmooth.lean"
+    cited.write_text(
+        "import Demo.Chapter14.Alt\ndef boundarySmooth : Nat := alt14\n"
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+
+    work = tmp_path / "work"
+    work.mkdir()
+    staged = _build_refine_submission_dir(
+        repo_dir=repo,
+        tex_path=None,
+        workdir_log=None,
+        work_dir=work,
+        target_dir=repo / "Demo" / "Chapter15",
+        bundle_context_text=f"Use {cited}:12 as the existing boundary API.",
+    )
+    assert (staged / "Demo" / "Chapter1" / "BoundarySmooth.lean").is_file()
+    assert (staged / "Demo" / "Chapter14" / "Alt.lean").is_file()
     assert not (staged / "Demo" / "Chapter16" / "Stokes.lean").exists()
     assert not (staged / "Demo" / "Chapter16" / "Orphan.lean").exists()
 

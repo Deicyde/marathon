@@ -19,6 +19,7 @@ Claude is never given the ``.tex`` file — Marathon reads its bytes only to
 include them in the Aristotle bundle.
 """
 
+import re
 import shutil
 import sys
 import tempfile
@@ -501,22 +502,109 @@ prior entries.
 """
 
 
+_LEAN_PATH_TOKEN_RE = re.compile(
+    r"(?P<path>(?:[A-Za-z]:)?/?[A-Za-z0-9_./+@~\\-]+\.lean)"
+    r"(?::\d+(?::\d+)?)?"
+    r"(?:#L\d+(?:-L\d+)?)?"
+)
+
+
+def _mentioned_repo_lean_modules(repo_dir: Path, text: Optional[str]) -> set[str]:
+    """Return project-local Lean modules explicitly mentioned in prompt text.
+
+    Focused rejection notes often cite helper files by absolute editor links
+    (``/repo/Foo/Bar.lean:123``) or by repo-relative paths. The bundle scoper
+    is intentionally upstream-only by default, but when a prompt names a Lean
+    file we must ship that file as read-only context; otherwise Aristotle is
+    asked to follow a breadcrumb Marathon removed from the submission.
+    """
+    if not text:
+        return set()
+
+    try:
+        from marathon.module_closure import local_module_map
+
+        module_map = local_module_map(repo_dir)
+    except Exception:  # noqa: BLE001 — context widening is best-effort
+        return set()
+
+    repo_dir = repo_dir.resolve()
+    rel_to_mod = {
+        resolved.relative_to(repo_dir).as_posix(): mod
+        for mod, path in module_map.items()
+        for resolved in [path.resolve()]
+        if resolved.is_relative_to(repo_dir)
+    }
+    if not rel_to_mod:
+        return set()
+
+    hits: set[str] = set()
+
+    def add_rel(rel: str) -> None:
+        rel = rel.replace("\\", "/").lstrip("./")
+        mod = rel_to_mod.get(rel)
+        if mod is not None:
+            hits.add(mod)
+
+    def add_token(raw: str) -> None:
+        token = raw.strip().strip("`'\"<>()[]{}.,;")
+        token = token.split("#", 1)[0]
+        token = re.sub(r":\d+(?::\d+)?$", "", token)
+        token = token.replace("\\", "/")
+        if not token:
+            return
+
+        path = Path(token)
+        if path.is_absolute():
+            try:
+                add_rel(path.resolve().relative_to(repo_dir).as_posix())
+                return
+            except (OSError, ValueError):
+                pass
+
+        add_rel(token)
+        if token.startswith("./"):
+            add_rel(token[2:])
+        matches = [
+            rel for rel in rel_to_mod
+            if rel.endswith("/" + token) or rel == token
+        ]
+        if len(matches) == 1:
+            add_rel(matches[0])
+
+    for match in _LEAN_PATH_TOKEN_RE.finditer(text):
+        add_token(match.group("path"))
+
+    # Fallback for Markdown/editor links whose punctuation confused the token
+    # regex: if the repo-relative path appears verbatim, it is a cited module.
+    normalized = text.replace("\\", "/")
+    for rel, mod in rel_to_mod.items():
+        if rel in normalized:
+            hits.add(mod)
+
+    return hits
+
+
 def _build_refine_submission_dir(
     repo_dir: Path,
     tex_path: Optional[Path],
     workdir_log: Optional[Path],
     work_dir: Path,
     target_dir: Optional[Path] = None,
+    bundle_context_text: Optional[str] = None,
 ) -> Path:
     """Stage the Aristotle submission tree.
 
     With ``target_dir``, the staged tree is SCOPED to the target's import
-    closure: a ``.lean`` file ships only if the target chapter (or the
-    lakefile's root lib) transitively imports it. Downstream consumers and
+    closure plus any prompt-cited Lean context: a ``.lean`` file ships only if
+    the target chapter (or the lakefile's root lib) transitively imports it, or
+    if the human/Claude prompt explicitly names it. Downstream consumers and
     orphans are excluded — a broken module the iteration is not allowed to
     touch must never ride along and poison Aristotle's own verification
     (the #170 stall: Chapter 15 refines wedged COMPLETE_WITH_ERRORS on
-    Chapter 16 files that stopped compiling when Ch15's API moved).
+    Chapter 16 files that stopped compiling when Ch15's API moved). Prompt-
+    cited files remain read-only context; extraction still enforces the
+    writable path fence.
     Non-``.lean`` files (lakefile, toolchain, manifest, …) always ship."""
     staged = work_dir / "submission"
     staged.mkdir()
@@ -526,11 +614,26 @@ def _build_refine_submission_dir(
         try:
             from marathon.module_closure import target_scope
 
-            allowed, excluded = target_scope(repo_dir, target_dir)
+            context_modules = _mentioned_repo_lean_modules(
+                repo_dir, bundle_context_text
+            )
+            allowed, excluded = target_scope(
+                repo_dir,
+                target_dir,
+                extra_seed_modules=context_modules,
+            )
         except Exception as exc:  # noqa: BLE001 — scoping is a filter, never a blocker
             print(f"  bundle scope: skipped ({exc}); staging the full repo")
             allowed = None
         else:
+            if context_modules:
+                shown = sorted(context_modules)
+                print(
+                    f"  bundle scope: adding {len(shown)} prompt-cited "
+                    "context module(s): "
+                    + ", ".join(shown[:4])
+                    + (", …" if len(shown) > 4 else "")
+                )
             if excluded:
                 print(
                     f"  bundle scope: {len(allowed)} module(s) in the target's "
@@ -638,6 +741,7 @@ async def _submit_fresh_refine(
     attempt_idx: int,
     max_retries: int,
     target_dir: Optional[Path] = None,
+    bundle_context_text: Optional[str] = None,
 ) -> Optional[tuple[Project, AgentTask]]:
     state.attempts += 1
     state.output_path = None
@@ -653,6 +757,7 @@ async def _submit_fresh_refine(
             workdir_log=workdir_log,
             work_dir=Path(stage_tmp),
             target_dir=target_dir,
+            bundle_context_text=bundle_context_text,
         )
         try:
             project, task = await submit_from_directory(prompt=prompt, project_dir=staged)
@@ -736,6 +841,8 @@ async def _run_refine_attempt(
     existing_mode: Optional[str] = None,
     review_rejection: Optional[int] = None,
     watcher_factory=None,
+    bundle_context_text: Optional[str] = None,
+    refine_log_path: Optional[Path] = None,
 ) -> Optional[TaskStatus]:
     """Run one Aristotle attempt for the current iteration. Returns the
     terminal ``TaskStatus``, or ``None`` for Marathon-level errors.
@@ -797,6 +904,7 @@ async def _run_refine_attempt(
             # iteration is judged by Chapter 15 (and upstream) ONLY — a broken
             # downstream chapter must not ride along to Aristotle.
             target_dir=repo_dir / Path(*expected_path.parts),
+            bundle_context_text=bundle_context_text,
         )
         if submitted is None:
             return None
@@ -1002,6 +1110,41 @@ async def _run_refine_attempt(
                 "after a clean build/commit — the work is committed in this "
                 "worktree but did not land. Preserving the worktree for retry."
             )
+        build_result = pipeline_result.get("build")
+        if getattr(build_result, "ok", None) is False:
+            tail = (getattr(build_result, "log_tail", None) or "").strip()
+            summary = tail.splitlines()[-1][:180] if tail else "no build log tail"
+            print(
+                "  local build failed after Aristotle COMPLETE — treating as "
+                f"retryable Marathon failure ({summary})",
+                flush=True,
+            )
+            if refine_log_path is not None:
+                body = (
+                    "Marathon extracted Aristotle's output, but the local "
+                    "`lake build` gate failed. The next attempt must treat "
+                    "the current repo state and this build log as the ground "
+                    "truth; do not consider the prior Aristotle `COMPLETE` "
+                    "status a success.\n\n"
+                )
+                if tail:
+                    body += "```text\n" + tail + "\n```\n"
+                else:
+                    body += "(No build log tail was captured.)\n"
+                _append_refine_system_log(
+                    refine_log_path,
+                    iteration_idx,
+                    attempt_idx,
+                    "local build failure",
+                    body,
+                )
+            state.status = "POST_PIPELINE_BUILD_FAILED"
+            state.note = (
+                "Aristotle returned COMPLETE, but Marathon's local lake build "
+                f"failed; retrying fresh instead of marking success ({summary})"
+            )
+            save_refine_state(state_path, state)
+            return TaskStatus.FAILED
 
     return effective_status
 
@@ -1209,6 +1352,8 @@ async def _run_iteration(
             existing_mode=attempt_mode,
             review_rejection=review_rejection,
             watcher_factory=watcher_factory,
+            bundle_context_text=full_prompt,
+            refine_log_path=log_path,
         )
 
         if status is None:
@@ -1264,6 +1409,23 @@ def _append_refine_log(
             )
         f.write(f"\n\n{heading}\n\n")
         f.write(claude_response)
+        f.write("\n")
+
+
+def _append_refine_system_log(
+    log_path: Path,
+    iteration_idx: int,
+    attempt_idx: int,
+    title: str,
+    body: str,
+) -> None:
+    """Append Marathon-generated retry context to the refinement log."""
+    with log_path.open("a") as f:
+        f.write(
+            f"\n\n## Iteration {iteration_idx} attempt {attempt_idx + 1} — "
+            f"{title}\n\n"
+        )
+        f.write(body.rstrip())
         f.write("\n")
 
 

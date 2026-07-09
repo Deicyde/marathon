@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 import tomllib
+from collections.abc import Iterable
 from pathlib import Path
 
 from marathon.formalization import module_from_file_path
@@ -107,14 +108,23 @@ def lakefile_root_modules(
 
 
 def target_scope(
-    repo_dir: str | Path, target_dir: str | Path
+    repo_dir: str | Path,
+    target_dir: str | Path,
+    extra_seed_modules: Iterable[str] | None = None,
 ) -> "tuple[set[str], list[str]]":
     """``(allowed modules, excluded .lean rel-paths)`` for a run targeting
     *target_dir*.
 
-    Allowed = closure(target folder's modules ∪ lakefile root modules).
+    Allowed = closure(target folder's modules ∪ lakefile root modules ∪
+    extra_seed_modules).
     Excluded = every other mappable project ``.lean`` — downstream consumers
-    and orphans whose build state must not leak into this run's verdict."""
+    and orphans whose build state must not leak into this run's verdict.
+
+    ``extra_seed_modules`` is for read-only context explicitly cited by the
+    human/Claude prompt. These files still do not become writable; they merely
+    ride along in Aristotle's submission bundle so a focused rejection can
+    point at an upstream helper that is not imported by the current target yet.
+    """
     repo_dir = Path(repo_dir).resolve()
     target = Path(target_dir)
     if not target.is_absolute():
@@ -126,6 +136,8 @@ def target_scope(
         if f.resolve().is_relative_to(target)
     }
     seeds |= lakefile_root_modules(repo_dir, module_map)
+    if extra_seed_modules:
+        seeds |= {m for m in extra_seed_modules if m in module_map}
     allowed = import_closure(module_map, seeds)
     excluded = sorted(
         str(f.relative_to(repo_dir))
