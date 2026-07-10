@@ -513,6 +513,13 @@ def test_conductor_hands_verbatim_reject_note_to_worktree(monkeypatch, tmp_path)
         "Popen",
         lambda cmd, **kw: spawned.append(cmd) or SimpleNamespace(pid=4001),
     )
+    monkeypatch.setattr(
+        cond,
+        "_await_worker_handshake",
+        lambda _wt, proc, **_kw: {
+            "pid": proc.pid, "pgid": proc.pid, "status": "running",
+        },
+    )
 
     job = cond._dispatch_job(
         cfg, 22, 14, tmp_path / "runs", {22: str(worktree)}

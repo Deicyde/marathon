@@ -240,6 +240,7 @@ class ConductorJob:
     workdir: str                             # absolute path of the refine workdir
     branch: str                              # marathon/refine-c<N>-i<issue>
     pid: Optional[int] = None
+    pgid: Optional[int] = None               # detached process group/session id
     started_ts: Optional[str] = None         # ISO 8601
     finished_ts: Optional[str] = None        # ISO 8601
     status: str = "running"                  # running | succeeded | failed |
@@ -758,6 +759,12 @@ def _remove_worktree(repo_dir: Path, worktree: Path) -> None:
 #: snapshot alone can't carry this across a restart: the new conductor's first
 #: ``write_jobs_snapshot`` full-rewrites it with only its own (empty) job list.
 WORKTREE_PID_MARKER = Path(".marathon") / "conductor" / "refine.pid"
+# A pre-spawn launch marker with no PID means the trampoline has not completed
+# its marker handshake yet.  Protect the worktree briefly instead of confusing
+# "not observable yet" with "no worker" and reaping underneath a fork/exec.
+LAUNCH_INTENT_GRACE_SECONDS = 120.0
+LAUNCHING_PID_SENTINEL = -1
+WORKER_HANDSHAKE_TIMEOUT_SECONDS = 10.0
 
 #: ``{worktree_path_str: pid}`` for jobs a PREVIOUS conductor process left
 #: running (populated once at startup from the pre-restart jobs snapshot).
@@ -766,45 +773,258 @@ WORKTREE_PID_MARKER = Path(".marathon") / "conductor" / "refine.pid"
 _INHERITED_RUNNING: dict[str, int] = {}
 
 
-def _write_worktree_pid_marker(worktree: Path, pid: int) -> None:
-    """Drop the live-job marker into ``worktree`` (best-effort). Uses the
-    same self-ignoring convention as ``write_jobs_snapshot`` so the marker
-    neither dirties ``git status`` nor leaks into Aristotle bundles."""
+def _write_worktree_pid_marker(
+    worktree: Path,
+    pid: int,
+    *,
+    job: Optional["ConductorJob"] = None,
+) -> bool:
+    """Atomically persist a worktree's live worker identity.
+
+    Production dispatches include the complete job record.  That record is
+    first written with ``status=launching`` and no pid *before* ``Popen``, then
+    rewritten with the detached worker's pid.  A replacement conductor can
+    therefore recover a worker even if its parent dies between spawn and the
+    next repo-level ``jobs.json`` snapshot.  The pid-only form remains readable
+    for worktrees created by older Marathon releases.
+    """
     try:
         marker = worktree / WORKTREE_PID_MARKER
         marker.parent.mkdir(parents=True, exist_ok=True)
         gitignore = marker.parent / ".gitignore"
         if not gitignore.is_file():
             gitignore.write_text("*\n")
-        marker.write_text(f"{pid}\n")
+        if job is None:
+            content = f"{pid}\n"
+        else:
+            payload = job.to_json()
+            payload["marker_schema_version"] = 1
+            payload["pid"] = pid or None
+            content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        tmp = marker.with_name(f"{marker.name}.tmp-{os.getpid()}")
+        tmp.write_text(content)
+        tmp.replace(marker)
+        return True
     except OSError as e:
         print(f"  warning: could not write pid marker in {worktree} ({e})",
               flush=True)
-
-
-def _pid_is_job_for(pid: int, worktree: str) -> bool:
-    """True iff ``pid`` is alive AND is genuinely a marathon job running in
-    ``worktree`` — i.e. its command line references the worktree's unique
-    ``wt-i<issue>-<ts>`` basename (present via the refine's target path and
-    ``--repo-dir``). The basename identity check is what makes the liveness
-    test robust to PID REUSE: a bare ``os.kill(pid, 0)`` treats a recycled pid
-    (a different same-user process that inherited the number) as "the job is
-    alive", which would refuse the reap forever and re-open the #96 defer-loop
-    wedge. Basename (not full path) avoids macOS /private symlink normalization
-    mismatches between git's worktree list and the dispatch cmd."""
-    if not daemon.process_alive(pid):
         return False
-    name = Path(worktree).name
+
+
+def _read_worktree_job_marker(
+    worktree: str | Path,
+) -> tuple[Optional[int], Optional[dict]]:
+    """Return ``(pid, job_record)`` for new JSON and legacy integer markers."""
+    try:
+        raw = (Path(worktree) / WORKTREE_PID_MARKER).read_text().strip()
+    except OSError:
+        return None, None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None, None
+    if isinstance(parsed, int):
+        return parsed, None
+    if not isinstance(parsed, dict):
+        return None, None
+    try:
+        pid = int(parsed["pid"]) if parsed.get("pid") else None
+    except (TypeError, ValueError):
+        pid = None
+    return pid, parsed
+
+
+def _await_worker_handshake(
+    worktree: Path,
+    proc: object,
+    *,
+    timeout: float = WORKER_HANDSHAKE_TIMEOUT_SECONDS,
+) -> Optional[dict]:
+    """Wait until the detached trampoline durably publishes its PID/PGID."""
+    deadline = time.monotonic() + timeout
+    expected_pid = int(getattr(proc, "pid"))
+    while time.monotonic() < deadline:
+        pid, record = _read_worktree_job_marker(worktree)
+        if (
+            pid == expected_pid
+            and record is not None
+            and record.get("status") in {"ready", "running"}
+        ):
+            if record.get("status") == "ready":
+                try:
+                    acknowledged = ConductorJob.from_json(record)
+                    acknowledged.pid = expected_pid
+                    acknowledged.status = "running"
+                except (TypeError, ValueError):
+                    return None
+                if not _write_worktree_pid_marker(
+                    worktree, expected_pid, job=acknowledged
+                ):
+                    return None
+                record = acknowledged.to_json()
+            return record
+        poll = getattr(proc, "poll")
+        if poll() is not None:
+            return None
+        time.sleep(0.01)
+    return None
+
+
+def _canonical_worktree_key(worktree: str | Path) -> str:
+    """Canonical identity used to dedupe git/macOS path aliases."""
+    try:
+        return str(Path(worktree).resolve(strict=False))
+    except OSError:
+        return os.path.realpath(os.fspath(worktree))
+
+
+def _worktree_path_spellings(worktree: str | Path) -> set[str]:
+    """Raw + canonical path spellings that may appear in ``ps`` output."""
+    raw = os.path.abspath(os.fspath(worktree))
+    spellings = {raw, os.path.realpath(raw), _canonical_worktree_key(raw)}
+    # macOS commonly reports a /private-prefixed spelling for /tmp paths.
+    for value in tuple(spellings):
+        if value.startswith("/tmp/"):
+            spellings.add("/private" + value)
+        elif value.startswith("/private/tmp/"):
+            spellings.add(value[len("/private"):])
+    return {value for value in spellings if value}
+
+
+def _command_mentions_worktree(command: str, worktree: str | Path) -> bool:
+    return any(path in command for path in _worktree_path_spellings(worktree))
+
+
+def _command_is_marathon_worker(command: str) -> bool:
+    padded = f" {command} "
+    return (
+        " -m marathon.worker_launch " in padded
+        or any(
+            f" -m marathon {kind} " in padded
+            for kind in ("refine", "fill", "repair")
+        )
+    )
+
+
+def _process_group_alive(pgid: Optional[int]) -> bool:
+    """Whether a detached POSIX worker group still has any members."""
+    if not pgid or pgid <= 0 or os.name == "nt":
+        return False
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _process_group_matches_worktree(
+    pgid: Optional[int], worktree: str,
+) -> Optional[bool]:
+    """True/False when a POSIX group can be identified; None if ambiguous."""
+    if not pgid or pgid <= 0 or os.name == "nt":
+        return None
     try:
         cp = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            capture_output=True, text=True, timeout=5,
+            ["ps", "-axo", "pgid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
-        # Can't introspect the cmdline — fall back to bare liveness (better to
-        # defer a reap than destroy a possibly-live job).
+        return None
+    if cp.returncode != 0:
+        return None
+    found_group = False
+    for line in (cp.stdout or "").splitlines():
+        fields = line.strip().split(maxsplit=1)
+        if len(fields) != 2:
+            continue
+        try:
+            row_pgid = int(fields[0])
+        except ValueError:
+            continue
+        if row_pgid != pgid:
+            continue
+        found_group = True
+        if (
+            _command_is_marathon_worker(fields[1])
+            and _command_mentions_worktree(fields[1], worktree)
+        ):
+            return True
+    return None if found_group else False
+
+
+def _job_process_group_live(
+    pid: Optional[int], pgid: Optional[int], worktree: str,
+    *,
+    strict_identity: bool = False,
+) -> bool:
+    """Fail-safe liveness for a worker leader or its surviving descendants."""
+    if pid is not None and _pid_is_job_for(
+        pid, worktree, strict=strict_identity
+    ):
         return True
-    return name in (cp.stdout or "")
+    # ``start_new_session`` makes PGID equal the original worker PID.  The ID
+    # remains reserved while descendants live, so checking the group protects a
+    # worktree even if the Python leader died during lake/git cleanup.
+    group_match = _process_group_matches_worktree(pgid, worktree)
+    if group_match is True:
+        return True
+    if group_match is None and not strict_identity:
+        return _process_group_alive(pgid)
+    return False
+
+
+def _registered_worktrees(repo_dir: Path) -> list[str]:
+    """Absolute paths currently registered in the consumer's git worktree set."""
+    cp = _git(repo_dir, "worktree", "list", "--porcelain")
+    if cp.returncode != 0:
+        return []
+    return [
+        line[len("worktree "):].strip()
+        for line in cp.stdout.splitlines()
+        if line.startswith("worktree ")
+    ]
+
+
+def _pid_is_job_for(pid: int, worktree: str, *, strict: bool = False) -> bool:
+    """True iff ``pid`` is alive AND is genuinely a marathon job running in
+    ``worktree`` — i.e. its command line references that worktree's full raw or
+    canonical path (present via the target and ``--repo-dir``). Full-path
+    identity makes this robust to PID reuse *and* to two repositories choosing
+    the same timestamped worktree basename; path aliases such as macOS
+    ``/tmp``/``/private/tmp`` are normalized explicitly."""
+    if pid <= 0 or not daemon.process_alive(pid):
+        return False
+    try:
+        if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+            query = (
+                "(Get-CimInstance Win32_Process -Filter \"ProcessId = "
+                f"{pid}\").CommandLine"
+            )
+            cp = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", query],
+                capture_output=True, text=True, timeout=5,
+            )
+        else:
+            cp = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True, text=True, timeout=5,
+            )
+    except (OSError, subprocess.SubprocessError):
+        # Strict callers (adoption/completion ownership) never trust bare PID
+        # liveness. Reap guards fail safe and merely protect the worktree.
+        return not strict
+    if cp.returncode != 0 or not (cp.stdout or "").strip():
+        return not strict
+    command = cp.stdout or ""
+    return _command_is_marathon_worker(command) and _command_mentions_worktree(
+        command, worktree
+    )
 
 
 def _clear_worktree_pid_marker(worktree: str) -> None:
@@ -829,12 +1049,28 @@ def _worktree_live_pid(worktree: str) -> Optional[int]:
     startup (covers worktrees dispatched by an older conductor that predates
     the marker). A dead/stale/reused pid is pruned from the inherited map so
     a one-time miss never lingers."""
-    try:
-        pid = int((Path(worktree) / WORKTREE_PID_MARKER).read_text().strip())
-        if _pid_is_job_for(pid, worktree):
-            return pid
-    except (OSError, ValueError):
-        pass
+    pid, record = _read_worktree_job_marker(worktree)
+    pgid: Optional[int] = None
+    if record is not None:
+        try:
+            pgid = int(record["pgid"]) if record.get("pgid") else None
+        except (TypeError, ValueError):
+            pgid = None
+    if _job_process_group_live(pid, pgid, worktree):
+        return pid or pgid
+    if (
+        record is not None
+        and record.get("status") == "launching"
+        and pid is None
+    ):
+        try:
+            age = time.time() - (
+                Path(worktree) / WORKTREE_PID_MARKER
+            ).stat().st_mtime
+        except OSError:
+            age = LAUNCH_INTENT_GRACE_SECONDS + 1
+        if age <= LAUNCH_INTENT_GRACE_SECONDS:
+            return LAUNCHING_PID_SENTINEL
     pid = _INHERITED_RUNNING.get(worktree)
     if pid is not None:
         if _pid_is_job_for(pid, worktree):
@@ -862,19 +1098,81 @@ def _adopt_inherited_jobs(repo_dir: Path) -> list["ConductorJob"]:
     these worktrees even on the (now unreachable via dispatch) collision path."""
     _INHERITED_RUNNING.clear()
     out: list["ConductorJob"] = []
+    adopted_worktrees: set[str] = set()
     snap = load_jobs_snapshot(repo_dir)
     for raw in (snap or {}).get("jobs", []):
         pid, worktree = raw.get("pid"), raw.get("worktree")
-        if raw.get("status") != "running" or not pid or not worktree:
+        if raw.get("status") != "running" or not worktree:
             continue
         try:
-            if not daemon.process_alive(int(pid)):
-                continue
+            live_pid = int(pid) if pid else None
+            pgid = int(raw["pgid"]) if raw.get("pgid") else None
         except (TypeError, ValueError):
             continue
-        job = ConductorJob.from_json(raw)   # proc/log_handle are runtime-only → None
+        if not _job_process_group_live(
+            live_pid, pgid, str(worktree), strict_identity=True
+        ):
+            continue
+        recovered = dict(raw)
+        recovered["pid"] = live_pid
+        recovered["pgid"] = pgid
+        recovered["status"] = "running"
+        job = ConductorJob.from_json(recovered)
         out.append(job)
-        _INHERITED_RUNNING[str(worktree)] = int(pid)
+        key = _canonical_worktree_key(str(worktree))
+        adopted_worktrees.add(key)
+        if live_pid is not None:
+            _INHERITED_RUNNING[str(worktree)] = live_pid
+
+    # The per-worktree launch marker is written before spawn and carries the
+    # complete job record.  Scan it after jobs.json so a crash between Popen and
+    # the next snapshot cannot leave a detached, billed worker invisible.
+    for worktree in _registered_worktrees(repo_dir):
+        key = _canonical_worktree_key(worktree)
+        if key in adopted_worktrees:
+            continue
+        pid, raw = _read_worktree_job_marker(worktree)
+        if raw is None or raw.get("status") not in {"ready", "running"}:
+            continue
+        try:
+            recorded_worktree = str(raw.get("worktree") or "")
+            if Path(recorded_worktree).resolve() != Path(worktree).resolve():
+                continue
+            pgid = int(raw["pgid"]) if raw.get("pgid") else None
+            strictly_live = _job_process_group_live(
+                pid, pgid, worktree, strict_identity=True
+            )
+            marker_status = raw.get("status")
+            # A READY trampoline has not started billed work. Only a strictly
+            # identified replacement conductor may ACK it. A RUNNING marker,
+            # by contrast, is itself the durable completion journal: retain it
+            # even when the worker already exited so _reap_adopted_job can
+            # reconcile its checkpoint/PR instead of reaping and rebilling.
+            if marker_status == "ready" and not strictly_live:
+                continue
+            recovered = dict(raw)
+            recovered["pid"] = pid
+            recovered["pgid"] = pgid
+            recovered["status"] = "running"
+            job = ConductorJob.from_json(recovered)
+        except (KeyError, OSError, TypeError, ValueError):
+            continue
+        out.append(job)
+        adopted_worktrees.add(key)
+        if pid is not None and _job_process_group_live(
+            pid, pgid, worktree
+        ):
+            _INHERITED_RUNNING[worktree] = pid
+        if marker_status == "ready":
+            # The prior conductor died after the trampoline published identity
+            # but before ACK. This durable write authorizes the waiting
+            # trampoline to start the billed command under the new conductor.
+            if pid is None or not _write_worktree_pid_marker(
+                Path(worktree), pid, job=job
+            ):
+                out.pop()
+                adopted_worktrees.discard(key)
+                _INHERITED_RUNNING.pop(worktree, None)
     return out
 
 
@@ -1539,21 +1837,103 @@ def _dispatch_job(
         cmd += daemon.DEFAULT_REFINE_ARGS
         log_path = workdir / "conductor-refine.log"
         cmd += _tex_args(cfg, chapter)
+    job = ConductorJob(
+        issue_num=issue_num,
+        chapter=chapter,
+        target=_target_relpath(cfg, chapter),
+        worktree=str(worktree),
+        workdir=str(workdir),
+        branch=branch,
+        pid=None,
+        started_ts=now_iso(),
+        status="launching",
+        fill=fill,
+        repair=repair,
+        expected_verdict_ts=expected_verdict_ts,
+        rejection_note=rejection_note,
+    )
+    # Durable launch intent comes before Popen. If this conductor is SIGKILLed
+    # immediately after spawning the detached worker, the replacement can scan
+    # the marker, recover the PID from the command line, and adopt the job.
+    if not _write_worktree_pid_marker(worktree, 0, job=job):
+        kept_worktrees[kept_key] = str(worktree)
+        print(
+            f"--- deferring #{issue_num}: could not durably record worker "
+            "launch intent; refusing to spawn ---",
+            flush=True,
+        )
+        return None
     log_handle = log_path.open("ab")
     try:
-        popen = subprocess.Popen(cmd, stdout=log_handle, stderr=subprocess.STDOUT)
+        # Refine/fill/repair jobs must outlive a scheduler restart.  Giving each
+        # worker its own session prevents Ctrl-C, terminal teardown, or a
+        # conductor-only signal from reaching an already-billed Aristotle run.
+        # DEVNULL stdin also severs the controlling terminal input inherited by
+        # old workers. Windows needs its equivalent process-group flags.
+        spawn_kwargs: dict[str, object] = {
+            "stdout": log_handle,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.DEVNULL,
+        }
+        if os.name == "nt":  # pragma: no cover - POSIX CI/runtime
+            spawn_kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+            )
+        else:
+            spawn_kwargs["start_new_session"] = True
+        marker_path = worktree / WORKTREE_PID_MARKER
+        launch_cmd = [
+            sys.executable,
+            "-m",
+            "marathon.worker_launch",
+            str(marker_path),
+            "--",
+            *cmd,
+        ]
+        popen = subprocess.Popen(launch_cmd, **spawn_kwargs)
     except OSError as e:
         log_handle.close()
+        _clear_worktree_pid_marker(str(worktree))
         # The worktree exists and holds the branch now; remember it so
         # the retry reuses it instead of tripping its own branch guard.
         kept_worktrees[kept_key] = str(worktree)
         print(f"--- deferring #{issue_num}: could not spawn refine ({e}) ---")
         return None
+    handshake = _await_worker_handshake(worktree, popen)
+    if handshake is None:
+        # The trampoline never starts billed work until its marker update
+        # succeeds. Terminating it here is therefore safe and prevents an
+        # untracked process from lingering after a disk/exec failure.
+        try:
+            popen.terminate()
+            popen.wait(timeout=2)
+        except Exception:  # noqa: BLE001 — best-effort cleanup of failed launch
+            try:
+                popen.kill()
+            except Exception:
+                pass
+        log_handle.close()
+        _clear_worktree_pid_marker(str(worktree))
+        kept_worktrees[kept_key] = str(worktree)
+        print(
+            f"--- deferring #{issue_num}: detached worker did not complete "
+            "its durable launch handshake; billed command was not started ---",
+            flush=True,
+        )
+        return None
     kept_worktrees.pop(kept_key, None)
     # Live-job marker: lets a FUTURE conductor process (after a restart) tell
     # this worktree is in use, so its reap guard defers instead of destroying
     # a running (billed) job.
-    _write_worktree_pid_marker(worktree, popen.pid)
+    job.pid = popen.pid
+    try:
+        job.pgid = int(handshake["pgid"]) if handshake.get("pgid") else None
+    except (TypeError, ValueError):
+        job.pgid = None
+    job.status = "running"
+    job.proc = popen
+    job.log_handle = log_handle
     print(
         f"\n--- dispatched #{issue_num} (chapter {chapter}): pid={popen.pid} "
         f"branch={branch} ---"
@@ -1562,23 +1942,7 @@ def _dispatch_job(
     print(f"    workdir  = {workdir}")
     print(f"    log      = {log_path}")
     print(f"    cmd      = {' '.join(cmd)}", flush=True)
-    return ConductorJob(
-        issue_num=issue_num,
-        chapter=chapter,
-        target=_target_relpath(cfg, chapter),
-        worktree=str(worktree),
-        workdir=str(workdir),
-        branch=branch,
-        pid=popen.pid,
-        started_ts=now_iso(),
-        status="running",
-        fill=fill,
-        repair=repair,
-        expected_verdict_ts=expected_verdict_ts,
-        rejection_note=rejection_note,
-        proc=popen,
-        log_handle=log_handle,
-    )
+    return job
 
 
 def _refresh_job_runtime(job: ConductorJob) -> None:
@@ -2095,9 +2459,10 @@ def _reap_finished(
             continue
         if job.proc is None:
             # ADOPTED job (inherited from a previous conductor — we didn't
-            # spawn it, so there's no Popen to poll). Track it via the pid; on
-            # exit handle it without an exit code (we can't read one).
-            if job.pid is not None and daemon.process_alive(job.pid):
+            # spawn it, so there's no Popen to poll). Track the detached group,
+            # not only its leader: lake/git descendants can briefly outlive a
+            # worker that died abruptly and still own the worktree.
+            if _job_process_group_live(job.pid, job.pgid, job.worktree):
                 _refresh_job_runtime(job)
                 continue
             reaped += 1
@@ -2105,6 +2470,12 @@ def _reap_finished(
             continue
         rc = job.proc.poll()
         if rc is None:
+            _refresh_job_runtime(job)
+            continue
+        if _process_group_alive(job.pgid):
+            # The session leader exited but a descendant still belongs to the
+            # worker group. Never clean/reuse its worktree until the group is
+            # empty; the same row remains running and is checked next tick.
             _refresh_job_runtime(job)
             continue
         reaped += 1

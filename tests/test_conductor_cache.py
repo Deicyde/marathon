@@ -12,8 +12,20 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
 
 from marathon import conductor
+
+
+@pytest.fixture(autouse=True)
+def _complete_fake_worker_handshake(monkeypatch):
+    monkeypatch.setattr(
+        conductor,
+        "_await_worker_handshake",
+        lambda _wt, proc, **_kw: {
+            "pid": proc.pid, "pgid": proc.pid, "status": "running",
+        },
+    )
 
 
 def _write_lake_stub(bindir: Path, record: Path, *, exit_code: int = 0,

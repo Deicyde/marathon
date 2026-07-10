@@ -4,8 +4,21 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import marathon.conductor as cond
 from marathon.review.fill_discovery import FillTarget
+
+
+@pytest.fixture(autouse=True)
+def _complete_fake_worker_handshake(monkeypatch):
+    monkeypatch.setattr(
+        cond,
+        "_await_worker_handshake",
+        lambda _wt, proc, **_kw: {
+            "pid": proc.pid, "pgid": proc.pid, "status": "running",
+        },
+    )
 
 
 def _ft(issue, chapter=12):

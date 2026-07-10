@@ -449,6 +449,13 @@ def test_dispatch_adds_no_metadata_commit_keeps_daemon_args_verbatim(
         conductor.subprocess, "Popen",
         lambda cmd, **kw: spawned.append(list(cmd)) or SimpleNamespace(pid=4001),
     )
+    monkeypatch.setattr(
+        conductor,
+        "_await_worker_handshake",
+        lambda _wt, proc, **_kw: {
+            "pid": proc.pid, "pgid": proc.pid, "status": "running",
+        },
+    )
 
     job = conductor._dispatch_job(cfg, 22, 14, tmp_path / "runs", {})
 

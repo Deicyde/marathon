@@ -170,7 +170,10 @@ def popen_factory(monkeypatch):
 
     class FakePopen:
         def __init__(self, cmd, **kwargs):
-            self.cmd = list(cmd)
+            self.launch_cmd = list(cmd)
+            split = self.launch_cmd.index("--")
+            self.cmd = self.launch_cmd[split + 1:]
+            self.kwargs = dict(kwargs)
 
             def _arg(flag):
                 return (self.cmd[self.cmd.index(flag) + 1]
@@ -179,7 +182,17 @@ def popen_factory(monkeypatch):
             # refine → --review-rejection, fill → --issue, repair → neither.
             raw = _arg("--review-rejection") or _arg("--issue")
             self.issue = int(raw) if raw else 0
+            worktree = _arg("--repo-dir")
+            marker = (
+                __import__("pathlib").Path(worktree) / conductor.WORKTREE_PID_MARKER
+            )
+            # The launch intent must be durable before the detached process is
+            # created; otherwise a SIGKILL here leaves an invisible worker.
+            self.launch_marker = json.loads(marker.read_text())
             self.pid = 4000 + len(state.spawned)
+            ready_marker = dict(self.launch_marker)
+            ready_marker.update(pid=self.pid, pgid=self.pid, status="ready")
+            marker.write_text(json.dumps(ready_marker))
             conf = state.script.get(self.issue, {})
             self._polls_left = conf.get("polls", 1)
             self._rc = conf.get("rc", 0)
@@ -322,6 +335,14 @@ def test_worktree_add_remove_and_refine_args(e2e):
 
     [proc] = e2e.popen.spawned
     cmd = proc.cmd
+    assert proc.launch_marker["status"] == "launching"
+    assert proc.launch_marker["pid"] is None
+    assert proc.launch_cmd[1:3] == ["-m", "marathon.worker_launch"]
+    assert proc.kwargs["stdin"] == subprocess.DEVNULL
+    if os.name == "nt":
+        assert proc.kwargs["creationflags"]
+    else:
+        assert proc.kwargs["start_new_session"] is True
     assert cmd[:4] == [sys.executable, "-m", "marathon", "refine"]
     assert cmd[4].endswith("Demo/Chapter14")
     assert cmd[4].startswith(wt_path)  # target lives inside the job worktree
@@ -803,6 +824,36 @@ def test_branch_conflict_defers_not_crash(cfg, monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "reaping it and retrying" in out      # tries to clear the leftover first
     assert "deferring #22" in out                # then defers when it still can't
+
+
+def test_dispatch_refuses_spawn_without_durable_launch_intent(
+    cfg, monkeypatch, tmp_path, capsys,
+):
+    """A detached worker is never started if its recovery record cannot persist."""
+    monkeypatch.setattr(
+        conductor,
+        "_refine_branch_for_dispatch",
+        lambda *a, **k: "marathon/refine-c14-i22",
+    )
+    monkeypatch.setattr(
+        conductor,
+        "_git",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(conductor, "_prime_mathlib_cache", lambda *_: None)
+    monkeypatch.setattr(conductor, "_write_worktree_pid_marker", lambda *a, **k: False)
+    monkeypatch.setattr(
+        conductor.subprocess,
+        "Popen",
+        lambda *a, **k: pytest.fail("must not spawn an unjournaled worker"),
+    )
+
+    kept = {}
+    job = conductor._dispatch_job(cfg, 22, 14, tmp_path / "runs", kept)
+
+    assert job is None
+    assert 22 in kept
+    assert "refusing to spawn" in capsys.readouterr().out
 
 
 def test_worktree_parent_inside_repo_refused(cfg, monkeypatch):
