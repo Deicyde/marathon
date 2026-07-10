@@ -73,6 +73,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -258,6 +259,7 @@ class ConductorJob:
     # never consume/attempt/stall a later re-reject or a verified issue.
     expected_verdict_ts: Optional[str] = None
     rejection_note: Optional[str] = None
+    launch_nonce: Optional[str] = None         # binds the two-phase start ACK
     proc: Optional[object] = field(default=None, repr=False, compare=False)
     log_handle: Optional[object] = field(default=None, repr=False, compare=False)
 
@@ -858,6 +860,34 @@ def _read_worktree_job_marker(
     return pid, parsed
 
 
+def _worker_ack_path(
+    worktree: str | Path, pid: int, launch_nonce: str,
+) -> Path:
+    marker = Path(worktree) / WORKTREE_PID_MARKER
+    return marker.with_name(f"{marker.name}.ack-{pid}-{launch_nonce}")
+
+
+def _signal_worker_ack(
+    worktree: str | Path, pid: int, launch_nonce: str,
+) -> bool:
+    """Release the trampoline only after the running marker is durable."""
+    try:
+        # This file is intentionally created only *after* the marker's file and
+        # directory fsync complete. Its own persistence is unnecessary: if a
+        # host crash loses it, the already-durable running marker still lets the
+        # replacement conductor reconcile any remote work that began.
+        ack = _worker_ack_path(worktree, pid, launch_nonce)
+        tmp = ack.with_name(f"{ack.name}.tmp-{os.getpid()}")
+        tmp.write_text(f"{launch_nonce}\n")
+        # Atomic rename is the first moment the trampoline can observe this
+        # generation's ACK, and it is the final fallible operation here.
+        os.replace(tmp, ack)
+        return True
+    except OSError as exc:
+        print(f"  warning: could not signal worker launch ACK ({exc})", flush=True)
+        return False
+
+
 def _await_worker_handshake(
     worktree: Path,
     proc: object,
@@ -883,6 +913,10 @@ def _await_worker_handshake(
                     return None
                 if not _write_worktree_pid_marker(
                     worktree, expected_pid, job=acknowledged
+                ):
+                    return None
+                if not acknowledged.launch_nonce or not _signal_worker_ack(
+                    worktree, expected_pid, acknowledged.launch_nonce
                 ):
                     return None
                 record = acknowledged.to_json()
@@ -1057,7 +1091,10 @@ def _clear_worktree_pid_marker(worktree: str) -> None:
     marker would otherwise linger holding a dead — reusable — pid). The
     success path removes the whole worktree, so it needs no explicit clear."""
     try:
-        (Path(worktree) / WORKTREE_PID_MARKER).unlink(missing_ok=True)
+        marker = Path(worktree) / WORKTREE_PID_MARKER
+        marker.unlink(missing_ok=True)
+        for ack in marker.parent.glob(f"{marker.name}.ack-*"):
+            ack.unlink(missing_ok=True)
     except OSError:
         pass
     _INHERITED_RUNNING.pop(str(worktree), None)
@@ -1197,6 +1234,12 @@ def _adopt_inherited_jobs(repo_dir: Path) -> list["ConductorJob"]:
             # trampoline to start the billed command under the new conductor.
             if pid is None or not _write_worktree_pid_marker(
                 Path(worktree), pid, job=job
+            ):
+                out.pop()
+                adopted_worktrees.discard(key)
+                _INHERITED_RUNNING.pop(worktree, None)
+            elif not job.launch_nonce or not _signal_worker_ack(
+                worktree, pid, job.launch_nonce
             ):
                 out.pop()
                 adopted_worktrees.discard(key)
@@ -1879,6 +1922,7 @@ def _dispatch_job(
         repair=repair,
         expected_verdict_ts=expected_verdict_ts,
         rejection_note=rejection_note,
+        launch_nonce=secrets.token_hex(16),
     )
     # Durable launch intent comes before Popen. If this conductor is SIGKILLed
     # immediately after spawning the detached worker, the replacement can scan

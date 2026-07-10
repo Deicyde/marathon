@@ -138,11 +138,27 @@ def _wait_for_ack(marker: Path, pid: int) -> bool:
         except (OSError, json.JSONDecodeError):
             time.sleep(0.01)
             continue
+        nonce = data.get("launch_nonce") if isinstance(data, dict) else None
         if (
             isinstance(data, dict)
             and data.get("pid") == pid
             and data.get("status") == "running"
+            and isinstance(nonce, str)
+            and nonce
         ):
+            ack = marker.with_name(f"{marker.name}.ack-{pid}-{nonce}")
+            try:
+                ack_value = ack.read_text().strip()
+            except OSError:
+                time.sleep(0.01)
+                continue
+            if ack_value != nonce:
+                time.sleep(0.01)
+                continue
+            try:
+                ack.unlink()
+            except OSError:
+                pass
             return True
         time.sleep(0.01)
     return False

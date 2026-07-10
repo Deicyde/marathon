@@ -13,7 +13,11 @@ from marathon.worker_launch import EXIT_MARKER_ERROR
 def test_worker_trampoline_publishes_identity_before_exec(tmp_path):
     marker = tmp_path / "refine.pid"
     observed = tmp_path / "observed.json"
-    marker.write_text(json.dumps({"status": "launching", "pid": None, "pgid": None}))
+    nonce = "nonce-one"
+    marker.write_text(json.dumps({
+        "status": "launching", "pid": None, "pgid": None,
+        "launch_nonce": nonce,
+    }))
     script = (
         "from pathlib import Path; import sys; "
         "Path(sys.argv[2]).write_text(Path(sys.argv[1]).read_text())"
@@ -43,6 +47,9 @@ def test_worker_trampoline_publishes_identity_before_exec(tmp_path):
     assert ready["pid"] == proc.pid
     ready["status"] = "running"  # parent ACK: billed command may now execute
     marker.write_text(json.dumps(ready))
+    marker.with_name(f"{marker.name}.ack-{proc.pid}-{nonce}").write_text(
+        f"{nonce}\n"
+    )
     stdout, stderr = proc.communicate(timeout=5)
 
     assert proc.returncode == 0, stderr
@@ -71,7 +78,10 @@ def test_worker_trampoline_fails_closed_when_marker_is_missing(tmp_path):
 def test_worker_trampoline_never_starts_command_before_parent_ack(tmp_path):
     marker = tmp_path / "refine.pid"
     billed_side_effect = tmp_path / "must-not-exist"
-    marker.write_text(json.dumps({"status": "launching", "pid": None, "pgid": None}))
+    marker.write_text(json.dumps({
+        "status": "launching", "pid": None, "pgid": None,
+        "launch_nonce": "nonce-two",
+    }))
     command = [
         sys.executable, "-m", "marathon.worker_launch", str(marker), "--",
         sys.executable, "-c",
@@ -91,6 +101,12 @@ def test_worker_trampoline_never_starts_command_before_parent_ack(tmp_path):
     else:
         proc.kill()
         raise AssertionError("trampoline did not publish ready state")
+
+    running_without_signal = json.loads(marker.read_text())
+    running_without_signal["status"] = "running"
+    marker.write_text(json.dumps(running_without_signal))
+    time.sleep(0.05)
+    assert not billed_side_effect.exists()
 
     proc.terminate()
     proc.wait(timeout=5)

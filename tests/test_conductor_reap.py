@@ -228,6 +228,7 @@ def test_replacement_conductor_acknowledges_ready_trampoline(monkeypatch, tmp_pa
         worktree=str(wt),
         workdir=str(tmp_path / "wd-i43"),
         status="ready",
+        launch_nonce="ready-43",
     )
     conductor._write_worktree_pid_marker(wt, 4343, job=job)
     monkeypatch.setattr(
@@ -242,6 +243,7 @@ def test_replacement_conductor_acknowledges_ready_trampoline(monkeypatch, tmp_pa
     assert [(j.issue_num, j.status) for j in adopted] == [(43, "running")]
     _, marker = conductor._read_worktree_job_marker(wt)
     assert marker is not None and marker["status"] == "running"
+    assert conductor._worker_ack_path(wt, 4343, "ready-43").is_file()
 
 
 def test_dead_marker_only_job_is_recovered_for_completion_reconcile(
