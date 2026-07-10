@@ -773,6 +773,27 @@ WORKER_HANDSHAKE_TIMEOUT_SECONDS = 10.0
 _INHERITED_RUNNING: dict[str, int] = {}
 
 
+def _durable_replace_file(tmp: Path, destination: Path) -> None:
+    """Replace ``destination`` and persist the directory entry before return."""
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        move_file = kernel32.MoveFileExW
+        move_file.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+        move_file.restype = ctypes.c_int
+        # REPLACE_EXISTING | WRITE_THROUGH
+        if not move_file(str(tmp), str(destination), 0x1 | 0x8):
+            raise OSError(ctypes.get_last_error(), "MoveFileExW failed")
+        return
+    os.replace(tmp, destination)
+    directory_fd = os.open(destination.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _write_worktree_pid_marker(
     worktree: Path,
     pid: int,
@@ -802,8 +823,11 @@ def _write_worktree_pid_marker(
             payload["pid"] = pid or None
             content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
         tmp = marker.with_name(f"{marker.name}.tmp-{os.getpid()}")
-        tmp.write_text(content)
-        tmp.replace(marker)
+        with tmp.open("w") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _durable_replace_file(tmp, marker)
         return True
     except OSError as e:
         print(f"  warning: could not write pid marker in {worktree} ({e})",
@@ -1109,9 +1133,13 @@ def _adopt_inherited_jobs(repo_dir: Path) -> list["ConductorJob"]:
             pgid = int(raw["pgid"]) if raw.get("pgid") else None
         except (TypeError, ValueError):
             continue
-        if not _job_process_group_live(
+        strictly_live = _job_process_group_live(
             live_pid, pgid, str(worktree), strict_identity=True
-        ):
+        )
+        protected_live = _job_process_group_live(
+            live_pid, pgid, str(worktree)
+        )
+        if not strictly_live and not protected_live:
             continue
         recovered = dict(raw)
         recovered["pid"] = live_pid
@@ -1121,7 +1149,7 @@ def _adopt_inherited_jobs(repo_dir: Path) -> list["ConductorJob"]:
         out.append(job)
         key = _canonical_worktree_key(str(worktree))
         adopted_worktrees.add(key)
-        if live_pid is not None:
+        if live_pid is not None and protected_live:
             _INHERITED_RUNNING[str(worktree)] = live_pid
 
     # The per-worktree launch marker is written before spawn and carries the

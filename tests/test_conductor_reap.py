@@ -172,6 +172,24 @@ def test_adopt_inherited_jobs_rejects_live_unrelated_pid(monkeypatch, tmp_path):
     assert conductor._INHERITED_RUNNING == {}
 
 
+def test_adopt_inherited_jobs_retains_ambiguous_live_snapshot(monkeypatch, tmp_path):
+    """Uninspectable legacy workers remain protected instead of redispatched."""
+    conductor.write_jobs_snapshot(tmp_path, [
+        _job(issue_num=10, pid=1010, worktree="/wt/ambiguous"),
+    ], 1)
+    monkeypatch.setattr(
+        conductor,
+        "_job_process_group_live",
+        lambda *a, strict_identity=False, **k: not strict_identity,
+    )
+    monkeypatch.setattr(conductor, "_registered_worktrees", lambda *_: [])
+
+    adopted = conductor._adopt_inherited_jobs(tmp_path)
+
+    assert [(j.issue_num, j.pid) for j in adopted] == [(10, 1010)]
+    assert conductor._INHERITED_RUNNING == {"/wt/ambiguous": 1010}
+
+
 def test_adopt_recovers_pre_snapshot_worker_from_launch_marker(monkeypatch, tmp_path):
     """The trampoline marker survives a parent crash before jobs.json."""
     wt = tmp_path / "wt-i42-crash-window"
