@@ -76,6 +76,9 @@ def fake_lake(monkeypatch):
 
     def install(stdout=GOLDEN_TEXT, returncode=0, stderr="", exc=None):
         monkeypatch.setattr(engine, "_find_lake", lambda: "/fake/lake")
+        monkeypatch.setattr(
+            engine, "source_state", lambda repo: ("a" * 40, True)
+        )
         # Neutralize the build-targets-first phase: it probes on-disk oleans
         # (a separate boundary from the subprocess seam these tests mock), and
         # the fixture package is never built. Treat every module as buildable
@@ -117,6 +120,11 @@ class TestGoldenEndToEnd:
         assert snap.package_revs == {}  # fixture manifest has no packages
         assert set(DEFAULT_TRUSTED_PREFIXES) <= set(snap.trusted_prefixes)
         assert all(d.status == "ok" for d in snap.decls)
+        assert snap.source_revision == "a" * 40
+        assert snap.module_revisions == {
+            module: "a" * 40 for module in FIXTURE_MODULES
+        }
+        assert snap.attempted_modules == FIXTURE_MODULES
 
     def test_spot_fields(self, fake_lake):
         fake_lake()
@@ -410,6 +418,18 @@ class TestDegradation:
         assert snap.decls == []
         assert any("nothing audited" in f for f in snap.failures)
 
+    def test_head_change_during_audit_never_binds_revision(
+        self, fake_lake, monkeypatch
+    ):
+        fake_lake()
+        states = iter([("a" * 40, True), ("b" * 40, True)])
+        monkeypatch.setattr(engine, "source_state", lambda repo: next(states))
+        snap = engine.run_audit(FIXTURE_DIR, "AuditFixture")
+        assert snap.decls  # diagnostic output is retained
+        assert snap.source_revision is None
+        assert snap.module_revisions == {}
+        assert any("changed or became dirty" in f for f in snap.failures)
+
     def test_missing_target_folder(self, fake_lake):
         fake_lake()
         snap = engine.run_audit(FIXTURE_DIR, "NoSuchFolder")
@@ -536,6 +556,9 @@ class TestSkipBrokenIntegration:
     ):
         monkeypatch.setattr(engine, "_find_lake", lambda: "/fake/lake")
         monkeypatch.setattr(
+            engine, "source_state", lambda repo: ("a" * 40, True)
+        )
+        monkeypatch.setattr(
             engine, "partition_buildable",
             lambda lake, repo, modules, timeout: ([], list(modules)),
         )
@@ -648,6 +671,107 @@ class TestPersistence:
         assert engine.load_snapshot(tmp_path) is None
         (d / engine.LATEST_NAME).write_text('{"schema_version": 99}')
         assert engine.load_snapshot(tmp_path) is None
+
+    def test_v1_snapshot_migrates_but_fails_closed_in_git_checkout(
+        self, tmp_path, monkeypatch
+    ):
+        legacy = mk_snapshot([mk_decl()]).to_json()
+        legacy["schema_version"] = 1
+        legacy.pop("source_revision", None)
+        legacy.pop("module_revisions", None)
+        legacy.pop("attempted_modules", None)
+        state = engine.audit_state_dir(tmp_path)
+        state.mkdir(parents=True)
+        (state / engine.LATEST_NAME).write_text(json.dumps(legacy))
+        monkeypatch.setattr(
+            engine, "source_state", lambda repo: ("b" * 40, True)
+        )
+
+        raw = engine.load_snapshot(tmp_path, validate_revision=False)
+        assert raw is not None and len(raw.decls) == 1
+        assert raw.schema_version == 2 and raw.module_revisions == {}
+        fresh = engine.load_snapshot(tmp_path)
+        assert fresh is not None and fresh.decls == []
+        assert any("legacy snapshot" in f for f in fresh.failures)
+
+    def test_partial_module_merge_keeps_old_revision_and_cascades_staleness(
+        self, tmp_path, monkeypatch
+    ):
+        old_rev, new_rev = "a" * 40, "b" * 40
+        old = mk_snapshot(
+            [
+                mk_decl(name="A.depends", module="A", cone=["B.base"]),
+                mk_decl(name="B.base", module="B"),
+            ],
+            repo_dir=str(tmp_path), modules=["A", "B"],
+            source_revision=old_rev,
+            module_revisions={"A": old_rev, "B": old_rev},
+            attempted_modules=["A", "B"],
+        )
+        engine.save_snapshot(old, merge=False)
+        # Only A completed at the new revision; B's prior evidence is retained
+        # with its old revision rather than being silently blessed.
+        partial = mk_snapshot(
+            [mk_decl(name="A.depends", module="A", cone=["B.base"])],
+            repo_dir=str(tmp_path), modules=["A"],
+            source_revision=new_rev,
+            module_revisions={"A": new_rev},
+            attempted_modules=["A", "B"],
+            failures=["module B failed to build; excluded from audit"],
+        )
+        engine.save_snapshot(partial)
+        raw = engine.load_snapshot(tmp_path, validate_revision=False)
+        assert raw is not None
+        assert raw.module_revisions == {"A": new_rev, "B": old_rev}
+        assert set(raw.by_name()) == {"A.depends", "B.base"}
+
+        monkeypatch.setattr(
+            engine, "source_state", lambda repo: (new_rev, True)
+        )
+        fresh = engine.load_snapshot(tmp_path)
+        assert fresh is not None
+        # B is directly stale and A's statement cone depends on B, so neither
+        # can grant a trust tier/readiness decision.
+        assert fresh.decls == []
+        assert any("withheld module(s): B" in f for f in fresh.failures)
+        assert any("statement cone" in f for f in fresh.failures)
+
+    def test_failed_audit_does_not_advance_or_replace_successful_evidence(
+        self, tmp_path
+    ):
+        old_rev = "a" * 40
+        good = mk_snapshot(
+            [mk_decl(name="A.good", module="A")], repo_dir=str(tmp_path),
+            modules=["A"], source_revision=old_rev,
+            module_revisions={"A": old_rev}, attempted_modules=["A"],
+        )
+        engine.save_snapshot(good, merge=False)
+        failed = mk_snapshot(
+            [mk_decl(name="A.partial", module="A")], repo_dir=str(tmp_path),
+            modules=["A"], attempted_modules=["A"],
+            failures=["missing AUDIT_DONE trailer"],
+        )
+        engine.save_snapshot(failed)
+        raw = engine.load_snapshot(tmp_path, validate_revision=False)
+        assert raw is not None
+        assert raw.source_revision == old_rev
+        assert raw.module_revisions == {"A": old_rev}
+        assert set(raw.by_name()) == {"A.good"}
+        assert raw.failures == ["missing AUDIT_DONE trailer"]
+
+    def test_dirty_worktree_withholds_even_matching_revision(
+        self, tmp_path, monkeypatch
+    ):
+        rev = "c" * 40
+        snap = mk_snapshot(
+            [mk_decl()], repo_dir=str(tmp_path), source_revision=rev,
+            module_revisions={"Foo": rev}, attempted_modules=["Foo"],
+        )
+        engine.save_snapshot(snap, merge=False)
+        monkeypatch.setattr(engine, "source_state", lambda repo: (rev, False))
+        loaded = engine.load_snapshot(tmp_path)
+        assert loaded is not None and loaded.decls == []
+        assert any("working tree" in f for f in loaded.failures)
 
 
 # ---------------------------------------------------------------------------

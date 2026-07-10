@@ -14,10 +14,18 @@ API surface (shared contract — the gate reconciles any drift):
 * ``GET  /api/queue?chapter=N`` → ``{cards, building, landed_today}``
 * ``GET  /api/card/{id}``     → the full :class:`CardDetail`
 * ``GET  /api/subdeck/{id}``  → the issue's per-declaration SUBDECK (read)
+* ``GET  /api/review-workspace`` → source-ordered file/chapter review (read)
+* ``GET  /api/review-source`` → lazy repo-local whole-file Lean source (read)
+* ``GET  /api/project-graph`` → project issue/declaration dependency DAG (read)
+* ``GET  /api/definition``    → current-source identifier lookup (read)
+* ``GET  /api/definition-terms`` → compact project identifier index (read)
+* ``GET  /api/reconciliation/{id}`` → pending identity proposals (read)
 * ``GET  /api/status``        → live conductor/landing events (poll)
 * ``GET  /api/events``        → the same, as Server-Sent Events
 * ``POST /api/verdict``       → route a verdict (IRREVERSIBLE — guarded)
 * ``POST /api/decl-verdict``  → record one per-decl verdict (LOCAL — guarded)
+* ``POST /api/batch-decl-verdict`` → atomically record many (LOCAL — guarded)
+* ``POST /api/reconcile-proposal`` → confirm/dismiss exact identity proposal
 * ``POST /api/ship``          → ship a subdeck's issue (IRREVERSIBLE — guarded)
 * ``POST /api/refresh-issue`` → push-refresh signatures to GitHub (WRITE — guarded)
 
@@ -121,6 +129,7 @@ MAX_POST_BYTES = 256 * 1024
 # filesystem permissions: repo-local, regular, modest-sized text only.
 MAX_INFORMAL_SOURCE_BYTES = 5 * 1024 * 1024
 INFORMAL_SOURCE_SUFFIXES = frozenset({".md", ".markdown", ".txt"})
+MAX_REVIEW_SOURCE_BYTES = 2 * 1024 * 1024
 
 
 def _repo_informal_source(repo_dir: Path, raw: str) -> Path:
@@ -163,6 +172,30 @@ def _repo_informal_source(repo_dir: Path, raw: str) -> Path:
             "informal-statements file is too large "
             f"(maximum {MAX_INFORMAL_SOURCE_BYTES // (1024 * 1024)} MiB)"
         )
+    return candidate
+
+
+def _repo_lean_source(repo_dir: Path, raw: str) -> Path:
+    """Resolve a repo-local ``.lean`` file for the whole-file reader.
+
+    This GET is read-only but still must not become an arbitrary host-file read
+    primitive. Absolute paths, traversal/symlink escapes, non-files, and
+    non-Lean files are refused before reading.
+    """
+    supplied = Path(raw)
+    if supplied.is_absolute():
+        raise ValueError("source path must be repo-relative")
+    repo = Path(repo_dir).resolve()
+    try:
+        candidate = (repo / supplied).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"source file does not exist or cannot be resolved: {raw}") from exc
+    try:
+        candidate.relative_to(repo)
+    except ValueError as exc:
+        raise ValueError("source path must stay inside the repository") from exc
+    if not candidate.is_file() or candidate.suffix.lower() != ".lean":
+        raise ValueError("source path must name a repo-local .lean file")
     return candidate
 
 
@@ -290,6 +323,20 @@ class DeckHandler(BaseHTTPRequestHandler):
                 return self._api_run_detail(path[len("/api/run/"):])
             if path == "/api/issues-overview":
                 return self._api_issues_overview()
+            if path == "/api/review-workspace":
+                return self._api_review_workspace(query)
+            if path == "/api/review-source":
+                return self._api_review_source(query)
+            if path == "/api/project-graph":
+                return self._api_project_graph()
+            if path == "/api/definition":
+                return self._api_definition(query)
+            if path == "/api/definition-terms":
+                return self._api_definition_terms()
+            if path.startswith("/api/reconciliation/"):
+                return self._api_reconciliation(
+                    path[len("/api/reconciliation/"):]
+                )
             if path == "/api/stuck":
                 return self._api_stuck()
             if path == "/api/history":
@@ -472,6 +519,130 @@ class DeckHandler(BaseHTTPRequestHandler):
         from marathon.deck.dashboard import issues_overview
         self._send_json(issues_overview(self.cfg))
 
+    def _api_review_workspace(self, query: dict) -> None:
+        """Source-ordered declarations for one chapter (or ``chapter=all``).
+
+        PURE read: the project-wide adapter bulk-loads issue metadata once and
+        overlays only the local subdeck sidecar.  It never records a verdict.
+        """
+        if self._demo:
+            return self._send_json({
+                "repo": None, "chapter": None, "chapters": [], "files": [],
+                "issues": [], "progress": {"reviewed": 0, "total": 0,
+                "verified": 0, "rejected": 0, "deferred": 0},
+                "audit": {"status": "missing", "created_at": None,
+                "source_revision": None, "failures": []}, "errors": [],
+            })
+        raw = (query.get("chapter") or [None])[0]
+        chapter = None if raw == "all" else self._chapter_from_query(query)
+        from marathon.deck.workspace import build_review_workspace
+
+        self._send_json(build_review_workspace(self.cfg, chapter))
+
+    def _api_review_source(self, query: dict) -> None:
+        """Lazy whole-file source for the Files reader — PURE, repo-local."""
+        raw = (query.get("path") or [None])[0]
+        if not isinstance(raw, str) or not raw:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, "missing source path")
+        if self._demo:
+            return self._send_error_json(
+                HTTPStatus.NOT_FOUND, "whole-file source is unavailable in demo mode"
+            )
+        try:
+            path = _repo_lean_source(Path(self.cfg.repo_dir), raw)
+            with path.open("rb") as handle:
+                payload = handle.read(MAX_REVIEW_SOURCE_BYTES + 1)
+        except ValueError as exc:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except OSError as exc:
+            return self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, f"could not read source: {exc}"
+            )
+        truncated = len(payload) > MAX_REVIEW_SOURCE_BYTES
+        if truncated:
+            payload = payload[:MAX_REVIEW_SOURCE_BYTES]
+        relative = str(path.relative_to(Path(self.cfg.repo_dir).resolve()))
+        self._send_json({
+            "path": relative,
+            "source": payload.decode("utf-8", errors="replace"),
+            "truncated": truncated,
+            "max_bytes": MAX_REVIEW_SOURCE_BYTES,
+        })
+
+    def _api_project_graph(self) -> None:
+        """Project-wide issue/declaration dependency DAG — PURE read."""
+        if self._demo:
+            return self._send_json({
+                "repo": None, "chapters": [], "nodes": [], "edges": [],
+                "unresolved_edges": [], "cyclic_edges": [],
+                "audit": {"status": "missing", "created_at": None,
+                "source_revision": None, "failures": []},
+                "counts": {"nodes": 0, "edges": 0, "by_status": {},
+                "by_type": {}, "by_build_status": {}, "changed": 0,
+                "impacted": 0, "unresolved_edges": 0,
+                "cyclic_edges": 0}, "errors": [],
+            })
+        from marathon.deck.workspace import build_project_graph
+
+        self._send_json(build_project_graph(self.cfg))
+
+    def _api_definition(self, query: dict) -> None:
+        """Current-source definition/signature lookup — PURE read."""
+        name = (query.get("name") or [None])[0]
+        if not isinstance(name, str) or not name.strip():
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "missing definition name"
+            )
+        issue_raw = (query.get("issue") or [None])[0]
+        issue_num = None
+        if issue_raw not in (None, ""):
+            try:
+                issue_num = int(issue_raw)
+            except (TypeError, ValueError):
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST, f"bad issue {issue_raw!r}"
+                )
+        if self._demo:
+            return self._send_json({
+                "query": name, "status": "unresolved", "matches": [],
+                "truncated": False,
+                "message": "definition lookup is unavailable in demo mode",
+            })
+        from marathon.deck.definitions import lookup_definition
+
+        self._send_json(
+            lookup_definition(self.cfg, name, issue_num=issue_num)
+        )
+
+    def _api_definition_terms(self) -> None:
+        """Compact current project identifier index — PURE read."""
+        if self._demo:
+            return self._send_json({
+                "names": [], "short": {}, "count": 0, "truncated": False,
+            })
+        from marathon.deck.definitions import definition_terms
+
+        self._send_json(definition_terms(self.cfg))
+
+    def _api_reconciliation(self, raw_id: str) -> None:
+        """Pending rename/split proposals reconstructed from the live cursor."""
+        try:
+            issue_num = int(raw_id)
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad issue id {raw_id!r}"
+            )
+        if self._demo:
+            return self._send_json({
+                "ok": True, "updated": False,
+                "proposed_renames": [], "proposed_splits": [],
+                "proposal_token": None,
+                "message": "no live reconciliation in demo mode",
+            })
+        from marathon.deck.refresh import reconciliation_preview
+
+        self._send_json(reconciliation_preview(self.cfg, issue_num))
+
     def _api_history(self, query: dict) -> None:
         """The History tab: recent issue-status changes (verdicts log) + merged
         PRs (one ``gh`` read). ``?limit=N`` caps each feed (default 30)."""
@@ -490,7 +661,9 @@ class DeckHandler(BaseHTTPRequestHandler):
     # feature), ``/api/decl-verdict`` is LOCAL-only. A path not here is a 404
     # with no side effect.
     _POST_ROUTES = (
-        "/api/verdict", "/api/decl-verdict", "/api/decl-lock", "/api/missing", "/api/ship",
+        "/api/verdict", "/api/decl-verdict", "/api/batch-decl-verdict",
+        "/api/reconcile-proposal",
+        "/api/decl-lock", "/api/missing", "/api/ship",
         "/api/refresh-issue", "/api/drop-citation", "/api/requeue",
         "/api/add-chapter", "/api/chapter-intake-status", "/api/approve-chapter",
         "/api/prover-toggle",
@@ -514,6 +687,10 @@ class DeckHandler(BaseHTTPRequestHandler):
                     self._api_verdict()
                 elif parsed.path == "/api/decl-verdict":
                     self._api_decl_verdict()
+                elif parsed.path == "/api/batch-decl-verdict":
+                    self._api_batch_decl_verdict()
+                elif parsed.path == "/api/reconcile-proposal":
+                    self._api_reconcile_proposal()
                 elif parsed.path == "/api/decl-lock":
                     self._api_decl_lock()
                 elif parsed.path == "/api/missing":
@@ -890,6 +1067,287 @@ class DeckHandler(BaseHTTPRequestHandler):
             "informal": subdeck.get("informal"),
             "next_decl": next_unreviewed_card(subdeck),
         })
+
+    def _api_batch_decl_verdict(self) -> None:
+        """Atomically record several LOCAL declaration verdicts.
+
+        This is the file/chapter reader's batch seam.  The complete request is
+        validated against fresh subdecks before one local sidecar transaction.
+        This endpoint deliberately accepts only DEFER.  KEEP/FIX remain
+        single-declaration actions so a filtered chapter cannot accidentally
+        turn into bulk human approval.  No committed issue verdict, GitHub
+        write, or Aristotle run occurs here.
+        """
+        data = self._read_guarded_body()
+        if data is None:
+            return
+        items = data.get("items")
+        if not isinstance(items, list) or not items:
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                "batch must contain a non-empty items list",
+            )
+        if len(items) > 500:
+            return self._send_error_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "batch may contain at most 500 declaration verdicts",
+            )
+        if self._demo:
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                "batch declaration review is not available in demo mode",
+            )
+
+        from marathon.deck.subdeck import (
+            DECL_VERDICTS,
+            build_subdeck,
+            record_decl_verdict_batch,
+        )
+
+        normalized: list[dict] = []
+        seen: set[tuple[int, str]] = set()
+        for raw in items:
+            if not isinstance(raw, dict):
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST, "each batch item must be an object"
+                )
+            try:
+                issue_num = int(raw.get("issue"))
+            except (TypeError, ValueError):
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    f"bad or missing issue {raw.get('issue')!r}",
+                )
+            decl = raw.get("decl")
+            verdict = raw.get("verdict")
+            note = raw.get("note")
+            if not isinstance(decl, str) or not decl.strip():
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST, f"bad or missing decl {decl!r}"
+                )
+            decl = decl.strip()
+            if verdict not in DECL_VERDICTS:
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    f"unknown decl verdict {verdict!r}; expected one of {DECL_VERDICTS}",
+                )
+            if verdict != "defer":
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    "batch review accepts only 'defer'; KEEP/FIX require an explicit per-declaration decision",
+                )
+            if verdict == "reject" and (note is None or not str(note).strip()):
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    f"a reject for {decl} requires a non-empty note",
+                )
+            key = (issue_num, decl)
+            if key in seen:
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    f"duplicate declaration target in batch: issue #{issue_num} {decl}",
+                )
+            seen.add(key)
+            normalized.append({
+                "issue": issue_num, "decl": decl,
+                "verdict": verdict, "note": note,
+            })
+
+        grouped: dict[int, list[dict]] = {}
+        for item in normalized:
+            grouped.setdefault(item["issue"], []).append(item)
+
+        blocked: list[dict] = []
+        for issue_num, proposed in grouped.items():
+            try:
+                subdeck = build_subdeck(self.cfg, issue_num)
+            except Exception as exc:  # noqa: BLE001 - report, never partially write
+                return self._send_error_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    f"could not validate issue #{issue_num}: {exc}",
+                )
+            cards = subdeck.get("cards") or []
+            by_name = {card.get("name"): card for card in cards if card.get("name")}
+            for item in proposed:
+                if item["decl"] not in by_name:
+                    return self._send_error_json(
+                        HTTPStatus.CONFLICT,
+                        f"#{issue_num}: declaration {item['decl']!r} is not in the current code-backed subdeck",
+                    )
+
+            projected = {name: card.get("verdict") for name, card in by_name.items()}
+            wire = {"verify": "verified", "reject": "rejected", "defer": "deferred"}
+            for item in proposed:
+                projected[item["decl"]] = wire[item["verdict"]]
+
+            names = list(by_name)
+            for item in proposed:
+                if item["verdict"] == "defer":
+                    continue
+                card = by_name[item["decl"]]
+                rejected_deps: set[str] = set()
+                for member in card.get("kernel") or []:
+                    raw_name = member.get("name")
+                    if not raw_name:
+                        continue
+                    matches = [
+                        name for name in names
+                        if name == raw_name
+                        or name.endswith("." + raw_name)
+                        or raw_name.endswith("." + name)
+                    ]
+                    if len(matches) == 1 and projected.get(matches[0]) == "rejected":
+                        rejected_deps.add(matches[0])
+                if rejected_deps:
+                    blocked.append({
+                        "issue": issue_num,
+                        "decl": item["decl"],
+                        "blocked_by": sorted(rejected_deps),
+                    })
+        # The chapter reader spans issue boundaries.  Apply its project-wide
+        # guard too: a definition rejected in issue A pauses a theorem in issue
+        # B even though build_subdeck(B) cannot see A's local sidecar cards.
+        if any(item["verdict"] != "defer" for item in normalized):
+            try:
+                from marathon.deck.workspace import build_review_workspace
+
+                wide = build_review_workspace(self.cfg, None)
+                wide_targets = {
+                    (target.get("issue"), target.get("name")): target
+                    for file in wide.get("files") or []
+                    for target in file.get("declarations") or []
+                }
+                for item in normalized:
+                    if item["verdict"] == "defer":
+                        continue
+                    cross = (wide_targets.get((item["issue"], item["decl"])) or {}).get(
+                        "blocked_by"
+                    ) or []
+                    if cross:
+                        blocked.append({
+                            "issue": item["issue"],
+                            "decl": item["decl"],
+                            "blocked_by": sorted(set(cross)),
+                        })
+            except Exception as exc:  # noqa: BLE001 - validation must fail closed
+                return self._send_error_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    f"could not validate project dependencies: {exc}",
+                )
+        if blocked:
+            unique_blocked = {}
+            for item in blocked:
+                key = (item["issue"], item["decl"])
+                unique_blocked.setdefault(key, set()).update(item["blocked_by"])
+            return self._send_json(
+                {
+                    "ok": False,
+                    "error": "later declarations are waiting on rejected predecessors",
+                    "blocked": [
+                        {"issue": key[0], "decl": key[1],
+                         "blocked_by": sorted(deps)}
+                        for key, deps in sorted(unique_blocked.items())
+                    ],
+                },
+                status=HTTPStatus.CONFLICT,
+            )
+
+        try:
+            stored = record_decl_verdict_batch(self.cfg, normalized)
+        except ValueError as exc:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except Exception as exc:  # noqa: BLE001 - surface, never crash server
+            return self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"batch decl-verdict failed: {exc}",
+            )
+        self._send_json({"ok": True, "count": len(stored), "items": stored})
+
+    def _api_reconcile_proposal(self) -> None:
+        """Confirm or dismiss one exact, token-bound rename/split proposal."""
+        data = self._read_guarded_body()
+        if data is None:
+            return
+        try:
+            issue_num = int(data.get("issue"))
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                f"bad or missing issue {data.get('issue')!r}",
+            )
+        token = data.get("proposal_token")
+        action = data.get("action")
+        kind = data.get("kind")
+        old = data.get("old")
+        if not isinstance(token, str) or len(token) != 64:
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "missing or invalid proposal token"
+            )
+        if action not in ("confirm", "dismiss"):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "action must be 'confirm' or 'dismiss'"
+            )
+        if kind not in ("rename", "split"):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "kind must be 'rename' or 'split'"
+            )
+        if not isinstance(old, str) or not old.strip():
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "proposal is missing its old declaration"
+            )
+
+        confirmation = {
+            "token": token,
+            "renames": [], "splits": [],
+            "dismiss_renames": [], "dismiss_splits": [],
+        }
+        if kind == "rename":
+            new = data.get("new")
+            if not isinstance(new, str) or not new.strip():
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    "rename proposal is missing its new declaration",
+                )
+            mapping = {"old": old.strip(), "new": new.strip()}
+            confirmation[
+                "renames" if action == "confirm" else "dismiss_renames"
+            ].append(mapping)
+        else:
+            targets = data.get("targets")
+            if (
+                not isinstance(targets, list)
+                or not targets
+                or not all(isinstance(item, str) and item.strip() for item in targets)
+                or len(targets) > 50
+            ):
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    "split proposal requires 1-50 declaration targets",
+                )
+            mapping = {
+                "old": old.strip(),
+                "targets": [item.strip() for item in targets],
+            }
+            confirmation[
+                "splits" if action == "confirm" else "dismiss_splits"
+            ].append(mapping)
+
+        if self._demo:
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                "reconciliation decisions are unavailable in demo mode",
+            )
+        from marathon.deck.refresh import confirm_reconciliation_proposal
+
+        result = confirm_reconciliation_proposal(
+            self.cfg, issue_num, confirmation
+        )
+        status = (
+            HTTPStatus.CONFLICT
+            if not result.get("ok", True)
+            else HTTPStatus.OK
+        )
+        self._send_json(result, status=status)
 
     def _api_decl_lock(self) -> None:
         """Toggle the opt-in HARD-FREEZE lock on one declaration — LOCAL ONLY
@@ -1317,7 +1775,18 @@ def collect_status(cfg: "ReviewConfig") -> dict:
         "landings": _status_landings(cfg),
         "bounces": _status_bounces(cfg),
         "building": _count_running(cfg),
+        "source_token": _status_source_token(cfg),
     }
+
+
+def _status_source_token(cfg: "ReviewConfig") -> Optional[str]:
+    """Current HEAD/worktree token for browser definition-index refreshes."""
+    try:
+        from marathon.deck.definitions import definition_source_token
+
+        return definition_source_token(Path(cfg.repo_dir))
+    except Exception:  # noqa: BLE001 - status remains fail-soft
+        return None
 
 
 def _status_jobs(cfg: "ReviewConfig") -> list[dict]:

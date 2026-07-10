@@ -82,6 +82,7 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlencode
 
 import marathon.review.daemon as daemon
 from marathon.post_pipeline import _branch_name_for_issue
@@ -96,7 +97,6 @@ from marathon.review.config import ReviewConfig, load_config
 from marathon.review.state import (
     clear_pending_pr_check,
     load_state,
-    pending_pr_checks,
     pending_rejections_needing_iteration,
     record_iteration,
 )
@@ -1100,24 +1100,45 @@ def _ensure_prover_branch(repo_dir: Path, prover_branch: str) -> None:
               flush=True)
 
 
-def _has_open_pr_for_issue(
-    cfg: ReviewConfig, issue_num: int, chapter: int, *, kind: str = "refine"
-) -> bool:
-    """True when the issue's per-issue branch already has an OPEN PR — a fill is
-    pending merge, so don't dispatch another. ``kind`` picks the branch prefix
-    (``proof`` for a fill's prover-branch PR). Best-effort: a check failure
-    returns False (better a rare duplicate than a wedged queue)."""
+def _branch_pull_requests(
+    cfg: ReviewConfig, branch: str, *, state: str,
+) -> Optional[list[dict]]:
+    """REST-backed PR rows for ``branch``, or ``None`` when GitHub is unknown.
+
+    The conductor must not depend on GraphQL quota for dispatch safety or
+    completion accounting.  ``gh pr list`` is GraphQL-backed; ``gh api`` here
+    targets the pull-request REST collection directly.
+    """
     from marathon.review.github import gh
 
-    branch = _branch_name_for_issue(f"Chapter{chapter}", issue_num, kind=kind)
+    owner = cfg.github_repo.split("/", 1)[0]
+    query = urlencode(
+        {"head": f"{owner}:{branch}", "state": state, "per_page": 100}
+    )
     try:
-        cp = gh("pr", "list", "--repo", cfg.github_repo, "--head", branch,
-                "--state", "open", "--json", "number", "--limit", "1", check=False)
+        cp = gh(
+            "api", f"repos/{cfg.github_repo}/pulls?{query}", check=False
+        )
         if cp.returncode != 0:
-            return False
-        return bool(json.loads(cp.stdout or "[]"))
-    except Exception:  # noqa: BLE001
-        return False
+            return None
+        rows = json.loads(cp.stdout or "[]")
+        return rows if isinstance(rows, list) else None
+    except Exception:  # noqa: BLE001 — unknown must fail closed at callers
+        return None
+
+
+def _has_open_pr_for_issue(
+    cfg: ReviewConfig, issue_num: int, chapter: int, *, kind: str = "refine"
+) -> Optional[bool]:
+    """Whether the issue's persistent branch has an open PR.
+
+    ``None`` means GitHub could not answer. Dispatch callers treat that as
+    occupied (fail closed), avoiding a duplicate billed run during an API or
+    quota outage.
+    """
+    branch = _branch_name_for_issue(f"Chapter{chapter}", issue_num, kind=kind)
+    rows = _branch_pull_requests(cfg, branch, state="open")
+    return None if rows is None else bool(rows)
 
 
 #: Sentinel: `_pick_fill_dispatchable(..., _snapshot=_UNSET)` loads the real
@@ -1192,12 +1213,68 @@ def _pick_fill_dispatchable(
                 continue
             if fill_attempts.get(n, 0) >= max_fill_attempts:
                 continue
-            if open_pr(cfg, n, chapter, kind="proof"):
+            # Unknown is occupied: never bill a duplicate proof merely because
+            # GitHub's dispatch-safety check is temporarily unavailable.
+            if open_pr(cfg, n, chapter, kind="proof") is not False:
                 continue
             dispatchable.append(t)
     snapshot = _load_audit_snapshot(cfg) if _snapshot is _UNSET else _snapshot
     ordered = order_targets(dispatchable, snapshot)
     return [(t.issue, t.chapter) for t in ordered]
+
+
+def _refine_branch_for_dispatch(
+    cfg: ReviewConfig,
+    issue_num: int,
+    chapter: int,
+    verdict_ts: Optional[str],
+) -> Optional[str]:
+    """Select an owned publication branch without overwriting stale refs.
+
+    The normal branch remains persistent per issue so a later session updates
+    its existing open PR.  If that remote ref exists but has *no* open PR, it is
+    stale/unowned for the active review loop; use a deterministic verdict-
+    generation branch and leave the old ref untouched.  Any inability to
+    establish remote/PR state fails closed before Aristotle is dispatched.
+    """
+    legacy = _branch_name_for_issue(f"Chapter{chapter}", issue_num, kind="refine")
+    ref = f"refs/heads/{legacy}"
+    remote = _git(cfg.repo_dir, "ls-remote", "--heads", "origin", ref)
+    if remote.returncode != 0:
+        print(
+            f"--- deferring #{issue_num}: could not establish ownership of "
+            f"remote branch {legacy} ---",
+            flush=True,
+        )
+        return None
+    if not (remote.stdout or "").strip():
+        return legacy
+    open_rows = _branch_pull_requests(cfg, legacy, state="open")
+    if open_rows is None:
+        print(
+            f"--- deferring #{issue_num}: GitHub could not confirm whether "
+            f"{legacy} has an open PR ---",
+            flush=True,
+        )
+        return None
+    if open_rows:
+        return legacy
+    if not verdict_ts:
+        print(
+            f"--- deferring #{issue_num}: stale remote branch {legacy} exists "
+            "but this dispatch has no verdict generation for a safe suffix ---",
+            flush=True,
+        )
+        return None
+    branch = _branch_name_for_issue(
+        f"Chapter{chapter}", issue_num, kind="refine", generation=verdict_ts
+    )
+    print(
+        f"--- #{issue_num}: remote {legacy} has no open PR; preserving it and "
+        f"publishing this verdict on {branch} ---",
+        flush=True,
+    )
+    return branch
 
 
 def _dispatch_job(
@@ -1265,7 +1342,12 @@ def _dispatch_job(
         branch = _branch_name_for_issue(f"Chapter{chapter}", issue_num, kind="proof")
         start_point = f"origin/{prover_branch}"
     else:
-        branch = _branch_name_for_issue(f"Chapter{chapter}", issue_num, kind="refine")
+        selected_branch = _refine_branch_for_dispatch(
+            cfg, issue_num, chapter, expected_verdict_ts
+        )
+        if selected_branch is None:
+            return None
+        branch = selected_branch
         start_point = WORKTREE_START_POINT
 
     kept_key = _kept_worktree_key(issue_num, fill=fill)
@@ -1346,6 +1428,12 @@ def _dispatch_job(
             and checkpoint.review_verdict_ts
         ):
             expected_verdict_ts = checkpoint.review_verdict_ts
+            pending_branch = checkpoint.pending_publication.get("branch")
+            if isinstance(pending_branch, str) and pending_branch:
+                # Publication-only recovery must keep the branch recorded with
+                # the committed fix, even if today's remote-state selector
+                # would choose a different branch.
+                branch = pending_branch
     target = worktree / _target_relpath(cfg, chapter)
     # The exact per-issue dispatch the daemon uses, flag-for-flag:
     # DEFAULT_REFINE_ARGS is imported, never forked. The conductor adds
@@ -1367,6 +1455,7 @@ def _dispatch_job(
             "--workdir", str(workdir),
             "--no-metadata-commit",
             "--build-timeout", "2400",
+            "--auto-pr-repo", cfg.github_repo,
         ]
         for m in (repair_modules or []):
             cmd += ["--module", m]
@@ -1388,6 +1477,7 @@ def _dispatch_job(
             "--issue", str(issue_num),
             "--no-metadata-commit",
             "--build-timeout", "2400",
+            "--auto-pr-repo", cfg.github_repo,
             # Proofs land on the SEPARATE prover branch, never main. The
             # worktree already branched from origin/<prover_branch>; target the
             # PR at it too so the [build:OK] automerge (base-equality gated)
@@ -1436,6 +1526,11 @@ def _dispatch_job(
             "--workdir", str(workdir),
             "--review-rejection", str(issue_num),
             "--no-metadata-commit",
+            # The consumer repo is configuration, not something a worker must
+            # infer through GraphQL.  #238 completed and built successfully but
+            # silently skipped its PR when `gh repo view` hit quota.
+            "--auto-pr-repo", cfg.github_repo,
+            "--auto-pr-branch", branch,
         ]
         if expected_verdict_ts is not None:
             cmd += ["--review-verdict-ts", expected_verdict_ts]
@@ -1602,21 +1697,33 @@ def _regenerate_metadata_after_success(cfg: ReviewConfig) -> None:
         print("  metadata: formalization.yaml + metric rollups regenerated + committed", flush=True)
 
 
-def _branch_pr_exists(cfg: ReviewConfig, branch: str) -> Optional[bool]:
-    """True/False whether ANY PR (open or merged) exists for ``branch``, or
-    None if the check couldn't run (gh missing/errored). Shared by the no-PR
-    requeue and the adopted-job completion path."""
-    from marathon.review.github import gh
+def _branch_pr_exists(
+    cfg: ReviewConfig,
+    branch: str,
+    expected_head_sha: Optional[str] = None,
+) -> Optional[bool]:
+    """Whether a PR for ``branch`` publishes the expected commit.
 
-    try:
-        cp = gh("pr", "list", "--repo", cfg.github_repo, "--head", branch,
-                "--state", "all", "--json", "number", "--limit", "1", check=False)
-        if cp.returncode != 0:
-            return None
-        return bool(json.loads(cp.stdout or "[]"))
-    except Exception as exc:  # noqa: BLE001 — a check failure must not crash a reap
-        print(f"  PR check for {branch} failed ({exc}); skipping", flush=True)
+    A persistent per-issue branch can have older PR history.  Merely finding
+    *any* PR caused #238's old 50eff009 PR to count as publication of the new
+    local 6221ffa commit.  When ``expected_head_sha`` is supplied, only a PR
+    whose REST ``head.sha`` matches that iteration counts. ``None`` means the
+    REST check itself was unavailable and must be retried fail-closed.
+    """
+    rows = _branch_pull_requests(cfg, branch, state="all")
+    if rows is None:
         return None
+    if not expected_head_sha:
+        return bool(rows)
+    expected = expected_head_sha.lower()
+    for row in rows:
+        head = row.get("head") if isinstance(row, dict) else None
+        sha = head.get("sha") if isinstance(head, dict) else None
+        if isinstance(sha, str) and (
+            sha.lower().startswith(expected) or expected.startswith(sha.lower())
+        ):
+            return True
+    return False
 
 
 def _reap_adopted_job(
@@ -1689,7 +1796,11 @@ def _reap_adopted_job(
                 flush=True,
             )
         return
-    has_pr = _branch_pr_exists(cfg, job.branch) if job.branch else None
+    job_head_sha = _job_head_sha(job)
+    has_pr = (
+        _branch_pr_exists(cfg, job.branch, job_head_sha)
+        if job.branch and job_head_sha else None
+    )
     if has_pr:
         job.status = "succeeded"
         if job.expected_verdict_ts is None:
@@ -1697,7 +1808,7 @@ def _reap_adopted_job(
                 cfg,
                 job.issue_num,
                 iteration_branch=job.branch,
-                iteration_commit_sha=_job_head_sha(job),
+                iteration_commit_sha=job_head_sha,
             )
         else:
             record_iteration(
@@ -1705,7 +1816,7 @@ def _reap_adopted_job(
                 job.issue_num,
                 expected_verdict_ts=job.expected_verdict_ts,
                 iteration_branch=job.branch,
-                iteration_commit_sha=_job_head_sha(job),
+                iteration_commit_sha=job_head_sha,
             )
         _remove_worktree(cfg.repo_dir, Path(job.worktree))
         _regenerate_metadata_after_success(cfg)
@@ -1727,7 +1838,7 @@ def _reap_adopted_job(
         if has_pr is None and completed_cleanly:
             kwargs = {
                 "pending_pr_branch": job.branch,
-                "iteration_commit_sha": _job_head_sha(job),
+                "iteration_commit_sha": job_head_sha,
             }
             if job.expected_verdict_ts is not None:
                 kwargs["expected_verdict_ts"] = job.expected_verdict_ts
@@ -1755,7 +1866,15 @@ def _requeue_if_no_pr_landed(cfg: ReviewConfig, job: ConductorJob) -> None:
 
     if not _REFINE_BRANCH_RE.match(branch):
         return
-    exists = _branch_pr_exists(cfg, branch)
+    expected_head = getattr(job, "iteration_commit_sha", None)
+    if expected_head is None and getattr(job, "worktree", None):
+        expected_head = _job_head_sha(job)
+    if not expected_head:
+        # Without commit identity an older PR on the persistent branch is
+        # indistinguishable from this iteration. Leave the durable pending
+        # marker untouched rather than guessing success or no-PR.
+        return
+    exists = _branch_pr_exists(cfg, branch, expected_head)
     expected_verdict_ts = getattr(job, "expected_verdict_ts", None)
     if exists is None:
         # record_iteration already persisted pending_pr_branch.  Leave it set:
@@ -1793,31 +1912,51 @@ def _requeue_if_no_pr_landed(cfg: ReviewConfig, job: ConductorJob) -> None:
 
 
 def _retry_pending_pr_checks(cfg: ReviewConfig) -> int:
-    """Resolve durable rc=0 PR uncertainty from prior conductor ticks/runs.
+    """Resolve durable or legacy rc=0 publication uncertainty.
 
     ``record_iteration(..., pending_pr_branch=...)`` parks the rejection while
     GitHub is uncertain.  This pass either clears the marker when a PR exists or
-    requeues unchanged code when no PR exists; transient failures leave the
-    marker untouched for the next tick. Returns the number resolved.
+    requeues unchanged code when no matching PR exists; transient failures leave
+    it untouched for the next tick.  It also audits older suppressed rows that
+    have ``iteration_branch`` + ``iteration_commit_sha`` but no pending marker,
+    recovering the exact #238 state written before SHA-aware publication checks.
+    Returns the number resolved.
     """
     from marathon.review.automerge import _requeue_refined_issue
 
     resolved = 0
-    for issue_num, entry in pending_pr_checks(cfg):
-        branch = entry.pending_pr_branch
-        if not branch:
+    state = load_state(cfg)
+    checks = sorted(
+        (
+            (issue_num, entry)
+            for issue_num, entry in state.issues.items()
+            if entry.status == "rejected"
+            and not entry.needs_iteration()
+            and (
+                entry.pending_pr_branch
+                or (entry.iteration_branch and entry.iteration_commit_sha)
+            )
+        ),
+        key=lambda item: item[1].verdict_ts,
+    )
+    for issue_num, entry in checks:
+        branch = entry.pending_pr_branch or entry.iteration_branch
+        if not branch or not entry.iteration_commit_sha:
             continue
-        exists = _branch_pr_exists(cfg, branch)
+        exists = _branch_pr_exists(
+            cfg, branch, entry.iteration_commit_sha
+        )
         if exists is None:
             continue
         if exists:
-            if clear_pending_pr_check(
-                cfg,
-                issue_num,
-                branch,
-                expected_verdict_ts=entry.verdict_ts,
-            ):
-                resolved += 1
+            if entry.pending_pr_branch:
+                if clear_pending_pr_check(
+                    cfg,
+                    issue_num,
+                    branch,
+                    expected_verdict_ts=entry.verdict_ts,
+                ):
+                    resolved += 1
             continue
         n = _requeue_refined_issue(
             cfg,
@@ -2404,6 +2543,36 @@ def _audit_target_folder(cfg: ReviewConfig) -> Optional[str]:
         return None
 
 
+def _persisted_audit_revision(cfg: ReviewConfig) -> Optional[str]:
+    """The revision durably audited for every module in the auto-audit target.
+
+    This is the conductor's restart-safe success cursor.  It is derived from
+    the atomically persisted per-module revision map, never from current HEAD
+    and never from an audit process merely having been launched.  Partial or
+    legacy snapshots return ``None``.
+    """
+    target = _audit_target_folder(cfg)
+    if target is None:
+        return None
+    try:
+        from marathon.audit.engine import derive_modules, load_snapshot
+
+        modules, failures = derive_modules(Path(cfg.repo_dir), target)
+        if not modules or failures:
+            return None
+        snapshot = load_snapshot(cfg.repo_dir, validate_revision=False)
+        if snapshot is None:
+            return None
+        revisions = {
+            snapshot.module_revisions.get(module) for module in modules
+        }
+        if None in revisions or len(revisions) != 1:
+            return None
+        return next(iter(revisions))
+    except Exception:  # noqa: BLE001 - cursor recovery is best-effort
+        return None
+
+
 def _has_uncommitted_lean(repo_dir: Path) -> bool:
     """True if the checkout has uncommitted ``.lean`` changes (operator mid-edit)
     — or we cannot tell. Used to SKIP an auto-audit that would otherwise race the
@@ -2443,13 +2612,19 @@ def _maybe_auto_audit(
     :data:`AUTO_AUDIT_MIN_INTERVAL_SECONDS`, and skipped while the operator has
     uncommitted Lean work. Best-effort — never raises."""
     now = _now_fn()
-    if now - last_time < AUTO_AUDIT_MIN_INTERVAL_SECONDS:
-        return last_head, last_time
+    # Poll the durable result before the throttle.  A child that completed
+    # since the previous tick advances the cursor immediately; a failed child
+    # changes nothing and is retried after the normal interval.
+    persisted = _persisted_audit_revision(cfg)
+    if persisted is not None and persisted != last_head:
+        last_head = persisted
     from marathon.deck.refresh import head_sha
 
     cur = head_sha(cfg.repo_dir)
     if cur is None or cur == last_head:
         return last_head, last_time  # HEAD unmoved / unknown — nothing to refresh
+    if now - last_time < AUTO_AUDIT_MIN_INTERVAL_SECONDS:
+        return last_head, last_time
     if _has_uncommitted_lean(cfg.repo_dir):
         return last_head, now  # operator mid-edit — skip, but reset the throttle
     target = _audit_target_folder(cfg)
@@ -2466,7 +2641,10 @@ def _maybe_auto_audit(
             )
         print(f"  audit: main moved to {cur[:8]} — auto-refreshing the snapshot "
               f"(target {target}) so a downstream break surfaces", flush=True)
-        return cur, now
+        # Launch is not success.  The next tick advances ``last_head`` only
+        # after save_snapshot has atomically persisted complete per-module
+        # coverage for this revision.
+        return last_head, now
     except Exception as e:  # noqa: BLE001 — a refresh failure must not crash a tick
         print(f"  audit: auto-refresh skipped ({e})", flush=True)
         return last_head, now
@@ -2522,6 +2700,14 @@ def _maybe_reconcile_signatures(
                 cfg, num,
                 diff_window=diff_window,
             )
+            if not r.get("ok", True):
+                retry_needed = True
+                print(
+                    f"  warning: reconcile #{num} did not complete "
+                    f"({r.get('message', 'unknown error')}); retaining cursor",
+                    flush=True,
+                )
+                continue
             # A verified/frozen issue cannot be silently rewritten.  But merely
             # returning "flagged/suppressed" and advancing the HEAD cursor loses
             # the event forever: the body never gains the new card, and its old
@@ -2573,6 +2759,24 @@ def _maybe_reconcile_signatures(
                         flush=True,
                     )
                     continue
+            # Heuristic rename/split candidates need one human decision.  Keep
+            # the reconcile cursor on the SAME old..new window until that
+            # decision is applied: advancing here loses the only evidence for a
+            # changed-leaf split, and a later browser preview could no longer
+            # reconstruct what Aristotle changed.
+            proposals = (
+                list(r.get("proposed_renames") or [])
+                + list(r.get("proposed_splits") or [])
+            )
+            if proposals:
+                retry_needed = True
+                print(
+                    f"  reconcile #{num}: {len(proposals)} declaration "
+                    "identity proposal(s) awaiting human confirmation; "
+                    "retaining the HEAD cursor",
+                    flush=True,
+                )
+                continue
             if r.get("updated"):
                 print(f"--- reconciled #{num}: {r.get('message', '')} ---", flush=True)
         except Exception as e:  # noqa: BLE001 — one issue's failure isn't fatal
@@ -2791,11 +2995,11 @@ def run_conductor(
     # Durable across restarts so an Aristotle rename/split/delete retains its
     # exact old..new provenance instead of degrading to a leaf-name guess.
     last_reconcile_sha: Optional[str] = load_reconcile_cursor(cfg.repo_dir)
-    # Auto re-audit tracking: the HEAD our last audit covered (init to the
-    # current HEAD so we don't audit at startup — only after a change lands) and
-    # the throttle clock.
-    from marathon.deck.refresh import head_sha as _head_sha
-    last_audit_head: Optional[str] = _head_sha(cfg.repo_dir)
+    # Auto re-audit tracking: recover the revision whose complete module
+    # coverage was atomically persisted.  Never assume current HEAD on startup:
+    # a restart after merge but before audit completion must re-audit, not
+    # silently bless the older snapshot.
+    last_audit_head: Optional[str] = _persisted_audit_revision(cfg)
     last_audit_time = float("-inf")
     last_tracker_sync = float("-inf")  # tracker safety-net cadence (~once/2min)
     last_merge_reconcile = float("-inf")  # merged-but-rejected re-review heal (~once/min)

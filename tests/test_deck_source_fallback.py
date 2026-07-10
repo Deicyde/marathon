@@ -98,6 +98,7 @@ def patch_bulk(monkeypatch, meta: dict) -> None:
     import marathon.review.github as gh_mod
 
     monkeypatch.setattr(gh_mod, "fetch_issues_bulk", fake_bulk)
+    monkeypatch.setattr(gh_mod, "fetch_issues_rest_bulk", lambda nums, repo: {})
 
 
 def _bundle_body(*decls: str) -> str:

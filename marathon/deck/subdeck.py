@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import json
 import threading
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional, TypeVar
@@ -95,6 +95,12 @@ INFORMAL_KEY = "__informal__"
 #: becomes a card or enters progress/summary. At ship it makes the outcome route
 #: to Aristotle with an ADD section even when every existing decl is verified.
 MISSING_KEY = "__missing__"
+
+#: Audit trail for declaration-identity changes.  It is reserved like the
+#: informal/missing slots, so it never becomes a review card or counts toward
+#: progress.  Active verdicts are deliberately not copied through a rename or
+#: split unless the reviewer re-opens the new declaration and decides again.
+RECONCILIATION_HISTORY_KEY = "__reconciliation_history__"
 
 #: The STORED per-decl verdict (``verify``/``reject``/``defer``) → the
 #: PAST-TENSE verdict the deck FRONTEND consumes on a serialized card
@@ -375,6 +381,122 @@ def issue_verdicts(cfg: "ReviewConfig", issue_num: int) -> dict:
     return _load_store(cfg).get(str(issue_num), {})
 
 
+def reconcile_decl_verdict_ownership(
+    cfg: "ReviewConfig",
+    issue_num: int,
+    *,
+    renames: list[dict],
+    splits: list[dict],
+    additions: list[str],
+) -> dict:
+    """Atomically reconcile local verdict keys after a successful body edit.
+
+    A confirmed one-to-one rename moves an old record to the exact new key but
+    clears its active verdict/lock/fingerprint: human confirmation establishes
+    declaration identity, not that the changed declaration remains correct.
+    The new card is therefore owned and explicitly marked for re-review.  If the
+    target already has an independently reviewed record, it wins and the old
+    record is archived instead of overwritten.
+
+    Splits never guess how one parent verdict applies to multiple children.  Any
+    parent record is removed from the active keyspace and archived with the
+    exact target list.  Additions already use their current declaration key, so
+    an existing surfaced-card record is preserved byte-for-byte.
+    """
+    normalized_renames = [
+        {"old": item.get("old"), "new": item.get("new")}
+        for item in renames
+        if isinstance(item, dict)
+        and isinstance(item.get("old"), str)
+        and isinstance(item.get("new"), str)
+        and item.get("old") != item.get("new")
+    ]
+    normalized_splits = [
+        {"old": item.get("old"), "targets": sorted(item.get("targets") or [])}
+        for item in splits
+        if isinstance(item, dict)
+        and isinstance(item.get("old"), str)
+        and all(isinstance(target, str) for target in (item.get("targets") or []))
+        and item.get("targets")
+    ]
+    normalized_additions = sorted({
+        name for name in additions if isinstance(name, str) and name
+    })
+
+    def mutate(store: dict) -> tuple[dict, bool]:
+        decls = store.get(str(issue_num))
+        if not isinstance(decls, dict):
+            return {
+                "migrated": [], "collisions": [], "split_archived": [],
+                "additions_preserved": [],
+            }, False
+        history_slot = decls.get(RECONCILIATION_HISTORY_KEY) or {}
+        old_events = history_slot.get("events") or []
+        events = [event for event in old_events if isinstance(event, dict)]
+        migrated: list[dict] = []
+        collisions: list[dict] = []
+        split_archived: list[dict] = []
+        changed = False
+
+        def archive(event: dict) -> None:
+            nonlocal changed
+            if event not in events:
+                events.append(event)
+                changed = True
+
+        for mapping in normalized_renames:
+            old, new = mapping["old"], mapping["new"]
+            previous = decls.pop(old, None)
+            if not isinstance(previous, dict):
+                continue
+            changed = True
+            event = {
+                "kind": "rename", "old": old, "new": new,
+                "previous_record": previous,
+            }
+            if new in decls:
+                collisions.append(dict(mapping))
+                event["target_record_preserved"] = True
+                archive(event)
+                continue
+            decls[new] = {
+                "requires_review": True,
+                "renamed_from": old,
+                "previous_record": previous,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+            migrated.append(dict(mapping))
+            archive(event)
+
+        for mapping in normalized_splits:
+            old = mapping["old"]
+            previous = decls.pop(old, None)
+            if not isinstance(previous, dict):
+                continue
+            changed = True
+            event = {
+                "kind": "split", "old": old,
+                "targets": list(mapping["targets"]),
+                "previous_record": previous,
+            }
+            archive(event)
+            split_archived.append(dict(mapping))
+
+        if events:
+            decls[RECONCILIATION_HISTORY_KEY] = {"events": events}
+        additions_preserved = [name for name in normalized_additions if name in decls]
+        return {
+            "migrated": migrated,
+            "collisions": collisions,
+            "split_archived": split_archived,
+            "additions_preserved": additions_preserved,
+        }, changed
+
+    with _issue_operation_lock(cfg, issue_num):
+        _clear_ship_receipt(cfg, issue_num)
+        return _mutate_store(cfg, mutate)
+
+
 def record_decl_verdict(
     cfg: "ReviewConfig",
     issue_num: int,
@@ -423,6 +545,90 @@ def record_decl_verdict(
 
     with _issue_operation_lock(cfg, issue_num):
         _clear_ship_receipt(cfg, issue_num)
+        return _mutate_store(cfg, mutate)
+
+
+def record_decl_verdict_batch(
+    cfg: "ReviewConfig", items: list[dict]
+) -> list[dict]:
+    """Atomically record several LOCAL per-declaration verdicts.
+
+    The file/chapter reader uses this for deliberate batch KEEP/DEFER actions.
+    Shape validation is performed for the complete request before any write;
+    duplicate ``(issue, decl)`` targets are refused.  All affected issue locks
+    are then acquired in numeric order and the whole sidecar is replaced in one
+    store transaction, so a failure cannot leave a half-applied batch.
+
+    Like :func:`record_decl_verdict`, this is LOCAL ONLY: no GitHub, git,
+    Aristotle, or committed issue verdict is touched.  Reject notes remain
+    verbatim and are required for every batched reject.
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("batch must contain at least one declaration verdict")
+
+    normalized: list[dict] = []
+    seen: set[tuple[int, str]] = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            raise ValueError("each batch item must be an object")
+        try:
+            issue_num = int(raw.get("issue"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"bad or missing issue {raw.get('issue')!r}") from exc
+        decl = raw.get("decl")
+        verdict = raw.get("verdict")
+        note = raw.get("note")
+        if not isinstance(decl, str) or not decl.strip():
+            raise ValueError(f"bad or missing decl {decl!r}")
+        decl = decl.strip()
+        if verdict not in DECL_VERDICTS:
+            raise ValueError(
+                f"unknown decl verdict {verdict!r}; expected one of {DECL_VERDICTS}"
+            )
+        if verdict == "reject" and (note is None or not str(note).strip()):
+            raise ValueError(
+                f"a reject for {decl} requires a non-empty note carried to Aristotle"
+            )
+        key = (issue_num, decl)
+        if key in seen:
+            raise ValueError(
+                f"duplicate declaration target in batch: issue #{issue_num} {decl}"
+            )
+        seen.add(key)
+        normalized.append({
+            "issue": issue_num,
+            "decl": decl,
+            "verdict": verdict,
+            "note": str(note) if note is not None else None,
+        })
+
+    issues = sorted({item["issue"] for item in normalized})
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    def mutate(store: dict) -> tuple[list[dict], bool]:
+        results: list[dict] = []
+        for item in normalized:
+            decls = store.setdefault(str(item["issue"]), {})
+            previous = decls.get(item["decl"]) or {}
+            entry = {
+                "verdict": item["verdict"],
+                "note": item["note"],
+                "ts": timestamp,
+            }
+            if item["verdict"] == "verify" and previous.get("locked"):
+                entry["locked"] = True
+            decls[item["decl"]] = entry
+            results.append({**item, "record": dict(entry)})
+        return results, True
+
+    # Numeric lock order prevents two overlapping multi-issue batches from
+    # deadlocking each other.  The shared store transaction is acquired only
+    # after every issue lock, matching single-issue mutation ordering.
+    with ExitStack() as stack:
+        for issue_num in issues:
+            stack.enter_context(_issue_operation_lock(cfg, issue_num))
+        for issue_num in issues:
+            _clear_ship_receipt(cfg, issue_num)
         return _mutate_store(cfg, mutate)
 
 
@@ -783,6 +989,8 @@ def build_subdeck(
         rec = records.get(name)
         if not rec:
             return None, None
+        if rec.get("requires_review"):
+            return None, "changed"
         if rec.get("fingerprint") is None:
             return rec, None
         view = view_by_name.get(name)

@@ -30,7 +30,7 @@ import marathon.review.github as github_mod
 import marathon.review.review as review_mod
 import marathon.review.verified_decls as vd_mod
 from marathon.review.config import ChapterRegistry, ReviewConfig, ReviewLabels
-from marathon.review.github import fetch_issues_bulk
+from marathon.review.github import fetch_issues_bulk, fetch_issues_rest_bulk
 
 
 # --- helpers -----------------------------------------------------------------
@@ -71,7 +71,7 @@ class FakeGh:
         self.calls: list[tuple[str, ...]] = []
         self.handler = handler
 
-    def __call__(self, *args, check=True, capture=True):
+    def __call__(self, *args, check=True, capture=True, timeout=None):
         self.calls.append(args)
         if self.handler is not None:
             result = self.handler(args)
@@ -342,6 +342,63 @@ def test_fetch_issues_bulk_empty_and_bad_repo():
     assert fetch_issues_bulk([14], "not-a-repo-slug") is None
 
 
+def test_fetch_issues_rest_bulk_normalizes_labels_body_and_excludes_prs(
+    monkeypatch,
+):
+    issue = {
+        "number": 14,
+        "title": "Lemma 14.7 (REST)",
+        "state": "open",
+        "body": "```lean\ntheorem restFoo : True := trivial\n```",
+        "labels": [
+            {"name": "review:verified"},
+            "legacy-string-label",
+            {"name": ""},
+        ],
+    }
+    pull_request = {
+        "number": 15,
+        "title": "This is a PR, not an issue",
+        "state": "open",
+        "body": "must not surface",
+        "labels": [{"name": "review:verified"}],
+        "pull_request": {"url": "https://api.github.test/pulls/15"},
+    }
+
+    def handler(args):
+        endpoint = args[3]
+        payload = issue if endpoint.endswith("/14") else pull_request
+        return completed(stdout=json.dumps(payload))
+
+    fake = FakeGh(handler)
+    monkeypatch.setattr(github_mod, "gh", fake)
+
+    out = fetch_issues_rest_bulk([14, 15, 14], "someone/SomeProject")
+
+    assert len(fake.calls) == 2  # input is deduplicated before fan-out
+    assert out == {
+        14: {
+            "title": "Lemma 14.7 (REST)",
+            "state": "OPEN",
+            "body": issue["body"],
+            "labels": {"review:verified", "legacy-string-label"},
+        }
+    }
+
+
+def test_fetch_issues_rest_bulk_failures_are_omitted(monkeypatch):
+    def handler(args):
+        endpoint = args[3]
+        if endpoint.endswith("/14"):
+            return completed(returncode=1, stderr="REST quota exhausted")
+        return completed(stdout="not json")
+
+    monkeypatch.setattr(github_mod, "gh", FakeGh(handler))
+    assert fetch_issues_rest_bulk(
+        [14, 15], "someone/SomeProject"
+    ) == {}
+
+
 # --- verified_declarations: bulk path + fallback -------------------------------
 
 LEAN_BODY = "intro\n```lean\ntheorem foo : True := trivial\n```\n"
@@ -468,20 +525,33 @@ def test_sync_tracker_flips_verified_but_stale(tmp_path, monkeypatch):
     body = ("### Chapter 14:\n"
             "1. Lemma 14.7 — foo 🟠\n"
             "2. Proposition 14.8 — bar 🟠\n")
-    monkeypatch.setattr(tr, "issue_body", lambda n, repo: body)
+    remote_body = {"value": body}
+    monkeypatch.setattr(
+        tr, "issue_body", lambda n, repo, **kwargs: remote_body["value"]
+    )
     monkeypatch.setattr(
         gh_mod, "fetch_issues_bulk",
         lambda nums, repo: {14: {"labels": ["review:verified"]},
                             15: {"labels": ["review"]}},
     )
-    fake = FakeGh()
+    staged: dict[str, str] = {}
+
+    def capture_tracker_body(args):
+        if args[:2] == ("issue", "edit"):
+            body_path = Path(args[args.index("--body-file") + 1])
+            staged["body"] = body_path.read_text()
+            remote_body["value"] = staged["body"]
+        return None
+
+    fake = FakeGh(capture_tracker_body)
     monkeypatch.setattr(tr, "gh", fake)
 
     ok, msg = tr.sync_tracker_to_verified(cfg, tmp_dir=tmp_path)
     assert ok is True
-    written = (tmp_path / "review-tracker-body-batch.md").read_text()
+    written = staged["body"]
     assert "Lemma 14.7 — foo 🟡" in written        # verified → flipped
     assert "Proposition 14.8 — bar 🟠" in written   # unverified → left alone
+    assert list(tmp_path.glob("marathon-tracker-*")) == []  # staging cleaned
 
 
 def test_sync_tracker_noop_when_all_synced(tmp_path, monkeypatch):
@@ -489,7 +559,7 @@ def test_sync_tracker_noop_when_all_synced(tmp_path, monkeypatch):
     import marathon.review.github as gh_mod
     cfg = make_cfg(tmp_path)
     body = "### Chapter 14:\n1. Lemma 14.7 — foo 🟡\n"  # already 🟡
-    monkeypatch.setattr(tr, "issue_body", lambda n, repo: body)
+    monkeypatch.setattr(tr, "issue_body", lambda n, repo, **kwargs: body)
     monkeypatch.setattr(gh_mod, "fetch_issues_bulk",
                         lambda nums, repo: {14: {"labels": ["review:verified"]}})
     monkeypatch.setattr(tr, "gh", FakeGh())

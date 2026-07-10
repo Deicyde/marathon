@@ -1272,6 +1272,16 @@ def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--auto-pr-branch",
+        default=None,
+        metavar="BRANCH",
+        help=(
+            "Explicit marathon-owned branch for --auto-pr. Used by the "
+            "conductor when a stale remote per-issue ref must be preserved; "
+            "normally derived automatically."
+        ),
+    )
+    parser.add_argument(
         "--auto-pr-base",
         default="main",
         metavar="BRANCH",

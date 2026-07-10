@@ -112,6 +112,7 @@ def patch_bulk(monkeypatch, meta: dict) -> None:
     import marathon.review.github as gh_mod
 
     monkeypatch.setattr(gh_mod, "fetch_issues_bulk", fake_bulk)
+    monkeypatch.setattr(gh_mod, "fetch_issues_rest_bulk", lambda nums, repo: {})
 
 
 def patch_no_verdict_handlers(monkeypatch) -> dict:
@@ -219,6 +220,101 @@ def test_clear_issue_drops_store(tmp_path):
         == "verify"
     # Clearing an absent issue is a no-op.
     subdeck.clear_issue(cfg, 999)
+
+
+def test_exact_rename_moves_ownership_but_requires_fresh_review(tmp_path):
+    cfg = make_cfg(tmp_path)
+    old = "Demo.Chapter14.OldFoo"
+    new = "Demo.Chapter14.NewFoo"
+    subdeck.record_decl_verdict(cfg, 22, old, "verify")
+    subdeck.set_decl_lock(cfg, 22, old, True)
+
+    result = subdeck.reconcile_decl_verdict_ownership(
+        cfg, 22,
+        renames=[{"old": old, "new": new}], splits=[], additions=[],
+    )
+
+    records = subdeck.issue_verdicts(cfg, 22)
+    assert result["migrated"] == [{"old": old, "new": new}]
+    assert old not in records
+    assert records[new]["requires_review"] is True
+    assert records[new]["renamed_from"] == old
+    assert "verdict" not in records[new] and "locked" not in records[new]
+    assert records[new]["previous_record"]["verdict"] == "verify"
+    assert records[new]["previous_record"]["locked"] is True
+
+
+def test_migrated_rename_is_unreviewed_in_the_built_subdeck(
+    tmp_path, monkeypatch,
+):
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    old = "Demo.Chapter14.LegacyFoo"
+    new = "Demo.Chapter14.Foo"
+    subdeck.record_decl_verdict(cfg, 22, old, "verify")
+    subdeck.set_decl_lock(cfg, 22, old, True)
+
+    subdeck.reconcile_decl_verdict_ownership(
+        cfg, 22,
+        renames=[{"old": old, "new": new}], splits=[], additions=[],
+    )
+
+    built = subdeck.build_subdeck(cfg, 22)
+    card = next(item for item in built["cards"] if item["name"] == new)
+    assert card["verdict"] is None
+    assert card["locked"] is False
+    assert card["changed_since_review"] is True
+    assert new not in built["summary"]["kept"]
+    assert built["complete"] is False
+
+
+def test_rename_collision_preserves_target_and_split_never_copies_parent(tmp_path):
+    cfg = make_cfg(tmp_path)
+    old = "Demo.Chapter14.Old"
+    existing = "Demo.Chapter14.Existing"
+    split_old = "Demo.Chapter14.Parent"
+    children = ["Demo.Chapter14.Left", "Demo.Chapter14.Right"]
+    subdeck.record_decl_verdict(cfg, 22, old, "reject", note="old note")
+    subdeck.record_decl_verdict(cfg, 22, existing, "verify")
+    subdeck.record_decl_verdict(cfg, 22, split_old, "verify")
+    subdeck.set_decl_lock(cfg, 22, split_old, True)
+
+    result = subdeck.reconcile_decl_verdict_ownership(
+        cfg, 22,
+        renames=[{"old": old, "new": existing}],
+        splits=[{"old": split_old, "targets": children}],
+        additions=[],
+    )
+
+    records = subdeck.issue_verdicts(cfg, 22)
+    assert old not in records and split_old not in records
+    assert records[existing]["verdict"] == "verify"
+    assert result["collisions"] == [{"old": old, "new": existing}]
+    assert result["split_archived"] == [
+        {"old": split_old, "targets": children}
+    ]
+    assert all(child not in records for child in children)
+    events = records[subdeck.RECONCILIATION_HISTORY_KEY]["events"]
+    assert {event["kind"] for event in events} == {"rename", "split"}
+
+
+def test_reconcile_addition_preserves_existing_surfaced_verdict_and_is_idempotent(
+    tmp_path,
+):
+    cfg = make_cfg(tmp_path)
+    name = "Demo.Chapter14.Surfaced"
+    subdeck.record_decl_verdict(cfg, 22, name, "reject", note="still wrong")
+    before = subdeck.issue_verdicts(cfg, 22)[name].copy()
+
+    first = subdeck.reconcile_decl_verdict_ownership(
+        cfg, 22, renames=[], splits=[], additions=[name],
+    )
+    second = subdeck.reconcile_decl_verdict_ownership(
+        cfg, 22, renames=[], splits=[], additions=[name],
+    )
+
+    assert first["additions_preserved"] == [name]
+    assert second["additions_preserved"] == [name]
+    assert subdeck.issue_verdicts(cfg, 22)[name] == before
 
 
 def test_concurrent_store_mutations_are_one_locked_read_modify_write(

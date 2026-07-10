@@ -85,7 +85,7 @@ def _install_boundaries(
         calls.setdefault("commit", []).append(message)
         return CommitResult(sha="abc1234")
 
-    def fake_pr(*, repo_dir, branch, base, repo, title, body):
+    def fake_pr(*, repo_dir, branch, base, repo, title, body, **_publication):
         calls.setdefault("pr", []).append(
             {"branch": branch, "base": base, "title": title, "body": body}
         )

@@ -48,7 +48,9 @@ if TYPE_CHECKING:  # pragma: no cover — type-only
 #: A merged PR on this branch is Aristotle's REFINE of a rejected issue; merging
 #: it re-queues issue ``M`` for the human to RE-REVIEW (reject -> refine ->
 #: merge -> re-review). Matches ``post_pipeline._branch_name_for_issue``.
-_REFINE_BRANCH_RE = re.compile(r"^marathon/refine-c\d+-i(\d+)$")
+_REFINE_BRANCH_RE = re.compile(
+    r"^marathon/refine-c\d+-i(\d+)(?:-v[0-9a-f]{12})?$"
+)
 
 #: PR JSON fields the gate needs. ``mergeable``/``mergeStateStatus`` are the
 #: conflict + protection signals; ``statusCheckRollup`` is the CI signal;

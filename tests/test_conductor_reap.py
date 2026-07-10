@@ -153,7 +153,8 @@ def test_reap_adopted_job_with_pr_marks_iterated(monkeypatch, tmp_path):
     # re-dispatched) + worktree removed; automerge lands the PR separately.
     import marathon.conductor as c
     calls = {"iterated": [], "removed": []}
-    monkeypatch.setattr(c, "_branch_pr_exists", lambda cfg, b: True)
+    monkeypatch.setattr(c, "_job_head_sha", lambda job: "new-head-sha")
+    monkeypatch.setattr(c, "_branch_pr_exists", lambda *a, **k: True)
     monkeypatch.setattr(c, "record_iteration",
                         lambda cfg, n, **kw: calls["iterated"].append(n))
     monkeypatch.setattr(c, "_remove_worktree",
@@ -171,7 +172,8 @@ def test_reap_adopted_job_without_pr_requeues(monkeypatch, tmp_path):
     # no-PR requeue path; NEVER record_iteration (would wrongly consume it).
     import marathon.conductor as c
     calls = {"iterated": 0, "requeued": []}
-    monkeypatch.setattr(c, "_branch_pr_exists", lambda cfg, b: False)
+    monkeypatch.setattr(c, "_job_head_sha", lambda job: "new-head-sha")
+    monkeypatch.setattr(c, "_branch_pr_exists", lambda *a, **k: False)
     monkeypatch.setattr(c, "record_iteration",
                         lambda cfg, n: calls.__setitem__("iterated", calls["iterated"] + 1))
     monkeypatch.setattr(c, "_requeue_if_no_pr_landed",

@@ -130,14 +130,20 @@ def gh_spy(monkeypatch):
     ``issue edit`` body rewrites happened (must be exactly one per
     batched apply)."""
     calls: list[tuple] = []
+    remote = {"body": PARENT_BODY}
 
     def fake_gh(*args, **kwargs):
         calls.append(args)
+        if args[:2] == ("issue", "edit"):
+            path = Path(args[args.index("--body-file") + 1])
+            remote["body"] = path.read_text()
         return subprocess.CompletedProcess(args=list(args), returncode=0,
                                            stdout="", stderr="")
 
     monkeypatch.setattr(tracker, "gh", fake_gh)
-    monkeypatch.setattr(tracker, "issue_body", lambda num, repo: PARENT_BODY)
+    monkeypatch.setattr(
+        tracker, "issue_body", lambda num, repo, **kwargs: remote["body"]
+    )
     return calls
 
 

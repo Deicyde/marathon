@@ -789,6 +789,11 @@ def test_branch_conflict_defers_not_crash(cfg, monkeypatch, tmp_path, capsys):
 
     monkeypatch.setattr(conductor.subprocess, "run", fake_run)
     monkeypatch.setattr(
+        conductor,
+        "_refine_branch_for_dispatch",
+        lambda *a, **k: "marathon/refine-c14-i22",
+    )
+    monkeypatch.setattr(
         conductor.subprocess, "Popen",
         lambda *a, **kw: pytest.fail("must not spawn refine on a deferred dispatch"),
     )

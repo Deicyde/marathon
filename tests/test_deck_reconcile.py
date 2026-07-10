@@ -268,6 +268,40 @@ def test_conductor_keeps_old_cursor_when_unverify_not_confirmed(
     ) == "OLD"
 
 
+def test_conductor_keeps_diff_window_while_identity_proposal_is_pending(
+    tmp_path, monkeypatch,
+):
+    """A changed-leaf split may only be reconstructable from OLD..NEW.  Do not
+    consume that cursor until the deck applies the human's decision."""
+    from marathon import conductor
+    from marathon.deck import refresh as refresh_mod
+
+    cfg = make_cfg(tmp_path)
+    seen = []
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda d: "NEW")
+    monkeypatch.setattr(conductor, "reconcile_cursor_is_ancestor", lambda *a: True)
+
+    def fake_reconcile(c, n, **kwargs):
+        seen.append(kwargs.get("diff_window"))
+        return {
+            "ok": True,
+            "updated": False,
+            "flagged_renames": [],
+            "flagged_splits": [],
+            "flagged_deletes": [],
+            "suppressed_adds": [],
+            "proposed_renames": [],
+            "proposed_splits": [{"old": "A.old", "targets": ["A.left", "A.right"]}],
+        }
+
+    monkeypatch.setattr(refresh_mod, "auto_reconcile_issue", fake_reconcile)
+
+    assert conductor._maybe_reconcile_signatures(
+        cfg, "OLD", exclude_issues=frozenset(),
+    ) == "OLD"
+    assert seen == [("OLD", "NEW")]
+
+
 def test_reconcile_cursor_round_trip(tmp_path):
     from marathon import conductor
 

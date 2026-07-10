@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import subprocess
@@ -83,14 +84,18 @@ def issue_view_json(
     fields: str,
     *,
     check: bool = True,
+    timeout: Optional[float] = None,
 ) -> Optional[dict]:
     """``gh issue view ... --json fields`` → parsed dict (or None on failure)."""
-    cp = gh(
+    args = (
         "issue", "view", str(issue_num),
         "--repo", repo,
         "--json", fields,
-        check=check,
     )
+    if timeout is None:
+        cp = gh(*args, check=check)
+    else:
+        cp = gh(*args, check=check, timeout=timeout)
     if cp.returncode != 0:
         return None
     return json.loads(cp.stdout)
@@ -108,12 +113,24 @@ def issue_title(issue_num: int, repo: str) -> str:
     return (data or {}).get("title", "(?)")
 
 
-def issue_body(issue_num: int, repo: str) -> Optional[str]:
-    data = issue_view_json(issue_num, repo, "body", check=False)
+def issue_body(
+    issue_num: int, repo: str, *, timeout: Optional[float] = None
+) -> Optional[str]:
+    """Issue body, optionally bounding the underlying ``gh`` call."""
+    if timeout is None:
+        data = issue_view_json(issue_num, repo, "body", check=False)
+    else:
+        data = issue_view_json(
+            issue_num, repo, "body", check=False, timeout=timeout
+        )
     return (data or {}).get("body")
 
 
-# --- bulk fetch (one GraphQL round-trip instead of N `gh issue view`s) --------
+# --- bulk fetches -------------------------------------------------------------
+
+
+_REST_ISSUE_TIMEOUT_SECONDS = 10.0
+_REST_ISSUE_MAX_WORKERS = 8
 
 
 def fetch_issues_bulk(
@@ -172,8 +189,10 @@ def fetch_issues_bulk(
             "-f", f"owner={owner}",
             "-f", f"name={name}",
             check=False,
+            timeout=20,
         )
-    except OSError:  # gh binary missing/unrunnable
+    except (OSError, subprocess.TimeoutExpired):
+        # gh binary missing/unrunnable, or the one-shot request hung.
         return None
     if cp.returncode != 0:
         return None
@@ -199,6 +218,106 @@ def fetch_issues_bulk(
             "body": node.get("body") or "",
             "labels": {l["name"] for l in labels_nodes if l.get("name")},
         }
+    return out
+
+
+def _parse_rest_issue(node: object, expected_num: int) -> Optional[dict]:
+    """Normalize one REST ``/issues/{number}`` response to the GraphQL shape.
+
+    GitHub's REST issues endpoint also returns pull requests.  The
+    ``pull_request`` marker is therefore an explicit exclusion, not merely an
+    ignored field: a PR number must never become a review issue card.
+    """
+    if not isinstance(node, dict) or "pull_request" in node:
+        return None
+
+    number = node.get("number")
+    if number is not None:
+        try:
+            if int(number) != expected_num:
+                return None
+        except (TypeError, ValueError):
+            return None
+
+    labels: set[str] = set()
+    raw_labels = node.get("labels") or []
+    if isinstance(raw_labels, list):
+        for label in raw_labels:
+            raw_name = label.get("name") if isinstance(label, dict) else label
+            if isinstance(raw_name, str) and raw_name:
+                labels.add(raw_name)
+
+    title = node.get("title")
+    state = node.get("state")
+    body = node.get("body")
+    return {
+        "title": title if isinstance(title, str) and title else "(?)",
+        # GraphQL emits OPEN/CLOSED; REST emits open/closed.
+        "state": state.upper() if isinstance(state, str) else "",
+        "body": body if isinstance(body, str) else "",
+        "labels": labels,
+    }
+
+
+def fetch_issues_rest_bulk(
+    issue_nums: Sequence[int],
+    repo: str,
+) -> dict[int, dict]:
+    """Fetch issue metadata from REST, concurrently and fail-soft.
+
+    This is the degraded-path companion to :func:`fetch_issues_bulk`: callers
+    should first make the single GraphQL request, then pass only unresolved
+    numbers here.  Each REST call has a hard timeout and the worker pool is
+    capped, so a GraphQL outage cannot turn a deck request into an unbounded
+    serial N+1 wait.  There is deliberately no cache: results are live reads
+    and cannot outlive the request that consumed them.
+
+    Returns only successfully parsed issues. Missing/inaccessible issues,
+    pull requests, command failures, timeouts, and malformed JSON are omitted.
+    """
+    nums = list(dict.fromkeys(int(n) for n in issue_nums))
+    if not nums or "/" not in repo:
+        return {}
+    owner, name = repo.split("/", 1)
+    if not owner or not name:
+        return {}
+
+    def fetch_one(number: int) -> Optional[dict]:
+        try:
+            cp = gh(
+                "api", "--method", "GET",
+                f"repos/{owner}/{name}/issues/{number}",
+                check=False,
+                timeout=_REST_ISSUE_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if cp.returncode != 0:
+            return None
+        try:
+            node = json.loads(cp.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return _parse_rest_issue(node, number)
+
+    out: dict[int, dict] = {}
+    workers = min(_REST_ISSUE_MAX_WORKERS, len(nums))
+    # ContextVars do not automatically cross thread boundaries.  Copy one
+    # context per worker invocation so a shared deck's read uses the requesting
+    # collaborator's GH_TOKEN rather than silently falling back to host auth.
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(contextvars.copy_context().run, fetch_one, number): number
+            for number in nums
+        }
+        for future in as_completed(futures):
+            number = futures[future]
+            try:
+                metadata = future.result()
+            except Exception:  # noqa: BLE001 - degraded read must fail soft
+                continue
+            if metadata is not None:
+                out[number] = metadata
     return out
 
 

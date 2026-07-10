@@ -1,6 +1,6 @@
 """B0 hardening of the conductor's job machinery (the #98 failure class):
-- pushes use an explicit refspec/force so they survive an upstream mismatch or a
-  stale remote-tracking ref;
+- pushes use an explicit refspec plus an observed-OID force-with-lease, so they
+  survive an upstream mismatch without overwriting an unowned remote ref;
 - a refine that exits clean but opened no PR is requeued, not left stuck.
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ def test_run_git_push_uses_explicit_origin_head(monkeypatch):
     assert calls[0] == ["git", "push", "origin", "HEAD"]
 
 
-def test_open_or_update_pr_force_pushes_explicit_refspec(monkeypatch):
+def test_open_or_update_pr_uses_explicit_oid_lease_and_refspec(monkeypatch):
     calls = []
     monkeypatch.setattr(pp.subprocess, "run", lambda a, **k: calls.append(a) or _ok(a))
     monkeypatch.setattr(pp, "_existing_pr_number", lambda *a, **k: None)
@@ -49,16 +49,136 @@ def test_open_or_update_pr_force_pushes_explicit_refspec(monkeypatch):
         repo_dir=Path("/repo"), branch="marathon/refine-c12-i98",
         base="main", repo="o/r", title="t", body="b",
     )
-    # explicit HEAD:refs/heads/<branch> + plain --force: robust to a stale
-    # remote-tracking ref (which made --force-with-lease reject as "stale info")
-    assert ["git", "push", "--force", "origin",
-            "HEAD:refs/heads/marathon/refine-c12-i98"] in calls
+    # Explicit lease says the branch was observed absent. A concurrent/stale
+    # remote ref cannot be clobbered by a plain force push.
+    assert [
+        "git", "push",
+        "--force-with-lease=refs/heads/marathon/refine-c12-i98:",
+        "origin", "HEAD:refs/heads/marathon/refine-c12-i98",
+    ] in calls
+
+
+def test_repeat_issue_session_updates_owned_open_pr_without_duplicate(
+    monkeypatch, tmp_path,
+):
+    """A later verdict keeps the persistent branch when its PR is still open,
+    CAS-updates that remote head, and PATCHes the existing PR (never POSTs a
+    duplicate)."""
+    from tests.test_conductor import make_cfg
+
+    cfg = make_cfg(tmp_path)
+    legacy = "marathon/refine-c14-i22"
+    monkeypatch.setattr(
+        cond,
+        "_git",
+        lambda *a, **k: SimpleNamespace(
+            returncode=0,
+            stdout=f"50eff009\trefs/heads/{legacy}\n",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        cond,
+        "_branch_pull_requests",
+        lambda *a, **k: [{"number": 273, "head": {"sha": "50eff009"}}],
+    )
+    assert cond._refine_branch_for_dispatch(
+        cfg, 22, 14, "2026-07-10T11:21:06+01:00"
+    ) == legacy
+
+    pushes = []
+    api_calls = []
+    monkeypatch.setattr(
+        pp,
+        "observe_remote_branch",
+        lambda *a, **k: (True, "50eff009deadbeef", "observed"),
+    )
+    monkeypatch.setattr(
+        pp.subprocess,
+        "run",
+        lambda args, **kw: pushes.append(args) or _ok(args),
+    )
+    monkeypatch.setattr(pp, "_existing_pr_number", lambda *a, **k: 273)
+    monkeypatch.setattr(
+        pp,
+        "_gh",
+        lambda *args, **kw: api_calls.append(args) or _ok(("gh",) + args),
+    )
+
+    ok, url = pp.open_or_update_pr(
+        repo_dir=Path("/repo"), branch=legacy, base="main", repo="o/r",
+        title="new", body="new body",
+        expected_remote_oid="50eff009deadbeef",
+        local_commit_sha="6221ffa0",
+    )
+
+    assert ok and url.endswith("/273")
+    assert [
+        "git", "push",
+        f"--force-with-lease=refs/heads/{legacy}:50eff009deadbeef",
+        "origin", f"HEAD:refs/heads/{legacy}",
+    ] in pushes
+    assert any(call[:4] == ("api", "--method", "PATCH", "repos/o/r/pulls/273")
+               for call in api_calls)
+    assert not any("POST" in call for call in api_calls)
+
+
+def test_stale_remote_without_open_pr_gets_verdict_branch(monkeypatch, tmp_path):
+    """A leftover/closed remote ref is preserved, not force-overwritten."""
+    from tests.test_conductor import make_cfg
+
+    cfg = make_cfg(tmp_path)
+    legacy = "marathon/refine-c14-i22"
+    verdict = "2026-07-10T11:21:06+01:00"
+    monkeypatch.setattr(
+        cond,
+        "_git",
+        lambda *a, **k: SimpleNamespace(
+            returncode=0,
+            stdout=f"oldsha\trefs/heads/{legacy}\n",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(cond, "_branch_pull_requests", lambda *a, **k: [])
+
+    selected = cond._refine_branch_for_dispatch(cfg, 22, 14, verdict)
+
+    assert selected == pp._branch_name_for_issue(
+        "Chapter14", 22, generation=verdict
+    )
+    assert selected != legacy
+
+
+def test_safe_push_refuses_remote_changed_after_preparation(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        pp,
+        "observe_remote_branch",
+        lambda *a, **k: (True, "someone-elses-sha", "observed"),
+    )
+    monkeypatch.setattr(
+        pp.subprocess, "run", lambda args, **kw: calls.append(args) or _ok(args)
+    )
+
+    ok, message = pp.open_or_update_pr(
+        repo_dir=Path("/repo"), branch="marathon/refine-c14-i22",
+        base="main", repo="o/r", title="t", body="b",
+        expected_remote_oid="50eff009",
+        local_commit_sha="6221ffa0",
+    )
+
+    assert not ok and "refusing to overwrite" in message
+    assert not any(call[:2] == ["git", "push"] for call in calls)
 
 
 # --- B0c: requeue a refine that landed no PR ---------------------------------
 
 def _job(issue=98, branch="marathon/refine-c12-i98"):
-    return SimpleNamespace(issue_num=issue, branch=branch)
+    return SimpleNamespace(
+        issue_num=issue,
+        branch=branch,
+        iteration_commit_sha="new-head-sha",
+    )
 
 
 def _patch_gh(monkeypatch, prs_json):
@@ -87,7 +207,10 @@ def test_no_pr_and_still_rejected_requeues(monkeypatch):
 
 def test_pr_exists_does_not_requeue(monkeypatch):
     cfg = SimpleNamespace(github_repo="o/r")
-    _patch_gh(monkeypatch, '[{"number": 116}]')  # a PR exists → leave to merge→requeue
+    _patch_gh(
+        monkeypatch,
+        '[{"number":116,"head":{"sha":"new-head-sha"}}]',
+    )  # matching PR exists → leave to merge→requeue
     requeued = _capture_requeue(monkeypatch)
     cond._requeue_if_no_pr_landed(cfg, _job())
     assert requeued == []
@@ -111,6 +234,40 @@ def test_no_pr_but_not_rejected_does_not_requeue(monkeypatch):
 
 
 # --- committed publication recovery ----------------------------------------
+
+def test_pr_only_retry_skips_push_already_at_committed_head(monkeypatch):
+    """If the push landed but PR creation failed, retry only the REST PR step;
+    the stale pre-push lease does not cause a second push or another session."""
+    pushes = []
+    api_calls = []
+    monkeypatch.setattr(
+        pp,
+        "observe_remote_branch",
+        lambda *a, **k: (True, "abc12345deadbeef", "observed"),
+    )
+    monkeypatch.setattr(
+        pp.subprocess,
+        "run",
+        lambda args, **kw: pushes.append(args) or _ok(args),
+    )
+    monkeypatch.setattr(pp, "_existing_pr_number", lambda *a, **k: None)
+    monkeypatch.setattr(
+        pp,
+        "_gh",
+        lambda *args, **kw: api_calls.append(args)
+        or subprocess.CompletedProcess(args, 0, "https://github.com/o/r/pull/9\n", ""),
+    )
+
+    ok, _ = pp.open_or_update_pr(
+        repo_dir=Path("/repo"), branch="marathon/refine-c14-i22",
+        base="main", repo="o/r", title="t", body="b",
+        expected_remote_oid="old-pre-push-oid",
+        local_commit_sha="abc12345",
+    )
+
+    assert ok
+    assert not any(call[:2] == ["git", "push"] for call in pushes)
+    assert any(call[:3] == ("api", "--method", "POST") for call in api_calls)
 
 def test_refine_pending_publication_retries_only_network_step(
     monkeypatch, tmp_path,
@@ -230,9 +387,10 @@ def test_transient_pr_check_failure_recovers_on_later_tick(monkeypatch, tmp_path
         22,
         expected_verdict_ts=verdict.verdict_ts,
         pending_pr_branch=branch,
+        iteration_commit_sha="new-head-sha",
     )
     answers = iter([None, False])
-    monkeypatch.setattr(cond, "_branch_pr_exists", lambda cfg, branch: next(answers))
+    monkeypatch.setattr(cond, "_branch_pr_exists", lambda *args: next(answers))
 
     def requeue(cfg_, branch_, **kwargs):
         assert kwargs["expected_verdict_ts"] == verdict.verdict_ts
@@ -254,6 +412,86 @@ def test_transient_pr_check_failure_recovers_on_later_tick(monkeypatch, tmp_path
     assert 22 not in load_state(cfg).issues
 
 
+def test_stale_prior_pr_does_not_count_as_new_iteration(monkeypatch):
+    cfg = SimpleNamespace(github_repo="o/r")
+    branch = "marathon/refine-c16-i238"
+    monkeypatch.setattr(
+        cond,
+        "_branch_pull_requests",
+        lambda *a, **k: [
+            {"number": 273, "head": {"sha": "50eff0099056a3c7"}}
+        ],
+    )
+
+    assert cond._branch_pr_exists(cfg, branch, "6221ffa0da414cce") is False
+    assert cond._branch_pr_exists(cfg, branch, "50eff009") is True
+
+
+def test_legacy_suppressed_no_pr_row_is_requeued_by_sha_audit(
+    monkeypatch, tmp_path,
+):
+    """Exact live #238 shape: last_iteration is set, no pending marker was
+    persisted, and the branch's only PR points at an older commit."""
+    from tests.test_conductor import make_cfg
+
+    cfg = make_cfg(tmp_path)
+    verdict = record_rejection(cfg, 22, "fix")
+    branch = "marathon/refine-c14-i22"
+    record_iteration(
+        cfg,
+        22,
+        expected_verdict_ts=verdict.verdict_ts,
+        iteration_branch=branch,
+        iteration_commit_sha="6221ffa0",
+    )
+    monkeypatch.setattr(
+        cond,
+        "_branch_pr_exists",
+        lambda cfg_, branch_, expected: (
+            False
+            if branch_ == branch and expected == "6221ffa0"
+            else (_ for _ in ()).throw(AssertionError("unexpected check"))
+        ),
+    )
+
+    def requeue(cfg_, branch_, **kwargs):
+        assert kwargs == {
+            "landed": False,
+            "expected_verdict_ts": verdict.verdict_ts,
+        }
+        assert requeue_for_rereview(
+            cfg_, 22, expected_verdict_ts=verdict.verdict_ts
+        )
+        return 22
+
+    monkeypatch.setattr(amod, "_requeue_refined_issue", requeue)
+
+    assert cond._retry_pending_pr_checks(cfg) == 1
+    assert 22 not in load_state(cfg).issues
+
+
+def test_pr_presence_check_uses_rest_not_graphql(monkeypatch):
+    cfg = SimpleNamespace(github_repo="o/r")
+    calls = []
+
+    def fake_gh(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(
+            returncode=0,
+            stdout='[{"number":273,"head":{"sha":"6221ffa0"}}]',
+            stderr="",
+        )
+
+    monkeypatch.setattr(ghmod, "gh", fake_gh)
+
+    assert cond._branch_pr_exists(
+        cfg, "marathon/refine-c16-i238", "6221ffa0"
+    ) is True
+    assert calls and calls[0][0] == "api"
+    assert "pulls?" in calls[0][1]
+    assert "pr" not in calls[0][:1] and "repo" not in calls[0][:1]
+
+
 def test_conductor_hands_verbatim_reject_note_to_worktree(monkeypatch, tmp_path):
     from tests.test_conductor import make_cfg
 
@@ -265,6 +503,11 @@ def test_conductor_hands_verbatim_reject_note_to_worktree(monkeypatch, tmp_path)
     spawned = []
     monkeypatch.setattr(cond, "_prime_mathlib_cache", lambda *a, **k: True)
     monkeypatch.setattr(cond, "_mathlib_already_built", lambda *a, **k: True)
+    monkeypatch.setattr(
+        cond,
+        "_refine_branch_for_dispatch",
+        lambda *a, **k: "marathon/refine-c14-i22",
+    )
     monkeypatch.setattr(
         cond.subprocess,
         "Popen",
@@ -285,6 +528,9 @@ def test_conductor_hands_verbatim_reject_note_to_worktree(monkeypatch, tmp_path)
         "verdict_ts": verdict.verdict_ts,
         "notes": note,
     }
+    assert cmd[cmd.index("--auto-pr-repo") + 1] == cfg.github_repo
+    assert cmd[cmd.index("--auto-pr-branch") + 1] == \
+        "marathon/refine-c14-i22"
 
 
 def test_focused_refine_without_note_fails_before_aristotle(monkeypatch, tmp_path):

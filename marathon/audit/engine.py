@@ -39,14 +39,16 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
 import tempfile
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -83,6 +85,17 @@ DIFF_KEYS = (
 )
 
 _LINE_PREFIXES = (SENTINEL + "|", META_SENTINEL + "|", DONE_SENTINEL + "|")
+
+# Git pathspecs whose dirty state makes a HEAD-bound audit dishonest.  Build
+# artefacts and Marathon runtime files are intentionally excluded; Lean source,
+# its dependency/toolchain inputs, and Lake configuration are included.
+_AUDIT_SOURCE_PATHS = (
+    ":(glob)**/*.lean",
+    "lean-toolchain",
+    "lakefile.toml",
+    "lakefile.lean",
+    "lake-manifest.json",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +326,44 @@ def read_package_revs(repo_dir: Path) -> dict[str, str]:
     return revs
 
 
+def source_state(repo_dir: str | Path) -> tuple[str | None, bool | None]:
+    """Return ``(HEAD revision, audit-source-clean?)`` for *repo_dir*.
+
+    ``(None, None)`` means the directory is not a readable Git checkout.  A
+    revision with ``False`` means HEAD is known but one of the Lean/Lake inputs
+    in :data:`_AUDIT_SOURCE_PATHS` differs from that commit.  Callers must not
+    attach the HEAD revision to evidence in that case: doing so would make an
+    uncommitted working-tree elaboration look like committed evidence.
+
+    This helper is deliberately fail-soft because audits also run against
+    generated fixture directories.  In a real Git checkout, however, ordinary
+    snapshot loads use this state to withhold stale or dirty evidence.
+    """
+    repo = Path(repo_dir)
+    try:
+        rev = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=str(repo), capture_output=True, text=True, check=False,
+        )
+        if rev.returncode != 0:
+            return None, None
+        revision = (rev.stdout or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{7,64}", revision):
+            return None, None
+        status = subprocess.run(
+            [
+                "git", "status", "--porcelain=v1", "--untracked-files=all",
+                "--", *_AUDIT_SOURCE_PATHS,
+            ],
+            cwd=str(repo), capture_output=True, text=True, check=False,
+        )
+        if status.returncode != 0:
+            return revision, None
+        return revision, not bool((status.stdout or "").strip())
+    except OSError:
+        return None, None
+
+
 # ---------------------------------------------------------------------------
 # Output parsing
 # ---------------------------------------------------------------------------
@@ -499,12 +550,22 @@ def run_audit(
     toolchain = read_toolchain(repo)
     package_revs = read_package_revs(repo)
     modules, failures = derive_modules(repo, target_folder)
+    attempted_modules = list(modules)
     trusted = derive_trusted_prefixes(repo)
+    start_revision, start_clean = source_state(repo)
+    if start_revision is not None and start_clean is not True:
+        failures.append(
+            "audit source is not a clean committed revision; evidence from "
+            "this run will not be revision-bound"
+        )
 
     def snapshot(
         decls: list[DeclAudit], extra_failures: list[str],
         lean_version: str | None = None,
+        *, source_revision: str | None = None,
+        successful_modules: list[str] | None = None,
     ) -> AuditSnapshot:
+        successful_modules = successful_modules or []
         return AuditSnapshot(
             repo_dir=str(repo),
             modules=modules,
@@ -515,6 +576,13 @@ def run_audit(
             created_at=created_at,
             decls=decls,
             failures=failures + extra_failures,
+            source_revision=source_revision,
+            module_revisions={
+                module: source_revision
+                for module in successful_modules
+                if source_revision is not None
+            },
+            attempted_modules=attempted_modules,
         )
 
     if not modules:
@@ -591,14 +659,53 @@ def run_audit(
             "no audit contract lines on stdout — nothing audited"
         )
     reported = parsed.meta.get("modules") or []
-    if parsed.saw_contract and reported and reported != modules:
+    if parsed.saw_contract and reported != modules:
         run_failures.append(
             f"script reported modules {reported} but {modules} were "
             "requested"
         )
+
+    # A revision is evidence only when the checkout stayed at the same clean
+    # source state for the entire process.  Checking at both boundaries closes
+    # the merge/audit race where HEAD advances while Lean is still elaborating.
+    end_revision, end_clean = source_state(repo)
+    stable_revision = (
+        start_revision
+        if start_revision is not None
+        and start_clean is True
+        and end_revision == start_revision
+        and end_clean is True
+        else None
+    )
+    if start_revision is not None and stable_revision is None:
+        run_failures.append(
+            "audit source revision changed or became dirty while the audit "
+            "was running; evidence was not revision-bound"
+        )
+
+    # Module evidence is all-or-nothing for this contract invocation.  A
+    # nonzero exit, timeout, malformed/truncated line, or module-list mismatch
+    # can omit arbitrary declarations, so no module in that batch receives a
+    # success revision.  Build-excluded modules are not in ``modules`` and are
+    # independently represented in ``attempted_modules`` + failures.
+    contract_complete = (
+        proc is not None
+        and proc.returncode == 0
+        and parsed.saw_contract
+        and not parsed.failures
+        and reported == modules
+        and stable_revision is not None
+        and not any(
+            failure.startswith("no audit contract lines")
+            for failure in run_failures
+        )
+    )
+    successful_modules = list(modules) if contract_complete else []
     return snapshot(
         parsed.decls, run_failures,
         lean_version=parsed.meta.get("lean_version"),
+        source_revision=stable_revision if contract_complete else None,
+        successful_modules=successful_modules,
     )
 
 
@@ -608,6 +715,93 @@ def run_audit(
 
 def audit_state_dir(repo_dir: str | Path) -> Path:
     return Path(repo_dir) / AUDIT_STATE_RELPATH
+
+
+@contextlib.contextmanager
+def _snapshot_write_lock(state_dir: Path):
+    """Serialize snapshot read/merge/write across audit processes."""
+    lock_path = state_dir / ".write.lock"
+    with open(lock_path, "a+") as lock_file:
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - Windows fallback
+            yield
+            return
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Durably write *text* then atomically replace *path*."""
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as tmp:
+            tmp_name = tmp.name
+            tmp.write(text)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, path)
+        tmp_name = None
+    finally:
+        if tmp_name is not None:
+            with contextlib.suppress(OSError):
+                Path(tmp_name).unlink()
+
+
+def _merge_snapshot(
+    existing: AuditSnapshot, incoming: AuditSnapshot
+) -> AuditSnapshot:
+    """Merge one audit run without laundering partial evidence.
+
+    Revision-aware runs replace only modules whose *complete* contract earned a
+    ``module_revisions`` entry.  Failed/truncated modules keep their older rows
+    and older revision, which means a normal load at a newer HEAD withholds
+    them.  Legacy/programmatically-constructed snapshots retain the historical
+    declaration-module merge behavior for compatibility.
+    """
+    revision_aware = bool(
+        incoming.attempted_modules
+        or incoming.module_revisions
+        or incoming.source_revision
+    )
+    if not revision_aware:
+        new_modules = {d.module for d in incoming.decls}
+        if not new_modules:
+            return existing
+        kept = [d for d in existing.decls if d.module not in new_modules]
+        merged = kept + list(incoming.decls)
+        return replace(
+            incoming, decls=merged,
+            modules=sorted({d.module for d in merged}),
+        )
+
+    successful = set(incoming.module_revisions)
+    if not successful:
+        # Persist the latest failure channel, but do not alter any successful
+        # cursor/evidence metadata merely because another process failed.
+        return replace(
+            existing,
+            failures=list(incoming.failures),
+            attempted_modules=list(incoming.attempted_modules),
+        )
+
+    kept = [d for d in existing.decls if d.module not in successful]
+    accepted = [d for d in incoming.decls if d.module in successful]
+    revisions = dict(existing.module_revisions)
+    revisions.update({m: incoming.module_revisions[m] for m in successful})
+    merged = kept + accepted
+    return replace(
+        incoming,
+        decls=merged,
+        modules=sorted(set(existing.modules) | successful),
+        module_revisions=revisions,
+    )
 
 
 def save_snapshot(
@@ -622,56 +816,132 @@ def save_snapshot(
     ``jobs.json``: this is droppable derived cache living inside the
     consumer repo.
 
-    With ``merge=True`` (default) the new audit's declarations are MERGED into
-    the existing snapshot PER TARGET MODULE: auditing one chapter updates that
-    chapter's decls and keeps every other chapter's, so a multi-chapter review
-    holds evidence for all chapters at once instead of the snapshot being one
-    target's wholesale replacement. An audit that captured nothing (e.g. a
-    ``lake env lean`` failure → 0 decls) keeps the existing snapshot rather than
-    wiping it. Pass ``merge=False`` for a clean from-scratch overwrite."""
-    from dataclasses import replace as _dc_replace
-
+    With ``merge=True`` (default), only modules carrying a successful revision
+    replace their prior rows.  Other modules keep both their prior declarations
+    *and prior revisions*, so stale evidence can never be made current by a
+    failed or partial run.  The merge and atomic swap are serialized across
+    processes. Pass ``merge=False`` for a clean from-scratch overwrite."""
     repo = Path(repo_dir) if repo_dir is not None else Path(snapshot.repo_dir)
-    if merge:
-        existing = load_snapshot(repo)
-        if existing is not None:
-            new_modules = {d.module for d in snapshot.decls}
-            if not new_modules:
-                snapshot = existing  # nothing new audited → don't wipe what's there
-            else:
-                kept = [d for d in existing.decls if d.module not in new_modules]
-                merged = kept + list(snapshot.decls)
-                snapshot = _dc_replace(
-                    snapshot, decls=merged,
-                    modules=sorted({d.module for d in merged}),
-                )
     state_dir = audit_state_dir(repo)
     state_dir.mkdir(parents=True, exist_ok=True)
     gitignore = state_dir / ".gitignore"
     if not gitignore.is_file():
         gitignore.write_text("*\n")
     latest = state_dir / LATEST_NAME
-    tmp = latest.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(snapshot.to_json(), indent=2) + "\n")
-    if latest.is_file():
-        latest.replace(state_dir / PREVIOUS_NAME)
-    tmp.replace(latest)
+    with _snapshot_write_lock(state_dir):
+        if merge:
+            existing = load_snapshot(repo, validate_revision=False)
+            if existing is not None:
+                snapshot = _merge_snapshot(existing, snapshot)
+        payload = json.dumps(snapshot.to_json(), indent=2) + "\n"
+        if latest.is_file():
+            # Copy, then atomically replace previous; never move latest out of
+            # the way before the new payload is ready.
+            _atomic_write_text(
+                state_dir / PREVIOUS_NAME,
+                latest.read_text(),
+            )
+        _atomic_write_text(latest, payload)
     return latest
 
 
+def _fresh_snapshot(
+    snapshot: AuditSnapshot, revision: str, clean: bool | None,
+) -> AuditSnapshot:
+    """Return a read view containing only evidence fresh for *revision*.
+
+    The persisted file is left intact for diagnostics/diffing.  Normal callers
+    receive this fail-closed view, so trust tiers, dependency fingerprints, the
+    prover DAG, and deck readiness all consume the same freshness boundary.
+    """
+    failures = list(snapshot.failures)
+    if clean is not True:
+        if snapshot.decls:
+            failures.append(
+                "audit evidence withheld: the working tree has uncommitted "
+                "or unverifiable Lean/Lake source changes"
+            )
+        return replace(snapshot, decls=[], modules=[], failures=failures)
+
+    raw_by = snapshot.by_name()
+    if not snapshot.module_revisions:
+        if snapshot.decls:
+            failures.append(
+                "audit evidence withheld: legacy snapshot has no source "
+                f"revision for current HEAD {revision[:12]}"
+            )
+        return replace(snapshot, decls=[], modules=[], failures=failures)
+
+    fresh_modules = {
+        module for module, audited in snapshot.module_revisions.items()
+        if audited == revision
+    }
+    evidence_modules = set(snapshot.modules) | {d.module for d in snapshot.decls}
+    stale_modules = sorted(evidence_modules - fresh_modules)
+    if stale_modules:
+        shown = ", ".join(stale_modules[:12])
+        if len(stale_modules) > 12:
+            shown += f", … (+{len(stale_modules) - 12})"
+        failures.append(
+            f"audit evidence stale at HEAD {revision[:12]}; withheld module(s): "
+            f"{shown}"
+        )
+
+    eligible = {d.name for d in snapshot.decls if d.module in fresh_modules}
+    directly_fresh = set(eligible)
+    # A declaration audited now but whose statement cone reaches an older
+    # module is not independently fresh.  Cascade until the remaining graph is
+    # closed over fresh evidence.
+    while True:
+        dependent_on_stale = {
+            name for name in eligible
+            if any(dep in raw_by and dep not in eligible for dep in raw_by[name].cone)
+        }
+        if not dependent_on_stale:
+            break
+        eligible -= dependent_on_stale
+    cascaded = len(directly_fresh - eligible)
+    if cascaded:
+        failures.append(
+            f"audit evidence withheld for {cascaded} declaration(s) whose "
+            "statement cone depends on stale module evidence"
+        )
+
+    return replace(
+        snapshot,
+        decls=[d for d in snapshot.decls if d.name in eligible],
+        modules=sorted(m for m in snapshot.modules if m in fresh_modules),
+        failures=failures,
+    )
+
+
 def load_snapshot(
-    repo_dir: str | Path, name: str = LATEST_NAME
+    repo_dir: str | Path, name: str = LATEST_NAME, *,
+    validate_revision: bool = True,
 ) -> AuditSnapshot | None:
     """Load a persisted snapshot; None when absent or unparseable
-    (a corrupt cache is absence of evidence, not an error)."""
+    (a corrupt cache is absence of evidence, not an error).
+
+    By default, a Git checkout receives a fail-closed view with dirty, legacy,
+    or older-revision declarations withheld.  Diagnostic callers such as audit
+    diff and the conductor's durable-cursor recovery may pass
+    ``validate_revision=False`` to inspect the raw persisted evidence and its
+    explicit revision map.
+    """
     path = audit_state_dir(repo_dir) / name
     try:
-        return AuditSnapshot.from_json(json.loads(path.read_text()))
+        snapshot = AuditSnapshot.from_json(json.loads(path.read_text()))
     except FileNotFoundError:
         return None
     except (OSError, ValueError, KeyError, TypeError) as exc:
         logger.warning("unreadable audit snapshot %s: %s", path, exc)
         return None
+    if not validate_revision:
+        return snapshot
+    revision, clean = source_state(repo_dir)
+    if revision is None:
+        return snapshot
+    return _fresh_snapshot(snapshot, revision, clean)
 
 
 # ---------------------------------------------------------------------------

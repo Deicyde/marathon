@@ -62,6 +62,8 @@
   -->
   <nav class="tab-nav" role="tablist" aria-label="Dashboard views">
     <button class="tab-btn active" data-tab="review" role="tab" aria-selected="true">Review</button>
+    <button class="tab-btn" data-tab="files" role="tab" aria-selected="false">Files</button>
+    <button class="tab-btn" data-tab="graph" role="tab" aria-selected="false">Graph</button>
     <button class="tab-btn" data-tab="status" role="tab" aria-selected="false">Status</button>
     <button class="tab-btn" data-tab="issues" role="tab" aria-selected="false">Issues</button>
     <button class="tab-btn" data-tab="history" role="tab" aria-selected="false">History</button>
@@ -104,6 +106,15 @@
     </nav>
   </main>
   </div><!-- /#tab-review -->
+
+  <!-- Wide-angle review surfaces: a source-ordered chapter/file reader and
+       the project-wide issue/declaration dependency graph. -->
+  <div id="tab-files" class="tab-pane" role="tabpanel" hidden>
+    <div class="dash dash-wide" id="dash-files"></div>
+  </div>
+  <div id="tab-graph" class="tab-pane" role="tabpanel" hidden>
+    <div class="dash dash-graph" id="dash-graph"></div>
+  </div>
 
   <!-- Dashboard panes (rendered by app.js on first activation, then polled). -->
   <div id="tab-status" class="tab-pane" role="tabpanel" hidden>

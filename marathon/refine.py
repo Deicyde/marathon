@@ -1700,6 +1700,7 @@ async def refine_command(args) -> None:
         formalization_framework="Marathon",
         auto_pr=getattr(args, "auto_pr", False),
         auto_pr_repo=getattr(args, "auto_pr_repo", None),
+        auto_pr_branch=getattr(args, "auto_pr_branch", None),
         auto_pr_review_issue=review_issue_num,
         auto_pr_base=getattr(args, "auto_pr_base", "main"),
         # Machine gate (phase-2). Mode follows --skeleton (skeleton
@@ -1758,6 +1759,7 @@ async def refine_command(args) -> None:
     if pipeline_config.auto_pr:
         from marathon.post_pipeline import (
             _branch_name_for_issue,
+            observe_remote_branch,
             prepare_auto_pr_branch,
         )
         # ``chapter_label`` isn't bound in this function — the analog
@@ -1769,10 +1771,21 @@ async def refine_command(args) -> None:
             else "repair" if pipeline_config.repair_run
             else "refine"
         )
+        branch_name = pipeline_config.auto_pr_branch or _branch_name_for_issue(
+            target_folder.name, review_issue_num, kind=branch_kind
+        )
+        pipeline_config.auto_pr_branch = branch_name
+        remote_ok, remote_oid, remote_msg = observe_remote_branch(
+            repo_dir, branch_name
+        )
+        if not remote_ok:
+            print(f"  auto-pr: {remote_msg}", flush=True)
+            print("  refusing to run without a safe remote-branch lease.", flush=True)
+            sys.exit(EXIT_AUTO_PR_BRANCH_ABORT)
+        # Empty string is an affirmative "branch absent" lease expectation;
+        # None is reserved for legacy callers that never observed the remote.
+        pipeline_config.auto_pr_expected_remote_oid = remote_oid or ""
         if state.preserve_local_branch:
-            branch_name = _branch_name_for_issue(
-                target_folder.name, review_issue_num, kind=branch_kind
-            )
             branch_cp = subprocess.run(
                 ["git", "branch", "--show-current"],
                 cwd=str(repo_dir), capture_output=True, text=True, check=False,
@@ -1814,6 +1827,7 @@ async def refine_command(args) -> None:
                 # partial progress lives on the un-merged PR); resetting to
                 # origin/<base> would wipe it and the rounds would oscillate.
                 continue_remote_branch=pipeline_config.repair_run,
+                branch_name=branch_name,
             )
         if not ok:
             print(f"  auto-pr: {branch_msg}", flush=True)

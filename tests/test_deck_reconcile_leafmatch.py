@@ -183,6 +183,248 @@ def test_signatures_namespace_rename_requires_confirmation(tmp_path, monkeypatch
     assert r["proposed_renames"] == [mapping]
     assert mapping["old"] in r["kept_stale"]
     assert "new_body" not in r
+    assert len(r["proposal_token"]) == 64
+
+
+def test_signatures_confirmed_current_proposal_is_applied(tmp_path, monkeypatch):
+    """One explicit confirmation promotes only the exact proposal the human
+    saw.  The second pass re-derives the candidate and compare-and-swaps on its
+    proposal token before performing the single body edit."""
+    cited = "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial"
+    new = "Demo.Chapter15.Tf.CovariantTensorField.exists_of_tensorial"
+    mapping = {"old": cited, "new": new}
+    cfg, body = _setup_sig(tmp_path, monkeypatch, cited=cited)
+    from marathon.deck.subdeck import (
+        issue_verdicts, record_decl_verdict, set_decl_lock,
+    )
+
+    record_decl_verdict(cfg, 98, cited, "verify")
+    set_decl_lock(cfg, 98, cited, True)
+    preview = auto_reconcile_issue(cfg, 98, dry_run=True)
+    written = {}
+    monkeypatch.setattr(
+        refresh_mod, "_gh_edit_body",
+        lambda repo, issue, new_body: written.update(
+            repo=repo, issue=issue, body=new_body
+        ),
+    )
+
+    result = auto_reconcile_issue(
+        cfg,
+        98,
+        confirmation={
+            "token": preview["proposal_token"],
+            "renames": [mapping],
+            "splits": [],
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["updated"] is True
+    assert result["renamed"] == [mapping]
+    assert written["issue"] == 98
+    assert new in written["body"]
+    assert cited not in written["body"]
+    assert body != written["body"]
+    records = issue_verdicts(cfg, 98)
+    assert cited not in records
+    assert records[new]["requires_review"] is True
+    assert "verdict" not in records[new] and "locked" not in records[new]
+    assert result["ownership_reconciliation"]["migrated"] == [mapping]
+
+
+def test_confirmation_token_conflict_fails_without_write(tmp_path, monkeypatch):
+    cited = "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial"
+    new = "Demo.Chapter15.Tf.CovariantTensorField.exists_of_tensorial"
+    cfg, _body = _setup_sig(tmp_path, monkeypatch, cited=cited)
+    from marathon.deck.subdeck import issue_verdicts, record_decl_verdict
+
+    record_decl_verdict(cfg, 98, cited, "verify")
+    before = issue_verdicts(cfg, 98)
+    monkeypatch.setattr(
+        refresh_mod, "_gh_edit_body",
+        lambda *a, **k: pytest.fail("a stale confirmation must not edit GitHub"),
+    )
+
+    result = auto_reconcile_issue(
+        cfg,
+        98,
+        confirmation={
+            "token": "0" * 64,
+            "renames": [{"old": cited, "new": new}],
+            "splits": [],
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["updated"] is False
+    assert result["confirmation_conflict"] is True
+    assert result["proposed_renames"] == [{"old": cited, "new": new}]
+    assert "reload" in result["message"]
+    assert issue_verdicts(cfg, 98) == before
+
+
+def test_human_body_edit_during_confirmation_is_not_overwritten(
+    tmp_path, monkeypatch
+):
+    cited = "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial"
+    new = "Demo.Chapter15.Tf.CovariantTensorField.exists_of_tensorial"
+    mapping = {"old": cited, "new": new}
+    cfg, body = _setup_sig(tmp_path, monkeypatch, cited=cited)
+    preview = auto_reconcile_issue(cfg, 98, dry_run=True)
+
+    import marathon.review.github as gh_mod
+
+    reads = iter([body, body + "\nHuman note written concurrently.\n"])
+    monkeypatch.setattr(gh_mod, "issue_body", lambda n, repo: next(reads))
+    monkeypatch.setattr(
+        refresh_mod, "_gh_edit_body",
+        lambda *a, **k: pytest.fail("concurrent human prose must not be overwritten"),
+    )
+
+    result = auto_reconcile_issue(
+        cfg,
+        98,
+        confirmation={
+            "token": preview["proposal_token"],
+            "renames": [mapping],
+            "splits": [],
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["updated"] is False
+    assert result["body_conflict"] is True
+    assert result["confirmation_conflict"] is True
+    assert "no edit was made" in result["message"]
+
+
+def test_false_proposal_can_be_dismissed_once_without_stalling_cursor(
+    tmp_path, monkeypatch
+):
+    cited = "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial"
+    new = "Demo.Chapter15.Tf.CovariantTensorField.exists_of_tensorial"
+    mapping = {"old": cited, "new": new}
+    cfg, body = _setup_sig(tmp_path, monkeypatch, cited=cited)
+    remote = {"body": body}
+    import marathon.review.github as gh_mod
+
+    monkeypatch.setattr(gh_mod, "issue_body", lambda n, repo: remote["body"])
+    preview = auto_reconcile_issue(cfg, 98, dry_run=True)
+    monkeypatch.setattr(
+        refresh_mod, "_gh_edit_body",
+        lambda *a, **k: pytest.fail("dismissing identity does not edit the body"),
+    )
+
+    dismissed = auto_reconcile_issue(
+        cfg,
+        98,
+        confirmation={
+            "token": preview["proposal_token"],
+            "renames": [],
+            "splits": [],
+            "dismiss_renames": [mapping],
+        },
+    )
+    # Unrelated prose and HEAD movement do not change citation identity or the
+    # proposed target, so the one human dismissal remains durable.
+    remote["body"] = body.replace("\ntext\n", "\nunrelated prose edit\n")
+    again = auto_reconcile_issue(cfg, 98, dry_run=True)
+    # An unrelated later commit must not resurrect the same false leaf match.
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda d: "NEXTSHA")
+    after_unrelated_head = auto_reconcile_issue(cfg, 98, dry_run=True)
+
+    assert dismissed["ok"] is True
+    assert dismissed["updated"] is False
+    assert dismissed["dismissed_renames"] == [mapping]
+    assert again["proposed_renames"] == []
+    assert after_unrelated_head["proposed_renames"] == []
+    assert "already reconciled" in again["message"]
+    decision_dir = (
+        cfg.repo_dir / ".marathon" / "conductor" / "reconcile-decisions"
+    )
+    assert (decision_dir / "98.json").is_file()
+    assert (decision_dir / ".gitignore").read_text() == "*\n"
+
+
+def test_dismissed_mapping_resurfaces_when_target_source_changes(
+    tmp_path, monkeypatch
+):
+    cited = "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial"
+    new = "Demo.Chapter15.Tf.CovariantTensorField.exists_of_tensorial"
+    mapping = {"old": cited, "new": new}
+    cfg, body = _setup_sig(tmp_path, monkeypatch, cited=cited)
+    preview = auto_reconcile_issue(cfg, 98, dry_run=True)
+    auto_reconcile_issue(
+        cfg, 98,
+        confirmation={
+            "token": preview["proposal_token"],
+            "renames": [], "splits": [], "dismiss_renames": [mapping],
+        },
+    )
+
+    path = cfg.repo_dir / "Demo" / "Chapter15" / "Tf.lean"
+    path.write_text(_SIG_SRC.replace(": True := trivial", ": True := by\n  trivial"))
+    from marathon.deck.definitions import clear_definition_index_cache
+
+    clear_definition_index_cache(cfg.repo_dir)
+    import marathon.review.github as gh_mod
+    monkeypatch.setattr(gh_mod, "issue_body", lambda n, repo: body)
+
+    result = auto_reconcile_issue(cfg, 98, dry_run=True)
+    assert result["proposed_renames"] == [mapping]
+
+
+def test_dismissed_mapping_resurfaces_when_citation_anchor_changes(
+    tmp_path, monkeypatch
+):
+    cited = "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial"
+    new = "Demo.Chapter15.Tf.CovariantTensorField.exists_of_tensorial"
+    mapping = {"old": cited, "new": new}
+    cfg, body = _setup_sig(tmp_path, monkeypatch, cited=cited)
+    preview = auto_reconcile_issue(cfg, 98, dry_run=True)
+    auto_reconcile_issue(
+        cfg, 98,
+        confirmation={
+            "token": preview["proposal_token"],
+            "renames": [], "splits": [], "dismiss_renames": [mapping],
+        },
+    )
+    changed = body.replace(f"theorem {cited} : True", f"theorem {cited} : True := by trivial")
+    import marathon.review.github as gh_mod
+    monkeypatch.setattr(gh_mod, "issue_body", lambda n, repo: changed)
+
+    result = auto_reconcile_issue(cfg, 98, dry_run=True)
+    assert result["proposed_renames"] == [mapping]
+
+
+def test_many_dismissals_are_independent_not_a_prunable_chain(tmp_path):
+    cfg = make_cfg(tmp_path)
+    mappings = [
+        {"old": f"A.Old{i}", "new": f"A.New{i}"}
+        for i in range(101)
+    ]
+    body = "### Lean declarations\n" + "".join(
+        f"- `A.Old{i}`\n" for i in range(101)
+    )
+    source = "namespace A\n" + "".join(
+        f"def New{i} : Nat := {i}\n" for i in range(101)
+    ) + "end A\n"
+    (cfg.repo_dir / "Targets.lean").write_text(source)
+    refresh_mod._record_reconciliation_dismissal(
+        cfg, 22, body, mappings, []
+    )
+
+    remaining, splits = refresh_mod._apply_persisted_dismissals(
+        cfg, 22, body, mappings, []
+    )
+
+    assert remaining == [] and splits == []
+    payload = (
+        cfg.repo_dir / ".marathon" / "conductor" /
+        "reconcile-decisions" / "22.json"
+    ).read_text()
+    assert '"A.Old0"' in payload and '"A.Old100"' in payload
 
 
 def test_verified_issue_flags_rename_no_write(tmp_path, monkeypatch):
@@ -245,6 +487,35 @@ def test_declarations_format_leaf_match_is_proposal_only(tmp_path, monkeypatch):
     assert r["proposed_renames"] == [{"old": cited, "new": new}]
     assert cited in r["kept_stale"]
     assert "new_body" not in r
+
+
+def test_declarations_format_confirmed_proposal_is_applied(tmp_path, monkeypatch):
+    cited = "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial"
+    new = "Demo.Chapter15.Tf.CovariantTensorField.exists_of_tensorial"
+    mapping = {"old": cited, "new": new}
+    body = _decl_body(cited)
+    cfg, _b = _setup_sig(tmp_path, monkeypatch, cited="unused", body=body)
+    preview = auto_reconcile_issue(cfg, 98, dry_run=True)
+    written = {}
+    monkeypatch.setattr(
+        refresh_mod, "_gh_edit_body",
+        lambda repo, issue, new_body: written.update(body=new_body),
+    )
+
+    result = auto_reconcile_issue(
+        cfg,
+        98,
+        confirmation={
+            "token": preview["proposal_token"],
+            "renames": [mapping],
+            "splits": [],
+        },
+    )
+
+    assert result["updated"] is True
+    assert result["renamed"] == [mapping]
+    assert new in written["body"]
+    assert cited not in written["body"]
 
 
 def test_declarations_keyword_shape_is_proposal_only(tmp_path, monkeypatch):

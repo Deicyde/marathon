@@ -17,19 +17,131 @@ Two writers share one line-matcher (:func:`_apply_emoji_flip`):
   Phase-5b invalidation engine, which may need to flip N downstream
   issues 🟡→🟠 at once. The write-storm ruling
   (docs/v2-analysis/crit-feas-verification-surface-first.md §5)
-  forbids one tracker-body rewrite per affected decl: this helper reads
-  the parent body ONCE, applies every substring→emoji edit in memory,
-  and writes ONCE — substring surgery happens a single time per audit
-  run regardless of how many issues flip.
+  forbids one tracker-body rewrite per affected decl: this helper applies
+  every substring→emoji edit to one fresh snapshot in memory and performs one
+  write in the uncontended case (with pre-write conflict detection and
+  post-write verification) — substring surgery happens as a single batch per
+  audit run regardless of how many issues flip.
 """
 
 from __future__ import annotations
 
+import subprocess
+import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
+try:  # POSIX advisory locks (Linux/macOS).
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised on non-POSIX hosts
+    _fcntl = None
+
+try:  # Windows advisory byte-range locks.
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - exercised on non-Windows hosts
+    _msvcrt = None
+
 from marathon.review.config import ReviewConfig
 from marathon.review.github import gh, issue_body
+
+
+# GitHub documents conditional requests for GET, but the issue-update endpoint
+# does not opt its unsafe PATCH into conditional requests.  There is therefore
+# no remote compare-and-swap primitive for an issue body.  We serialize every
+# Marathon writer that shares this checkout, check immediately before writing,
+# then verify immediately afterward and rebase/retry any conflict we can
+# observe.  The tiny final check→PATCH window remains irreducible for a human or
+# writer in another checkout; see :func:`_rewrite_tracker_emojis`.
+_TRACKER_LOCKS_GUARD = threading.Lock()
+_MAX_CONFLICT_RETRIES = 3
+_GITHUB_CALL_TIMEOUT_SECONDS = 60.0
+
+
+class _TrackerLockState:
+    """One path's thread-reentrant lock plus its outermost OS-lock handle."""
+
+    def __init__(self) -> None:
+        self.rlock = threading.RLock()
+        self.depth = 0
+        self.handle = None
+
+
+_TRACKER_LOCKS: dict[str, _TrackerLockState] = {}
+
+
+def _tracker_lock_path(cfg: ReviewConfig) -> Path:
+    # ``runner-locks/`` is the review subsystem's existing ignored runtime
+    # directory.  Keeping the persistent flock inode here prevents it from
+    # dirtying the consumer checkout or leaking into auto-generated commits.
+    return cfg.runner_lock_dir / f"tracker-parent-{cfg.parent_issue}.lock"
+
+
+def _tracker_lock_state(path: Path) -> _TrackerLockState:
+    key = str(path.resolve())
+    with _TRACKER_LOCKS_GUARD:
+        return _TRACKER_LOCKS.setdefault(key, _TrackerLockState())
+
+
+def _lock_file(handle) -> None:
+    if _fcntl is not None:
+        _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX)
+        return
+    if _msvcrt is not None:  # pragma: no cover - Windows-only branch
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        _msvcrt.locking(handle.fileno(), _msvcrt.LK_LOCK, 1)
+
+
+def _unlock_file(handle) -> None:
+    if _fcntl is not None:
+        _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+        return
+    if _msvcrt is not None:  # pragma: no cover - Windows-only branch
+        handle.seek(0)
+        _msvcrt.locking(handle.fileno(), _msvcrt.LK_UNLCK, 1)
+
+
+@contextmanager
+def _tracker_writer_lock(cfg: ReviewConfig):
+    """Hold the stable tracker-writer lock across fresh read + remote write.
+
+    Nested acquisition by the same thread shares the outer file descriptor and
+    flock.  Opening and flocking the path again would deadlock against the
+    process's own independent open-file description on POSIX.
+    """
+    path = _tracker_lock_path(cfg)
+    state = _tracker_lock_state(path)
+    with state.rlock:
+        if state.depth == 0:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            gitignore = path.parent / ".gitignore"
+            if not gitignore.is_file():
+                gitignore.write_text("*\n")
+            state.handle = path.open("a+b")
+            try:
+                _lock_file(state.handle)
+            except BaseException:
+                state.handle.close()
+                state.handle = None
+                raise
+        state.depth += 1
+        try:
+            yield
+        finally:
+            state.depth -= 1
+            if state.depth == 0:
+                handle = state.handle
+                state.handle = None
+                assert handle is not None
+                try:
+                    _unlock_file(handle)
+                finally:
+                    handle.close()
 
 
 def _apply_emoji_flip(
@@ -83,6 +195,199 @@ def _apply_emoji_flip(
     return new_body, f"'{pattern}' line updated {old_emoji} → {new_emoji}"
 
 
+def _plan_emoji_flips(
+    cfg: ReviewConfig,
+    body: str,
+    flips: list[tuple[int, str]],
+    old_emoji: str,
+) -> tuple[str, list[int], list[str], list[str]]:
+    """Apply a batch to one immutable remote-body snapshot in memory."""
+    applied: list[int] = []
+    applied_messages: list[str] = []
+    skipped: list[str] = []
+    result = body
+    for issue_num, new_emoji in flips:
+        new_body, msg = _apply_emoji_flip(
+            cfg, result, issue_num, new_emoji, old_emoji
+        )
+        if new_body is None:
+            skipped.append(f"#{issue_num}: {msg}")
+            continue
+        result = new_body
+        applied.append(issue_num)
+        applied_messages.append(msg)
+    return result, applied, applied_messages, skipped
+
+
+def _requested_states_present(
+    cfg: ReviewConfig,
+    body: str,
+    flips: list[tuple[int, str]],
+    old_emoji: str,
+) -> bool:
+    """Whether every requested line already carries its destination emoji.
+
+    Reuse the exact chapter/pattern matcher in reverse: if replacing
+    ``new_emoji`` back to ``old_emoji`` would match, the requested destination
+    is present.  This distinguishes a successful write followed by an unrelated
+    human prose edit from a writer that actually reverted our emoji.
+    """
+    for issue_num, new_emoji in flips:
+        matched, _message = _apply_emoji_flip(
+            cfg, body, issue_num, old_emoji, new_emoji
+        )
+        if matched is None:
+            return False
+    return True
+
+
+def _read_tracker_body(cfg: ReviewConfig) -> Optional[str]:
+    """Read the remote body with a bound lock-held GitHub call."""
+    return issue_body(
+        cfg.parent_issue,
+        cfg.github_repo,
+        timeout=_GITHUB_CALL_TIMEOUT_SECONDS,
+    )
+
+
+def _rewrite_tracker_emojis(
+    cfg: ReviewConfig,
+    flips: list[tuple[int, str]],
+    old_emoji: str,
+    *,
+    tmp_dir: Path,
+    temp_prefix: str,
+) -> tuple[bool, list[int], list[str], list[str], Optional[str]]:
+    """Conflict-safe whole-body rewrite shared by single + batch writers.
+
+    Returns ``(written, applied, applied_messages, skipped, error)``. A human
+    edit observed between planning and the pre-write check rebases the full
+    plan. The body is read again after PATCH: a later competing edit that kept
+    our requested states is accepted; one that reverted them is rebased and
+    retried. After three continuously changing snapshots the operation aborts.
+
+    GitHub does not expose conditional PATCH for this endpoint, so no client can
+    close the final pre-check→PATCH window. A human update that lands inside
+    that window and is immediately overwritten by PATCH is not recoverable from
+    the issue endpoint. The post-write read detects every conflict still visible
+    after PATCH and makes that limitation explicit rather than claiming CAS.
+    """
+    with _tracker_writer_lock(cfg):
+        prior_write: Optional[tuple[list[int], list[str], list[str]]] = None
+        for attempt in range(_MAX_CONFLICT_RETRIES):
+            try:
+                base = _read_tracker_body(cfg)
+            except subprocess.TimeoutExpired:
+                return False, [], [], [], (
+                    "timed out loading the tracker body while holding the "
+                    "writer lock; aborted without writing"
+                )
+            if base is None:
+                return False, [], [], [], (
+                    f"could not load parent issue #{cfg.parent_issue}"
+                )
+
+            planned, applied, applied_messages, skipped = _plan_emoji_flips(
+                cfg, base, flips, old_emoji
+            )
+            if not applied:
+                if prior_write is not None:
+                    prior_applied, prior_messages, prior_skipped = prior_write
+                    if _requested_states_present(
+                        cfg, base, flips, old_emoji
+                    ):
+                        return (
+                            True, prior_applied, prior_messages,
+                            prior_skipped, None,
+                        )
+                    return False, [], [], [], (
+                        "tracker body changed after update and no longer "
+                        "contains a line where every requested emoji state "
+                        "can be recovered safely"
+                    )
+                return False, applied, applied_messages, skipped, None
+
+            # Human edits and writers from another checkout do not hold our
+            # local flock. Re-read immediately before replacement; if the body
+            # changed, discard the stale plan and rebase all flips onto the new
+            # remote prose on the next iteration.
+            try:
+                latest = _read_tracker_body(cfg)
+            except subprocess.TimeoutExpired:
+                return False, [], [], [], (
+                    "timed out confirming the tracker body before update; "
+                    "aborted without writing"
+                )
+            if latest is None:
+                return False, [], [], [], (
+                    f"could not confirm parent issue #{cfg.parent_issue} "
+                    "before update; aborted without writing"
+                )
+            if latest != base:
+                if attempt + 1 < _MAX_CONFLICT_RETRIES:
+                    continue
+                return False, [], [], [], (
+                    "tracker body changed concurrently during all "
+                    f"{_MAX_CONFLICT_RETRIES} attempts; aborted without "
+                    "overwriting the newer prose"
+                )
+
+            # The directory name is unique per invocation/process. The staged
+            # file exists only for the synchronous gh call and is cleaned on
+            # success or exception, preventing cross-chapter/body exchange.
+            with tempfile.TemporaryDirectory(
+                prefix=temp_prefix,
+                dir=str(tmp_dir),
+            ) as temp_name:
+                body_path = Path(temp_name) / "tracker-body.md"
+                body_path.write_text(planned, encoding="utf-8")
+                try:
+                    gh(
+                        "issue", "edit", str(cfg.parent_issue),
+                        "--repo", cfg.github_repo,
+                        "--body-file", str(body_path),
+                        timeout=_GITHUB_CALL_TIMEOUT_SECONDS,
+                    )
+                except subprocess.TimeoutExpired:
+                    return False, [], [], [], (
+                        "tracker update timed out; the remote outcome is "
+                        "uncertain, so no automatic retry was attempted "
+                        "(retry is idempotent)"
+                    )
+
+            try:
+                observed = _read_tracker_body(cfg)
+            except subprocess.TimeoutExpired:
+                return False, [], [], [], (
+                    "tracker update was submitted but post-write verification "
+                    "timed out; remote outcome uncertain (retry is idempotent)"
+                )
+            if observed is None:
+                return False, [], [], [], (
+                    "tracker update was submitted but the resulting body could "
+                    "not be verified; remote outcome uncertain (retry is "
+                    "idempotent)"
+                )
+            if observed == planned:
+                return True, applied, applied_messages, skipped, None
+            if _requested_states_present(cfg, observed, flips, old_emoji):
+                annotated = [
+                    message + " (confirmed after a concurrent remote edit)"
+                    for message in applied_messages
+                ]
+                return True, applied, annotated, skipped, None
+            if attempt + 1 < _MAX_CONFLICT_RETRIES:
+                prior_write = (applied, applied_messages, skipped)
+                continue
+            return False, [], [], [], (
+                "tracker body changed after every update attempt and the "
+                "requested emoji state was not retained; stopped rather than "
+                "overwriting the newest observed body"
+            )
+
+    raise AssertionError("unreachable tracker rewrite state")
+
+
 def update_tracker_emoji(
     cfg: ReviewConfig,
     issue_num: int,
@@ -97,24 +402,20 @@ def update_tracker_emoji(
     Returns ``(ok, message)``. On a no-op (already in the new state, or
     not matched), ``ok`` is False and ``message`` explains why.
     """
-    body = issue_body(cfg.parent_issue, cfg.github_repo)
-    if body is None:
-        return False, f"could not load parent issue #{cfg.parent_issue}"
-
-    new_body, msg = _apply_emoji_flip(
-        cfg, body, issue_num, new_emoji, old_emoji
+    written, _applied, messages, skipped, error = _rewrite_tracker_emojis(
+        cfg,
+        [(issue_num, new_emoji)],
+        old_emoji,
+        tmp_dir=tmp_dir,
+        temp_prefix=f"marathon-tracker-{cfg.parent_issue}-{issue_num}-",
     )
-    if new_body is None:
-        return False, msg
-
-    tmp_path = tmp_dir / f"review-tracker-body-{issue_num}.md"
-    tmp_path.write_text(new_body)
-    gh(
-        "issue", "edit", str(cfg.parent_issue),
-        "--repo", cfg.github_repo,
-        "--body-file", str(tmp_path),
-    )
-    return True, msg
+    if error is not None:
+        return False, error
+    if not written:
+        return False, skipped[0].split(": ", 1)[-1] if skipped else (
+            f"no tracker line flipped for #{issue_num}"
+        )
+    return True, messages[0]
 
 
 def sync_tracker_to_verified(
@@ -129,10 +430,10 @@ def sync_tracker_to_verified(
 
     The verify/ship path already flips the tracker per issue; this catches
     stragglers — an issue verified out-of-band (a hand-added label), or a flip
-    that silently no-op'd. ONE bulk label read + ONE tracker write (only the
-    still-🟠 lines flip; an already-🟡 line is a no-op). Scoped to ``chapter``
-    when given, else all registered chapters. Returns ``(ok, message)``; ``ok``
-    is True iff at least one line was flipped."""
+    that silently no-op'd. ONE bulk label read + ONE tracker write (plus the
+    conflict-check/verification reads; only still-🟠 lines flip). Scoped to
+    ``chapter`` when given, else all registered chapters. Returns
+    ``(ok, message)``; ``ok`` is True iff at least one line was flipped."""
     from marathon.review.github import fetch_issues_bulk
 
     if chapter is not None:
@@ -167,15 +468,18 @@ def update_tracker_emojis(
     tmp_dir: Path = Path("/tmp"),
 ) -> tuple[bool, str]:
     """BATCHED multi-flip: apply every ``(issue_num, new_emoji)`` edit to
-    the parent body in ONE read + ONE ``gh issue edit`` write.
+    the parent body in one conflict-checked transaction + one
+    ``gh issue edit`` write in the uncontended case.
 
     The write-storm ruling forbids one tracker-body rewrite per affected
     decl (crit-feas §5): the invalidation engine may flip dozens of
     downstream issues 🟡→🟠 in one audit run, and that must cost a single
-    body rewrite. So the parent body is fetched once, each flip is
-    applied in memory through the shared :func:`_apply_emoji_flip`
-    matcher (same line logic as the single-flip writer), and the result
-    is written once.
+    body rewrite. Each flip is applied to one fresh snapshot in memory through
+    the shared :func:`_apply_emoji_flip` matcher, that snapshot is confirmed
+    immediately before the write (and rebased on conflict), and the result is
+    written once unless post-write verification observes that a competing
+    writer reverted part of the batch, in which case the newer body is rebased
+    and the remaining transitions are retried together.
 
     ``old_emoji`` defaults to 🟡 (the invalidation direction: a verified
     decl whose tier dropped goes back to 🟠), overridable per call.
@@ -187,37 +491,20 @@ def update_tracker_emojis(
     nothing."""
     if not flips:
         return False, "no flips requested"
-    body = issue_body(cfg.parent_issue, cfg.github_repo)
-    if body is None:
-        return False, f"could not load parent issue #{cfg.parent_issue}"
-
-    applied: list[int] = []
-    skipped: list[str] = []
-    for issue_num, new_emoji in flips:
-        new_body, msg = _apply_emoji_flip(
-            cfg, body, issue_num, new_emoji, old_emoji
-        )
-        if new_body is None:
-            skipped.append(f"#{issue_num}: {msg}")
-            continue
-        body = new_body  # accumulate edits so each writes onto the last
-        applied.append(issue_num)
-
-    if not applied:
+    written, applied, _messages, skipped, error = _rewrite_tracker_emojis(
+        cfg,
+        flips,
+        old_emoji,
+        tmp_dir=tmp_dir,
+        temp_prefix=f"marathon-tracker-{cfg.parent_issue}-batch-",
+    )
+    if error is not None:
+        return False, error
+    if not written:
         return False, (
             "no tracker lines flipped "
             + ("(" + "; ".join(skipped) + ")" if skipped else "")
         )
-
-    # ONE write for all N flips — the substring surgery already happened
-    # in memory above.
-    tmp_path = tmp_dir / "review-tracker-body-batch.md"
-    tmp_path.write_text(body)
-    gh(
-        "issue", "edit", str(cfg.parent_issue),
-        "--repo", cfg.github_repo,
-        "--body-file", str(tmp_path),
-    )
     msg = (
         f"flipped {len(applied)} tracker line(s) → {old_emoji}-replaced "
         f"in one rewrite (issues {', '.join(f'#{n}' for n in applied)})"

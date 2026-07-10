@@ -105,6 +105,11 @@ def test_reuse_branch_primes_only_when_not_built(tmp_path, monkeypatch):
     primed: list[str] = []
     monkeypatch.setattr(conductor, "_prime_mathlib_cache",
                         lambda w, **k: primed.append(str(w)) or False)
+    monkeypatch.setattr(
+        conductor,
+        "_refine_branch_for_dispatch",
+        lambda *a, **k: "marathon/refine-c14-i22",
+    )
     monkeypatch.setattr(conductor.subprocess, "Popen",
                         lambda cmd, **kw: SimpleNamespace(pid=4001))
 

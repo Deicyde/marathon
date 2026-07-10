@@ -128,6 +128,97 @@ def patch_bulk(monkeypatch, meta: dict) -> None:
     import marathon.review.github as gh_mod
 
     monkeypatch.setattr(gh_mod, "fetch_issues_bulk", fake_bulk)
+    monkeypatch.setattr(gh_mod, "fetch_issues_rest_bulk", lambda nums, repo: {})
+
+
+def test_load_context_rest_fallback_on_whole_graphql_failure(
+    tmp_path, monkeypatch,
+):
+    cfg = make_cfg(tmp_path)
+    import marathon.review.github as gh_mod
+
+    graphql_calls = []
+    rest_calls = []
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_bulk",
+        lambda nums, repo: graphql_calls.append(list(nums)) or None,
+    )
+    recovered = _bodies_for({22: "Foo", 23: "Bar"})
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_rest_bulk",
+        lambda nums, repo: (
+            rest_calls.append(list(nums))
+            or {n: recovered[n] for n in nums if n in recovered}
+        ),
+    )
+
+    ctx = cards._load_context(cfg, [22, 23])
+
+    assert graphql_calls == [[22, 23]]
+    assert rest_calls == [[22, 23]]
+    assert ctx.issue_meta == recovered
+
+
+def test_load_context_rest_fallback_only_fetches_partial_graphql_gaps(
+    tmp_path, monkeypatch,
+):
+    cfg = make_cfg(tmp_path)
+    import marathon.review.github as gh_mod
+
+    metadata = _bodies_for({22: "Foo", 23: "Bar"})
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_bulk", lambda nums, repo: {22: metadata[22]}
+    )
+    rest_calls = []
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_rest_bulk",
+        lambda nums, repo: (
+            rest_calls.append(list(nums)) or {23: metadata[23]}
+        ),
+    )
+
+    ctx = cards._load_context(cfg, [22, 23])
+
+    assert rest_calls == [[23]]
+    assert ctx.issue_meta == metadata
+
+
+def test_load_context_rest_failure_is_fail_soft(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    import marathon.review.github as gh_mod
+
+    monkeypatch.setattr(gh_mod, "fetch_issues_bulk", lambda nums, repo: None)
+
+    def unavailable(nums, repo):
+        raise RuntimeError("REST unavailable")
+
+    monkeypatch.setattr(gh_mod, "fetch_issues_rest_bulk", unavailable)
+
+    ctx = cards._load_context(cfg, [22])
+
+    assert ctx.issue_meta == {}
+    assert ctx.verdict_status == {}
+
+
+def test_load_context_complete_graphql_fast_path_skips_rest(
+    tmp_path, monkeypatch,
+):
+    cfg = make_cfg(tmp_path)
+    import marathon.review.github as gh_mod
+
+    metadata = _bodies_for({22: "Foo"})
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_bulk", lambda nums, repo: metadata
+    )
+
+    def unexpected(nums, repo):
+        raise AssertionError("REST fallback ran despite complete GraphQL data")
+
+    monkeypatch.setattr(gh_mod, "fetch_issues_rest_bulk", unexpected)
+
+    ctx = cards._load_context(cfg, [22])
+
+    assert ctx.issue_meta == metadata
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +769,88 @@ def test_get_queue_is_pure_no_verdict(running_server, monkeypatch):
     assert "jobs" in json.loads(sbody)
 
 
+def test_definition_lookup_and_term_index_routes(running_server):
+    server, base, _token = running_server
+    source = server.cfg.repo_dir / "Demo" / "Chapter14.lean"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        "namespace Demo.Chapter14\n"
+        "def Foo : Nat := 1\n"
+        "end Demo.Chapter14\n"
+    )
+
+    status, raw = _get(
+        base + "/api/definition?name=Demo.Chapter14.Foo&issue=22"
+    )
+    payload = json.loads(raw)
+    assert status == 200
+    assert payload["status"] == "exact"
+    assert payload["matches"][0]["source_line"] == 2
+    assert payload["matches"][0]["owners"][0]["issue"] == 22
+
+    status, raw = _get(base + "/api/definition-terms")
+    terms = json.loads(raw)
+    assert status == 200
+    assert "Demo.Chapter14.Foo" in terms["names"]
+    assert terms["short"]["Foo"] == ["Demo.Chapter14.Foo"]
+    assert len(terms["source_token"]) == 64
+
+
+def test_reconciliation_preview_and_guarded_decision_routes(
+    running_server, monkeypatch
+):
+    _server, base, token = running_server
+    from marathon.deck import refresh as refresh_mod
+
+    proposal = {"old": "A.old", "new": "A.new"}
+    preview = {
+        "ok": True, "updated": False,
+        "proposed_renames": [proposal], "proposed_splits": [],
+        "proposal_token": "a" * 64, "message": "review",
+    }
+    monkeypatch.setattr(
+        refresh_mod, "reconciliation_preview", lambda cfg, issue: preview
+    )
+    status, raw = _get(base + "/api/reconciliation/22")
+    assert status == 200
+    assert json.loads(raw)["proposed_renames"] == [proposal]
+
+    seen = {}
+    monkeypatch.setattr(
+        refresh_mod,
+        "confirm_reconciliation_proposal",
+        lambda cfg, issue, confirmation: (
+            seen.update(issue=issue, confirmation=confirmation)
+            or {"ok": True, "updated": True, "renamed": [proposal]}
+        ),
+    )
+    status, raw = _post(
+        base + "/api/reconcile-proposal",
+        {
+            "issue": 22,
+            "proposal_token": "a" * 64,
+            "action": "confirm",
+            "kind": "rename",
+            "old": "A.old",
+            "new": "A.new",
+        },
+        headers={deck_server.TOKEN_HEADER: token},
+    )
+    assert status == 200 and json.loads(raw)["updated"] is True
+    assert seen["issue"] == 22
+    assert seen["confirmation"]["renames"] == [proposal]
+
+    status, _raw = _post(
+        base + "/api/reconcile-proposal",
+        {
+            "issue": 22, "proposal_token": "a" * 64,
+            "action": "dismiss", "kind": "rename",
+            "old": "A.old", "new": "A.new",
+        },
+    )
+    assert status == 403
+
+
 def test_post_verdict_without_token_is_403(running_server, monkeypatch):
     server, base, _token = running_server
     from marathon.review import review as review_mod
@@ -761,6 +934,7 @@ def test_status_emits_from_runtime_files(tmp_path, monkeypatch):
     assert status["jobs"][0]["issue_num"] == 23
     assert status["jobs"][0]["aristotle_status"] == "RUNNING"
     assert status["landings"] == [] and status["bounces"] == []
+    assert len(status["source_token"]) == 64
 
     # landed_today is 0 now (its landing-queue source is gone; merged-PR count
     # is a follow-up). The queue still builds + counts building jobs.

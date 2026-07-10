@@ -73,6 +73,7 @@ def test_auto_audit_gates_on_throttle_and_head_move(tmp_path, monkeypatch):
     monkeypatch.setattr(cond.subprocess, "Popen",
                         lambda *a, **k: calls.append(list(a[0])))
     monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda r: False)
+    monkeypatch.setattr(cond, "_persisted_audit_revision", lambda cfg: None)
     monkeypatch.setattr(refresh_mod, "head_sha", lambda r: "newhead123")
     I = cond.AUTO_AUDIT_MIN_INTERVAL_SECONDS
 
@@ -86,7 +87,8 @@ def test_auto_audit_gates_on_throttle_and_head_move(tmp_path, monkeypatch):
 
     # HEAD moved + clean + throttle ok → spawn `marathon audit run --target …`
     h, t = cond._maybe_auto_audit(cfg, "old", last_time=0.0, _now_fn=lambda: 1e12)
-    assert h == "newhead123" and t == 1e12
+    # Launch is not success: the durable cursor stays at the old revision.
+    assert h == "old" and t == 1e12
     assert len(calls) == 1
     assert "audit" in calls[0] and "run" in calls[0] and "GA/LeeSM" in calls[0]
 
@@ -101,10 +103,101 @@ def test_auto_audit_skips_while_operator_editing(tmp_path, monkeypatch):
     monkeypatch.setattr(cond.subprocess, "Popen", lambda *a, **k: calls.append(a))
     monkeypatch.setattr(refresh_mod, "head_sha", lambda r: "newhead")
     monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda r: True)  # mid-edit
+    monkeypatch.setattr(cond, "_persisted_audit_revision", lambda cfg: None)
     h, t = cond._maybe_auto_audit(cfg, "old", last_time=0.0, _now_fn=lambda: 1e12)
     assert h == "old"        # not audited
     assert t == 1e12         # throttle reset so we retry next window
     assert not calls         # no subprocess spawned
+
+
+def test_auto_audit_advances_only_after_persisted_success(tmp_path, monkeypatch):
+    """A completed+saved child advances the cursor on the next tick; merely
+    spawning it never does (the merge/restart race from issue #10)."""
+    import marathon.deck.refresh as refresh_mod
+
+    cfg = SimpleNamespace(
+        repo_dir=tmp_path,
+        target_path_template="GA/LeeSM/Chapter{chapter}",
+    )
+    persisted = {"revision": None}
+    calls = []
+    monkeypatch.setattr(
+        cond, "_persisted_audit_revision", lambda cfg: persisted["revision"]
+    )
+    monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda r: False)
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda r: "newhead")
+    monkeypatch.setattr(
+        cond.subprocess, "Popen", lambda *a, **k: calls.append(a)
+    )
+
+    head, last_time = cond._maybe_auto_audit(
+        cfg, "oldhead", 0.0, _now_fn=lambda: 1e12
+    )
+    assert head == "oldhead"
+    assert len(calls) == 1
+
+    # Simulate the child's successful atomic save.  Recovery happens even
+    # inside the throttle window and does not launch a second child.
+    persisted["revision"] = "newhead"
+    head, last_time_2 = cond._maybe_auto_audit(
+        cfg, head, last_time, _now_fn=lambda: 1e12 + 1
+    )
+    assert (head, last_time_2) == ("newhead", last_time)
+    assert len(calls) == 1
+
+
+def test_auto_audit_failure_keeps_cursor_and_retries(tmp_path, monkeypatch):
+    import marathon.deck.refresh as refresh_mod
+
+    cfg = SimpleNamespace(
+        repo_dir=tmp_path,
+        target_path_template="GA/LeeSM/Chapter{chapter}",
+    )
+    calls = []
+    monkeypatch.setattr(cond, "_persisted_audit_revision", lambda cfg: "old")
+    monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda r: False)
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda r: "new")
+    monkeypatch.setattr(
+        cond.subprocess, "Popen", lambda *a, **k: calls.append(a)
+    )
+    interval = cond.AUTO_AUDIT_MIN_INTERVAL_SECONDS
+
+    head, when = cond._maybe_auto_audit(
+        cfg, "old", 0.0, _now_fn=lambda: interval + 1
+    )
+    assert head == "old" and len(calls) == 1
+    # No persisted success appeared.  Once the throttle expires, retry.
+    head, _ = cond._maybe_auto_audit(
+        cfg, head, when, _now_fn=lambda: when + interval + 1
+    )
+    assert head == "old" and len(calls) == 2
+
+
+def test_persisted_audit_revision_requires_complete_same_revision_coverage(
+    tmp_path, monkeypatch
+):
+    import marathon.audit.engine as audit_engine
+
+    cfg = SimpleNamespace(
+        repo_dir=tmp_path,
+        target_path_template="GA/LeeSM/Chapter{chapter}",
+    )
+    monkeypatch.setattr(
+        audit_engine, "derive_modules", lambda repo, target: (["A", "B"], [])
+    )
+    snapshot = SimpleNamespace(
+        module_revisions={"A": "old", "B": "old"}
+    )
+    monkeypatch.setattr(
+        audit_engine, "load_snapshot", lambda *a, **k: snapshot
+    )
+    assert cond._persisted_audit_revision(cfg) == "old"
+
+    # A partial new audit must not become the all-project cursor.
+    snapshot.module_revisions = {"A": "new", "B": "old"}
+    assert cond._persisted_audit_revision(cfg) is None
+    snapshot.module_revisions = {"A": "new"}
+    assert cond._persisted_audit_revision(cfg) is None
 
 
 def test_prover_control_file_roundtrip(tmp_path):

@@ -124,6 +124,37 @@
   function fetchStatus() {
     return getJSON("/api/status");
   }
+  function fetchReviewWorkspace(chapter) {
+    var query = chapter === "all"
+      ? "?chapter=all"
+      : chapter != null && chapter !== ""
+        ? "?chapter=" + encodeURIComponent(chapter)
+        : "";
+    return getJSON("/api/review-workspace" + query);
+  }
+  function fetchReviewSource(path) {
+    return getJSON("/api/review-source?path=" + encodeURIComponent(path))
+      .then(function (payload) {
+        // A whole-file reload is an explicit observation point for Aristotle's
+        // worktree changes. Refresh the compact term index in the background.
+        refreshDefinitionTerms(null, true);
+        return payload;
+      });
+  }
+  function fetchProjectGraph() {
+    return getJSON("/api/project-graph");
+  }
+  function fetchDefinitionTerms() {
+    return getJSON("/api/definition-terms");
+  }
+  function fetchDefinition(name) {
+    var url = "/api/definition?name=" + encodeURIComponent(name);
+    if (state.issue != null) url += "&issue=" + encodeURIComponent(state.issue);
+    return getJSON(url);
+  }
+  function fetchReconciliation(issue) {
+    return getJSON("/api/reconciliation/" + encodeURIComponent(issue));
+  }
 
   // --- network: the token-bearing POST primitive ---------------------------
   // postJSON attaches the per-session token (header + body fallback) and
@@ -214,6 +245,13 @@
     return postJSON("/api/decl-verdict", body);
   }
 
+  // Atomic LOCAL-ONLY batch verdicts for the file/chapter reader. The backend
+  // validates every target and rejected-predecessor guard before replacing the
+  // sidecar once; this never ships an issue or dispatches Aristotle.
+  function postBatchDeclVerdicts(items) {
+    return postJSON("/api/batch-decl-verdict", { items: items || [] });
+  }
+
   // postDeclLock — LOCAL-ONLY. Toggles the opt-in HARD-FREEZE lock on a
   // declaration. A locked decl's signature is frozen at reject-ship so no
   // sibling-decl refine can change it; unlocked (soft) decls stay rewritable.
@@ -242,6 +280,19 @@
   // "Drop citation" button.
   function postDropCitation(issue, decl) {
     return postJSON("/api/drop-citation", { issue: issue, decl: decl });
+  }
+
+  function postReconciliationDecision(issue, proposalToken, action, kind, mapping) {
+    var body = {
+      issue: issue,
+      proposal_token: proposalToken,
+      action: action,
+      kind: kind,
+      old: mapping.old,
+    };
+    if (kind === "rename") body.new = mapping.new;
+    else body.targets = mapping.targets || [];
+    return postJSON("/api/reconcile-proposal", body);
   }
 
   // The manual "refresh issue body from code" write was RETIRED: the conductor
@@ -301,9 +352,97 @@
     // two-step choice.  Overrides are per issue+decl and live only in this tab.
     dependencyOverrides: {},
     subdeckRequestSeq: 0, // discards stale async GETs after issue/navigation changes
-    activeTab: "review", // dashboard tab: review | status | issues | history
+    activeTab: "review", // review | files | graph | status | issues | history
+    filesChapter: "",   // "" = server default, "all" = project-wide reader
+    filesData: null,
+    filesQuery: "",
+    filesFilter: "all", // all | unreviewed | rejected | changed | surfaced
+    filesFocus: null,
+    filesResumeScroll: null,
+    filesResumeName: null,
+    filesBusy: false,
+    graphData: null,
+    graphFilter: { chapter: "all", status: "all", type: "all", query: "" },
+    graphView: { zoom: 1 },
+    definitionTerms: { names: [], short: {} },
+    definitionNameSet: {},
+    definitionSourceToken: null,
+    definitionTermsRequest: null,
+    definitionTermsRequestToken: null,
+    definitionTermsQueued: null,
+    definitionRequestSeq: 0,
+    reconciliation: null,
+    reconciliationBusy: false,
   };
   state.skipApi = readSkipApiPref();
+
+  function repaintDefinitionSurfaces() {
+    if (state.activeTab === "review" && state.subdeck &&
+        !state.rejectComposerOpen && !state.busy) {
+      // Preserve an explicitly revisited card instead of jumping back to the
+      // first unreviewed declaration merely because highlighting data arrived.
+      if (state.currentDecl) revisitDecl(state.currentDecl.name);
+      else renderSubdeckStage();
+    } else if (state.activeTab === "files" && state.filesData) {
+      // Never rebuild over a draft that has not been POSTed yet.
+      var openDraft = document.querySelector(
+        '#tab-files .reader-reject-editor:not([hidden]) textarea'
+      );
+      if (!openDraft) paintFilesTab();
+    }
+  }
+
+  function installDefinitionTerms(terms) {
+    terms = terms || { names: [], short: {} };
+    var token = terms.source_token || JSON.stringify(terms.names || []);
+    if (token === state.definitionSourceToken) return false;
+    state.definitionTerms = terms;
+    state.definitionNameSet = Object.create(null);
+    (terms.names || []).forEach(function (name) {
+      state.definitionNameSet[name] = true;
+    });
+    state.definitionSourceToken = token;
+    repaintDefinitionSurfaces();
+    return true;
+  }
+
+  // Single-flight source-term refresh. Status/SSE, a subdeck reload, and a
+  // whole-file source read can arrive together; coalesce identical observations
+  // and queue at most one follow-up when source may have moved mid-request.
+  function refreshDefinitionTerms(expectedToken, force) {
+    expectedToken = expectedToken || null;
+    if (!force && expectedToken && expectedToken === state.definitionSourceToken) {
+      return Promise.resolve(state.definitionTerms);
+    }
+    if (state.definitionTermsRequest) {
+      if (force || (expectedToken && expectedToken !== state.definitionTermsRequestToken)) {
+        state.definitionTermsQueued = {
+          expectedToken: expectedToken,
+          force: !!force,
+        };
+      }
+      return state.definitionTermsRequest;
+    }
+
+    state.definitionTermsRequestToken = expectedToken;
+    var flight = fetchDefinitionTerms()
+      .then(function (terms) {
+        installDefinitionTerms(terms);
+        return terms;
+      })
+      .catch(function () { return null; });
+    state.definitionTermsRequest = flight.then(function (result) {
+      var queued = state.definitionTermsQueued;
+      state.definitionTermsRequest = null;
+      state.definitionTermsRequestToken = null;
+      state.definitionTermsQueued = null;
+      if (queued) {
+        refreshDefinitionTerms(queued.expectedToken, queued.force);
+      }
+      return result;
+    });
+    return state.definitionTermsRequest;
+  }
 
   function overrideSet() {
     var k = String(state.issue);
@@ -657,15 +796,11 @@
     return s;
   }
 
-  function regexpEscape(s) {
-    return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-
   // Map both qualified kernel names and unambiguous short names to their
   // definitions.  Ambiguous short names are deliberately not clickable.
   function kernelTermLookup(kernel) {
-    var lookup = {};
-    var short = {};
+    var lookup = Object.create(null);
+    var short = Object.create(null);
     (kernel || []).forEach(function (member) {
       if (!member || !member.name) return;
       lookup[member.name] = member;
@@ -685,36 +820,47 @@
     ref.setAttribute("role", "button");
     ref.setAttribute("tabindex", "0");
     ref.setAttribute("data-no-swipe", "true");
-    ref.setAttribute("title", "Inspect " + member.name);
-    ref.setAttribute("aria-label", "Inspect definition of " + member.name);
+    var lookupName = (member && member.name) || label;
+    ref.setAttribute("title", "Inspect " + lookupName);
+    ref.setAttribute("aria-label", "Inspect definition of " + lookupName);
     ref.addEventListener("click", function (e) {
       e.stopPropagation();
-      showKernelDefinition(member);
+      showDefinitionLookup(label, member);
     });
     ref.addEventListener("keydown", function (e) {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
-        showKernelDefinition(member);
+        showDefinitionLookup(label, member);
       }
     });
     return ref;
+  }
+
+  function projectTermCandidates(label) {
+    if (state.definitionNameSet[label]) return [label];
+    var short = (state.definitionTerms && state.definitionTerms.short) || {};
+    return Object.prototype.hasOwnProperty.call(short, label) ? short[label] : [];
   }
 
   // Highlight references only in ordinary code text; comments and strings are
   // emitted by leanHighlight as atomic spans and never receive fake links.
   function leanPlainNodes(txt, kernel) {
     var lookup = kernelTermLookup(kernel);
-    var keys = Object.keys(lookup).sort(function (a, b) { return b.length - a.length; });
-    if (!keys.length) return [document.createTextNode(txt)];
-    var pattern = keys.map(regexpEscape).join("|");
-    var re = new RegExp("(^|[^A-Za-z0-9_'.])(" + pattern + ")(?=[^A-Za-z0-9_'.]|$)", "g");
+    // Tokenize ordinary identifiers, then link only names present in the
+    // current-source project index (or the card's audit kernel). This avoids
+    // making local variables/keywords look resolvable while still supporting
+    // project identifiers outside the minimized statement kernel.
+    var re = /(^|[^A-Za-z0-9_'.])([A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*)(?=[^A-Za-z0-9_'.]|$)/g;
     var nodes = [];
     var last = 0;
     var m;
     while ((m = re.exec(txt))) {
       if (m.index > last) nodes.push(document.createTextNode(txt.slice(last, m.index)));
       if (m[1]) nodes.push(document.createTextNode(m[1]));
-      nodes.push(leanReference(lookup[m[2]], m[2]));
+      var member = lookup[m[2]];
+      var candidates = projectTermCandidates(m[2]);
+      if (member || candidates.length) nodes.push(leanReference(member || null, m[2]));
+      else nodes.push(document.createTextNode(m[2]));
       last = re.lastIndex;
       if (re.lastIndex === m.index) re.lastIndex++;
     }
@@ -965,6 +1111,93 @@
       });
   }
 
+  function loadReconciliation(issue, requestSeq) {
+    state.reconciliation = { loading: true };
+    fetchReconciliation(issue)
+      .then(function (result) {
+        if (requestSeq !== state.subdeckRequestSeq || state.issue !== issue) return;
+        state.reconciliation = result || null;
+        if (state.activeTab === "review" && !state.rejectComposerOpen) renderSubdeckStage();
+      })
+      .catch(function (err) {
+        if (requestSeq !== state.subdeckRequestSeq || state.issue !== issue) return;
+        state.reconciliation = { error: err.message || "reconciliation preview failed" };
+        if (state.activeTab === "review" && !state.rejectComposerOpen) renderSubdeckStage();
+      });
+  }
+
+  function decideReconciliation(kind, mapping, action, button) {
+    var preview = state.reconciliation || {};
+    if (state.issue == null || !preview.proposal_token || state.reconciliationBusy) return;
+    state.reconciliationBusy = true;
+    if (button) {
+      button.disabled = true;
+      button.textContent = action === "confirm" ? "applying…" : "dismissing…";
+    }
+    postReconciliationDecision(
+      state.issue, preview.proposal_token, action, kind, mapping
+    ).then(function (result) {
+      flashToast((result && result.message) ||
+        (action === "confirm" ? "Reconciliation applied" : "Proposal dismissed"));
+      state.reconciliationBusy = false;
+      refetchSubdeck();
+    }).catch(function (err) {
+      state.reconciliationBusy = false;
+      flashToast(err && err.message ? err.message : "Reconciliation decision failed");
+      // A conflict means the proposal/body changed. Reload both read models so
+      // the reviewer never acts on a stale mapping.
+      refetchSubdeck();
+    });
+  }
+
+  function reconciliationProposalPanel() {
+    var preview = state.reconciliation;
+    if (!preview) return null;
+    if (preview.loading) return el("div", { class: "reconcile-proposals muted", text:
+      "Checking declaration identity…" });
+    if (preview.error) return el("div", { class: "reconcile-proposals inspector-warning", text:
+      preview.error });
+    var renames = preview.proposed_renames || [];
+    var splits = preview.proposed_splits || [];
+    if (!renames.length && !splits.length) return null;
+    var list = el("div", { class: "reconcile-proposal-list" });
+
+    function proposalRow(kind, mapping, destination) {
+      var confirm = el("button", {
+        class: "btn btn-tiny reconcile-confirm",
+        type: "button",
+        disabled: state.reconciliationBusy ? "disabled" : null,
+      }, ["Confirm"]);
+      var dismiss = el("button", {
+        class: "btn btn-tiny reconcile-dismiss",
+        type: "button",
+        disabled: state.reconciliationBusy ? "disabled" : null,
+      }, ["Not the same"]);
+      confirm.addEventListener("click", function () {
+        decideReconciliation(kind, mapping, "confirm", confirm);
+      });
+      dismiss.addEventListener("click", function () {
+        decideReconciliation(kind, mapping, "dismiss", dismiss);
+      });
+      return el("div", { class: "reconcile-proposal" }, [
+        el("div", { class: "reconcile-map mono", text: mapping.old + " → " + destination }),
+        el("div", { class: "reconcile-actions" }, [confirm, dismiss]),
+      ]);
+    }
+    renames.forEach(function (mapping) {
+      list.appendChild(proposalRow("rename", mapping, mapping.new));
+    });
+    splits.forEach(function (mapping) {
+      list.appendChild(proposalRow("split", mapping, (mapping.targets || []).join(" + ")));
+    });
+    return el("section", { class: "reconcile-proposals", role: "alert" }, [
+      el("strong", { text: "Aristotle may have changed declaration identity" }),
+      el("p", { text:
+        "Review each mapping once. Confirm rewrites the citation; “Not the same” keeps the stale citation without stalling future reconciliation." }),
+      list,
+    ]);
+  }
+
   function staleFootnote() {
     var stale = staleCitations();
     var n = stale.length;
@@ -1001,6 +1234,7 @@
           n + " citation" + (n === 1 ? "" : "s") +
           " in the issue body not found in the current code:" }),
         rows,
+        reconciliationProposalPanel(),
         el("span", { class: "stale-foot-tail", text:
           "These are NOT review cards. The conductor reconciles renames " +
           "automatically; a citation with no proven rename is kept (it may " +
@@ -1078,6 +1312,7 @@
   function closeReviewInspector() {
     var host = inspectorHost();
     if (!host) return;
+    state.definitionRequestSeq += 1;
     var onClose = host._marathonOnClose;
     host._marathonOnClose = null;
     host.setAttribute("hidden", "hidden");
@@ -1139,13 +1374,147 @@
       member.kind ? el("span", { class: "decl-panel-kind", text: member.kind }) : null,
       el("span", { class: "mono", text: member.name }),
     ]);
-    openReviewInspector("Definition", [
+    openDefinitionSurface("Definition", [
       meta,
       inspectorCode("Elaborated type", member.type_pp),
       inspectorCode("Definition body", member.value_pp),
       el("p", { class: "inspector-hint", text:
         "This is the audit snapshot's elaborated kernel entry. Click another highlighted term to inspect it." }),
     ]);
+  }
+
+  function openDefinitionSurface(title, children) {
+    if (state.activeTab === "review" && inspectorHost()) {
+      return openReviewInspector(title, children);
+    }
+    function closeDefinitionModal() {
+      closeModal();
+    }
+    var panel = el("div", { class: "modal-panel definition-modal" }, [
+      el("div", { class: "inspector-head" }, [
+        el("h2", { class: "inspector-title", text: title }),
+        el("button", { class: "inspector-close", type: "button",
+          "aria-label": "Close definition", onclick: closeDefinitionModal }, ["×"]),
+      ]),
+    ]);
+    (children || []).forEach(function (child) { if (child) panel.appendChild(child); });
+    openModal(panel, function () { state.definitionRequestSeq += 1; });
+    return panel;
+  }
+
+  function definitionEvidence(match) {
+    var evidence = (match && match.evidence) || {};
+    var rows = [
+      "trust tier: " + (match.tier || "-"),
+      "sorry: " + (evidence.sorry == null ? "unknown" : evidence.sorry ? "yes" : "no"),
+      "axioms beyond whitelist: " + ((evidence.axioms_beyond_whitelist || []).join(", ") || "none"),
+      "deception tags: " + ((evidence.deception_tags || []).join("; ") || "none"),
+    ];
+    if ((match.qualifiers || []).length) rows.push("qualifiers: " + match.qualifiers.join(", "));
+    if (!match.in_audit) rows.push("audit: not yet present in the current snapshot");
+    return rows.join("\n");
+  }
+
+  function renderDefinitionMatch(match) {
+    var location = match.source_file || "source unavailable";
+    if (match.source_line != null) location += ":" + match.source_line;
+    var owners = el("section", { class: "inspector-sec" }, [
+      el("h3", { class: "inspector-label", text: "Owning review card" }),
+    ]);
+    if (!(match.owners || []).length) {
+      owners.appendChild(el("p", { class: "inspector-empty", text:
+        "No current issue owns this declaration; it may be newly added or shared vocabulary." }));
+    } else {
+      (match.owners || []).forEach(function (owner) {
+        owners.appendChild(el("button", {
+          class: "btn btn-tiny definition-owner",
+          type: "button",
+          onclick: function () {
+            closeReviewInspector();
+            closeModal();
+            switchTab("review");
+            openIssue(owner.issue);
+          },
+        }, ["Open #" + owner.issue + " · " + (owner.title || "review card")]));
+      });
+    }
+    openDefinitionSurface("Definition", [
+      el("p", { class: "inspector-meta" }, [
+        match.kind ? el("span", { class: "decl-panel-kind", text: match.kind }) : null,
+        tierBadge(match.tier || "-", match.qualifiers || []),
+        el("span", { class: "mono", text: match.name }),
+      ]),
+      el("p", { class: "resource-file" }, [
+        el("strong", { text: "Current source" }),
+        el("span", { class: "mono", text: location }),
+      ]),
+      inspectorCode("Source block", match.source_block),
+      inspectorCode("Elaborated type", match.statement_pp),
+      inspectorCode("Definition body", match.value_pp),
+      inspectorCode("Trust evidence", definitionEvidence(match)),
+      owners,
+    ]);
+  }
+
+  function showDefinitionLookup(name, fallbackMember) {
+    var requestSeq = ++state.definitionRequestSeq;
+    var issue = state.issue;
+    var activeTab = state.activeTab;
+    var declaration = activeTab === "review" && state.currentDecl
+      ? state.currentDecl.name : null;
+    function stillCurrent() {
+      return requestSeq === state.definitionRequestSeq
+        && issue === state.issue
+        && activeTab === state.activeTab
+        && (activeTab !== "review"
+          || declaration === (state.currentDecl && state.currentDecl.name));
+    }
+    openDefinitionSurface("Definition lookup", [
+      el("p", { class: "inspector-hint", text: "Resolving " + name + " against current project source…" }),
+    ]);
+    fetchDefinition(name)
+      .then(function (result) {
+        if (!stillCurrent()) return;
+        var matches = (result && result.matches) || [];
+        if (matches.length === 1) return renderDefinitionMatch(matches[0]);
+        if (matches.length > 1) {
+          var choices = el("div", { class: "definition-choices" });
+          matches.forEach(function (match) {
+            choices.appendChild(el("button", {
+              class: "btn definition-choice",
+              type: "button",
+              onclick: function () { renderDefinitionMatch(match); },
+            }, [
+              el("span", { class: "mono", text: match.name }),
+              el("span", { class: "definition-choice-source", text:
+                (match.source_file || "source unavailable") +
+                (match.source_line != null ? ":" + match.source_line : "") }),
+            ]));
+          });
+          openDefinitionSurface("Choose a definition", [
+            el("p", { class: "inspector-warning", text:
+              (result.message || "This short name is ambiguous.") + " Choose the intended qualified declaration." }),
+            choices,
+          ]);
+          return;
+        }
+        if (fallbackMember) {
+          showKernelDefinition(fallbackMember);
+          return;
+        }
+        openDefinitionSurface("Definition not resolved", [
+          el("p", { class: "inspector-warning", text:
+            (result && result.message) ||
+            "This identifier is not a current project declaration; it may be Mathlib/core vocabulary or a local variable." }),
+        ]);
+      })
+      .catch(function (err) {
+        if (!stillCurrent()) return;
+        if (fallbackMember) return showKernelDefinition(fallbackMember);
+        openDefinitionSurface("Definition lookup failed", [
+          el("p", { class: "inspector-warning", text: err.message || "Lookup failed" }),
+        ]);
+      });
   }
 
   function verdictGlyph(card) {
@@ -1367,7 +1736,8 @@
         el("section", { class: "statement" }, [
           el("details", { class: "elab-type", "data-no-swipe": "true" }, [
             el("summary", { text: "Elaborated type (what is actually proven)", "data-no-swipe": "true" }),
-            el("pre", { class: "mono statement-pp" }, [prettyLeanType(card.statement_pp)]),
+            el("pre", { class: "mono statement-pp" },
+              leanHighlight(prettyLeanType(card.statement_pp), card.kernel)),
           ]),
         ])
       );
@@ -1702,6 +2072,7 @@
       return;
     }
     var requestSeq = ++state.subdeckRequestSeq;
+    state.definitionRequestSeq += 1;
     if (issue !== state.issue) state.apiPanelOpen = false; // fresh per issue
     state.issue = issue;
     state.showSummary = false;
@@ -1709,6 +2080,7 @@
     // session's "decide later" dismissal does not carry across issues).
     state.informalDismissed = false;
     state.informalActive = false;
+    state.reconciliation = null;
     setActionsEnabled(false);
     stage().innerHTML = "";
     stage().appendChild(el("div", { class: "card card-loading", text: "loading declarations…" }));
@@ -1717,6 +2089,8 @@
         if (requestSeq !== state.subdeckRequestSeq || state.issue !== issue) return;
         state.subdeck = normalizeSubdeck(sd);
         renderSubdeckStage();
+        refreshDefinitionTerms(null, true);
+        if (staleCitations().length) loadReconciliation(issue, requestSeq);
       })
       .catch(function (err) {
         if (requestSeq !== state.subdeckRequestSeq || state.issue !== issue) return;
@@ -1745,7 +2119,10 @@
         if (requestSeq !== state.subdeckRequestSeq || state.issue !== issue) return;
         state.subdeck = normalizeSubdeck(sd);
         state.showSummary = false;
+        state.reconciliation = null;
         renderSubdeckStage();
+        refreshDefinitionTerms(null, true);
+        if (staleCitations().length) loadReconciliation(issue, requestSeq);
       })
       .catch(function (err) {
         if (requestSeq !== state.subdeckRequestSeq || state.issue !== issue) return;
@@ -1755,6 +2132,7 @@
 
   function backToQueue() {
     state.subdeckRequestSeq += 1;
+    state.definitionRequestSeq += 1;
     state.issue = null;
     state.subdeck = null;
     state.currentDecl = null;
@@ -1762,6 +2140,7 @@
     state.apiPanelOpen = false;
     state.rejectComposerOpen = false;
     state.dependencyOverrides = {};
+    state.reconciliation = null;
     // The skip-API preference persists per session; overrides are scoped per
     // issue and harmless to retain, but we drop them so a fresh open starts
     // from the backend's auto-approved classification.
@@ -2006,6 +2385,11 @@
         state.busy = false;
         // Reflect the recorded verdict + progress back into our subdeck copy.
         applyDeclResult(decl, verdict, note, resp);
+        // Wide read models may already be cached from an earlier tab visit.
+        // Invalidate both so returning to Files/Graph cannot show the old
+        // declaration verdict or blocker projection.
+        state.filesData = null;
+        state.graphData = null;
         // Stop at the first bad declaration. A reject may be shipped partially:
         // reviewed predecessors become KEEP, this declaration becomes FIX, and
         // later declarations remain untouched for the post-Aristotle round.
@@ -2574,6 +2958,8 @@
         state.subdeck = null;
         state.issue = null;
         state.showSummary = false;
+        state.filesData = null;
+        state.graphData = null;
         flashToast(msg);
         var adv = resp && resp.advanced_to_issue;
         if (adv != null) {
@@ -2601,15 +2987,19 @@
   }
   function closeModal() {
     var root = modalRoot();
+    var onClose = root._marathonOnClose;
+    root._marathonOnClose = null;
     root.setAttribute("hidden", "hidden");
     root.innerHTML = "";
+    if (typeof onClose === "function") onClose();
   }
-  function openModal(node, onEscape) {
+  function openModal(node, onClose) {
     var root = modalRoot();
     root.innerHTML = "";
+    root._marathonOnClose = onClose || null;
     var backdrop = el("div", { class: "modal-backdrop" }, [node]);
     backdrop.addEventListener("click", function (e) {
-      if (e.target === backdrop) { closeModal(); if (onEscape) onEscape(); }
+      if (e.target === backdrop) closeModal();
     });
     root.appendChild(backdrop);
     root.removeAttribute("hidden");
@@ -2692,6 +3082,7 @@
     if (b) b.textContent = state.building + " building";
     if (l) l.textContent = state.landedToday + " landed today";
     if (s.jobs && s.jobs.length) renderJobProgress(s.jobs);
+    if (s.source_token) refreshDefinitionTerms(s.source_token, false);
   }
   function renderJobProgress(jobs) {
     var conn = document.getElementById("status-conn");
@@ -2947,6 +3338,7 @@
 
   function switchTab(name) {
     if (!name) return;
+    if (state.activeTab !== name) state.definitionRequestSeq += 1;
     state.activeTab = name;
     var btns = document.querySelectorAll(".tab-btn");
     for (var i = 0; i < btns.length; i++) {
@@ -2954,7 +3346,7 @@
       btns[i].classList.toggle("active", on);
       btns[i].setAttribute("aria-selected", on ? "true" : "false");
     }
-    ["review", "status", "issues", "history", "add-chapter"].forEach(function (t) {
+    ["review", "files", "graph", "status", "issues", "history", "add-chapter"].forEach(function (t) {
       var pane = document.getElementById("tab-" + t);
       if (!pane) return;
       if (t === name) pane.removeAttribute("hidden");
@@ -2969,6 +3361,10 @@
     if (name === "status") {
       renderStatusTab();
       dashTimer = setInterval(renderStatusTab, DASH_POLL_MS);
+    } else if (name === "files") {
+      renderFilesTab();
+    } else if (name === "graph") {
+      renderGraphTab();
     } else if (name === "issues") {
       renderIssuesTab();
     } else if (name === "history") {
@@ -2977,6 +3373,948 @@
       renderAddChapterTab();
     }
     // Review tab renders on its own (event-driven); nothing to do here.
+  }
+
+  // --- Files tab: chapter/file reading + contextual/batch review ----------
+
+  function readerTargets(data) {
+    var out = [];
+    ((data && data.files) || []).forEach(function (file) {
+      (file.declarations || []).forEach(function (target) { out.push(target); });
+    });
+    return out;
+  }
+
+  function readerTargetMatches(target, query, filter) {
+    filter = filter || "all";
+    if (filter === "unreviewed" && target.verdict) return false;
+    if (filter === "rejected" && target.verdict !== "rejected") return false;
+    if (filter === "changed" &&
+        !target.changed_since_review && !target.dependency_invalidated) return false;
+    if (filter === "surfaced" && !target.surfaced) return false;
+    query = String(query || "").trim().toLowerCase();
+    if (!query) return true;
+    return [
+      target.name, target.source_file, target.issue_title,
+      target.issue, target.kind, target.statement_pp,
+    ].some(function (value) {
+      return value != null && String(value).toLowerCase().indexOf(query) >= 0;
+    });
+  }
+
+  function readerVisibleTargets(data) {
+    return readerTargets(data).filter(function (target) {
+      return readerTargetMatches(target, state.filesQuery, state.filesFilter);
+    });
+  }
+
+  function readerVerdict(target, verdict, note, button) {
+    if (state.filesBusy) return;
+    if (verdict !== "defer" && (target.blocked_by || []).length) {
+      flashToast("Waiting on " + target.blocked_by.join(", ") + " — defer or repair it first");
+      return;
+    }
+    state.filesBusy = true;
+    if (button) button.disabled = true;
+    postDeclVerdict(target.issue, target.name, verdict, note)
+      .then(function () {
+        state.filesBusy = false;
+        state.graphData = null;
+        flashToast(
+          (verdict === "verify" ? "Kept " : verdict === "reject" ? "Marked for fix " : "Deferred ") +
+          target.name
+        );
+        renderFilesTab();
+      })
+      .catch(function (err) {
+        state.filesBusy = false;
+        if (button) button.disabled = false;
+        flashToast((err && err.message) || "Could not record declaration verdict");
+      });
+  }
+
+  function readerRejectEditor(target) {
+    var note = el("textarea", {
+      class: "reject-note reader-reject-note",
+      rows: "4",
+      placeholder: "What is wrong, and what should Aristotle change?",
+      "aria-label": "Rejection note for " + target.name,
+    });
+    note.value = target.note || "";
+    var save = el("button", { class: "btn btn-danger", type: "button" }, ["Save FIX"]);
+    var panel = el("div", {
+      class: "reader-reject-editor",
+      hidden: target.verdict === "rejected" ? null : "hidden",
+    }, [
+      el("div", { class: "reader-editor-help", text:
+        "This note stays beside the source and is sent verbatim only when you later SHIP the issue." }),
+      note,
+      el("div", { class: "reader-editor-actions" }, [save]),
+    ]);
+    save.addEventListener("click", function () {
+      if (!note.value.trim()) {
+        note.focus();
+        flashToast("A FIX needs a concrete note");
+        return;
+      }
+      readerVerdict(target, "reject", note.value, save);
+    });
+    return { panel: panel, note: note };
+  }
+
+  function readerFullFile(path) {
+    if (!path || path === "(source unavailable)") return null;
+    var body = el("div", { class: "reader-full-body" });
+    var details = el("details", { class: "reader-full-file" }, [
+      el("summary", {}, [
+        el("span", { text: "Read complete file" }),
+        el("span", { class: "mono", text: path }),
+      ]),
+      body,
+    ]);
+    details.addEventListener("toggle", function () {
+      if (!details.open || details.getAttribute("data-loaded") === "1") return;
+      details.setAttribute("data-loaded", "1");
+      body.appendChild(el("div", { class: "dash-loading", text: "loading complete source…" }));
+      fetchReviewSource(path)
+        .then(function (payload) {
+          body.innerHTML = "";
+          if (payload.truncated) {
+            body.appendChild(el("div", { class: "reader-errors", text:
+              "This unusually large file is shown up to " + payload.max_bytes + " bytes." }));
+          }
+          var code = el("code", { class: "lean" });
+          leanHighlight(payload.source || "", []).forEach(function (node) { code.appendChild(node); });
+          body.appendChild(el("pre", { class: "source-block reader-full-source" }, [code]));
+        })
+        .catch(function (err) {
+          body.innerHTML = "";
+          body.appendChild(el("div", { class: "reader-errors", text:
+            "Could not load the complete file: " + ((err && err.message) || err) }));
+          details.removeAttribute("data-loaded");
+        });
+    });
+    return details;
+  }
+
+  function renderReaderTarget(target) {
+    var blocked = (target.blocked_by || []).length > 0;
+    var article = el("article", {
+      class: "reader-decl reader-status-" + (target.verdict || "unreviewed") +
+        (blocked ? " reader-blocked" : ""),
+      "data-decl-name": target.name,
+    });
+    var issueLink = target.permalink
+      ? el("a", {
+          class: "reader-issue-link",
+          href: target.permalink,
+          target: "_blank",
+          rel: "noopener noreferrer",
+        }, ["#" + target.issue])
+      : el("span", { class: "reader-issue-link", text: "#" + target.issue });
+    article.appendChild(el("div", { class: "reader-decl-head" }, [
+      el("div", { class: "reader-decl-identity" }, [
+        el("span", { class: "reader-decl-name mono", text: target.name }),
+        target.kind ? el("span", { class: "decl-panel-kind", text: target.kind }) : null,
+      ]),
+      el("div", { class: "reader-badges" }, [
+        statusBadge(target.verdict || "unreviewed"),
+        tierBadge(target.tier, target.qualifiers),
+      ]),
+    ]));
+    article.appendChild(el("div", { class: "reader-context" }, [
+      issueLink,
+      el("span", { text: target.issue_title || "" }),
+      target.source_line != null
+        ? el("span", { class: "reader-line mono", text: "line " + target.source_line })
+        : null,
+      target.surfaced ? el("span", { class: "surfaced-badge", text: "surfaced from code" }) : null,
+    ]));
+    if (blocked) {
+      article.appendChild(el("div", { class: "reader-wait" }, [
+        el("strong", { text: "WAIT — upstream FIX first. " }),
+        "Decisions are paused because this declaration depends on " + target.blocked_by.join(", ") + ".",
+      ]));
+    }
+    if (target.changed_since_review || target.dependency_invalidated) {
+      article.appendChild(el("div", { class: "reader-wait" }, [
+        el("strong", { text: "Re-review required. " }),
+        target.dependency_invalidated
+          ? "A rejected dependency invalidated the earlier KEEP."
+          : "The declaration or its elaborated dependency context changed.",
+      ]));
+    }
+
+    if (target.source_block) {
+      var code = el("code", { class: "lean" });
+      leanHighlight(target.source_block, []).forEach(function (node) { code.appendChild(node); });
+      article.appendChild(el("pre", { class: "source-block reader-source" }, [code]));
+    } else {
+      article.appendChild(el("div", { class: "decl-nosource", text:
+        "Source unavailable for this current review target." }));
+    }
+    if (target.statement_pp) {
+      article.appendChild(el("details", { class: "reader-elab" }, [
+        el("summary", { text: "Elaborated type" }),
+        el("pre", { class: "statement-pp mono" },
+          leanHighlight(prettyLeanType(target.statement_pp), [])),
+      ]));
+    }
+
+    var editor = readerRejectEditor(target);
+    var keep = el("button", {
+      class: "btn reader-keep",
+      type: "button",
+      disabled: blocked ? "disabled" : null,
+      title: blocked ? "Fix the rejected predecessor first" : "Keep this declaration (local only)",
+    }, [target.verdict === "verified" ? "✓ Kept" : "Keep"]);
+    var reject = el("button", {
+      class: "btn reader-fix",
+      type: "button",
+      disabled: blocked ? "disabled" : null,
+      title: blocked ? "Fix the rejected predecessor first" : "Write a FIX note beside the source",
+    }, [target.verdict === "rejected" ? "✗ Edit FIX" : "Fix…"]);
+    var defer = el("button", { class: "btn", type: "button" }, [
+      target.verdict === "deferred" ? "↺ Deferred" : "Defer",
+    ]);
+    var focused = el("button", { class: "btn btn-tiny", type: "button" }, ["Focused review"]);
+    keep.addEventListener("click", function () { readerVerdict(target, "verify", null, keep); });
+    reject.addEventListener("click", function () {
+      if (editor.panel.hasAttribute("hidden")) editor.panel.removeAttribute("hidden");
+      else editor.panel.setAttribute("hidden", "hidden");
+      if (!editor.panel.hasAttribute("hidden")) editor.note.focus();
+    });
+    defer.addEventListener("click", function () { readerVerdict(target, "defer", null, defer); });
+    focused.addEventListener("click", function () {
+      state.filesResumeScroll = window.scrollY || window.pageYOffset || 0;
+      state.filesResumeName = target.name;
+      switchTab("review");
+      openIssue(target.issue);
+    });
+    article.appendChild(el("div", { class: "reader-actions" }, [keep, reject, defer, focused]));
+    article.appendChild(editor.panel);
+    return article;
+  }
+
+  function readerBatch(verdict, targets) {
+    if (!targets.length || state.filesBusy) return;
+    if (verdict !== "defer") return;
+    var verb = "DEFER";
+    if (!window.confirm(
+      verb + " " + targets.length + " visible unreviewed declaration" +
+      (targets.length === 1 ? "" : "s") + "?\n\n" +
+      "This records local review state only. It does not SHIP any issue."
+    )) return;
+    state.filesBusy = true;
+    var items = targets.map(function (target) {
+      return { issue: target.issue, decl: target.name, verdict: verdict };
+    });
+    postBatchDeclVerdicts(items)
+      .then(function (response) {
+        state.filesBusy = false;
+        state.graphData = null;
+        flashToast("Recorded " + response.count + " local " + verb + " verdicts");
+        renderFilesTab();
+      })
+      .catch(function (err) {
+        state.filesBusy = false;
+        flashToast((err && err.message) || "Batch review failed");
+      });
+  }
+
+  function paintFilesTab() {
+    if (state.activeTab !== "files" || !state.filesData) return;
+    var data = state.filesData;
+    var host = dashHost("dash-files");
+    if (!host) return;
+    host.innerHTML = "";
+
+    var chapter = data.chapter == null ? "all" : String(data.chapter);
+    if (!state.filesChapter) state.filesChapter = chapter;
+    var chapterSelect = el("select", { class: "reader-select", "aria-label": "Chapter" });
+    chapterSelect.appendChild(el("option", { value: "all", text: "All chapters" }));
+    (data.chapters || []).forEach(function (number) {
+      chapterSelect.appendChild(el("option", { value: String(number), text: "Chapter " + number }));
+    });
+    chapterSelect.value = state.filesChapter === "" ? chapter : state.filesChapter;
+    chapterSelect.addEventListener("change", function () {
+      state.filesChapter = chapterSelect.value;
+      state.filesData = null;
+      renderFilesTab();
+    });
+    var search = el("input", {
+      class: "reader-search",
+      type: "search",
+      placeholder: "Filter declaration, file, issue, or type…",
+      value: state.filesQuery,
+      "aria-label": "Filter chapter review",
+    });
+    search.value = state.filesQuery;
+    search.addEventListener("input", function () {
+      state.filesQuery = search.value;
+      paintFilesTab();
+      var replacement = dashHost("dash-files").querySelector(".reader-search");
+      if (replacement) {
+        replacement.focus();
+        replacement.setSelectionRange(replacement.value.length, replacement.value.length);
+      }
+    });
+    var targetFilter = el("select", {
+      class: "reader-select", "aria-label": "Declaration status filter",
+    }, [
+      el("option", { value: "all", text: "All targets" }),
+      el("option", { value: "unreviewed", text: "Unreviewed" }),
+      el("option", { value: "rejected", text: "Rejected" }),
+      el("option", { value: "changed", text: "Changed" }),
+      el("option", { value: "surfaced", text: "Surfaced" }),
+    ]);
+    targetFilter.value = state.filesFilter;
+    targetFilter.addEventListener("change", function () {
+      state.filesFilter = targetFilter.value;
+      paintFilesTab();
+    });
+    var refresh = el("button", { class: "btn", type: "button" }, ["Refresh"]);
+    refresh.addEventListener("click", function () {
+      state.filesData = null;
+      renderFilesTab();
+    });
+    host.appendChild(el("div", { class: "reader-header" }, [
+      el("div", {}, [
+        el("h2", { text: data.chapter == null ? "Project file review" : "Chapter " + data.chapter + " file review" }),
+        el("p", { class: "reader-help", text:
+          "Read declarations in source order, keep notes beside the code, and batch only deliberate local verdicts." }),
+      ]),
+      el("div", { class: "reader-toolbar" }, [chapterSelect, targetFilter, search, refresh]),
+    ]));
+
+    var progress = data.progress || {};
+    host.appendChild(el("div", { class: "stat-row reader-stats" }, [
+      statChip(progress.reviewed || 0, "reviewed"),
+      statChip(progress.total || 0, "targets"),
+      statChip(progress.verified || 0, "kept"),
+      statChip(progress.rejected || 0, "fix"),
+      statChip((data.files || []).length, "files"),
+    ]));
+
+    var visible = readerVisibleTargets(data);
+    var deferrable = visible.filter(function (target) { return !target.verdict; });
+    var deferAll = el("button", {
+      class: "btn", type: "button",
+      disabled: deferrable.length ? null : "disabled",
+    }, ["Defer visible unreviewed (" + deferrable.length + ")"]);
+    deferAll.addEventListener("click", function () { readerBatch("defer", deferrable); });
+    host.appendChild(el("div", { class: "reader-batch" }, [
+      el("span", { class: "reader-batch-note", text:
+        "Batch DEFER is a non-decision and never ships. KEEP/FIX remain explicit per declaration." }),
+      deferAll,
+    ]));
+
+    var files = (data.files || []).map(function (file) {
+      return {
+        path: file.path,
+        progress: file.progress,
+        issues: file.issues,
+        declarations: (file.declarations || []).filter(function (target) {
+          return readerTargetMatches(target, state.filesQuery, state.filesFilter);
+        }),
+      };
+    }).filter(function (file) { return file.declarations.length; });
+
+    if (!files.length) {
+      host.appendChild(el("div", { class: "dash-empty", text:
+        (state.filesQuery || state.filesFilter !== "all")
+          ? "No declarations match this filter."
+          : "No code-backed declarations are registered in this scope." }));
+      return;
+    }
+    var nav = el("nav", { class: "reader-file-nav", "aria-label": "Source files" });
+    files.forEach(function (file, index) {
+      var button = el("button", { class: "reader-file-link", type: "button" }, [
+        el("span", { class: "mono", text: file.path }),
+        el("span", { text: file.declarations.length + " target" + (file.declarations.length === 1 ? "" : "s") }),
+      ]);
+      button.addEventListener("click", function () {
+        var section = document.getElementById("reader-file-" + index);
+        if (section) section.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+      nav.appendChild(button);
+    });
+    host.appendChild(nav);
+
+    var body = el("div", { class: "reader-files" });
+    files.forEach(function (file, index) {
+      var section = el("section", { class: "reader-file", id: "reader-file-" + index });
+      section.appendChild(el("div", { class: "reader-file-head" }, [
+        el("h3", { class: "mono", text: file.path }),
+        el("span", { text: file.declarations.length + " visible declaration" +
+          (file.declarations.length === 1 ? "" : "s") }),
+      ]));
+      var fullFile = readerFullFile(file.path);
+      if (fullFile) section.appendChild(fullFile);
+      file.declarations.forEach(function (target) {
+        section.appendChild(renderReaderTarget(target));
+      });
+      body.appendChild(section);
+    });
+    host.appendChild(body);
+
+    if ((data.errors || []).length) {
+      host.appendChild(el("div", { class: "reader-errors", text:
+        data.errors.length + " issue payload" + (data.errors.length === 1 ? "" : "s") +
+        " could not be assembled; the rest of the chapter is still shown." }));
+    }
+    if (state.filesFocus) {
+      var focusName = state.filesFocus;
+      state.filesFocus = null;
+      setTimeout(function () {
+        var rows = document.querySelectorAll(".reader-decl[data-decl-name]");
+        for (var i = 0; i < rows.length; i++) {
+          if (rows[i].getAttribute("data-decl-name") === focusName) {
+            rows[i].classList.add("reader-focused");
+            rows[i].scrollIntoView({ behavior: "smooth", block: "center" });
+            break;
+          }
+        }
+      }, 0);
+    }
+    if (state.filesResumeScroll != null) {
+      var resumeScroll = state.filesResumeScroll;
+      var resumeName = state.filesResumeName;
+      state.filesResumeScroll = null;
+      state.filesResumeName = null;
+      setTimeout(function () {
+        if (resumeName) {
+          var rows = document.querySelectorAll(".reader-decl[data-decl-name]");
+          for (var i = 0; i < rows.length; i++) {
+            if (rows[i].getAttribute("data-decl-name") === resumeName) {
+              rows[i].classList.add("reader-focused");
+              break;
+            }
+          }
+        }
+        window.scrollTo(0, resumeScroll);
+      }, 0);
+    }
+  }
+
+  function renderFilesTab() {
+    if (state.activeTab !== "files") return;
+    var host = dashHost("dash-files");
+    if (!host) return;
+    host.innerHTML = "";
+    host.appendChild(el("div", { class: "dash-loading", text: "assembling source-ordered chapter review…" }));
+    fetchReviewWorkspace(state.filesChapter)
+      .then(function (data) {
+        if (state.activeTab !== "files") return;
+        state.filesData = data;
+        if (!state.filesChapter) {
+          state.filesChapter = data.chapter == null ? "all" : String(data.chapter);
+        }
+        if (state.filesFocus) state.filesQuery = state.filesFocus;
+        paintFilesTab();
+      })
+      .catch(function (err) { dashError("dash-files", err); });
+  }
+
+  // --- Graph tab: project-wide issue/declaration dependency DAG -----------
+
+  function graphNodeMatches(node, filter) {
+    if (filter.chapter !== "all") {
+      var chapters = node.chapters || (node.chapter != null ? [node.chapter] : []);
+      if (chapters.map(String).indexOf(String(filter.chapter)) < 0) return false;
+    }
+    if (filter.status !== "all" && node.status !== filter.status) return false;
+    if (filter.type !== "all" && node.type !== filter.type) return false;
+    var query = String(filter.query || "").trim().toLowerCase();
+    if (query) {
+      var haystack = [node.label, node.title, node.source_file, node.issue,
+        (node.issues || []).join(" ")].join(" ").toLowerCase();
+      if (haystack.indexOf(query) < 0) return false;
+    }
+    return true;
+  }
+
+  function graphLayout(nodes, edges) {
+    var byId = {};
+    var indegree = {};
+    var outgoing = {};
+    var rank = {};
+    nodes.forEach(function (node) {
+      byId[node.id] = node;
+      indegree[node.id] = 0;
+      outgoing[node.id] = [];
+      rank[node.id] = 0;
+    });
+    edges.forEach(function (edge) {
+      if (!byId[edge.source] || !byId[edge.target]) return;
+      outgoing[edge.source].push(edge.target);
+      indegree[edge.target] += 1;
+    });
+    var ready = nodes.filter(function (node) { return indegree[node.id] === 0; });
+    ready.sort(function (a, b) { return a.label.localeCompare(b.label); });
+    var placed = {};
+    while (ready.length) {
+      var node = ready.shift();
+      if (placed[node.id]) continue;
+      placed[node.id] = true;
+      outgoing[node.id].forEach(function (target) {
+        rank[target] = Math.max(rank[target], rank[node.id] + 1);
+        indegree[target] -= 1;
+        if (indegree[target] === 0) ready.push(byId[target]);
+      });
+      ready.sort(function (a, b) { return a.label.localeCompare(b.label); });
+    }
+    // A malformed/cyclic dependency snapshot must remain explorable. Put the
+    // cyclic remainder in a final layer; the backend's issue gating already
+    // removes cyclic issue edges, so this is normally declaration-only.
+    var maxRank = 0;
+    Object.keys(rank).forEach(function (id) { maxRank = Math.max(maxRank, rank[id]); });
+    nodes.forEach(function (node) {
+      if (!placed[node.id]) rank[node.id] = maxRank + 1;
+    });
+    var layers = {};
+    nodes.forEach(function (node) {
+      var r = rank[node.id];
+      if (!layers[r]) layers[r] = [];
+      layers[r].push(node);
+    });
+    Object.keys(layers).forEach(function (key) {
+      layers[key].sort(function (a, b) {
+        var ach = (a.chapters || [a.chapter == null ? 9999 : a.chapter])[0];
+        var bch = (b.chapters || [b.chapter == null ? 9999 : b.chapter])[0];
+        return ach - bch || a.type.localeCompare(b.type) || a.label.localeCompare(b.label);
+      });
+    });
+    var positions = {};
+    var widest = 1;
+    var layerNums = Object.keys(layers).map(Number).sort(function (a, b) { return a - b; });
+    layerNums.forEach(function (r) {
+      widest = Math.max(widest, layers[r].length);
+      layers[r].forEach(function (node, index) {
+        positions[node.id] = { x: 30 + r * 235, y: 30 + index * 76, rank: r };
+      });
+    });
+    var largestRank = layerNums.length ? layerNums[layerNums.length - 1] : 0;
+    return {
+      positions: positions,
+      width: Math.max(520, 60 + (largestRank + 1) * 235),
+      height: Math.max(220, 60 + widest * 76),
+    };
+  }
+
+  function graphSvg(tag, attrs, textValue) {
+    var node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    Object.keys(attrs || {}).forEach(function (key) { node.setAttribute(key, attrs[key]); });
+    if (textValue != null) node.textContent = textValue;
+    return node;
+  }
+
+  function graphShortLabel(node) {
+    if (node.type === "issue") return node.label;
+    var bits = String(node.label || "").split(".");
+    var label = bits.length > 1 ? bits.slice(-2).join(".") : bits[0];
+    return label.length > 27 ? "…" + label.slice(-26) : label;
+  }
+
+  function graphApplyZoom(resetPan) {
+    var host = dashHost("dash-graph");
+    if (!host) return;
+    var svg = host.querySelector(".project-graph");
+    var viewport = host.querySelector(".graph-viewport");
+    if (!svg || !viewport) return;
+    var zoom = Math.max(0.5, Math.min(2.25, state.graphView.zoom || 1));
+    state.graphView.zoom = zoom;
+    svg.setAttribute("width", Math.round(Number(svg.getAttribute("data-base-width")) * zoom));
+    svg.setAttribute("height", Math.round(Number(svg.getAttribute("data-base-height")) * zoom));
+    var label = host.querySelector(".graph-zoom-value");
+    if (label) label.textContent = Math.round(zoom * 100) + "%";
+    if (resetPan) {
+      viewport.scrollLeft = 0;
+      viewport.scrollTop = 0;
+    }
+  }
+
+  function graphChangeZoom(delta) {
+    state.graphView.zoom = Math.max(
+      0.5, Math.min(2.25, (state.graphView.zoom || 1) + delta)
+    );
+    graphApplyZoom(false);
+  }
+
+  function showGraphNode(node, data) {
+    var byId = {};
+    (data.nodes || []).forEach(function (candidate) { byId[candidate.id] = candidate; });
+    var incoming = [];
+    var outgoing = [];
+    (data.edges || []).forEach(function (edge) {
+      if (edge.target === node.id && byId[edge.source]) {
+        incoming.push({ node: byId[edge.source], kind: edge.kind });
+      }
+      if (edge.source === node.id && byId[edge.target]) {
+        outgoing.push({ node: byId[edge.target], kind: edge.kind });
+      }
+    });
+    var unresolved = (data.unresolved_edges || []).filter(function (edge) {
+      return edge.target === node.id;
+    });
+    var cyclic = (data.cyclic_edges || []).some(function (edge) {
+      return edge.source === node.id || edge.target === node.id;
+    });
+    function relationList(title, rows) {
+      var section = el("section", { class: "graph-inspector-section" }, [
+        el("h3", { text: title }),
+      ]);
+      if (!rows.length) {
+        section.appendChild(el("div", { class: "dash-empty", text: "none" }));
+        return section;
+      }
+      var list = el("ul", { class: "graph-relations" });
+      rows.slice(0, 40).forEach(function (row) {
+        var button = el("button", { class: "graph-relation", type: "button" }, [
+          el("span", { class: "mono", text: row.node.label }),
+          el("span", { text: row.kind }),
+        ]);
+        button.addEventListener("click", function () { showGraphNode(row.node, data); });
+        list.appendChild(el("li", {}, [button]));
+      });
+      section.appendChild(list);
+      return section;
+    }
+
+    var panel = el("div", { class: "modal-panel graph-inspector" }, [
+      el("h2", { class: "modal-title mono", text: node.label }),
+      node.title ? el("p", { class: "modal-sub graph-node-title", text: node.title }) : null,
+      el("div", { class: "graph-node-meta" }, [
+        statusBadge(node.status),
+        node.build_status ? el("span", {
+          class: "graph-build-status graph-build-" + node.build_status,
+          text: "build " + node.build_status,
+        }) : null,
+        node.tier ? tierBadge(node.tier) : null,
+        node.kind ? el("span", { class: "decl-panel-kind", text: node.kind }) : null,
+        (node.chapters || []).length
+          ? el("span", { class: "chapter-pill", text: "ch " + node.chapters.join(", ") })
+          : null,
+      ]),
+      node.source_file ? el("p", { class: "resource-file" }, [
+        el("strong", { text: "Source" }),
+        el("span", { class: "mono", text: node.source_file +
+          (node.source_line != null ? ":" + node.source_line : "") }),
+      ]) : null,
+      (node.blocked_by || []).length ? el("p", { class: "reader-wait", text:
+        "Waiting on rejected predecessor(s): " + node.blocked_by.join(", ") }) : null,
+      node.impact ? el("p", {
+        class: "graph-impact-note graph-impact-" + node.impact,
+        text: node.impact === "changed"
+          ? "This declaration changed and needs fresh review."
+          : "Downstream impact: this node depends on a changed declaration.",
+      }) : null,
+      cyclic ? el("p", { class: "reader-wait", text:
+        "A cyclic dependency edge touches this node; inspect both directions before relying on the ordering." }) : null,
+      relationList("Predecessors / owners", incoming),
+      relationList("Dependents / declarations", outgoing),
+    ]);
+    if (unresolved.length) {
+      var unresolvedSection = el("section", { class: "graph-inspector-section" }, [
+        el("h3", { text: "Unresolved dependencies" }),
+      ]);
+      var unresolvedList = el("ul", { class: "graph-relations" });
+      unresolved.forEach(function (edge) {
+        unresolvedList.appendChild(el("li", { class: "mono", text: edge.dependency }));
+      });
+      unresolvedSection.appendChild(unresolvedList);
+      panel.appendChild(unresolvedSection);
+    }
+    var actions = el("div", { class: "modal-actions graph-inspector-actions" });
+    if (node.type === "declaration") {
+      var openFile = el("button", { class: "btn btn-primary", type: "button" }, ["Open in Files"]);
+      openFile.addEventListener("click", function () {
+        closeModal();
+        state.filesChapter = (node.chapters || []).length === 1
+          ? String(node.chapters[0]) : "all";
+        state.filesFocus = node.label;
+        state.filesQuery = node.label;
+        state.filesFilter = "all";
+        state.filesResumeScroll = null;
+        state.filesResumeName = null;
+        state.filesData = null;
+        switchTab("files");
+      });
+      actions.appendChild(openFile);
+      if ((node.issues || []).length) {
+        var openDeclIssue = el("button", { class: "btn", type: "button" }, [
+          "Focused review #" + node.issues[0],
+        ]);
+        openDeclIssue.addEventListener("click", function () {
+          closeModal(); switchTab("review"); openIssue(node.issues[0]);
+        });
+        actions.appendChild(openDeclIssue);
+      }
+    } else if (node.issue != null) {
+      var openReview = el("button", { class: "btn btn-primary", type: "button" }, ["Open focused review"]);
+      openReview.addEventListener("click", function () {
+        closeModal(); switchTab("review"); openIssue(node.issue);
+      });
+      actions.appendChild(openReview);
+    }
+    if (node.permalink) {
+      actions.appendChild(el("a", {
+        class: "btn graph-gh-link",
+        href: node.permalink,
+        target: "_blank",
+        rel: "noopener noreferrer",
+      }, ["GitHub issue"]));
+    }
+    var close = el("button", { class: "btn", type: "button" }, ["Close"]);
+    close.addEventListener("click", closeModal);
+    actions.appendChild(close);
+    panel.appendChild(actions);
+    openModal(panel);
+  }
+
+  function renderGraphCanvas(host, data, nodes, edges) {
+    var capped = nodes.length > 220;
+    if (capped) nodes = nodes.slice(0, 220);
+    var included = {};
+    nodes.forEach(function (node) { included[node.id] = true; });
+    edges = edges.filter(function (edge) {
+      return included[edge.source] && included[edge.target];
+    });
+    if (!nodes.length) {
+      host.appendChild(el("div", { class: "dash-empty", text: "No graph nodes match these filters." }));
+      return;
+    }
+    if (capped) {
+      host.appendChild(el("div", { class: "graph-cap", text:
+        "Showing the first 220 matching nodes. Narrow by chapter, status, type, or search to inspect the rest." }));
+    }
+    var layout = graphLayout(nodes, edges);
+    var viewport = el("div", { class: "graph-viewport" });
+    var zoom = Math.max(0.5, Math.min(2.25, state.graphView.zoom || 1));
+    var svg = graphSvg("svg", {
+      class: "project-graph",
+      width: Math.round(layout.width * zoom),
+      height: Math.round(layout.height * zoom),
+      "data-base-width": layout.width,
+      "data-base-height": layout.height,
+      viewBox: "0 0 " + layout.width + " " + layout.height,
+      role: "img",
+      "aria-label": "Project issue and declaration dependency graph",
+    });
+    var defs = graphSvg("defs");
+    var marker = graphSvg("marker", {
+      id: "graph-arrow", markerWidth: "7", markerHeight: "7",
+      refX: "6", refY: "3.5", orient: "auto", markerUnits: "strokeWidth",
+    });
+    marker.appendChild(graphSvg("path", { d: "M0,0 L7,3.5 L0,7 z", class: "graph-arrow" }));
+    defs.appendChild(marker);
+    svg.appendChild(defs);
+    edges.forEach(function (edge) {
+      var from = layout.positions[edge.source];
+      var to = layout.positions[edge.target];
+      if (!from || !to) return;
+      var x1 = from.x + 190, y1 = from.y + 25;
+      var x2 = to.x, y2 = to.y + 25;
+      var bend = Math.max(30, Math.abs(x2 - x1) / 2);
+      svg.appendChild(graphSvg("path", {
+        class: "graph-edge graph-edge-" + edge.kind +
+          (edge.cyclic ? " graph-edge-cyclic" : ""),
+        d: "M" + x1 + "," + y1 + " C" + (x1 + bend) + "," + y1 +
+          " " + (x2 - bend) + "," + y2 + " " + x2 + "," + y2,
+        "marker-end": "url(#graph-arrow)",
+      }));
+    });
+    nodes.forEach(function (node) {
+      var pos = layout.positions[node.id];
+      if (!pos) return;
+      var group = graphSvg("g", {
+        class: "graph-node graph-node-" + node.type + " graph-status-" +
+          (node.status || "pending") +
+          (node.impact ? " graph-impact-" + node.impact : ""),
+        transform: "translate(" + pos.x + " " + pos.y + ")",
+        tabindex: "0", role: "button",
+        "aria-label": node.type + " " + node.label + ", " + node.status,
+      });
+      group.appendChild(graphSvg("rect", { width: "190", height: "50", rx: "9", ry: "9" }));
+      var title = graphSvg("title", {}, node.label + " — " + (node.title || ""));
+      group.appendChild(title);
+      group.appendChild(graphSvg("text", { x: "10", y: "20", class: "graph-node-label" }, graphShortLabel(node)));
+      var sub = node.type === "issue"
+        ? ("ch " + (node.chapter == null ? "—" : node.chapter) + " · " + node.status)
+        : ((node.source_file ? node.source_file.split("/").slice(-1)[0] : "source ?") + " · " + node.status);
+      group.appendChild(graphSvg("text", { x: "10", y: "38", class: "graph-node-sub" }, sub));
+      group.addEventListener("click", function () { showGraphNode(node, data); });
+      group.addEventListener("keydown", function (event) {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault(); showGraphNode(node, data);
+        }
+      });
+      svg.appendChild(group);
+    });
+    viewport.appendChild(svg);
+    var drag = null;
+    viewport.addEventListener("pointerdown", function (event) {
+      if (event.button !== 0 || event.target.closest(".graph-node")) return;
+      drag = {
+        pointer: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        left: viewport.scrollLeft,
+        top: viewport.scrollTop,
+      };
+      viewport.classList.add("graph-dragging");
+      viewport.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+    viewport.addEventListener("pointermove", function (event) {
+      if (!drag || event.pointerId !== drag.pointer) return;
+      viewport.scrollLeft = drag.left - (event.clientX - drag.x);
+      viewport.scrollTop = drag.top - (event.clientY - drag.y);
+    });
+    function stopGraphDrag(event) {
+      if (!drag || event.pointerId !== drag.pointer) return;
+      drag = null;
+      viewport.classList.remove("graph-dragging");
+    }
+    viewport.addEventListener("pointerup", stopGraphDrag);
+    viewport.addEventListener("pointercancel", stopGraphDrag);
+    host.appendChild(viewport);
+  }
+
+  function paintGraphTab() {
+    if (state.activeTab !== "graph" || !state.graphData) return;
+    var data = state.graphData;
+    var host = dashHost("dash-graph");
+    if (!host) return;
+    host.innerHTML = "";
+    var filter = state.graphFilter;
+
+    var chapter = el("select", { class: "reader-select", "aria-label": "Graph chapter" });
+    chapter.appendChild(el("option", { value: "all", text: "All chapters" }));
+    (data.chapters || []).forEach(function (number) {
+      chapter.appendChild(el("option", { value: String(number), text: "Chapter " + number }));
+    });
+    chapter.value = filter.chapter;
+    var status = el("select", { class: "reader-select", "aria-label": "Graph status" });
+    status.appendChild(el("option", { value: "all", text: "All statuses" }));
+    var statuses = {};
+    (data.nodes || []).forEach(function (node) { statuses[node.status] = true; });
+    Object.keys(statuses).sort().forEach(function (name) {
+      status.appendChild(el("option", { value: name, text: name }));
+    });
+    status.value = filter.status;
+    var type = el("select", { class: "reader-select", "aria-label": "Graph node type" }, [
+      el("option", { value: "all", text: "Issues + declarations" }),
+      el("option", { value: "issue", text: "Issues only" }),
+      el("option", { value: "declaration", text: "Declarations only" }),
+    ]);
+    type.value = filter.type;
+    var search = el("input", {
+      class: "reader-search", type: "search", value: filter.query,
+      placeholder: "Find issue, declaration, or file…",
+      "aria-label": "Filter project graph",
+    });
+    search.value = filter.query;
+    var refresh = el("button", { class: "btn", type: "button" }, ["Refresh"]);
+    var zoomOut = el("button", {
+      class: "btn btn-tiny", type: "button", "aria-label": "Zoom graph out",
+    }, ["−"]);
+    var zoomValue = el("span", {
+      class: "graph-zoom-value", text: Math.round((state.graphView.zoom || 1) * 100) + "%",
+    });
+    var resetView = el("button", {
+      class: "btn btn-tiny", type: "button", "aria-label": "Reset graph view",
+    }, ["Reset view"]);
+    var zoomIn = el("button", {
+      class: "btn btn-tiny", type: "button", "aria-label": "Zoom graph in",
+    }, ["+"]);
+    chapter.addEventListener("change", function () { filter.chapter = chapter.value; paintGraphTab(); });
+    status.addEventListener("change", function () { filter.status = status.value; paintGraphTab(); });
+    type.addEventListener("change", function () { filter.type = type.value; paintGraphTab(); });
+    search.addEventListener("input", function () {
+      filter.query = search.value;
+      paintGraphTab();
+      var replacement = dashHost("dash-graph").querySelector(".reader-search");
+      if (replacement) {
+        replacement.focus();
+        replacement.setSelectionRange(replacement.value.length, replacement.value.length);
+      }
+    });
+    refresh.addEventListener("click", function () {
+      state.graphData = null;
+      renderGraphTab();
+    });
+    zoomOut.addEventListener("click", function () { graphChangeZoom(-0.2); });
+    zoomIn.addEventListener("click", function () { graphChangeZoom(0.2); });
+    resetView.addEventListener("click", function () {
+      state.graphView.zoom = 1;
+      graphApplyZoom(true);
+    });
+    host.appendChild(el("div", { class: "reader-header graph-header" }, [
+      el("div", {}, [
+        el("h2", { text: "Project dependency DAG" }),
+        el("p", { class: "reader-help", text:
+          "Edges point from predecessor to dependent. Drag or scroll to pan; click a node to expand relationships." }),
+      ]),
+      el("div", { class: "reader-toolbar graph-toolbar" }, [
+        chapter, status, type, search, zoomOut, zoomValue, resetView, zoomIn, refresh,
+      ]),
+    ]));
+
+    if (data.audit && data.audit.status !== "fresh") {
+      host.appendChild(el("div", { class: "reader-errors graph-audit-warning", text:
+        data.audit.status === "missing"
+          ? "No audit snapshot is available; build/tier evidence is shown as unknown."
+          : "Audit evidence is " + data.audit.status +
+            "; stale or unavailable build evidence is never presented as current." }));
+    }
+
+    var nodes = (data.nodes || []).filter(function (node) { return graphNodeMatches(node, filter); });
+    var visibleIds = {};
+    nodes.forEach(function (node) { visibleIds[node.id] = true; });
+    var edges = (data.edges || []).filter(function (edge) {
+      return visibleIds[edge.source] && visibleIds[edge.target];
+    });
+    host.appendChild(el("div", { class: "stat-row graph-stats" }, [
+      statChip(nodes.length, "visible nodes"),
+      statChip(edges.length, "visible edges"),
+      statChip((data.counts && data.counts.by_type && data.counts.by_type.issue) || 0, "issues total"),
+      statChip((data.counts && data.counts.by_type && data.counts.by_type.declaration) || 0, "declarations total"),
+      statChip((data.counts && data.counts.impacted) || 0, "downstream impact"),
+    ]));
+    host.appendChild(el("div", { class: "graph-legend" }, [
+      el("span", { class: "graph-key graph-key-issue", text: "issue" }),
+      el("span", { class: "graph-key graph-key-decl", text: "declaration" }),
+      el("span", { class: "graph-key graph-key-dependency", text: "dependency" }),
+      el("span", { class: "graph-key graph-key-contains", text: "reviews / contains" }),
+      el("span", { class: "graph-key graph-key-changed", text: "changed" }),
+      el("span", { class: "graph-key graph-key-impact", text: "changed downstream" }),
+      el("span", { class: "graph-key graph-key-warning", text:
+        ((data.counts && data.counts.unresolved_edges) || 0) + " unresolved · " +
+        ((data.counts && data.counts.cyclic_edges) || 0) + " cyclic" }),
+    ]));
+    renderGraphCanvas(host, data, nodes, edges);
+    if ((data.errors || []).length) {
+      host.appendChild(el("div", { class: "reader-errors", text:
+        data.errors.length + " issue payload" + (data.errors.length === 1 ? "" : "s") +
+        " could not be included; the remaining project graph is still navigable." }));
+    }
+  }
+
+  function renderGraphTab() {
+    if (state.activeTab !== "graph") return;
+    if (state.graphData) return paintGraphTab();
+    var host = dashHost("dash-graph");
+    if (!host) return;
+    host.innerHTML = "";
+    host.appendChild(el("div", { class: "dash-loading", text: "building project dependency DAG…" }));
+    fetchProjectGraph()
+      .then(function (data) {
+        if (state.activeTab !== "graph") return;
+        state.graphData = data;
+        paintGraphTab();
+      })
+      .catch(function (err) { dashError("dash-graph", err); });
   }
 
   // --- Add Chapter tab (F1): headless chapter-intake → review → approve -----
@@ -3586,7 +4924,12 @@
     attachKeys();
     attachSwipe();
     setActionsEnabled(false);
-    refreshQueue();   // pure read — opens the first ready issue's subdeck
+    // Prime the compact current-source identifier index before rendering code,
+    // so project terms (including ambiguous short names) are clickable on the
+    // first card. Lookup failure never blocks the review deck; kernel links
+    // remain available as the honest fallback.
+    refreshQueue();   // pure read — opens the first ready issue's subdeck immediately
+    refreshDefinitionTerms(null, true);
     startStatus();    // pure read (SSE/poll)
   }
 
@@ -3615,6 +4958,11 @@
     localDependencyNames: localDependencyNames,
     dependencyOrder: dependencyOrder,
     kernelTermLookup: kernelTermLookup,
+    projectTermCandidates: projectTermCandidates,
+    showDefinitionLookup: showDefinitionLookup,
+    reconciliationProposalPanel: reconciliationProposalPanel,
+    readerTargetMatches: readerTargetMatches,
+    graphLayout: graphLayout,
     switchTab: switchTab,   // dashboard tab navigation (pure read)
     _state: state,
   };

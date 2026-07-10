@@ -35,7 +35,11 @@ from typing import Any
 from marathon.audit.lean_template import VALUE_KINDS
 
 #: Version of the persisted snapshot JSON (``.marathon/audit/latest.json``).
-SNAPSHOT_SCHEMA_VERSION = 1
+#:
+#: v2 binds evidence to the Git revision it elaborated.  The binding is
+#: per-module because :func:`marathon.audit.engine.save_snapshot` supports
+#: merging a chapter audit into a larger, older snapshot.
+SNAPSHOT_SCHEMA_VERSION = 2
 
 #: The two declaration status values of the Lean-script contract.
 STATUSES = ("ok", "unknown")
@@ -144,6 +148,19 @@ class AuditSnapshot:
     created_at: str  # ISO-8601 UTC
     decls: list[DeclAudit]
     failures: list[str]
+    # Git revision observed both before and after the latest successful audit
+    # process.  ``None`` means the run could not be bound to a clean, stable
+    # checkout.  Per-module revisions below are authoritative after merges.
+    source_revision: str | None = None
+    # ``module -> source revision`` for modules whose complete audit contract
+    # finished successfully and was atomically persisted.  A declaration with
+    # no matching module entry is unrevisioned evidence and must fail closed in
+    # a Git checkout.
+    module_revisions: dict[str, str] = field(default_factory=dict)
+    # Every module the run attempted, including modules excluded because they
+    # did not build.  This distinguishes a complete audit from a partial one and
+    # lets the conductor recover its durable success cursor after restart.
+    attempted_modules: list[str] = field(default_factory=list)
     schema_version: int = SNAPSHOT_SCHEMA_VERSION
 
     def by_name(self) -> dict[str, DeclAudit]:
@@ -161,12 +178,19 @@ class AuditSnapshot:
             "created_at": self.created_at,
             "decls": [d.to_json() for d in self.decls],
             "failures": list(self.failures),
+            "source_revision": self.source_revision,
+            "module_revisions": dict(self.module_revisions),
+            "attempted_modules": list(self.attempted_modules),
         }
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> "AuditSnapshot":
         version = d.get("schema_version")
-        if version != SNAPSHOT_SCHEMA_VERSION:
+        # v1 snapshots remain readable so operators get an honest, visible
+        # stale-evidence degradation rather than a corrupt-cache error.  They
+        # intentionally load with no revision bindings; the engine withholds
+        # their declarations in a Git checkout until a fresh audit lands.
+        if version not in (1, SNAPSHOT_SCHEMA_VERSION):
             raise ValueError(
                 f"unsupported audit snapshot schema {version!r} "
                 f"(engine speaks {SNAPSHOT_SCHEMA_VERSION})"
@@ -181,5 +205,8 @@ class AuditSnapshot:
             created_at=d.get("created_at") or "",
             decls=[DeclAudit.from_json(x) for x in d.get("decls") or []],
             failures=list(d.get("failures") or []),
+            source_revision=d.get("source_revision"),
+            module_revisions=dict(d.get("module_revisions") or {}),
+            attempted_modules=list(d.get("attempted_modules") or []),
             schema_version=SNAPSHOT_SCHEMA_VERSION,
         )

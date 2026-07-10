@@ -653,19 +653,82 @@ def test_reject_editor_is_non_modal_and_keeps_source_visible(app_js: str, style_
     assert ".review-inspector[hidden]" in style_css
 
 
-def test_source_terms_open_kernel_definition_inspector(app_js: str, style_css: str):
+def test_source_terms_open_current_definition_inspector(app_js: str, style_css: str):
     code = _strip_block_comments(app_js)
     lookup = _fn_body(code, "function kernelTermLookup")
     assert "member.name" in lookup
     ref = _fn_body(code, "function leanReference")
-    assert "showKernelDefinition" in ref
+    assert "showDefinitionLookup" in ref
     assert 'setAttribute("role", "button")' in ref
     assert 'setAttribute("tabindex", "0")' in ref
     plain = _fn_body(code, "function leanPlainNodes")
-    assert "regexpEscape" in plain and "leanReference" in plain
-    inspector = _fn_body(code, "function showKernelDefinition")
-    assert "type_pp" in inspector and "value_pp" in inspector
+    assert "projectTermCandidates" in plain and "leanReference" in plain
+    inspector = _fn_body(code, "function showDefinitionLookup")
+    assert "fetchDefinition" in inspector and "renderDefinitionMatch" in inspector
+    rendered = _fn_body(code, "function renderDefinitionMatch")
+    for field in ("source_file", "source_line", "statement_pp", "value_pp", "owners"):
+        assert field in rendered
+    assert "/api/definition" in app_js
+    assert "/api/definition-terms" in app_js
     assert ".lh-ref" in style_css
+
+
+def test_definition_terms_refresh_is_single_flight_and_source_aware(app_js: str):
+    code = _strip_block_comments(app_js)
+    refresh = _fn_body(code, "function refreshDefinitionTerms")
+    assert "definitionTermsRequest" in refresh
+    assert "definitionTermsQueued" in refresh
+    assert "definitionSourceToken" in refresh
+    assert "fetchDefinitionTerms" in refresh
+    install = _fn_body(code, "function installDefinitionTerms")
+    assert "source_token" in install
+    assert "Object.create(null)" in install
+    assert "repaintDefinitionSurfaces" in install
+    assert "refreshDefinitionTerms(s.source_token" in _fn_body(
+        code, "function applyStatus"
+    )
+    for function_name in ("function openIssue", "function refetchSubdeck"):
+        assert "refreshDefinitionTerms(null, true)" in _fn_body(code, function_name)
+    assert "refreshDefinitionTerms(null, true)" in _fn_body(
+        code, "function fetchReviewSource"
+    )
+
+
+def test_every_definition_modal_close_path_cancels_pending_lookup(app_js: str):
+    code = _strip_block_comments(app_js)
+    close = _fn_body(code, "function closeModal")
+    assert "_marathonOnClose" in close
+    assert 'typeof onClose === "function"' in close
+    opened = _fn_body(code, "function openModal")
+    assert "_marathonOnClose" in opened
+    assert "if (e.target === backdrop) closeModal()" in opened
+    definition = _fn_body(code, "function openDefinitionSurface")
+    assert "definitionRequestSeq += 1" in definition
+    keys = _fn_body(code, "function attachKeys")
+    assert 'if (e.key === "Escape") closeModal()' in keys
+
+
+def test_reconciliation_proposals_have_confirm_and_dismiss_ui(
+    app_js: str, style_css: str
+):
+    code = _strip_block_comments(app_js)
+    assert "/api/reconciliation/" in code
+    assert "/api/reconcile-proposal" in code
+    panel = _fn_body(code, "function reconciliationProposalPanel")
+    assert "proposed_renames" in panel and "proposed_splits" in panel
+    assert "Confirm" in panel and "Not the same" in panel
+    decision = _fn_body(code, "function decideReconciliation")
+    assert "postReconciliationDecision" in decision
+    assert "refetchSubdeck" in decision
+    assert ".reconcile-proposals" in style_css
+
+
+def test_optional_definition_index_never_blocks_queue_startup(app_js: str):
+    code = _strip_block_comments(app_js)
+    init = _fn_body(code, "function init")
+    assert "refreshQueue()" in init and "refreshDefinitionTerms(" in init
+    assert init.index("refreshQueue()") < init.index("refreshDefinitionTerms(")
+    assert ".then(refreshQueue)" not in init
 
 
 def test_deps_and_open_controls_have_durable_non_popup_surfaces(app_js: str):
@@ -1255,6 +1318,107 @@ def test_dashboard_endpoints_referenced(app_js: str):
 def test_style_has_tab_and_dashboard_classes(style_css: str):
     for cls in (".tab-nav", ".tab-btn", ".cond-banner", ".issue-row",
                 ".hist-row", ".sb-verified"):
+        assert cls in style_css
+
+
+# --- wide-angle file/chapter review + project dependency DAG ---------------
+
+def test_index_has_files_and_graph_tabs(index_html: str):
+    for tab, host in (("files", "dash-files"), ("graph", "dash-graph")):
+        assert 'data-tab="' + tab + '"' in index_html
+        assert 'id="tab-' + tab + '"' in index_html
+        assert 'id="' + host + '"' in index_html
+
+
+def test_files_reader_is_source_contextual_and_batch_is_local(app_js: str):
+    code = _strip_block_comments(app_js)
+    render = _fn_body(code, "function renderReaderTarget")
+    assert "source_block" in render and "source_line" in render
+    assert "readerRejectEditor" in render
+    assert 'switchTab("review")' in render and "openIssue(" in render
+    editor = _fn_body(code, "function readerRejectEditor")
+    assert "reader-reject-editor" in editor and "textarea" in editor
+    assert "openModal(" not in editor  # the note never covers the code
+    batch = _fn_body(code, "function readerBatch")
+    assert "postBatchDeclVerdicts" in batch
+    assert "postShip" not in batch and "/api/ship" not in batch
+    post = _fn_body(code, "function postBatchDeclVerdicts")
+    assert "/api/batch-decl-verdict" in post and "postJSON(" in post
+    whole = _fn_body(code, "function readerFullFile")
+    assert "fetchReviewSource" in whole and "Read complete file" in whole
+    assert "/api/review-source" in code
+    assert "Keep visible unreviewed" not in code
+    assert "readerBatch(\"verify\"" not in code
+    assert "Defer visible unreviewed" in code
+
+
+def test_files_reader_guards_rejected_predecessors(app_js: str):
+    code = _strip_block_comments(app_js)
+    single = _fn_body(code, "function readerVerdict")
+    assert "blocked_by" in single and 'verdict !== "defer"' in single
+
+
+def test_files_reader_filters_and_restores_overview_position(app_js: str):
+    code = _strip_block_comments(app_js)
+    match = _fn_body(code, "function readerTargetMatches")
+    for token in (
+        'filter === "unreviewed"', 'filter === "rejected"',
+        'filter === "changed"', 'filter === "surfaced"',
+    ):
+        assert token in match
+    paint = _fn_body(code, "function paintFilesTab")
+    for label in ("Unreviewed", "Rejected", "Changed", "Surfaced"):
+        assert label in paint
+    target = _fn_body(code, "function renderReaderTarget")
+    assert "filesResumeScroll" in target and "filesResumeName" in target
+    assert "window.scrollTo" in paint
+    commit = _fn_body(code, "function commitDeclVerdict")
+    assert "filesData = null" in commit and "graphData = null" in commit
+
+
+def test_project_graph_is_filterable_and_navigable(app_js: str):
+    code = _strip_block_comments(app_js)
+    assert "/api/project-graph" in code
+    assert "function graphLayout" in code
+    assert "function renderGraphCanvas" in code
+    paint = _fn_body(code, "function paintGraphTab")
+    for token in ("filter.chapter", "filter.status", "filter.type", "filter.query"):
+        assert token in paint
+    canvas = _fn_body(code, "function renderGraphCanvas")
+    assert "project-graph" in canvas and "marker-end" in canvas
+    inspect = _fn_body(code, "function showGraphNode")
+    assert "Open in Files" in inspect
+    assert 'switchTab("review")' in inspect
+    assert "openIssue(" in inspect
+    assert "unresolved_edges" in inspect and "cyclic_edges" in inspect
+
+
+def test_project_graph_supports_pan_zoom_and_changed_impact(app_js: str):
+    code = _strip_block_comments(app_js)
+    paint = _fn_body(code, "function paintGraphTab")
+    for token in (
+        "Zoom graph out", "Reset graph view", "Zoom graph in",
+        "changed downstream", "unresolved_edges", "cyclic_edges",
+    ):
+        assert token in paint
+    canvas = _fn_body(code, "function renderGraphCanvas")
+    for token in (
+        "pointerdown", "pointermove", "scrollLeft", "scrollTop",
+        "graph-impact-", "graph-edge-cyclic",
+    ):
+        assert token in canvas
+    zoom = _fn_body(code, "function graphApplyZoom")
+    assert 'setAttribute("width"' in zoom and 'setAttribute("height"' in zoom
+
+
+def test_wide_review_styles_exist(style_css: str):
+    for cls in (
+        ".reader-file", ".reader-decl", ".reader-reject-editor",
+        ".reader-batch", ".reader-full-file", ".graph-viewport",
+        ".project-graph", ".graph-node",
+        ".graph-impact-changed", ".graph-impact-downstream",
+        ".graph-edge-cyclic", ".graph-dragging",
+    ):
         assert cls in style_css
 
 

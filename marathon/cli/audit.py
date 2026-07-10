@@ -481,6 +481,17 @@ def _run_audit_run(args) -> None:
         for failure in snapshot.failures:
             print(f"    - {failure}")
     print(f"saved {path}")
+    attempted = set(getattr(snapshot, "attempted_modules", None) or ())
+    covered = set(getattr(snapshot, "module_revisions", None) or {})
+    if attempted and covered != attempted:
+        print(
+            f"audit incomplete: revision-bound coverage {len(covered)}/"
+            f"{len(attempted)} module(s)"
+        )
+        # A partial/truncated audit may have printed declarations, but it did
+        # not advance the durable success cursor and must be a failing process
+        # for conductor/retry automation.
+        raise SystemExit(1)
     if not decls and snapshot.failures:
         # Nothing audited at all — honest absence, but a failing exit so
         # scripts don't mistake an empty snapshot for a clean one.
@@ -493,11 +504,11 @@ def _run_audit_diff(args) -> None:
     )
 
     repo_dir: Path = args.repo_dir.resolve()
-    new = load_snapshot(repo_dir, LATEST_NAME)
+    new = load_snapshot(repo_dir, LATEST_NAME, validate_revision=False)
     if new is None:
         print("no latest audit snapshot; run `marathon audit run` first")
         raise SystemExit(1)
-    old = load_snapshot(repo_dir, PREVIOUS_NAME)
+    old = load_snapshot(repo_dir, PREVIOUS_NAME, validate_revision=False)
     if old is None:
         print(
             "no previous audit snapshot to diff against "
@@ -665,11 +676,13 @@ def _run_audit_invalidations(args) -> None:
     from marathon.review.config import load_config
 
     repo_dir: Path = args.repo_dir.resolve()
-    new = load_snapshot(repo_dir, LATEST_NAME)
+    new = load_snapshot(repo_dir, LATEST_NAME, validate_revision=False)
     if new is None:
         print("no latest audit snapshot; run `marathon audit run` first")
         raise SystemExit(1)
-    old = load_snapshot(repo_dir, PREVIOUS_NAME)  # may be None (first run)
+    old = load_snapshot(
+        repo_dir, PREVIOUS_NAME, validate_revision=False
+    )  # may be None (first run)
     ledger = Ledger.for_repo(repo_dir)
     report = compute_invalidations(old, new, ledger)
     if not args.apply:
@@ -690,7 +703,7 @@ def _run_audit_repin(args) -> None:
     if snapshot is None:
         print("no latest audit snapshot; run `marathon audit run` first")
         raise SystemExit(1)
-    previous = load_snapshot(repo_dir, PREVIOUS_NAME)
+    previous = load_snapshot(repo_dir, PREVIOUS_NAME, validate_revision=False)
     ledger = Ledger.for_repo(repo_dir)
     report = compute_invalidations(previous, snapshot, ledger)
     by_name = snapshot.by_name()

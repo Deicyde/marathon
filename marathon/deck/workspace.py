@@ -1,0 +1,745 @@
+"""Project-wide read models for the deck's file reader and dependency graph.
+
+The swipe deck intentionally focuses on one declaration in one issue.  This
+module supplies the complementary wide-angle views without creating a second
+source of truth:
+
+* :func:`build_review_workspace` groups every review target in a chapter by
+  source file and source line, overlaying the same local per-declaration
+  verdict records as the subdeck;
+* :func:`build_project_graph` projects those targets into a navigable graph of
+  issue and declaration nodes.  Dependency edges point predecessor-first.
+
+Both functions are pure reads.  Issue bodies are fetched in one bulk request
+through the cards layer's shared context, rather than rebuilding one subdeck
+per issue (which would turn a project view into O(issue-count) GitHub calls).
+The small private helpers imported from ``cards``/``subdeck`` are the same
+ones used by the canonical one-issue builders; keeping the adaptation here
+isolates the dashboard payload while preserving their resolution and carried
+review semantics.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Iterable, Optional
+
+if TYPE_CHECKING:  # pragma: no cover - type-only
+    from marathon.review.config import ReviewConfig
+
+
+def _issue_numbers(
+    cfg: "ReviewConfig", chapter: Optional[int] = None
+) -> list[int]:
+    """Registered issue numbers in chapter/registry order, de-duplicated."""
+    numbers: list[int] = []
+    seen: set[int] = set()
+    chapters = [chapter] if chapter is not None else sorted(cfg.chapters)
+    for number in chapters:
+        registry = cfg.chapters.get(number)
+        for issue, _label in getattr(registry, "entries", ()) or ():
+            if issue not in seen:
+                seen.add(issue)
+                numbers.append(issue)
+    return numbers
+
+
+def _name_match(left: str, right: str) -> bool:
+    return (
+        left == right
+        or left.endswith("." + right)
+        or right.endswith("." + left)
+    )
+
+
+def _source_line_index(repo_dir: Path, paths: Iterable[str]) -> dict[str, dict[str, int]]:
+    """``{source_file: {qualified_decl: line}}`` for the requested files.
+
+    ``DeclView`` deliberately carries only the file and source block.  The
+    reader needs a stable source-order key, so scan each distinct file once
+    with Marathon's shared Lean declaration scanner.  Unreadable/moved files
+    simply contribute no line information and sort after located declarations.
+    """
+    from marathon.deck.cards import _REPO_SCAN_MAX_FILE_BYTES
+    from marathon.formalization import scan_lean_source
+
+    out: dict[str, dict[str, int]] = {}
+    repo = Path(repo_dir).resolve()
+    for rel in sorted({p for p in paths if p}):
+        try:
+            candidate = (repo / rel).resolve(strict=True)
+            candidate.relative_to(repo)
+            if not candidate.is_file() or candidate.suffix.lower() != ".lean":
+                raise ValueError("not a contained Lean source file")
+            if candidate.stat().st_size > _REPO_SCAN_MAX_FILE_BYTES:
+                raise ValueError("Lean source file exceeds the review scan limit")
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+            sites, _sorries = scan_lean_source(text)
+        except (OSError, RuntimeError, ValueError):
+            out[rel] = {}
+            continue
+        names: dict[str, int] = {}
+        for site in sites:
+            if site.qualified:
+                names.setdefault(site.qualified, site.line)
+            if site.name:
+                names.setdefault(site.name, site.line)
+        out[rel] = names
+    return out
+
+
+def _line_for(name: str, source_file: Optional[str], lines: dict) -> Optional[int]:
+    if not source_file:
+        return None
+    index = lines.get(source_file) or {}
+    if name in index:
+        return index[name]
+    matches = {line for candidate, line in index.items() if _name_match(name, candidate)}
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def _wire_status(records: list[dict]) -> str:
+    """Conservative aggregate status for one declaration graph node."""
+    verdicts = [record.get("verdict") for record in records]
+    if "rejected" in verdicts:
+        return "rejected"
+    if any(verdict is None for verdict in verdicts):
+        return "unreviewed"
+    if "deferred" in verdicts:
+        return "deferred"
+    if verdicts and all(verdict == "verified" for verdict in verdicts):
+        return "verified"
+    return "unreviewed"
+
+
+def _issue_status(ctx, issue: int, ready: bool, blocked_reason: Optional[str]) -> str:
+    status = ctx.verdict_status.get(issue)
+    if status in {"verified", "rejected", "stalled", "deferred"}:
+        return status
+    if ready:
+        return "ready"
+    return "blocked" if blocked_reason else "pending"
+
+
+def _audit_summary(ctx) -> dict:
+    """Honest freshness/build context for wide review consumers.
+
+    ``load_snapshot`` already withholds revision-mismatched evidence.  Preserve
+    that distinction in the wire payload instead of making an empty stale
+    snapshot look like a genuinely empty, fresh audit.
+    """
+    snapshot = ctx.snapshot
+    if snapshot is None:
+        return {
+            "status": "missing",
+            "created_at": None,
+            "source_revision": None,
+            "failures": [],
+        }
+    failures = list(getattr(snapshot, "failures", None) or [])
+    lowered = "\n".join(failures).lower()
+    stale_markers = (
+        "stale", "withheld", "uncommitted", "source revision",
+    )
+    if any(marker in lowered for marker in stale_markers):
+        status = "stale"
+    elif failures:
+        status = "partial"
+    else:
+        status = "fresh"
+    return {
+        "status": status,
+        "created_at": getattr(snapshot, "created_at", None),
+        "source_revision": getattr(snapshot, "source_revision", None),
+        "failures": failures,
+    }
+
+
+def _aggregate_build_status(
+    statuses: Iterable[Optional[str]], *, fallback: str = "unknown"
+) -> str:
+    """Worst honest build state for an issue/multi-owner declaration."""
+    present = {status for status in statuses if status}
+    for status in ("failed", "unknown", "stale", "unaudited", "ok"):
+        if status in present:
+            return status
+    return fallback
+
+
+def _decl_build_status(cards, ctx, name: str, audit_status: str) -> str:
+    """Build status independent of the human verdict/trust tier."""
+    if audit_status == "missing":
+        return "unknown"
+    resolved = cards._resolve_to_snapshot(ctx, name)
+    if resolved and ctx.snapshot is not None:
+        audited = ctx.snapshot.by_name().get(resolved)
+        if audited is not None:
+            return audited.status
+    # A merged snapshot may contain a fresh subset while explicitly
+    # withholding older modules.  Declarations present above are current;
+    # only absent evidence inherits the aggregate stale state.
+    if audit_status == "stale":
+        return "stale"
+    short = name.rsplit(".", 1)[-1]
+    if short in (ctx.broken_module_decls or set()):
+        return "failed"
+    return "unaudited"
+
+
+def _surface_views(cards, ctx, ledger, cfg, issue: int, cited: list[str]):
+    """Run the canonical, batched reconciliation surfacing step."""
+    chapter = cfg.chapter_of_issue(issue)
+    chapter_issues = _issue_numbers(cfg, chapter)
+    exclude: set[str] = set()
+    for other in chapter_issues:
+        if other == issue:
+            continue
+        for raw in cards._decls_for_issue(ctx, other):
+            exclude.add(cards._resolve_to_snapshot(ctx, raw) or raw)
+    meta = ctx.issue_meta.get(issue) or {}
+    keys = cards._textbook_result_keys(meta.get("title") or "")
+    return cards._surface_namespace_decls(
+        ctx,
+        cited,
+        ledger,
+        Path(cfg.repo_dir),
+        exclude_names=exclude,
+        result_keys=keys,
+    )
+
+
+def _catalog(cfg: "ReviewConfig", chapter: Optional[int]) -> dict:
+    """Build the shared issue/declaration catalog behind both public views."""
+    from marathon.deck import cards
+    from marathon.deck.subdeck import (
+        _load_store,
+        _decl_card,
+        _decl_fingerprint,
+        _depends_on_any,
+    )
+
+    issue_nums = _issue_numbers(cfg, chapter)
+    ctx = cards._load_context(cfg, issue_nums)
+    audit = _audit_summary(ctx)
+    ledger = cards._ledger(cfg)
+    verdict_store = _load_store(cfg)
+
+    decl_to_issues = cards._decl_to_issues(ctx, issue_nums)
+    raw_issue_deps = {
+        issue: cards._predecessor_issues(ctx, issue, issue_nums, decl_to_issues)
+        for issue in issue_nums
+    }
+    issue_deps = cards._gating_deps(raw_issue_deps)
+
+    issue_rows: list[dict] = []
+    targets: list[dict] = []
+    errors: list[dict] = []
+    registry_rank = {issue: rank for rank, issue in enumerate(issue_nums)}
+
+    for issue in issue_nums:
+        meta = ctx.issue_meta.get(issue) or {}
+        cited = cards._decls_for_issue(ctx, issue)
+        views = []
+        seen: set[str] = set()
+        for raw in cited:
+            try:
+                view = cards._build_decl_view(ctx, ledger, raw, Path(cfg.repo_dir))
+            except Exception as exc:  # retain healthy sibling declarations
+                errors.append({"issue": issue, "declaration": raw, "error": str(exc)})
+                continue
+            if view.name in seen:
+                continue
+            seen.add(view.name)
+            views.append(view)
+        try:
+            surfaced = _surface_views(cards, ctx, ledger, cfg, issue, cited)
+        except Exception as exc:  # reconciliation is advisory for this view
+            errors.append({"issue": issue, "phase": "surfacing", "error": str(exc)})
+            surfaced = []
+        for view in surfaced:
+            if view.name not in seen:
+                seen.add(view.name)
+                views.append(view)
+        stale = [view.name for view in views if not view.in_code]
+        views = [view for view in views if view.in_code]
+
+        # Match build_subdeck's headline rule so its main result is not marked
+        # as easy API in the wide view either.
+        if views:
+            from marathon.audit.trust import TIER_ORDER
+
+            views.sort(key=lambda view: (
+                TIER_ORDER.index(view.tier) if view.tier in TIER_ORDER else 0,
+                view.name,
+            ))
+            headline = views[0].name
+            views = [
+                replace(
+                    view,
+                    **dict(zip(
+                        ("api", "api_reason"),
+                        cards.classify_api(view, headline),
+                    )),
+                )
+                for view in views
+            ]
+
+        records = verdict_store.get(str(issue), {})
+        effective: dict[str, tuple[Optional[dict], Optional[str]]] = {}
+        for view in views:
+            record = records.get(view.name)
+            carry = None
+            if record and record.get("fingerprint") is not None:
+                if _decl_fingerprint(view) != record["fingerprint"]:
+                    record, carry = None, "changed"
+                else:
+                    carry = "carried_over"
+            effective[view.name] = (record, carry)
+
+        rejected = {
+            name
+            for name, (record, _carry) in effective.items()
+            if (record or {}).get("verdict") == "reject"
+        }
+        for view in views:
+            record, _carry = effective[view.name]
+            if (record or {}).get("verdict") == "verify" and _depends_on_any(view, rejected):
+                effective[view.name] = (None, "dependency_invalidated")
+
+        cards_for_issue: list[dict] = []
+        for view in views:
+            card = _decl_card(view, *effective[view.name])
+            card.update({
+                "issue": issue,
+                "issue_title": meta.get("title") or f"#{issue}",
+                "chapter": cfg.chapter_of_issue(issue),
+                "permalink": cards._issue_permalink(cfg, issue),
+                "registry_order": registry_rank[issue],
+                "build_status": _decl_build_status(
+                    cards, ctx, view.name, audit["status"]
+                ),
+            })
+            cards_for_issue.append(card)
+
+        # Project rejected predecessors onto each target.  These names drive
+        # the contextual reader guard and are also useful graph annotations.
+        for card in cards_for_issue:
+            blocked_by = []
+            for candidate in cards_for_issue:
+                if candidate["name"] == card["name"] or candidate.get("verdict") != "rejected":
+                    continue
+                if any(
+                    _name_match(member.get("name") or "", candidate["name"])
+                    for member in card.get("kernel") or []
+                ):
+                    blocked_by.append(candidate["name"])
+            card["blocked_by"] = sorted(set(blocked_by))
+            targets.append(card)
+
+        tier, qualifiers, _headline = cards._issue_tier(ctx, issue)
+        ready, reason = cards._readiness(ctx, issue, tier, issue_deps.get(issue, []))
+        issue_rows.append({
+            "id": issue,
+            "title": meta.get("title") or f"#{issue}",
+            "chapter": cfg.chapter_of_issue(issue),
+            "tier": tier,
+            "tier_qualifiers": qualifiers,
+            "status": _issue_status(ctx, issue, ready, reason),
+            "build_status": _aggregate_build_status(
+                (card.get("build_status") for card in cards_for_issue),
+                fallback=(
+                    "stale" if audit["status"] == "stale" else "unknown"
+                ),
+            ),
+            "ready": ready,
+            "blocked_reason": reason,
+            "deps": list(issue_deps.get(issue, [])),
+            "graph_deps": list(raw_issue_deps.get(issue, [])),
+            "permalink": cards._issue_permalink(cfg, issue),
+            "stale_citations": stale,
+            "declarations": [card["name"] for card in cards_for_issue],
+        })
+
+    lines = _source_line_index(
+        Path(cfg.repo_dir), (target.get("source_file") for target in targets)
+    )
+    # Extend the issue-local guard across the whole selected scope. A locally
+    # rejected definition in issue A must pause a dependent theorem in issue B
+    # just as surely as two cards in the same subdeck; otherwise the chapter
+    # reader could approve downstream results while an upstream FIX is pending.
+    rejected_names = {
+        target["name"] for target in targets if target.get("verdict") == "rejected"
+    }
+    # A chapter-scoped view must still respect rejected definitions owned by an
+    # earlier/later registered chapter. The sidecar is already keyed by the
+    # fully-qualified declaration name, so this adds the global pending-FIX set
+    # without another GitHub/audit read.
+    for records in verdict_store.values():
+        for name, record in records.items():
+            if not name.startswith("__") and (record or {}).get("verdict") == "reject":
+                rejected_names.add(name)
+    for target in targets:
+        target["source_line"] = _line_for(
+            target["name"], target.get("source_file"), lines
+        )
+        blocked = set(target.get("blocked_by") or [])
+        for member in target.get("kernel") or []:
+            member_name = member.get("name") or ""
+            blocked.update(
+                rejected
+                for rejected in rejected_names
+                if rejected != target["name"] and _name_match(member_name, rejected)
+            )
+        target["blocked_by"] = sorted(blocked)
+
+    targets.sort(key=lambda target: (
+        target.get("source_file") or "\uffff",
+        target.get("source_line") if target.get("source_line") is not None else 10**12,
+        target["registry_order"],
+        target["name"],
+    ))
+    return {
+        "repo": cfg.github_repo,
+        "chapters": sorted(cfg.chapters),
+        "issues": issue_rows,
+        "targets": targets,
+        "issue_deps": issue_deps,
+        "raw_issue_deps": raw_issue_deps,
+        "audit": audit,
+        "errors": errors,
+    }
+
+
+def build_review_workspace(
+    cfg: "ReviewConfig", chapter: Optional[int] = None
+) -> dict:
+    """Chapter/file reading view in source order (pure read)."""
+    catalog = _catalog(cfg, chapter)
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for target in catalog["targets"]:
+        grouped[target.get("source_file") or "(source unavailable)"].append(target)
+
+    files = []
+    for path in sorted(grouped, key=lambda item: (item == "(source unavailable)", item)):
+        declarations = grouped[path]
+        reviewed = sum(
+            1 for item in declarations if item.get("verdict") in {"verified", "rejected"}
+        )
+        files.append({
+            "path": path,
+            "declarations": declarations,
+            "progress": {"reviewed": reviewed, "total": len(declarations)},
+            "issues": sorted({item["issue"] for item in declarations}),
+        })
+
+    total = len(catalog["targets"])
+    reviewed = sum(
+        1
+        for item in catalog["targets"]
+        if item.get("verdict") in {"verified", "rejected"}
+    )
+    return {
+        "repo": catalog["repo"],
+        "chapter": chapter,
+        "chapters": catalog["chapters"],
+        "files": files,
+        "issues": catalog["issues"],
+        "progress": {
+            "reviewed": reviewed,
+            "total": total,
+            "verified": sum(item.get("verdict") == "verified" for item in catalog["targets"]),
+            "rejected": sum(item.get("verdict") == "rejected" for item in catalog["targets"]),
+            "deferred": sum(item.get("verdict") == "deferred" for item in catalog["targets"]),
+        },
+        "audit": catalog["audit"],
+        "errors": catalog["errors"],
+    }
+
+
+def _resolve_known(name: str, known: set[str]) -> Optional[str]:
+    if name in known:
+        return name
+    matches = [candidate for candidate in known if _name_match(name, candidate)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _cyclic_edge_keys(edges: list[dict]) -> set[tuple[str, str, str]]:
+    """Dependency edges whose endpoints share a non-trivial SCC.
+
+    ``contains`` is ownership, not dependency, and must not manufacture a
+    cycle.  Tarjan traversal and all emitted collections are sorted so graph
+    diagnostics remain deterministic across processes and Python versions.
+    The two iterative Kosaraju passes avoid Python's recursion limit on a
+    large, deep project graph.
+    """
+    dependency_edges = [
+        edge for edge in edges
+        if edge.get("kind") in {"issue-dependency", "declaration-dependency"}
+    ]
+    adjacency: dict[str, set[str]] = defaultdict(set)
+    reverse: dict[str, set[str]] = defaultdict(set)
+    vertices: set[str] = set()
+    for edge in dependency_edges:
+        source, target = edge["source"], edge["target"]
+        vertices.update((source, target))
+        adjacency[source].add(target)
+        reverse[target].add(source)
+
+    visited: set[str] = set()
+    finish_order: list[str] = []
+    for start in sorted(vertices):
+        if start in visited:
+            continue
+        stack: list[tuple[str, bool]] = [(start, False)]
+        while stack:
+            vertex, expanded = stack.pop()
+            if expanded:
+                finish_order.append(vertex)
+                continue
+            if vertex in visited:
+                continue
+            visited.add(vertex)
+            stack.append((vertex, True))
+            for target in sorted(adjacency.get(vertex, ()), reverse=True):
+                if target not in visited:
+                    stack.append((target, False))
+
+    component_by: dict[str, int] = {}
+    cyclic_components: set[int] = set()
+    assigned: set[str] = set()
+    for start in reversed(finish_order):
+        if start in assigned:
+            continue
+        component_id = len(set(component_by.values()))
+        component: list[str] = []
+        stack = [start]
+        assigned.add(start)
+        while stack:
+            vertex = stack.pop()
+            component.append(vertex)
+            for source in sorted(reverse.get(vertex, ()), reverse=True):
+                if source not in assigned:
+                    assigned.add(source)
+                    stack.append(source)
+        for member in component:
+            component_by[member] = component_id
+        if len(component) > 1:
+            cyclic_components.add(component_id)
+    return {
+        (edge["source"], edge["target"], edge["kind"])
+        for edge in dependency_edges
+        if component_by.get(edge["source"]) == component_by.get(edge["target"])
+        and component_by.get(edge["source"]) in cyclic_components
+    }
+
+
+def build_project_graph(cfg: "ReviewConfig") -> dict:
+    """Project-wide issue/declaration dependency DAG (pure read).
+
+    Edge direction is predecessor -> dependent.  ``contains`` edges connect an
+    issue to each declaration it reviews; declaration and issue dependency
+    edges are separate kinds so the client can filter or style them.
+    """
+    catalog = _catalog(cfg, None)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    edge_keys: set[tuple[str, str, str]] = set()
+
+    def add_edge(source: str, target: str, kind: str) -> None:
+        key = (source, target, kind)
+        if source == target or key in edge_keys:
+            return
+        edge_keys.add(key)
+        edges.append({"source": source, "target": target, "kind": kind})
+
+    issues_by_id = {issue["id"]: issue for issue in catalog["issues"]}
+    for issue in catalog["issues"]:
+        nodes.append({
+            "id": f"issue:{issue['id']}",
+            "type": "issue",
+            "label": f"#{issue['id']}",
+            "title": issue["title"],
+            "issue": issue["id"],
+            "chapter": issue["chapter"],
+            "chapters": [issue["chapter"]] if issue["chapter"] is not None else [],
+            "status": issue["status"],
+            "build_status": issue["build_status"],
+            "tier": issue["tier"],
+            "permalink": issue["permalink"],
+            "blocked_reason": issue["blocked_reason"],
+        })
+        for predecessor in issue["graph_deps"]:
+            if predecessor in issues_by_id:
+                add_edge(f"issue:{predecessor}", f"issue:{issue['id']}", "issue-dependency")
+
+    by_decl: dict[str, list[dict]] = defaultdict(list)
+    for target in catalog["targets"]:
+        by_decl[target["name"]].append(target)
+    known = set(by_decl)
+    # Only current project declarations can be truthfully described as an
+    # unresolved review edge.  Kernel entries outside this set are ordinary
+    # external/library dependencies (or unavailable source), not missing DAG
+    # nodes. Reuse the definition inspector's bounded, mtime-cached index.
+    try:
+        from marathon.deck.definitions import _current_source_index
+
+        current_project_names = set(_current_source_index(Path(cfg.repo_dir)))
+    except Exception:  # pragma: no cover - fail-soft diagnostic enrichment
+        current_project_names = set()
+    current_by_short: dict[str, list[str]] = defaultdict(list)
+    for project_name in current_project_names:
+        current_by_short[project_name.rsplit(".", 1)[-1]].append(project_name)
+
+    def current_project_match(name: str) -> Optional[str]:
+        if name in current_project_names:
+            return name
+        candidates = current_by_short.get(name.rsplit(".", 1)[-1], [])
+        matches = [candidate for candidate in candidates if _name_match(name, candidate)]
+        return matches[0] if len(matches) == 1 else None
+
+    unresolved_edges: list[dict] = []
+    unresolved_keys: set[tuple[str, str]] = set()
+
+    for name in sorted(by_decl):
+        records = by_decl[name]
+        issues = sorted({record["issue"] for record in records})
+        chapters = sorted({record["chapter"] for record in records if record["chapter"] is not None})
+        located = next((record for record in records if record.get("source_file")), records[0])
+        title = located.get("statement_pp") or located.get("source_block") or name
+        nodes.append({
+            "id": "decl:" + name,
+            "type": "declaration",
+            "label": name,
+            "title": str(title)[:800],
+            "kind": located.get("kind"),
+            "status": _wire_status(records),
+            "build_status": _aggregate_build_status(
+                record.get("build_status") for record in records
+            ),
+            "tier": located.get("tier"),
+            "issues": issues,
+            "chapter": chapters[0] if len(chapters) == 1 else None,
+            "chapters": chapters,
+            "source_file": located.get("source_file"),
+            "source_line": located.get("source_line"),
+            "blocked_by": sorted({dep for record in records for dep in record.get("blocked_by", [])}),
+            "changed": any(
+                record.get("changed_since_review")
+                or record.get("dependency_invalidated")
+                for record in records
+            ),
+        })
+        for issue in issues:
+            add_edge(f"issue:{issue}", "decl:" + name, "contains")
+
+    # The elaborated kernel is transitive; collapsing duplicate entries still
+    # produces a useful predecessor-first project graph and matches the current
+    # swipe deck's dependency ordering semantics.
+    for dependent, records in sorted(by_decl.items()):
+        dependencies: set[str] = set()
+        for record in records:
+            for member in record.get("kernel") or []:
+                raw_name = member.get("name") or ""
+                resolved = _resolve_known(raw_name, known)
+                if resolved and resolved != dependent:
+                    dependencies.add(resolved)
+                elif (
+                    raw_name
+                    and resolved is None
+                    and current_project_match(raw_name) is not None
+                ):
+                    key = (raw_name, dependent)
+                    if key not in unresolved_keys:
+                        unresolved_keys.add(key)
+                        unresolved_edges.append({
+                            "source": "decl:" + raw_name,
+                            "target": "decl:" + dependent,
+                            "kind": "declaration-dependency",
+                            "dependency": raw_name,
+                            "status": "unreviewed-target",
+                            "reason": "current project dependency has no registered review target",
+                        })
+        for dependency in sorted(dependencies):
+            add_edge("decl:" + dependency, "decl:" + dependent, "declaration-dependency")
+
+    cyclic_keys = _cyclic_edge_keys(edges)
+    for edge in edges:
+        edge["cyclic"] = (
+            edge["source"], edge["target"], edge["kind"]
+        ) in cyclic_keys
+    cyclic_edges = [dict(edge) for edge in edges if edge["cyclic"]]
+
+    # Highlight the transitive impact of a declaration whose carried human
+    # approval was invalidated.  Propagation follows declaration dependency
+    # edges only; ownership edges must not make every declaration in an issue
+    # appear downstream merely because one sibling changed.
+    outgoing: dict[str, set[str]] = defaultdict(set)
+    for edge in edges:
+        if edge["kind"] == "declaration-dependency":
+            outgoing[edge["source"]].add(edge["target"])
+    changed_ids = {
+        node["id"] for node in nodes
+        if node["type"] == "declaration" and node.get("changed")
+    }
+    impacted = set(changed_ids)
+    frontier = sorted(changed_ids)
+    while frontier:
+        source = frontier.pop()
+        for target in sorted(outgoing.get(source, ())):
+            if target not in impacted:
+                impacted.add(target)
+                frontier.append(target)
+
+    declaration_by_id = {
+        node["id"]: node for node in nodes if node["type"] == "declaration"
+    }
+    issue_impact: dict[int, str] = {}
+    for node_id in sorted(impacted):
+        node = declaration_by_id.get(node_id)
+        if node is None:
+            continue
+        impact = "changed" if node_id in changed_ids else "downstream"
+        node["impact"] = impact
+        node["downstream_of_changed"] = impact == "downstream"
+        for issue in node.get("issues") or []:
+            if impact == "changed" or issue not in issue_impact:
+                issue_impact[issue] = impact
+    for node in nodes:
+        if node["type"] == "issue" and node.get("issue") in issue_impact:
+            node["impact"] = issue_impact[node["issue"]]
+            node["downstream_of_changed"] = node["impact"] == "downstream"
+
+    unresolved_edges.sort(key=lambda edge: (
+        edge["target"], edge["dependency"], edge["kind"]
+    ))
+
+    status_counts: dict[str, int] = defaultdict(int)
+    type_counts: dict[str, int] = defaultdict(int)
+    build_counts: dict[str, int] = defaultdict(int)
+    for node in nodes:
+        status_counts[node["status"]] += 1
+        type_counts[node["type"]] += 1
+        build_counts[node["build_status"]] += 1
+    return {
+        "repo": catalog["repo"],
+        "chapters": catalog["chapters"],
+        "nodes": nodes,
+        "edges": edges,
+        "unresolved_edges": unresolved_edges,
+        "cyclic_edges": cyclic_edges,
+        "audit": catalog["audit"],
+        "counts": {
+            "nodes": len(nodes),
+            "edges": len(edges),
+            "by_status": dict(sorted(status_counts.items())),
+            "by_type": dict(sorted(type_counts.items())),
+            "by_build_status": dict(sorted(build_counts.items())),
+            "changed": len(changed_ids),
+            "impacted": len(impacted - changed_ids),
+            "unresolved_edges": len(unresolved_edges),
+            "cyclic_edges": len(cyclic_edges),
+        },
+        "errors": catalog["errors"],
+    }

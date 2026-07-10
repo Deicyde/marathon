@@ -170,6 +170,10 @@ def test_refine_auto_pr_abort_exits_nonzero(monkeypatch, tmp_path):
         lambda **k: (False, "marathon/refine-c14-i156",
                      "git fetch origin main failed — GIT AUTH: ..."),
     )
+    monkeypatch.setattr(
+        post_pipeline, "observe_remote_branch",
+        lambda *a, **k: (True, None, "observed absent"),
+    )
 
     args = _make_refine_args(repo_dir, target, workdir)
     with pytest.raises(SystemExit) as exc:
@@ -209,6 +213,10 @@ def test_force_continuation_preserves_local_branch_without_reset(
         lambda **k: (_ for _ in ()).throw(
             AssertionError("must not checkout/reset a gate-blocked local commit")
         ),
+    )
+    monkeypatch.setattr(
+        post_pipeline, "observe_remote_branch",
+        lambda *a, **k: (True, None, "observed absent"),
     )
 
     def fake_git(cmd, **kwargs):
@@ -262,6 +270,10 @@ def test_transient_reattach_exits_attempt_free_and_preserves_ids(
         post_pipeline,
         "prepare_auto_pr_branch",
         lambda **k: (True, "marathon/refine-c14-i156", "on branch"),
+    )
+    monkeypatch.setattr(
+        post_pipeline, "observe_remote_branch",
+        lambda *a, **k: (True, None, "observed absent"),
     )
 
     async def transient(*args, **kwargs):
@@ -343,6 +355,10 @@ def test_refine_iteration_failure_exits_nonzero(monkeypatch, tmp_path):
     monkeypatch.setattr(
         post_pipeline, "prepare_auto_pr_branch",
         lambda **k: (True, "marathon/refine-c14-i170", "auto-pr: ok"))
+    monkeypatch.setattr(
+        post_pipeline, "observe_remote_branch",
+        lambda *a, **k: (True, None, "observed absent"),
+    )
 
     async def _no_reattach(*a, **k):
         return (None, None, None)

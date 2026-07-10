@@ -27,11 +27,22 @@ on a GET, on navigation, or during card assembly.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
+import secrets
 import subprocess
 import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+
+try:  # POSIX advisory locks (Linux/macOS).
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    _fcntl = None
 
 if TYPE_CHECKING:  # pragma: no cover — type-only
     from marathon.review.config import ReviewConfig
@@ -60,6 +71,77 @@ INFORMAL_HEADER = "### Informal Statement"
 _LLM_MARKER_RE = re.compile(
     r"(?:⚠️\s*)?LLM-rendered[^\n*]*?verification pending\.?"
 )
+
+
+_RECONCILE_LOCKS_GUARD = threading.Lock()
+_RECONCILE_LOCKS: dict[str, threading.RLock] = {}
+_RECONCILE_LOCK_LOCAL = threading.local()
+
+
+def _reconcile_lock_path(cfg: "ReviewConfig", issue_num: int) -> Path:
+    # runner-locks is already runtime-only/ignored in consumer repositories.
+    return (
+        Path(cfg.repo_dir) / ".marathon" / "review" / "runner-locks"
+        / f"reconcile-issue-{issue_num}.lock"
+    )
+
+
+@contextmanager
+def _reconciliation_issue_lock(cfg: "ReviewConfig", issue_num: int):
+    """Reentrant same-checkout lock for issue-body reconciliation writes."""
+    path = _reconcile_lock_path(cfg, issue_num)
+    key = str(path.resolve())
+    with _RECONCILE_LOCKS_GUARD:
+        thread_lock = _RECONCILE_LOCKS.setdefault(key, threading.RLock())
+    with thread_lock:
+        held = getattr(_RECONCILE_LOCK_LOCAL, "held", None)
+        if held is None:
+            held = {}
+            _RECONCILE_LOCK_LOCAL.held = held
+        current = held.get(key)
+        if current is not None:
+            current["depth"] += 1
+            try:
+                yield
+            finally:
+                current["depth"] -= 1
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        gitignore = path.parent / ".gitignore"
+        if not gitignore.is_file():
+            gitignore.write_text("*\n")
+        handle = path.open("a+b")
+        try:
+            if _fcntl is not None:
+                _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX)
+            held[key] = {"depth": 1, "handle": handle}
+            try:
+                yield
+            finally:
+                held.pop(key, None)
+                if _fcntl is not None:
+                    _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _remote_body_unchanged(repo: str, issue_num: int, expected: str) -> bool:
+    """Last-moment remote compare before an unavoidable whole-body PATCH."""
+    from marathon.review.github import issue_body
+
+    return issue_body(issue_num, repo) == expected
+
+
+def _source_is_clean_revision(repo_dir: Path, expected_sha: str) -> bool:
+    """Whether source blocks still describe the clean commit in permalinks."""
+    from marathon.audit.engine import source_state
+
+    revision, clean = source_state(repo_dir)
+    if revision is None:
+        # Non-Git fixture/workspace: there is no revision provenance beyond the
+        # caller's head_sha result, so retain historical best-effort behavior.
+        return head_sha(repo_dir) == expected_sha
+    return revision == expected_sha and clean is True
 
 
 def head_sha(repo_dir: Path) -> Optional[str]:
@@ -274,6 +356,14 @@ def _flip_informal_marker(body: str, date: str) -> tuple[str, bool]:
 
 
 def mark_informal_verified(cfg: "ReviewConfig", issue_num: int) -> dict:
+    """Serialized public wrapper for the issue-body marker update."""
+    with _reconciliation_issue_lock(cfg, issue_num):
+        return _mark_informal_verified_unlocked(cfg, issue_num)
+
+
+def _mark_informal_verified_unlocked(
+    cfg: "ReviewConfig", issue_num: int
+) -> dict:
     """Flip the issue body's ``### Informal Statement`` LLM-rendered marker to a
     human-approved verified marker — the durable realization of the deck's
     leading informal-approval card, written at SHIP (the explicit, token-gated
@@ -307,6 +397,15 @@ def mark_informal_verified(cfg: "ReviewConfig", issue_num: int) -> dict:
             "updated": False,
             "message": "no LLM-rendered informal marker to flip",
         }
+    if not _remote_body_unchanged(repo, issue_num, body):
+        return {
+            "ok": False,
+            "updated": False,
+            "message": (
+                "issue body changed while the informal marker update was "
+                "being prepared; no edit was made"
+            ),
+        }
     _gh_edit_body(repo, issue_num, new_body)
     return {
         "ok": True,
@@ -316,6 +415,16 @@ def mark_informal_verified(cfg: "ReviewConfig", issue_num: int) -> dict:
 
 
 def refresh_issue_signatures(
+    cfg: "ReviewConfig", issue_num: int, *, only_surfaced=None
+) -> dict:
+    """Serialized public wrapper for signature-section updates."""
+    with _reconciliation_issue_lock(cfg, issue_num):
+        return _refresh_issue_signatures_unlocked(
+            cfg, issue_num, only_surfaced=only_surfaced
+        )
+
+
+def _refresh_issue_signatures_unlocked(
     cfg: "ReviewConfig", issue_num: int, *, only_surfaced=None
 ) -> dict:
     """Append newly surfaced declarations to ``### Lean signatures``.
@@ -357,6 +466,12 @@ def refresh_issue_signatures(
             "ok": False, "updated": False, "dropped": [], "added": [],
             "sha": None,
             "message": "could not resolve HEAD SHA (git rev-parse failed)",
+        }
+    if not _source_is_clean_revision(repo_dir, sha):
+        return {
+            "ok": False, "updated": False, "dropped": [], "added": [],
+            "sha": sha,
+            "message": "source is dirty or moved; signatures were not prepared",
         }
 
     # Fetch the current issue body (read-only).
@@ -437,6 +552,25 @@ def refresh_issue_signatures(
             "message": (
                 f"#{issue_num}: no new source-locatable surfaced declarations "
                 "to append"
+            ),
+        }
+
+    if not _source_is_clean_revision(repo_dir, sha):
+        return {
+            "ok": False, "updated": False, "dropped": [], "added": [],
+            "sha": sha, "preserved_stale": stale,
+            "message": (
+                "source changed while signatures were being prepared; "
+                "no edit was made"
+            ),
+        }
+    if not _remote_body_unchanged(repo, issue_num, body):
+        return {
+            "ok": False, "updated": False, "dropped": [], "added": [],
+            "sha": sha, "preserved_stale": stale,
+            "message": (
+                "issue body changed while signatures were being prepared; "
+                "no edit was made"
             ),
         }
 
@@ -999,10 +1133,383 @@ def _leaves_related(stale_leaf: str, added_leaf: str) -> bool:
     return len(shared) >= len(s_tokens) - 1
 
 
+def _reconciliation_proposal_token(
+    issue_num: int,
+    sha: str,
+    body: str,
+    proposed_renames: "list[dict]",
+    proposed_splits: "list[dict]",
+) -> str:
+    """Stable compare-and-swap token for one reconciliation proposal set.
+
+    A human may leave a proposal open while Aristotle, another deck process, or
+    a collaborator edits the issue.  The confirmation POST must therefore bind
+    to the exact HEAD, issue body, and candidate mappings the human inspected.
+    This token is not an authorization secret (the server's session token is
+    that gate); it is an optimistic-concurrency fingerprint that makes stale
+    confirmation fail closed.
+    """
+    payload = {
+        "issue": issue_num,
+        "sha": sha,
+        "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        "renames": sorted(
+            (dict(item) for item in proposed_renames),
+            key=lambda item: (item.get("old", ""), item.get("new", "")),
+        ),
+        "splits": sorted(
+            (
+                {"old": item.get("old"),
+                 "targets": sorted(item.get("targets") or [])}
+                for item in proposed_splits
+            ),
+            key=lambda item: (item.get("old") or "", item.get("targets") or []),
+        ),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _decision_path(cfg: "ReviewConfig", issue_num: int) -> Path:
+    return (
+        Path(cfg.repo_dir) / ".marathon" / "conductor"
+        / "reconcile-decisions" / f"{issue_num}.json"
+    )
+
+
+def _load_reconciliation_decisions(
+    cfg: "ReviewConfig", issue_num: int
+) -> list[dict]:
+    try:
+        payload = json.loads(_decision_path(cfg, issue_num).read_text())
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return []
+    rows = None
+    if isinstance(payload, dict):
+        rows = payload.get("dismissals")
+        if rows is None:  # legacy body/token-bound journal; safely ignored later
+            rows = payload.get("decisions")
+    return [row for row in (rows or []) if isinstance(row, dict)]
+
+
+def _citation_identity_fingerprint(body: str, old: str) -> Optional[str]:
+    """Hash only the citation anchors that identify ``old``.
+
+    Whole-body hashes made an unrelated prose edit or informal-marker flip
+    resurrect an already-reviewed false rename.  These canonical anchors ignore
+    unrelated sections and mutable permalink coordinates while retaining the
+    cited token, citation format/count, and a signature fence's quoted Lean.
+    """
+    anchors: list[dict] = []
+    for match in _SIGNATURE_BLOCK_RE.finditer(body):
+        token = match.group("name")
+        if not _cites_same_decl(token, old):
+            continue
+        block = match.group(0)
+        fence_end = block.find("\n```\n")
+        lean = (
+            block[len("```lean\n"):fence_end]
+            if fence_end >= 0 else block
+        )
+        anchors.append({"format": "signature", "token": token, "lean": lean})
+
+    for section_match in _DECL_SECTION_RE.finditer(body):
+        for line in section_match.group(1).splitlines():
+            for token_match in _BACKTICK_TOKEN_RE.finditer(line):
+                content = token_match.group(1).strip()
+                decl_match = _DECL_RE.match(content)
+                token = decl_match.group("name") if decl_match else (
+                    content if _BARE_NAME_RE.match(content) else None
+                )
+                if token is not None and _cites_same_decl(token, old):
+                    anchors.append({
+                        "format": "declaration",
+                        "token": token,
+                        "shape": content,
+                    })
+    if not anchors:
+        return None
+    anchors.sort(key=lambda item: (
+        item.get("format") or "",
+        item.get("token") or "",
+        item.get("lean") or "",
+        item.get("shape") or "",
+    ))
+    encoded = json.dumps(
+        anchors, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _dismissal_record(
+    cfg: "ReviewConfig",
+    issue_num: int,
+    body: str,
+    kind: str,
+    mapping: dict,
+) -> Optional[dict]:
+    """Canonical persisted decision for one heuristic mapping.
+
+    The record survives unrelated HEAD/body edits, but changing the matching
+    citation anchor, target set, target file, or target declaration source makes
+    it stop matching and re-surfaces the proposal.  Missing source fails closed:
+    no durable suppression is created from evidence we cannot inspect.
+    """
+    old = mapping.get("old")
+    if not isinstance(old, str) or not old:
+        return None
+    if kind == "rename":
+        target = mapping.get("new")
+        if not isinstance(target, str) or not target:
+            return None
+        targets = [target]
+        canonical_mapping = {"old": old, "new": target}
+    elif kind == "split":
+        raw_targets = mapping.get("targets") or []
+        if not raw_targets or not all(isinstance(item, str) and item for item in raw_targets):
+            return None
+        targets = sorted(raw_targets)
+        canonical_mapping = {"old": old, "targets": targets}
+    else:
+        return None
+
+    citation_fingerprint = _citation_identity_fingerprint(body, old)
+    if citation_fingerprint is None:
+        return None
+    from marathon.deck.definitions import definition_source_fingerprint
+
+    target_fingerprints = []
+    for target in targets:
+        fingerprint = definition_source_fingerprint(Path(cfg.repo_dir), target)
+        if fingerprint is None:
+            return None
+        target_fingerprints.append({"name": target, "fingerprint": fingerprint})
+    return {
+        "version": 2,
+        "issue": issue_num,
+        "kind": kind,
+        "mapping": canonical_mapping,
+        "citation_fingerprint": citation_fingerprint,
+        "target_fingerprints": target_fingerprints,
+    }
+
+
+def _record_reconciliation_dismissal(
+    cfg: "ReviewConfig",
+    issue_num: int,
+    body: str,
+    renames: "list[dict]",
+    splits: "list[dict]",
+) -> None:
+    """Persist one human "not this mapping" decision across conductor ticks."""
+    path = _decision_path(cfg, issue_num)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    gitignore = path.parent / ".gitignore"
+    if not gitignore.is_file():
+        gitignore.write_text("*\n")
+    rows = _load_reconciliation_decisions(cfg, issue_num)
+    for kind, items in (("rename", renames), ("split", splits)):
+        for item in items:
+            row = _dismissal_record(cfg, issue_num, body, kind, item)
+            if row is not None and row not in rows:
+                rows.append(row)
+    # Independent records do not form a replay chain, so bounding old evidence
+    # cannot resurrect every newer decision at once.  A pruned mapping simply
+    # returns for review if it ever recurs.
+    rows = rows[-1000:]
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"dismissals": rows}, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+        tmp_name = ""
+    finally:
+        if tmp_name:
+            try:
+                Path(tmp_name).unlink()
+            except OSError:
+                pass
+
+
+def _apply_persisted_dismissals(
+    cfg: "ReviewConfig",
+    issue_num: int,
+    body: str,
+    proposed_renames: "list[dict]",
+    proposed_splits: "list[dict]",
+) -> tuple["list[dict]", "list[dict]"]:
+    """Replay token-bound dismissals, including sequential subset decisions."""
+    renames = [dict(item) for item in proposed_renames]
+    splits = [dict(item) for item in proposed_splits]
+    persisted = _load_reconciliation_decisions(cfg, issue_num)
+    renames = [
+        item for item in renames
+        if _dismissal_record(cfg, issue_num, body, "rename", item) not in persisted
+    ]
+    splits = [
+        item for item in splits
+        if _dismissal_record(cfg, issue_num, body, "split", item) not in persisted
+    ]
+    return renames, splits
+
+
+def _promote_confirmed_proposals(
+    *,
+    issue_num: int,
+    sha: str,
+    body: str,
+    proposed_renames: "list[dict]",
+    proposed_splits: "list[dict]",
+    confirmation: "Optional[dict]",
+) -> tuple[
+    "list[dict]", "list[dict]", "list[dict]", "list[dict]",
+    "list[dict]", "list[dict]", str, "Optional[str]",
+]:
+    """Validate and promote an explicitly confirmed proposal subset.
+
+    Returns confirmed renames/splits, dismissed renames/splits, remaining
+    renames/splits, the token, and an optional error. Exact mapping equality is
+    required; callers cannot turn an arbitrary client-supplied name into a body
+    edit. ``token`` fingerprints the complete visible set before the decision.
+    """
+    renames = [dict(item) for item in proposed_renames]
+    splits = [
+        {"old": item.get("old"), "targets": list(item.get("targets") or [])}
+        for item in proposed_splits
+    ]
+    token = _reconciliation_proposal_token(
+        issue_num, sha, body, renames, splits
+    )
+    if confirmation is None:
+        return [], [], [], [], renames, splits, token, None
+    if not isinstance(confirmation, dict):
+        return [], [], [], [], renames, splits, token, "confirmation must be an object"
+    supplied = str(confirmation.get("token") or "")
+    if not supplied or not secrets.compare_digest(supplied, token):
+        return (
+            [], [], [], [], renames, splits, token,
+            "reconciliation proposal changed; reload and review the current "
+            "candidate before confirming",
+        )
+
+    requested_renames = confirmation.get("renames") or []
+    requested_splits = confirmation.get("splits") or []
+    dismissed_renames = confirmation.get("dismiss_renames") or []
+    dismissed_splits = confirmation.get("dismiss_splits") or []
+    if not all(isinstance(items, list) for items in (
+        requested_renames, requested_splits, dismissed_renames, dismissed_splits
+    )):
+        return [], [], [], [], renames, splits, token, "confirmation lists are invalid"
+    if not any((
+        requested_renames, requested_splits, dismissed_renames, dismissed_splits
+    )):
+        return [], [], [], [], renames, splits, token, "no reconciliation proposal selected"
+
+    confirmed_renames: list[dict] = []
+    confirmed_splits: list[dict] = []
+    rejected_renames: list[dict] = []
+    rejected_splits: list[dict] = []
+    remaining_renames = list(renames)
+    remaining_splits = list(splits)
+
+    def take_rename(raw, destination: list[dict]) -> "Optional[str]":
+        if not isinstance(raw, dict):
+            return "invalid rename decision"
+        candidate = {"old": raw.get("old"), "new": raw.get("new")}
+        if candidate not in remaining_renames:
+            return f"rename proposal is no longer current: {candidate!r}"
+        remaining_renames.remove(candidate)
+        destination.append(candidate)
+        return None
+
+    def take_split(raw, destination: list[dict]) -> "Optional[str]":
+        if not isinstance(raw, dict):
+            return "invalid split decision"
+        candidate = {
+            "old": raw.get("old"),
+            "targets": list(raw.get("targets") or []),
+        }
+        if candidate not in remaining_splits:
+            return f"split proposal is no longer current: {candidate!r}"
+        remaining_splits.remove(candidate)
+        destination.append(candidate)
+        return None
+
+    for raw in requested_renames:
+        error = take_rename(raw, confirmed_renames)
+        if error:
+            return [], [], [], [], renames, splits, token, error
+    for raw in requested_splits:
+        error = take_split(raw, confirmed_splits)
+        if error:
+            return [], [], [], [], renames, splits, token, error
+    for raw in dismissed_renames:
+        error = take_rename(raw, rejected_renames)
+        if error:
+            return [], [], [], [], renames, splits, token, error
+    for raw in dismissed_splits:
+        error = take_split(raw, rejected_splits)
+        if error:
+            return [], [], [], [], renames, splits, token, error
+    return (
+        confirmed_renames, confirmed_splits,
+        rejected_renames, rejected_splits,
+        remaining_renames, remaining_splits, token, None,
+    )
+
+
 def auto_reconcile_issue(
     cfg: "ReviewConfig", issue_num: int, *, dry_run: bool = False,
     diff_window: "Optional[tuple[str, str]]" = None,
     allow_reopened: bool = False,
+    confirmation: "Optional[dict]" = None,
+) -> dict:
+    """Serialized reconciliation plus exact local verdict-key ownership update.
+
+    Lock order is issue-operation → GitHub reconciliation → verdict store, the
+    same order SHIP uses.  This prevents a concurrent local verdict from landing
+    under the old name after the body has moved to the confirmed new identity.
+    """
+    from marathon.deck.subdeck import (
+        _issue_operation_lock,
+        reconcile_decl_verdict_ownership,
+    )
+
+    with _issue_operation_lock(cfg, issue_num):
+        with _reconciliation_issue_lock(cfg, issue_num):
+            result = _auto_reconcile_issue_unlocked(
+                cfg,
+                issue_num,
+                dry_run=dry_run,
+                diff_window=diff_window,
+                allow_reopened=allow_reopened,
+                confirmation=confirmation,
+            )
+        if result.get("updated"):
+            result["ownership_reconciliation"] = (
+                reconcile_decl_verdict_ownership(
+                    cfg,
+                    issue_num,
+                    renames=list(result.get("renamed") or []),
+                    splits=list(result.get("splits") or []),
+                    additions=list(result.get("added") or []),
+                )
+            )
+        return result
+
+
+def _auto_reconcile_issue_unlocked(
+    cfg: "ReviewConfig", issue_num: int, *, dry_run: bool = False,
+    diff_window: "Optional[tuple[str, str]]" = None,
+    allow_reopened: bool = False,
+    confirmation: "Optional[dict]" = None,
 ) -> dict:
     """SAFE automatic reconcile of one issue's Lean-declaration citations against
     the LIVE code — the hands-off replacement for the manual "refresh from code"
@@ -1061,9 +1568,12 @@ def auto_reconcile_issue(
     forever.
 
     Returns ``{ok, updated, added, renamed, kept_stale, flagged_renames, sha,
-    message}``. Writes NOTHING when there is no recognized section, nothing to
-    add/rename, the issue is verified/frozen, or ``dry_run`` (then ``new_body``
-    is included for inspection)."""
+    message}``. Heuristic candidates also carry ``proposal_token``.  A caller
+    may pass ``confirmation={token, renames, splits}``; exact candidates are
+    promoted only while that compare-and-swap token still matches the current
+    HEAD, issue body, and full proposal set. Writes NOTHING when there is no
+    recognized section, nothing to add/rename, the issue is verified/frozen,
+    or ``dry_run`` (then ``new_body`` is included for inspection)."""
     from marathon.deck.cards import (
         _build_decl_view, _load_context, _decls_for_issue, _ledger,
         missing_suggestions_for_issue,
@@ -1077,12 +1587,23 @@ def auto_reconcile_issue(
         "splits": [], "kept_stale": [],
         "flagged_renames": [], "flagged_splits": [],
         "proposed_renames": [], "proposed_splits": [],
+        "dismissed_renames": [], "dismissed_splits": [],
+        "proposal_token": None, "confirmation_conflict": False,
+        "body_conflict": False, "source_conflict": False,
         "flagged_deletes": [], "suppressed_adds": [], "sha": None,
     }
 
     sha = head_sha(repo_dir)
     if not sha:
         return {**empty, "message": "could not resolve HEAD SHA"}
+    if not _source_is_clean_revision(repo_dir, sha):
+        return {
+            **empty, "ok": False, "sha": sha, "source_conflict": True,
+            "message": (
+                f"#{issue_num}: source is dirty or moved away from {sha[:12]}; "
+                "no reconciliation was prepared"
+            ),
+        }
     body = _issue_body(issue_num, repo)
     if body is None:
         return {**empty, "ok": False,
@@ -1133,7 +1654,7 @@ def auto_reconcile_issue(
             cfg, issue_num, body, sha, stale, orphaned, cited_set,
             empty=empty, dry_run=dry_run,
             diff_window=diff_window, chapter=chapter, live_names=live_names,
-            allow_reopened=allow_reopened,
+            allow_reopened=allow_reopened, confirmation=confirmation,
         )
 
     # ADD candidates: uncited (cited_by empty) in-code decls matching the
@@ -1201,13 +1722,68 @@ def auto_reconcile_issue(
     # ADD set = candidates not consumed by a rename/split.
     add_only = [n for n in add_names if n not in renamed_targets]
 
+    # HUMAN CONFIRMATION: heuristic co-occurrence/leaf matches remain inert
+    # until an exact candidate from the current proposal set is confirmed.  The
+    # token binds the click to the HEAD + issue body the reviewer saw; a race or
+    # a renamed candidate fails closed and returns the current proposals.
+    proposed_renames, proposed_splits = _apply_persisted_dismissals(
+        cfg, issue_num, body, proposed_renames, proposed_splits
+    )
+    (
+        confirmed_renames, confirmed_splits,
+        dismissed_renames, dismissed_splits,
+        proposed_renames, proposed_splits,
+        proposal_token, confirmation_error,
+    ) = _promote_confirmed_proposals(
+        issue_num=issue_num,
+        sha=sha,
+        body=body,
+        proposed_renames=proposed_renames,
+        proposed_splits=proposed_splits,
+        confirmation=confirmation,
+    )
+    if confirmation_error is not None:
+        return {
+            **empty,
+            "ok": False,
+            "sha": sha,
+            "kept_stale": kept_stale,
+            "proposed_renames": proposed_renames,
+            "proposed_splits": proposed_splits,
+            "proposal_token": proposal_token,
+            "confirmation_conflict": True,
+            "message": f"#{issue_num}: {confirmation_error}",
+        }
+    if dismissed_renames or dismissed_splits:
+        _record_reconciliation_dismissal(
+            cfg, issue_num, body,
+            dismissed_renames, dismissed_splits,
+        )
+    if confirmed_renames or confirmed_splits:
+        renamed.extend(confirmed_renames)
+        splits.extend(confirmed_splits)
+        confirmed_old = {
+            *[item["old"] for item in confirmed_renames],
+            *[item["old"] for item in confirmed_splits],
+        }
+        kept_stale = [name for name in kept_stale if name not in confirmed_old]
+
     if (
         not renamed and not splits and not proposed_renames
         and not proposed_splits and not confirmed_deletes and not add_only
     ):
-        return {**empty, "sha": sha, "kept_stale": kept_stale,
-                "message": f"#{issue_num}: already reconciled ({len(kept_stale)} "
-                           "stale citation(s) kept — no rename candidate)"}
+        return {
+            **empty, "sha": sha, "kept_stale": kept_stale,
+            "dismissed_renames": dismissed_renames,
+            "dismissed_splits": dismissed_splits,
+            "message": (
+                f"#{issue_num}: "
+                + (f"dismissed {len(dismissed_renames) + len(dismissed_splits)} "
+                   "identity proposal(s); " if dismissed_renames or dismissed_splits else "")
+                + f"already reconciled ({len(kept_stale)} stale citation(s) "
+                  "kept — no rename candidate)"
+            ),
+        }
 
     # VERIFIED-ISSUE SAFETY: a human-verified/frozen statement is NEVER silently
     # rewritten — not by a rename, not by an ADD. Flag any proposed renames for a
@@ -1227,6 +1803,7 @@ def auto_reconcile_issue(
                 "suppressed_adds": list(add_only),
                 "proposed_renames": [dict(r) for r in proposed_renames],
                 "proposed_splits": [dict(s) for s in proposed_splits],
+                "proposal_token": proposal_token,
                 "message": (
                     f"#{issue_num} is verified/frozen — "
                     f"{len(renamed) + len(proposed_renames)} rename(s) + "
@@ -1234,11 +1811,13 @@ def auto_reconcile_issue(
                     f"{len(confirmed_deletes)} delete(s) flagged for human review, "
                     f"{len(add_only)} add(s) suppressed, NOT auto-applied")}
 
-    if proposed_renames or proposed_splits:
+    if ((proposed_renames or proposed_splits)
+            and not (confirmed_renames or confirmed_splits)):
         return {
             **empty, "sha": sha, "kept_stale": kept_stale,
             "proposed_renames": [dict(r) for r in proposed_renames],
             "proposed_splits": [dict(s) for s in proposed_splits],
+            "proposal_token": proposal_token,
             "message": (
                 f"#{issue_num}"
                 + (" is verified/frozen — " if frozen else ": ")
@@ -1299,6 +1878,11 @@ def auto_reconcile_issue(
         "renamed": renamed_ok,
         "splits": [dict(s) for s in splits_ok],
         "kept_stale": kept_stale, "flagged_renames": [], "sha": sha,
+        "proposed_renames": [dict(r) for r in proposed_renames],
+        "proposed_splits": [dict(s) for s in proposed_splits],
+        # A successful write changes the body; force a refetch before another
+        # confirmation instead of handing out a token for obsolete content.
+        "proposal_token": None,
         "message": (
             f"#{issue_num} reconciled to {sha[:7]}: "
             f"{len(added_names)} added, {len(renamed_ok)} renamed, "
@@ -1310,8 +1894,87 @@ def auto_reconcile_issue(
         result["new_body"] = new_body
         result["updated"] = False
         return result
+    if not _source_is_clean_revision(repo_dir, sha):
+        return {
+            **empty, "ok": False, "sha": sha,
+            "source_conflict": True,
+            "message": (
+                f"#{issue_num}: source changed while reconciliation was "
+                "being prepared; no edit was made — reload and retry"
+            ),
+        }
+    if not _remote_body_unchanged(repo, issue_num, body):
+        return {
+            **empty,
+            "ok": False,
+            "sha": sha,
+            "kept_stale": kept_stale,
+            "proposed_renames": [dict(r) for r in proposed_renames],
+            "proposed_splits": [dict(s) for s in proposed_splits],
+            "confirmation_conflict": confirmation is not None,
+            "body_conflict": True,
+            "message": (
+                f"#{issue_num}: issue body changed while reconciliation was "
+                "being prepared; no edit was made — reload and retry"
+            ),
+        }
     _gh_edit_body(repo, issue_num, new_body)
     return result
+
+
+def _current_reconcile_window(
+    cfg: "ReviewConfig",
+) -> "Optional[tuple[str, str]]":
+    """The conductor's still-unconsumed HEAD window, when it is trustworthy."""
+    from marathon.conductor import (
+        load_reconcile_cursor,
+        reconcile_cursor_is_ancestor,
+    )
+
+    current = head_sha(Path(cfg.repo_dir))
+    previous = load_reconcile_cursor(Path(cfg.repo_dir))
+    if (
+        current
+        and previous
+        and previous != current
+        and reconcile_cursor_is_ancestor(Path(cfg.repo_dir), previous, current)
+    ):
+        return previous, current
+    return None
+
+
+def reconciliation_preview(cfg: "ReviewConfig", issue_num: int) -> dict:
+    """Pure read model for the deck's human-confirmation panel.
+
+    Reusing the conductor's unconsumed diff window is important for splits whose
+    replacement leaves no common leaf.  The conductor deliberately retains that
+    cursor while proposals exist, so a browser reload or process restart can
+    reconstruct the same candidates instead of losing the only identity clue.
+    """
+    return auto_reconcile_issue(
+        cfg,
+        issue_num,
+        dry_run=True,
+        diff_window=_current_reconcile_window(cfg),
+    )
+
+
+def confirm_reconciliation_proposal(
+    cfg: "ReviewConfig", issue_num: int, confirmation: dict
+) -> dict:
+    """Apply an exact, token-bound human reconciliation decision.
+
+    This is the backend seam for the guarded POST route.  Candidate discovery
+    is repeated against the current body and the conductor's pending diff; the
+    compare-and-swap token inside :func:`auto_reconcile_issue` rejects a stale
+    browser click without writing.
+    """
+    return auto_reconcile_issue(
+        cfg,
+        issue_num,
+        diff_window=_current_reconcile_window(cfg),
+        confirmation=confirmation,
+    )
 
 
 def _reconcile_body(
@@ -1496,6 +2159,16 @@ def _append_informal_drop_note(body: str, decl_name: str) -> tuple[str, bool]:
 def drop_stale_citation(
     cfg: "ReviewConfig", issue_num: int, decl_name: str, *, dry_run: bool = False
 ) -> dict:
+    """Serialized public wrapper for the explicit destructive citation drop."""
+    with _reconciliation_issue_lock(cfg, issue_num):
+        return _drop_stale_citation_unlocked(
+            cfg, issue_num, decl_name, dry_run=dry_run
+        )
+
+
+def _drop_stale_citation_unlocked(
+    cfg: "ReviewConfig", issue_num: int, decl_name: str, *, dry_run: bool = False
+) -> dict:
     """HUMAN-TRIGGERED drop of a confirmed DEAD citation — the one-click escape
     the auto-reconciler can't safely make. When an issue cites a decl that was
     DELIBERATELY removed from the code (folded/duplicated away — not renamed,
@@ -1541,6 +2214,13 @@ def drop_stale_citation(
 
     repo = cfg.github_repo
     repo_dir = Path(cfg.repo_dir)
+
+    sha = head_sha(repo_dir)
+    if not sha or not _source_is_clean_revision(repo_dir, sha):
+        return {
+            "ok": False, "dropped": False,
+            "message": "source is dirty or has no stable HEAD; citation was not dropped",
+        }
 
     body = _issue_body(issue_num, repo)
     if body is None:
@@ -1620,6 +2300,22 @@ def drop_stale_citation(
     if dry_run:
         result["new_body"] = new_body
         return result
+    if not _source_is_clean_revision(repo_dir, sha):
+        return {
+            "ok": False, "dropped": False,
+            "message": (
+                "source changed while the citation drop was being prepared; "
+                "no edit was made"
+            ),
+        }
+    if not _remote_body_unchanged(repo, issue_num, body):
+        return {
+            "ok": False, "dropped": False,
+            "message": (
+                "issue body changed while the citation drop was being prepared; "
+                "no edit was made"
+            ),
+        }
     _gh_edit_body(repo, issue_num, new_body)
     return result
 
@@ -1738,6 +2434,7 @@ def _reconcile_declarations_format(
     chapter: "Optional[int]" = None,
     live_names: "Optional[list[str]]" = None,
     allow_reopened: bool = False,
+    confirmation: "Optional[dict]" = None,
 ) -> dict:
     """Reconcile a ``### Lean declarations`` (chapter-intake) body: TWO edits,
     mirroring the signatures path —
@@ -1832,10 +2529,53 @@ def _reconcile_declarations_format(
         and s["decl"].rsplit(".", 1)[-1] not in folded_leaves
     ]
 
+    proposed_renames, proposed_splits = _apply_persisted_dismissals(
+        cfg, issue_num, body, proposed_renames, proposed_splits
+    )
+    (
+        confirmed_renames, confirmed_splits,
+        dismissed_renames, dismissed_splits,
+        proposed_renames, proposed_splits,
+        proposal_token, confirmation_error,
+    ) = _promote_confirmed_proposals(
+        issue_num=issue_num,
+        sha=sha,
+        body=body,
+        proposed_renames=proposed_renames,
+        proposed_splits=proposed_splits,
+        confirmation=confirmation,
+    )
+    if confirmation_error is not None:
+        return {
+            **empty,
+            "ok": False,
+            "sha": sha,
+            "kept_stale": kept_stale,
+            "proposed_renames": proposed_renames,
+            "proposed_splits": proposed_splits,
+            "proposal_token": proposal_token,
+            "confirmation_conflict": True,
+            "message": f"#{issue_num}: {confirmation_error}",
+        }
+    if dismissed_renames or dismissed_splits:
+        _record_reconciliation_dismissal(
+            cfg, issue_num, body,
+            dismissed_renames, dismissed_splits,
+        )
+    if confirmed_renames or confirmed_splits:
+        renamed.extend(confirmed_renames)
+        splits.extend(confirmed_splits)
+        confirmed_old = {
+            *[item["old"] for item in confirmed_renames],
+            *[item["old"] for item in confirmed_splits],
+        }
+        kept_stale = [name for name in kept_stale if name not in confirmed_old]
+
     # Token-overlap and sole-pair mappings are useful review hints, but git only
     # proves that declarations changed in the same window.  It does not prove
     # identity.  Never rewrite either body format from that heuristic.
-    if proposed_renames or proposed_splits:
+    if ((proposed_renames or proposed_splits)
+            and not (confirmed_renames or confirmed_splits)):
         frozen = _issue_is_frozen(cfg, issue_num, cited_set) and not allow_reopened
         return {
             **empty, "sha": sha, "kept_stale": kept_stale,
@@ -1851,6 +2591,7 @@ def _reconcile_declarations_format(
             "suppressed_adds": list(add_only) if frozen else [],
             "proposed_renames": [dict(r) for r in proposed_renames],
             "proposed_splits": [dict(s) for s in proposed_splits],
+            "proposal_token": proposal_token,
             "message": (
                 f"#{issue_num}"
                 + (" is verified/frozen — " if frozen else ": ")
@@ -1885,17 +2626,34 @@ def _reconcile_declarations_format(
     kept_stale.extend(sg["old"] for sg in splits if sg not in splits_ok)
 
     if not renamed and not splits_ok and not add_only and not confirmed_deletes:
-        return {**empty, "sha": sha, "kept_stale": kept_stale,
-                "message": f"#{issue_num}: already reconciled ({len(kept_stale)} "
-                           "stale declaration(s) kept)"}
+        return {
+            **empty, "sha": sha, "kept_stale": kept_stale,
+            "dismissed_renames": dismissed_renames,
+            "dismissed_splits": dismissed_splits,
+            "message": (
+                f"#{issue_num}: "
+                + (f"dismissed {len(dismissed_renames) + len(dismissed_splits)} "
+                   "identity proposal(s); " if dismissed_renames or dismissed_splits else "")
+                + f"already reconciled ({len(kept_stale)} stale declaration(s) kept)"
+            ),
+        }
 
     # VERIFIED-ISSUE SAFETY: a human-verified/frozen statement is NEVER silently
     # rewritten — renames/splits are flagged for a human, the ADD suppressed, and
     # NO write path reaches ``_gh_edit_body``.
     if _issue_is_frozen(cfg, issue_num, cited_set) and not allow_reopened:
         return {**empty, "sha": sha, "kept_stale": kept_stale,
-                "flagged_renames": [dict(r) for r in renamed],
-                "flagged_splits": [dict(s) for s in splits_ok],
+                "flagged_renames": [
+                    *[dict(r) for r in renamed],
+                    *[dict(r) for r in proposed_renames],
+                ],
+                "flagged_splits": [
+                    *[dict(s) for s in splits_ok],
+                    *[dict(s) for s in proposed_splits],
+                ],
+                "proposed_renames": [dict(r) for r in proposed_renames],
+                "proposed_splits": [dict(s) for s in proposed_splits],
+                "proposal_token": proposal_token,
                 "flagged_deletes": list(confirmed_deletes),
                 "suppressed_adds": list(add_only),
                 "message": (
@@ -1967,6 +2725,9 @@ def _reconcile_declarations_format(
         "ok": True, "updated": True, "added": added_names,
         "renamed": applied, "splits": [dict(s) for s in splits_applied],
         "kept_stale": kept_stale, "flagged_renames": [], "sha": sha,
+        "proposed_renames": [dict(r) for r in proposed_renames],
+        "proposed_splits": [dict(s) for s in proposed_splits],
+        "proposal_token": None,
         "message": (
             f"#{issue_num} declarations reconciled to {sha[:7]}: "
             f"{len(added_names)} added, {len(applied)} renamed, "
@@ -1977,6 +2738,30 @@ def _reconcile_declarations_format(
         result["new_body"] = new_body
         result["updated"] = False
         return result
+    if not _source_is_clean_revision(Path(cfg.repo_dir), sha):
+        return {
+            **empty, "ok": False, "sha": sha,
+            "source_conflict": True,
+            "message": (
+                f"#{issue_num}: source changed while reconciliation was "
+                "being prepared; no edit was made — reload and retry"
+            ),
+        }
+    if not _remote_body_unchanged(cfg.github_repo, issue_num, body):
+        return {
+            **empty,
+            "ok": False,
+            "sha": sha,
+            "kept_stale": kept_stale,
+            "proposed_renames": [dict(r) for r in proposed_renames],
+            "proposed_splits": [dict(s) for s in proposed_splits],
+            "confirmation_conflict": confirmation is not None,
+            "body_conflict": True,
+            "message": (
+                f"#{issue_num}: issue body changed while reconciliation was "
+                "being prepared; no edit was made — reload and retry"
+            ),
+        }
     _gh_edit_body(cfg.github_repo, issue_num, new_body)
     return result
 

@@ -16,14 +16,18 @@ one step are recorded but don't fail subsequent steps.
   Results are appended to a ``marathon-ratings.jsonl`` file in the workdir.
 """
 
+import hashlib
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import urlencode
 
 from marathon.claude_proc import run_claude
 
@@ -101,6 +105,14 @@ class PipelineConfig:
     # Owner/name of the GitHub repo. Inferred from ``gh repo view``
     # if None. Required when ``auto_pr`` is True.
     auto_pr_repo: Optional[str] = None
+    # Explicit publication branch selected by the caller.  The conductor uses
+    # a verdict-generation suffix when the legacy per-issue branch already
+    # exists remotely, so a later rejection cannot overwrite an older PR head.
+    auto_pr_branch: Optional[str] = None
+    # Remote branch OID observed before branch preparation. ``""`` means the
+    # ref was affirmatively absent; ``None`` is the legacy/unobserved mode.
+    # Publication uses this as an explicit force-with-lease expectation.
+    auto_pr_expected_remote_oid: Optional[str] = None
     # Sub-issue number this iteration is addressing. Set by refine
     # from ``--review-rejection N``. Used to (1) name the branch
     # deterministically per-issue and (2) link the PR back to the
@@ -373,17 +385,36 @@ def run_lake_build(
     would be wrongly tagged ``[build:OK]`` at rc=0."""
     if not shutil.which("lake"):
         return BuildResult(skipped_reason="lake CLI not on PATH")
+
+    selected_targets = targets or []
+    if selected_targets:
+        preview = ", ".join(selected_targets[:3])
+        if len(selected_targets) > 3:
+            preview += f", … (+{len(selected_targets) - 3} more)"
+        scope = f"{len(selected_targets)} explicit target(s): {preview}"
+    else:
+        scope = "default targets"
+    print(
+        f"  build: starting lake build ({scope}; timeout {timeout}s)",
+        flush=True,
+    )
+
     started = datetime.now()
+    # Give the build an isolated process group.  Lake fans out into Lean
+    # compiler children; killing only the direct ``lake`` process on a timeout
+    # leaves those children orphaned and still writing artifacts.
+    proc = subprocess.Popen(
+        ["lake", "build", *selected_targets],
+        cwd=str(repo_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            ["lake", "build", *(targets or [])],
-            cwd=str(repo_dir),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        _terminate_build_process_group(proc)
         elapsed = (datetime.now() - started).total_seconds()
         return BuildResult(
             ok=False,
@@ -391,14 +422,54 @@ def run_lake_build(
             timed_out=True,
             log_tail=f"timed out after {timeout}s",
         )
+    except BaseException:
+        # Ctrl-C/SystemExit must not strand Lake's compiler subtree either.
+        # Preserve the original exception after best-effort teardown/reaping.
+        _terminate_build_process_group(proc)
+        raise
 
     elapsed = (datetime.now() - started).total_seconds()
-    log_tail = _summarize_build_log(proc.stdout or "", proc.stderr or "")
+    log_tail = _summarize_build_log(stdout or "", stderr or "")
     return BuildResult(
         ok=proc.returncode == 0,
         duration_seconds=elapsed,
         log_tail=log_tail or None,
     )
+
+
+_BUILD_TERMINATION_GRACE_SECONDS = 5.0
+
+
+def _terminate_build_process_group(
+    proc: subprocess.Popen[str],
+    *,
+    grace_seconds: float = _BUILD_TERMINATION_GRACE_SECONDS,
+) -> None:
+    """Terminate and reap a ``lake build`` process group.
+
+    ``run_lake_build`` starts Lake with ``start_new_session=True``, so the
+    direct child's PID is also the process-group ID shared by its Lean
+    descendants.  Give the whole group a short graceful shutdown window, then
+    escalate to SIGKILL so a compiler that ignores SIGTERM cannot outlive the
+    build verdict.
+    """
+
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    try:
+        proc.communicate(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.communicate()
 
 
 def run_git_commit(
@@ -581,7 +652,11 @@ def _extra_chapters_in_writes(
 
 
 def _branch_name_for_issue(
-    chapter_label: str, issue_num: Optional[int], *, kind: str = "refine"
+    chapter_label: str,
+    issue_num: Optional[int],
+    *,
+    kind: str = "refine",
+    generation: Optional[str] = None,
 ) -> str:
     """Return the dedicated marathon branch name for an iteration.
 
@@ -599,8 +674,40 @@ def _branch_name_for_issue(
     chap_digits = "".join(ch for ch in chapter_label if ch.isdigit())
     chap = chap_digits or "?"
     if issue_num is not None:
-        return f"marathon/{kind}-c{chap}-i{issue_num}"
-    return f"marathon/{kind}-c{chap}"
+        branch = f"marathon/{kind}-c{chap}-i{issue_num}"
+    else:
+        branch = f"marathon/{kind}-c{chap}"
+    if generation:
+        # A timestamp itself is unsuitable in a ref (spaces, colons, timezone
+        # punctuation).  Hashing also keeps branch lengths bounded while making
+        # a human re-reject deterministic across conductor restarts.
+        token = hashlib.sha256(generation.encode("utf-8")).hexdigest()[:12]
+        branch += f"-v{token}"
+    return branch
+
+
+def observe_remote_branch(
+    repo_dir: Path, branch: str,
+) -> tuple[bool, Optional[str], str]:
+    """Read one remote branch without mutating local remote-tracking refs.
+
+    Returns ``(ok, oid, message)``.  ``oid is None`` means the remote ref was
+    affirmatively absent; ``ok is False`` means its state could not be known.
+    Callers must not publish on an unknown expectation.
+    """
+    ref = f"refs/heads/{branch}"
+    proc = subprocess.run(
+        ["git", "ls-remote", "--heads", "origin", ref],
+        cwd=str(repo_dir), capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        detail = ((proc.stderr or proc.stdout) or "unknown error").strip()
+        return False, None, f"git ls-remote {ref} failed: {detail[:200]}"
+    for line in (proc.stdout or "").splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == ref:
+            return True, fields[0], f"observed {branch}@{fields[0][:12]}"
+    return True, None, f"observed {branch} absent"
 
 
 def _gh(*args: str, cwd: Optional[Path] = None, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -670,6 +777,7 @@ def prepare_auto_pr_branch(
     base: str = "main",
     kind: str = "refine",
     continue_remote_branch: bool = False,
+    branch_name: Optional[str] = None,
 ) -> tuple[bool, str, str]:
     """Check out the marathon branch for this iteration, resetting to
     ``origin/<base>`` so each iteration's diff is clean.
@@ -686,7 +794,9 @@ def prepare_auto_pr_branch(
     ``kind`` selects the branch prefix: ``"refine"`` (→ ``main``) or
     ``"proof"`` (a fill, → the prover branch). ``base`` is the branch the
     iteration resets onto and the PR targets — the prover branch for a proof."""
-    branch = _branch_name_for_issue(chapter_label, issue_num, kind=kind)
+    branch = branch_name or _branch_name_for_issue(
+        chapter_label, issue_num, kind=kind
+    )
 
     # Fetch latest base to ensure the reset target is current.
     fetch = subprocess.run(
@@ -1008,14 +1118,13 @@ def _existing_pr_number(
 ) -> Optional[int]:
     """Return the number of an open PR with the given head branch, or
     None if no such PR exists."""
-    # ``gh pr list --head <branch>`` returns matching PRs; --json + jq
-    # gives us the number without parsing the human-readable output.
+    # Use GitHub's REST endpoint directly. ``gh pr list`` and ``gh repo view``
+    # are GraphQL-backed; exhausting that quota used to make a fully-completed
+    # iteration skip publication even though the REST quota was healthy.
+    owner = repo.split("/", 1)[0]
+    query = urlencode({"head": f"{owner}:{head}", "state": "open", "per_page": 1})
     proc = _gh(
-        "pr", "list",
-        "--repo", repo,
-        "--head", head,
-        "--state", "open",
-        "--json", "number",
+        "api", f"repos/{repo}/pulls?{query}",
         "--jq", ".[0].number // empty",
         cwd=repo_dir,
     )
@@ -1034,52 +1143,80 @@ def open_or_update_pr(
     repo: str,
     title: str,
     body: str,
+    expected_remote_oid: Optional[str] = None,
+    local_commit_sha: Optional[str] = None,
 ) -> tuple[bool, str]:
-    """Push ``branch`` (force) and open-or-update its PR. Returns
-    ``(ok, url_or_error)``."""
-    # Force-push to an EXPLICIT refspec so the push is robust to two failure
-    # modes that silently stranded #98: (1) a branch upstream that doesn't match
-    # the branch name (push.default=simple → "upstream does not match"), and
-    # (2) a STALE remote-tracking ref left after the branch was deleted on a prior
-    # merge, which makes --force-with-lease reject the push as "stale info". The
-    # per-issue persistent-branch model has a single writer (this daemon), so a
-    # plain --force with an explicit ``HEAD:refs/heads/<branch>`` is safe and
-    # avoids relying on the (possibly stale) lease.
-    push = subprocess.run(
-        ["git", "push", "--force", "origin", f"HEAD:refs/heads/{branch}"],
-        cwd=str(repo_dir), capture_output=True, text=True, check=False,
+    """Safely publish ``branch`` and open-or-update its PR.
+
+    Publication is a compare-and-swap against the remote OID observed before
+    branch preparation. It never uses plain ``--force``: an old or unrelated
+    remote ref cannot be silently overwritten, and a concurrent update makes
+    the explicit lease fail. On a PR-only retry, a remote already at
+    ``local_commit_sha`` proves the earlier push landed and is not repeated.
+    """
+    observed_ok, observed_oid, observed_msg = observe_remote_branch(repo_dir, branch)
+    if not observed_ok:
+        return False, observed_msg
+    observed = observed_oid or ""
+    expected = observed if expected_remote_oid is None else expected_remote_oid
+    already_pushed = bool(
+        observed_oid
+        and local_commit_sha
+        and observed_oid.startswith(local_commit_sha)
     )
-    if push.returncode != 0:
-        return False, f"git push failed: {(push.stderr or push.stdout).strip()[:300]}"
+    if observed != expected and not already_pushed:
+        return False, (
+            f"remote branch changed since preparation ({branch}@"
+            f"{observed[:12] or '<absent>'} != expected "
+            f"{expected[:12] or '<absent>'}); refusing to overwrite it"
+        )
+    if not already_pushed:
+        ref = f"refs/heads/{branch}"
+        push = subprocess.run(
+            [
+                "git", "push", f"--force-with-lease={ref}:{expected}",
+                "origin", f"HEAD:{ref}",
+            ],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
+        )
+        if push.returncode != 0:
+            return False, (
+                "git push failed: "
+                f"{(push.stderr or push.stdout).strip()[:300]}"
+            )
 
     existing = _existing_pr_number(repo, branch, repo_dir)
     if existing is not None:
         # Update the existing PR's title + body so the next reviewer
         # sees the freshest iteration's status.
         ed = _gh(
-            "pr", "edit", str(existing),
-            "--repo", repo,
-            "--title", title,
-            "--body", body,
+            "api", "--method", "PATCH", f"repos/{repo}/pulls/{existing}",
+            "-f", f"title={title}",
+            "-f", f"body={body}",
             cwd=repo_dir,
         )
         if ed.returncode != 0:
-            return False, f"gh pr edit #{existing} failed: {(ed.stderr or ed.stdout).strip()[:300]}"
+            return False, (
+                f"GitHub REST PR update #{existing} failed: "
+                f"{(ed.stderr or ed.stdout).strip()[:300]}"
+            )
         return True, f"https://github.com/{repo}/pull/{existing}"
 
     # No existing PR — open a fresh one.
     cr = _gh(
-        "pr", "create",
-        "--repo", repo,
-        "--base", base,
-        "--head", branch,
-        "--title", title,
-        "--body", body,
+        "api", "--method", "POST", f"repos/{repo}/pulls",
+        "-f", f"base={base}",
+        "-f", f"head={branch}",
+        "-f", f"title={title}",
+        "-f", f"body={body}",
+        "--jq", ".html_url",
         cwd=repo_dir,
     )
     if cr.returncode != 0:
-        return False, f"gh pr create failed: {(cr.stderr or cr.stdout).strip()[:300]}"
-    # gh prints the new PR URL as the last line of stdout.
+        return False, (
+            "GitHub REST PR create failed: "
+            f"{(cr.stderr or cr.stdout).strip()[:300]}"
+        )
     url = cr.stdout.strip().splitlines()[-1] if cr.stdout else ""
     return True, url
 
@@ -1138,6 +1275,12 @@ def retry_pending_publication(
             repo=str(pending["repo"]),
             title=str(pending["title"]),
             body=str(pending["body"]),
+            expected_remote_oid=(
+                str(pending["expected_remote_oid"])
+                if pending.get("expected_remote_oid") is not None
+                else None
+            ),
+            local_commit_sha=expected_head,
         )
     return False, f"unknown pending publication kind: {kind!r}"
 
@@ -1854,11 +1997,18 @@ def run_post_pipeline(
         try:
             repo = config.auto_pr_repo or _infer_repo(repo_dir)
             if repo is None:
-                print("  pr: skipped — could not infer GitHub repo "
-                      "(set --auto-pr-repo or run `gh auth login`)")
+                # Requested publication that cannot identify its destination
+                # is a failure, not a successful/skipped iteration.  refine
+                # will preserve the clean commit and enter publication-only
+                # recovery instead of letting the conductor suppress the
+                # still-rejected issue as "iterated".
+                out["pr_ok"] = False
+                print("  pr: failed — could not infer GitHub repo "
+                      "(set --auto-pr-repo explicitly)")
             else:
-                branch = _branch_name_for_issue(
-                    chapter_label, config.auto_pr_review_issue,
+                branch = config.auto_pr_branch or _branch_name_for_issue(
+                    chapter_label,
+                    config.auto_pr_review_issue,
                     kind=(
                         "proof" if config.fill_run
                         else "repair" if config.repair_run
@@ -2016,6 +2166,9 @@ def run_post_pipeline(
                         "repo": repo,
                         "title": pr_title,
                         "body": pr_body,
+                        "expected_remote_oid": (
+                            config.auto_pr_expected_remote_oid
+                        ),
                     }
                     # Persist the recovery recipe in the result *before* the
                     # network call so an exception is as recoverable as a
@@ -2028,6 +2181,10 @@ def run_post_pipeline(
                         repo=repo,
                         title=pr_title,
                         body=pr_body,
+                        expected_remote_oid=(
+                            config.auto_pr_expected_remote_oid
+                        ),
+                        local_commit_sha=out["commit"].sha,
                     )
                     out["pr_ok"] = pr_ok
                     if pr_ok:

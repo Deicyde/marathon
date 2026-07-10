@@ -391,11 +391,25 @@ def _load_context(
     # / ledger deps are lazy (mirrors the review CLI's audit↔review
     # boundary discipline).
     from marathon.audit.engine import load_snapshot
-    from marathon.review.github import fetch_issues_bulk
+    from marathon.review.github import fetch_issues_bulk, fetch_issues_rest_bulk
 
     snapshot = load_snapshot(cfg.repo_dir)
     tiers_by_decl = _tiers_by_decl(cfg, snapshot)
-    issue_meta = fetch_issues_bulk(issue_nums, cfg.github_repo) or {}
+    requested = list(dict.fromkeys(int(n) for n in issue_nums))
+    try:
+        issue_meta = fetch_issues_bulk(requested, cfg.github_repo) or {}
+    except Exception:  # noqa: BLE001 - read-side GitHub outage degrades honestly
+        issue_meta = {}
+    # Preserve the one-call GraphQL fast path. REST is live, uncached, and only
+    # fills numbers GraphQL did not return (including whole-call failure).
+    missing = [n for n in requested if n not in issue_meta]
+    if missing:
+        try:
+            issue_meta.update(
+                fetch_issues_rest_bulk(missing, cfg.github_repo)
+            )
+        except Exception:  # noqa: BLE001 - metadata is optional deck context
+            pass
     verdict_status = _verdict_status(cfg, issue_meta)
     return _DeckContext(
         snapshot=snapshot,

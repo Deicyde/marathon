@@ -217,6 +217,10 @@ def run_one_refine(
     dispatch_state = load_state(cfg).issues.get(focus_issue)
     if dispatch_state is not None:
         cmd += ["--review-verdict-ts", dispatch_state.verdict_ts]
+    # Repo identity is already authoritative configuration. Passing it avoids
+    # a GraphQL-backed `gh repo view` inference at the end of an otherwise
+    # successful, billed refine session.
+    cmd += ["--auto-pr-repo", cfg.github_repo]
     cmd += DEFAULT_REFINE_ARGS
     print(
         f"\n--- marathon refine starting (focus #{focus_issue}): "
