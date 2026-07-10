@@ -72,9 +72,12 @@ set as a single batch. The prior single-hash design lost any
 rejection that arrived during a refine iteration — see
 ``pending_rejections_needing_iteration`` for the corrected query.
 
-Concurrent writes are not protected; the CLI's per-issue command
-granularity makes overlap rare and the worst-case is a lost write
-that the next ``reject``/``verify`` reapplies.
+Every read-modify-write is serialized across both threads and processes.  The
+lock lives at a stable path beside ``state.json`` (the data file itself is
+atomically replaced, so locking that replaceable inode would be ineffective),
+and combines an in-process :class:`threading.RLock` with ``flock``.  Human
+verdict mirrors (``verdicts.jsonl`` + SQLite) are written while that same lock
+is held, preserving verdict order across the three stores.
 
 **Phase-1 dual-write (docs/marathon-v2-plan.md §3 Phase 1).** Every
 ``record_*`` write additionally mirrors into the SQLite ledger at
@@ -91,22 +94,34 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from fcntl import LOCK_EX, LOCK_SH, LOCK_UN, flock
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 
 from marathon.review.config import ReviewConfig
 
 
 SCHEMA_VERSION = 1
 STATE_RELPATH = Path(".marathon/review/state.json")
+# Stable advisory-lock inode.  Never replace or unlink this file: state.json is
+# replaced atomically on every write, so using state.json itself as the flock
+# target would let two processes lock different inodes after a replace.
+STATE_LOCK_RELPATH = Path(".marathon/review/runner-locks/state.lock")
 # Tracked, append-only, merge-friendly verdict log (one JSON object per
 # line, stable key order, never rewritten — the wall-time-v2-sidecar
 # pattern). Exists for git provenance of human verdicts: the
 # GeometricAnalysis operator hand-made PR #74 just to record a verify
 # in git, which this file makes a one-line auto-appended diff instead.
 VERDICTS_RELPATH = Path(".marathon/review/verdicts.jsonl")
+
+
+class CorruptReviewStateError(RuntimeError):
+    """A mutation refused to overwrite an unparseable review state file."""
 
 
 @dataclass
@@ -129,6 +144,16 @@ class IssueState:
                                              # Default 0 keeps older state
                                              # files (which lack the field)
                                              # loading unchanged.
+    # A clean refine has finished, but the conductor could not determine
+    # whether its branch has a PR because GitHub was temporarily unavailable.
+    # While set, needs_iteration remains False and later conductor ticks retry
+    # only the cheap PR check (never another Aristotle session).
+    pending_pr_branch: Optional[str] = None
+    # Branch produced by the clean iteration for this verdict. Unlike
+    # pending_pr_branch (transient GitHub uncertainty), this remains until the
+    # verdict changes/requeues and lets automerge reject stale/unowned PRs.
+    iteration_branch: Optional[str] = None
+    iteration_commit_sha: Optional[str] = None
 
     def needs_iteration(self) -> bool:
         """A rejection needs iteration iff status=='rejected' and either
@@ -143,7 +168,16 @@ class IssueState:
             return False
         if self.last_iteration_ts is None:
             return True
-        return self.last_iteration_ts < self.verdict_ts
+        try:
+            last = datetime.fromisoformat(
+                self.last_iteration_ts.replace("Z", "+00:00")
+            )
+            verdict = datetime.fromisoformat(self.verdict_ts.replace("Z", "+00:00"))
+            return last < verdict
+        except ValueError:
+            # Malformed legacy timestamps retain the previous conservative
+            # string behavior rather than making the entry unreadable.
+            return self.last_iteration_ts < self.verdict_ts
 
 
 @dataclass
@@ -171,6 +205,21 @@ class ReviewState:
                     # written before the retry feature byte-identical on
                     # round-trip.
                     **({"attempts": st.attempts} if st.attempts else {}),
+                    **(
+                        {"pending_pr_branch": st.pending_pr_branch}
+                        if st.pending_pr_branch is not None
+                        else {}
+                    ),
+                    **(
+                        {"iteration_branch": st.iteration_branch}
+                        if st.iteration_branch is not None
+                        else {}
+                    ),
+                    **(
+                        {"iteration_commit_sha": st.iteration_commit_sha}
+                        if st.iteration_commit_sha is not None
+                        else {}
+                    ),
                 }
                 for num, st in sorted(self.issues.items())
             },
@@ -181,10 +230,38 @@ def state_path(cfg: ReviewConfig) -> Path:
     return cfg.repo_dir / STATE_RELPATH
 
 
-def load_state(cfg: ReviewConfig) -> ReviewState:
+def state_lock_path(cfg: ReviewConfig) -> Path:
+    """Stable cross-process lock path for review state transactions."""
+    return cfg.repo_dir / STATE_LOCK_RELPATH
+
+
+# ``flock`` alone is process-scoped on some platforms and does not reliably
+# serialize independent threads in one interpreter.  The RLock covers that
+# layer and permits helpers in the same transaction to remain composable.
+_STATE_RLOCK = threading.RLock()
+
+
+@contextmanager
+def _state_lock(cfg: ReviewConfig, *, exclusive: bool):
+    """Hold the stable review-state lock until the surrounding operation ends."""
+    lock_path = state_lock_path(cfg)
+    with _STATE_RLOCK:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # a+ creates once but never truncates/replaces: the inode stays stable.
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            flock(lock_file.fileno(), LOCK_EX if exclusive else LOCK_SH)
+            try:
+                yield
+            finally:
+                flock(lock_file.fileno(), LOCK_UN)
+
+
+def _load_state_unlocked(
+    cfg: ReviewConfig, *, fail_on_corrupt: bool = False
+) -> ReviewState:
     """Load state.json. Returns an empty state if the file doesn't exist
     or is unparseable (logged but non-fatal — callers can `record_*`
-    against a fresh empty state)."""
+    against a fresh empty state). Caller must hold ``_state_lock``."""
     path = state_path(cfg)
     if not path.is_file():
         return ReviewState(issues={})
@@ -192,38 +269,161 @@ def load_state(cfg: ReviewConfig) -> ReviewState:
         data = json.loads(path.read_text())
     except json.JSONDecodeError as e:
         print(f"  warning: {path} unparseable ({e}); treating as empty state")
+        if fail_on_corrupt:
+            raise CorruptReviewStateError(
+                f"refusing to overwrite corrupt review state at {path}: {e}"
+            ) from e
+        return ReviewState(issues={})
+    if (
+        not isinstance(data, dict)
+        or data.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION
+        or not isinstance(data.get("issues", {}), dict)
+    ):
+        message = f"{path} has an invalid/unsupported review-state schema"
+        print(f"  warning: {message}; treating as empty state")
+        if fail_on_corrupt:
+            raise CorruptReviewStateError(f"refusing to overwrite: {message}")
         return ReviewState(issues={})
     raw_issues = data.get("issues", {})
     issues: dict[int, IssueState] = {}
     for key, val in raw_issues.items():
         try:
-            issues[int(key)] = IssueState(
-                status=val["status"],
-                verdict_ts=val["verdict_ts"],
+            issue_num = int(key)
+            if not isinstance(val, dict):
+                raise ValueError("entry is not an object")
+            status = val["status"]
+            verdict_ts = val["verdict_ts"]
+            if status not in {"rejected", "verified", "stalled"}:
+                raise ValueError(f"unknown status {status!r}")
+            if not isinstance(verdict_ts, str) or not verdict_ts:
+                raise ValueError("verdict_ts is not a non-empty string")
+            pending_branch = val.get("pending_pr_branch")
+            if pending_branch is not None and not isinstance(pending_branch, str):
+                raise ValueError("pending_pr_branch is not a string")
+            iteration_branch = val.get("iteration_branch")
+            if iteration_branch is not None and not isinstance(iteration_branch, str):
+                raise ValueError("iteration_branch is not a string")
+            iteration_commit_sha = val.get("iteration_commit_sha")
+            if iteration_commit_sha is not None and not isinstance(
+                iteration_commit_sha, str
+            ):
+                raise ValueError("iteration_commit_sha is not a string")
+            issues[issue_num] = IssueState(
+                status=status,
+                verdict_ts=verdict_ts,
                 notes=val.get("notes"),
                 last_iteration_ts=val.get("last_iteration_ts"),
                 # Absent in state files written before the daemon grew
                 # retry tracking — default to 0, never an error.
                 attempts=int(val.get("attempts", 0)),
+                pending_pr_branch=pending_branch,
+                iteration_branch=iteration_branch,
+                iteration_commit_sha=iteration_commit_sha,
             )
-        except (KeyError, ValueError) as e:
+        except (KeyError, TypeError, ValueError) as e:
             print(f"  warning: {path} issue {key!r} malformed ({e}); skipping")
+            if fail_on_corrupt:
+                raise CorruptReviewStateError(
+                    f"refusing to overwrite malformed issue {key!r} in {path}: {e}"
+                ) from e
     return ReviewState(issues=issues)
 
 
-def save_state(cfg: ReviewConfig, state: ReviewState) -> None:
-    """Atomic-ish write: write to ``state.json.tmp`` then rename."""
+def load_state(cfg: ReviewConfig) -> ReviewState:
+    """Load one consistent state snapshot under the stable shared lock."""
+    with _state_lock(cfg, exclusive=False):
+        return _load_state_unlocked(cfg)
+
+
+def _save_state_unlocked(cfg: ReviewConfig, state: ReviewState) -> None:
+    """Durably write then atomically replace state.json; caller holds lock."""
     path = state_path(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(state.to_json(), indent=2) + "\n")
-    tmp.replace(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = json.dumps(state.to_json(), indent=2) + "\n"
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        # Best-effort directory fsync makes the rename durable across a crash.
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def save_state(cfg: ReviewConfig, state: ReviewState) -> None:
+    """Atomically replace state with a caller-provided complete snapshot.
+
+    Production read-modify-write callers use :func:`_update_state` so their
+    read is refreshed *inside* the same lock.  This lower-level API remains for
+    migrations/tests that intentionally replace the whole document.
+    """
+    with _state_lock(cfg, exclusive=True):
+        _save_state_unlocked(cfg, state)
+
+
+_T = TypeVar("_T")
+
+
+def _update_state(
+    cfg: ReviewConfig,
+    mutator: Callable[[ReviewState], tuple[_T, bool]],
+    *,
+    after_save: Optional[Callable[[_T], None]] = None,
+) -> _T:
+    """Fresh-load, mutate, and atomic-replace under one stable lock.
+
+    ``mutator`` returns ``(result, changed)``.  It runs while the lock is held;
+    ``after_save`` runs after the atomic JSON replacement but before releasing
+    the lock.  Human-verdict callers use it for JSONL/SQLite mirrors, preserving
+    the same total order across all stores.
+    """
+    with _state_lock(cfg, exclusive=True):
+        state = _load_state_unlocked(cfg, fail_on_corrupt=True)
+        result, changed = mutator(state)
+        if changed:
+            _save_state_unlocked(cfg, state)
+            if after_save is not None:
+                after_save(result)
+        return result
 
 
 def _now_iso() -> str:
     # Local-timezone ISO 8601 with offset, matching the prior verdict-ts
     # style seen in issue comments. astimezone() picks the local TZ.
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    return datetime.now().astimezone().isoformat(timespec="microseconds")
+
+
+def _next_verdict_ts(previous: Optional[str]) -> str:
+    """A strictly-new verdict generation encoded as an ISO timestamp.
+
+    Microseconds avoid the old same-second collision, while the explicit
+    monotonic bump makes the token safe even under a frozen/coarse test clock.
+    Completion callbacks compare this token exactly (CAS), not by wall time.
+    """
+    candidate = _now_iso()
+    if not previous:
+        return candidate
+    try:
+        current_dt = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        previous_dt = datetime.fromisoformat(previous.replace("Z", "+00:00"))
+        if current_dt <= previous_dt:
+            return (previous_dt + timedelta(microseconds=1)).isoformat(
+                timespec="microseconds"
+            )
+    except ValueError:
+        # A malformed legacy timestamp is still replaced with a fresh token.
+        pass
+    return candidate
 
 
 # --- Phase-1 dual-write shim (docs/marathon-v2-plan.md §3 Phase 1) ----------
@@ -344,19 +544,111 @@ def record_rejection(cfg: ReviewConfig, issue_num: int, notes: str) -> IssueStat
     Phase-1 dual-write: also mirrored into the ledger (issues row + one
     verdict_events row) and appended to the tracked ``verdicts.jsonl``;
     both are best-effort and never block the legacy write."""
-    state = load_state(cfg)
-    entry = IssueState(
-        status="rejected",
-        verdict_ts=_now_iso(),
-        notes=notes.strip(),
-        last_iteration_ts=None,
-        attempts=0,
-    )
-    state.issues[issue_num] = entry
-    save_state(cfg, state)
-    _append_verdict_jsonl(cfg, issue_num, "rejected", entry.notes, entry.verdict_ts)
-    _ledger_upsert(cfg, issue_num, entry, verdict_event="rejected")
-    return entry
+    def mutate(state: ReviewState) -> tuple[IssueState, bool]:
+        previous = state.issues.get(issue_num)
+        entry = IssueState(
+            status="rejected",
+            verdict_ts=_next_verdict_ts(
+                previous.verdict_ts if previous is not None else None
+            ),
+            notes=notes.strip(),
+            last_iteration_ts=None,
+            attempts=0,
+            pending_pr_branch=None,
+            iteration_branch=None,
+            iteration_commit_sha=None,
+        )
+        state.issues[issue_num] = entry
+        return entry, True
+
+    def mirror(entry: IssueState) -> None:
+        _append_verdict_jsonl(
+            cfg, issue_num, "rejected", entry.notes, entry.verdict_ts
+        )
+        _ledger_upsert(cfg, issue_num, entry, verdict_event="rejected")
+
+    return _update_state(cfg, mutate, after_save=mirror)
+
+
+def record_rejection_if_current(
+    cfg: ReviewConfig,
+    issue_num: int,
+    notes: str,
+    *,
+    expected_status: str,
+    expected_verdict_ts: str,
+) -> Optional[IssueState]:
+    """CAS re-reject/requeue against one exact currently-observed verdict.
+
+    Web/API flows should converge their external label transition first, then
+    call this helper. A concurrent verify or newer re-reject returns ``None``
+    instead of being overwritten. Successful transitions retain the same
+    ordered state.json + verdict JSONL + ledger transaction as
+    :func:`record_rejection`.
+    """
+    def mutate(state: ReviewState) -> tuple[Optional[IssueState], bool]:
+        current = state.issues.get(issue_num)
+        if (
+            current is None
+            or current.status != expected_status
+            or current.verdict_ts != expected_verdict_ts
+        ):
+            return None, False
+        entry = IssueState(
+            status="rejected",
+            verdict_ts=_next_verdict_ts(current.verdict_ts),
+            notes=notes.strip(),
+            last_iteration_ts=None,
+            attempts=0,
+            pending_pr_branch=None,
+            iteration_branch=None,
+            iteration_commit_sha=None,
+        )
+        state.issues[issue_num] = entry
+        return entry, True
+
+    def mirror(entry: Optional[IssueState]) -> None:
+        if entry is None:
+            return
+        _append_verdict_jsonl(
+            cfg, issue_num, "rejected", entry.notes, entry.verdict_ts
+        )
+        _ledger_upsert(cfg, issue_num, entry, verdict_event="rejected")
+
+    return _update_state(cfg, mutate, after_save=mirror)
+
+
+def record_rejection_if_absent(
+    cfg: ReviewConfig,
+    issue_num: int,
+    notes: str,
+) -> Optional[IssueState]:
+    """Create a rejected verdict only if the issue still has no local row."""
+    def mutate(state: ReviewState) -> tuple[Optional[IssueState], bool]:
+        if issue_num in state.issues:
+            return None, False
+        entry = IssueState(
+            status="rejected",
+            verdict_ts=_next_verdict_ts(None),
+            notes=notes.strip(),
+            last_iteration_ts=None,
+            attempts=0,
+            pending_pr_branch=None,
+            iteration_branch=None,
+            iteration_commit_sha=None,
+        )
+        state.issues[issue_num] = entry
+        return entry, True
+
+    def mirror(entry: Optional[IssueState]) -> None:
+        if entry is None:
+            return
+        _append_verdict_jsonl(
+            cfg, issue_num, "rejected", entry.notes, entry.verdict_ts
+        )
+        _ledger_upsert(cfg, issue_num, entry, verdict_event="rejected")
+
+    return _update_state(cfg, mutate, after_save=mirror)
 
 
 def record_verification(cfg: ReviewConfig, issue_num: int) -> IssueState:
@@ -367,18 +659,28 @@ def record_verification(cfg: ReviewConfig, issue_num: int) -> IssueState:
     Phase-1 dual-write: also mirrored into the ledger (issues row + one
     verdict_events row) and appended to the tracked ``verdicts.jsonl``;
     both are best-effort and never block the legacy write."""
-    state = load_state(cfg)
-    entry = IssueState(
-        status="verified",
-        verdict_ts=_now_iso(),
-        notes=None,
-        last_iteration_ts=None,
-        attempts=0,
-    )
-    state.issues[issue_num] = entry
-    save_state(cfg, state)
-    _append_verdict_jsonl(cfg, issue_num, "verified", None, entry.verdict_ts)
-    _ledger_upsert(cfg, issue_num, entry, verdict_event="verified")
+    def mutate(state: ReviewState) -> tuple[IssueState, bool]:
+        previous = state.issues.get(issue_num)
+        entry = IssueState(
+            status="verified",
+            verdict_ts=_next_verdict_ts(
+                previous.verdict_ts if previous is not None else None
+            ),
+            notes=None,
+            last_iteration_ts=None,
+            attempts=0,
+            pending_pr_branch=None,
+            iteration_branch=None,
+            iteration_commit_sha=None,
+        )
+        state.issues[issue_num] = entry
+        return entry, True
+
+    def mirror(entry: IssueState) -> None:
+        _append_verdict_jsonl(cfg, issue_num, "verified", None, entry.verdict_ts)
+        _ledger_upsert(cfg, issue_num, entry, verdict_event="verified")
+
+    entry = _update_state(cfg, mutate, after_save=mirror)
     # Freeze the verified statements into the approved-statements manifest so a
     # later fill/refine iteration can never change them (the fill guard reverts
     # any signature change). Best-effort — capture must never block a verify.
@@ -391,7 +693,13 @@ def record_verification(cfg: ReviewConfig, issue_num: int) -> IssueState:
     return entry
 
 
-def requeue_for_rereview(cfg: ReviewConfig, issue_num: int) -> bool:
+def requeue_for_rereview(
+    cfg: ReviewConfig,
+    issue_num: int,
+    *,
+    expected_verdict_ts: Optional[str] = None,
+    expected_status: str = "rejected",
+) -> bool:
     """Drop an issue's local verdict so it RE-ENTERS the review queue — used
     after Aristotle's refine fix LANDS and the human must RE-REVIEW the result
     (reject -> refine -> merge -> re-review). Removes the ``state.json`` entry
@@ -399,15 +707,43 @@ def requeue_for_rereview(cfg: ReviewConfig, issue_num: int) -> bool:
     ``review:rejected`` GitHub label, the issue reads as unreviewed and becomes a
     ready card again. Returns True iff an entry was removed. Best-effort — no
     ledger / GitHub / verdicts.jsonl write of its own."""
-    state = load_state(cfg)
-    if issue_num not in state.issues:
-        return False
-    del state.issues[issue_num]
-    save_state(cfg, state)
-    return True
+    def mutate(state: ReviewState) -> tuple[bool, bool]:
+        entry = state.issues.get(issue_num)
+        if entry is None:
+            return False, False
+        if expected_verdict_ts is not None and (
+            entry.status != expected_status or entry.verdict_ts != expected_verdict_ts
+        ):
+            return False, False
+        del state.issues[issue_num]
+        return True, True
+
+    return _update_state(cfg, mutate)
 
 
-def record_iteration(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
+def _completion_matches(
+    entry: Optional[IssueState], expected_verdict_ts: Optional[str]
+) -> bool:
+    """CAS predicate for daemon/conductor completion bookkeeping."""
+    return (
+        entry is not None
+        and entry.status == "rejected"
+        and (
+            expected_verdict_ts is None
+            or entry.verdict_ts == expected_verdict_ts
+        )
+    )
+
+
+def record_iteration(
+    cfg: ReviewConfig,
+    issue_num: int,
+    *,
+    expected_verdict_ts: Optional[str] = None,
+    pending_pr_branch: Optional[str] = None,
+    iteration_branch: Optional[str] = None,
+    iteration_commit_sha: Optional[str] = None,
+) -> Optional[IssueState]:
     """Mark that the daemon dispatched a refine iteration for
     ``issue_num``. Sets ``last_iteration_ts = now()`` on the existing
     state entry. No-ops (with a warning) if no entry exists for the
@@ -421,30 +757,49 @@ def record_iteration(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
     instead — they must NOT consume the rejection (the old
     mark-iterated-regardless behavior silently dropped rejections on
     refine crashes and made the human the retry logic)."""
-    state = load_state(cfg)
-    entry = state.issues.get(issue_num)
-    if entry is None:
-        print(
-            f"  warning: record_iteration(#{issue_num}) called but no "
-            "state.json entry exists; skipping"
-        )
-        return None
-    # Record "at or AFTER the verdict": normally _now_iso() (which postdates a
-    # locally-recorded verdict), but never earlier than verdict_ts. This makes
-    # needs_iteration() go False after one iteration even when verdict_ts is a
-    # GitHub instant slightly ahead of the local clock (the --queue-from-github
-    # path) — otherwise the conductor would re-dispatch every tick. verdict_ts and
-    # _now_iso() share this machine's local offset, so the string max is
-    # chronological.
-    entry.last_iteration_ts = max(_now_iso(), entry.verdict_ts or "")
-    save_state(cfg, state)
-    # Daemon bookkeeping, not a human verdict — mirror the row but
-    # append no verdict_events entry.
-    _ledger_upsert(cfg, issue_num, entry)
-    return entry
+    def mutate(state: ReviewState) -> tuple[Optional[IssueState], bool]:
+        entry = state.issues.get(issue_num)
+        if not _completion_matches(entry, expected_verdict_ts):
+            print(
+                f"  warning: stale record_iteration(#{issue_num}) completion "
+                "does not own the current rejected verdict; skipping"
+            )
+            return None, False
+        assert entry is not None
+        # Record "at or AFTER the verdict": a GitHub instant can be ahead of
+        # the local clock.  Compare datetimes rather than relying on offsets in
+        # ISO strings, but preserve the historical safe fallback.
+        now = _now_iso()
+        try:
+            now_dt = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            verdict_dt = datetime.fromisoformat(
+                entry.verdict_ts.replace("Z", "+00:00")
+            )
+            entry.last_iteration_ts = (
+                max(now_dt, verdict_dt).isoformat(timespec="microseconds")
+            )
+        except ValueError:
+            entry.last_iteration_ts = max(now, entry.verdict_ts or "")
+        entry.pending_pr_branch = pending_pr_branch
+        entry.iteration_branch = iteration_branch or pending_pr_branch
+        entry.iteration_commit_sha = iteration_commit_sha
+        return entry, True
+
+    return _update_state(
+        cfg,
+        mutate,
+        after_save=lambda entry: (
+            _ledger_upsert(cfg, issue_num, entry) if entry is not None else None
+        ),
+    )
 
 
-def record_failed_attempt(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
+def record_failed_attempt(
+    cfg: ReviewConfig,
+    issue_num: int,
+    *,
+    expected_verdict_ts: Optional[str] = None,
+) -> Optional[IssueState]:
     """Increment the failed-dispatch counter for ``issue_num`` after a
     refine subprocess exited non-zero (and was NOT interrupted by a
     daemon stop signal — interrupted runs record nothing at all).
@@ -457,22 +812,33 @@ def record_failed_attempt(cfg: ReviewConfig, issue_num: int) -> Optional[IssueSt
     retry budget; no-ops (with a warning, returning None) if no entry
     exists — e.g. a concurrent ``verify``/state edit removed it
     mid-iteration."""
-    state = load_state(cfg)
-    entry = state.issues.get(issue_num)
-    if entry is None:
-        print(
-            f"  warning: record_failed_attempt(#{issue_num}) called but no "
-            "state.json entry exists; skipping"
-        )
-        return None
-    entry.attempts += 1
-    save_state(cfg, state)
-    # Daemon bookkeeping — mirror the row, no verdict event.
-    _ledger_upsert(cfg, issue_num, entry)
-    return entry
+    def mutate(state: ReviewState) -> tuple[Optional[IssueState], bool]:
+        entry = state.issues.get(issue_num)
+        if not _completion_matches(entry, expected_verdict_ts):
+            print(
+                f"  warning: stale record_failed_attempt(#{issue_num}) "
+                "completion does not own the current rejected verdict; skipping"
+            )
+            return None, False
+        assert entry is not None
+        entry.attempts += 1
+        return entry, True
+
+    return _update_state(
+        cfg,
+        mutate,
+        after_save=lambda entry: (
+            _ledger_upsert(cfg, issue_num, entry) if entry is not None else None
+        ),
+    )
 
 
-def record_stall(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
+def record_stall(
+    cfg: ReviewConfig,
+    issue_num: int,
+    *,
+    expected_verdict_ts: Optional[str] = None,
+) -> Optional[IssueState]:
     """Flip ``issue_num`` to status="stalled" after the daemon exhausted
     its retry budget (``--max-attempts`` consecutive failed dispatches).
 
@@ -482,20 +848,72 @@ def record_stall(cfg: ReviewConfig, issue_num: int) -> Optional[IssueState]:
     comment on the GitHub issue when it stalls an entry; re-rejecting
     (:func:`record_rejection`) resets the counter and re-queues. No-ops
     (with a warning) if no entry exists."""
+    def mutate(state: ReviewState) -> tuple[Optional[IssueState], bool]:
+        entry = state.issues.get(issue_num)
+        if not _completion_matches(entry, expected_verdict_ts):
+            print(
+                f"  warning: stale record_stall(#{issue_num}) completion "
+                "does not own the current rejected verdict; skipping"
+            )
+            return None, False
+        assert entry is not None
+        entry.status = "stalled"
+        entry.pending_pr_branch = None
+        entry.iteration_branch = None
+        entry.iteration_commit_sha = None
+        return entry, True
+
+    return _update_state(
+        cfg,
+        mutate,
+        after_save=lambda entry: (
+            _ledger_upsert(cfg, issue_num, entry) if entry is not None else None
+        ),
+    )
+
+
+def clear_pending_pr_check(
+    cfg: ReviewConfig,
+    issue_num: int,
+    branch: str,
+    *,
+    expected_verdict_ts: str,
+) -> bool:
+    """Resolve a durable PR-presence check without touching a newer verdict."""
+    def mutate(state: ReviewState) -> tuple[Optional[IssueState], bool]:
+        entry = state.issues.get(issue_num)
+        if (
+            not _completion_matches(entry, expected_verdict_ts)
+            or entry is None
+            or entry.pending_pr_branch != branch
+        ):
+            return None, False
+        entry.pending_pr_branch = None
+        return entry, True
+
+    entry = _update_state(
+        cfg,
+        mutate,
+        after_save=lambda current: (
+            _ledger_upsert(cfg, issue_num, current)
+            if current is not None
+            else None
+        ),
+    )
+    return entry is not None
+
+
+def pending_pr_checks(cfg: ReviewConfig) -> list[tuple[int, IssueState]]:
+    """Rejected iterations whose GitHub PR-presence check must be retried."""
     state = load_state(cfg)
-    entry = state.issues.get(issue_num)
-    if entry is None:
-        print(
-            f"  warning: record_stall(#{issue_num}) called but no "
-            "state.json entry exists; skipping"
-        )
-        return None
-    entry.status = "stalled"
-    save_state(cfg, state)
-    # Daemon bookkeeping (the underlying human verdict is unchanged) —
-    # mirror the row, no verdict event.
-    _ledger_upsert(cfg, issue_num, entry)
-    return entry
+    return sorted(
+        (
+            (num, entry)
+            for num, entry in state.issues.items()
+            if entry.status == "rejected" and entry.pending_pr_branch
+        ),
+        key=lambda item: item[1].verdict_ts,
+    )
 
 
 def pending_rejections(

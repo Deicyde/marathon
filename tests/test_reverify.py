@@ -448,7 +448,7 @@ def test_unverify_removes_label_deletes_state_and_comments(tmp_path, monkeypatch
         calls.append(list(args))
         class CP:
             returncode = 0
-            stdout = ""
+            stdout = '{"labels": []}' if args[:2] == ("issue", "view") else ""
             stderr = ""
         return CP()
 
@@ -460,7 +460,7 @@ def test_unverify_removes_label_deletes_state_and_comments(tmp_path, monkeypatch
     # state entry deleted (deck re-surfaces the issue).
     assert load_state(cfg).get(22) is None
 
-    # exactly one label-edit (remove verified) and one comment.
+    # exactly one label-edit (remove verified), one read-back, and one comment.
     edits = [c for c in calls if c[:1] == ["issue"] and "edit" in c]
     comments = [c for c in calls if c[:2] == ["issue", "comment"]]
     assert len(edits) == 1
@@ -481,13 +481,38 @@ def test_unverify_leaves_manifest_frozen(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "marathon.review.github.gh",
-        lambda *a, **k: type("CP", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+        lambda *a, **k: type("CP", (), {
+            "returncode": 0,
+            "stdout": '{"labels": []}' if a[:2] == ("issue", "view") else "",
+            "stderr": "",
+        })(),
     )
     reverify.unverify_for_rereview(cfg, 22, ["changed statement: foo"])
 
     from marathon.review.approved_statements import load_manifest
     # The manifest is deliberately NOT touched — a later change still diffs.
     assert "foo" in load_manifest(cfg.repo_dir)
+
+
+def test_unverify_preserves_local_state_when_label_removal_silently_fails(
+    tmp_path, monkeypatch, capsys,
+):
+    cfg = make_cfg(tmp_path)
+    seed_verified(cfg, 22)
+
+    def fake_gh(*args, **kwargs):
+        # edit returns success, but read-back still contains review:verified.
+        out = (
+            '{"labels": [{"name": "review:verified"}]}'
+            if args[:2] == ("issue", "view") else ""
+        )
+        return type("CP", (), {"returncode": 0, "stdout": out, "stderr": ""})()
+
+    monkeypatch.setattr("marathon.review.github.gh", fake_gh)
+
+    assert reverify.unverify_for_rereview(cfg, 22, ["new card: bar"]) is False
+    assert load_state(cfg).get(22) is not None  # durable retry anchor retained
+    assert "keeping local verified state" in capsys.readouterr().out
 
 
 # --- conductor pass ---------------------------------------------------------

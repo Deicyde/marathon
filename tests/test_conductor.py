@@ -22,6 +22,7 @@ invokes Aristotle, Claude, gh, or real git worktree commands.
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import os
 import signal
 import subprocess
@@ -48,6 +49,16 @@ CHAPTERS = {
     15: [(31, "Theorem C")],
     16: [(41, "Theorem D")],
 }
+
+
+def _conductor_lock_racer(cfg, start, release, results):
+    """Spawn-safe helper for the cross-process singleton regression."""
+    start.wait(10)
+    acquired = conductor.acquire_conductor_lock(cfg)
+    results.put(acquired)
+    if acquired:
+        release.wait(10)
+        conductor.release_conductor_lock(cfg)
 
 
 def make_cfg(tmp_path) -> ReviewConfig:
@@ -410,9 +421,9 @@ def test_failed_job_flows_through_record_failed_attempt(e2e, monkeypatch):
     calls: list[int] = []
     orig = daemon.record_failed_attempt
 
-    def spy(cfg_, issue_num):
+    def spy(cfg_, issue_num, **kwargs):
         calls.append(issue_num)
-        return orig(cfg_, issue_num)
+        return orig(cfg_, issue_num, **kwargs)
 
     # _handle_refine_exit lives in the daemon module and resolves
     # record_failed_attempt from its own namespace — patch it there.
@@ -422,11 +433,107 @@ def test_failed_job_flows_through_record_failed_attempt(e2e, monkeypatch):
 
     assert calls == [22, 22]  # one per failed dispatch, none after stall
     assert len(e2e.popen.spawned) == 2  # backoff requeue re-dispatched it
+    # The retry continues the SAME Aristotle checkpoint/log.  Before this fix
+    # only the worktree was reused and a fresh wd-i... forced a new paid session.
+    retry_workdirs = [
+        p.cmd[p.cmd.index("--workdir") + 1] for p in e2e.popen.spawned
+    ]
+    assert retry_workdirs[0] == retry_workdirs[1]
     # The retry waited out the Phase-0 exponential backoff (2^1 * 60s).
     assert e2e.clock.t >= 2 * daemon.BACKOFF_BASE_SECONDS
     entry = load_state(e2e.cfg).issues[22]
     assert entry.status == "stalled"
     assert entry.attempts == 2
+
+
+def test_recovers_failed_retry_checkpoint_across_conductor_restart(
+    cfg, tmp_path, monkeypatch,
+):
+    """A dead job preserved in jobs.json is paired with its workdir on the next
+    conductor launch, provided the rejection still needs an iteration."""
+    runs = tmp_path / "runs"
+    wt = runs / "wt-i22-20260710-120000"
+    wd = runs / "wd-i22-20260710-120000"
+    wt.mkdir(parents=True)
+    wd.mkdir(parents=True)
+    seed_rejections(cfg, {22: "2026-07-10T12:00:00-04:00"})
+    conductor.write_jobs_snapshot(cfg.repo_dir, [conductor.ConductorJob(
+        issue_num=22, chapter=14, target="Demo/Chapter14",
+        worktree=str(wt), workdir=str(wd),
+        branch="marathon/refine-c14-i22", pid=999999, status="failed",
+        exit_code=13,
+    )], concurrency=1)
+    monkeypatch.setattr(conductor, "_worktree_live_pid", lambda _p: None)
+
+    got = conductor._recover_retry_worktrees(cfg, runs, busy_issues=set())
+    assert got == {22: str(wt)}
+    assert conductor._paired_retry_workdir(runs, 22, wt) == wd
+
+
+def test_recovers_gate_blocked_fill_checkpoint_across_restart(
+    cfg, tmp_path, monkeypatch,
+):
+    from marathon.refine import REFINE_STATE_FILENAME
+    from marathon.state import RefineState, save_refine_state
+
+    runs = tmp_path / "runs"
+    wt = runs / "wt-i22-20260710-120000"
+    wd = runs / "wd-i22-20260710-120000"
+    wt.mkdir(parents=True)
+    wd.mkdir(parents=True)
+    save_refine_state(
+        wd / REFINE_STATE_FILENAME,
+        RefineState(
+            target_folder="Demo/Chapter14",
+            force_continuation=True,
+            status="POST_PIPELINE_PR_BLOCKED",
+        ),
+    )
+    conductor.write_jobs_snapshot(cfg.repo_dir, [conductor.ConductorJob(
+        issue_num=22, chapter=14, target="Demo/Chapter14",
+        worktree=str(wt), workdir=str(wd),
+        branch="marathon/proof-c14-i22", pid=999999, status="failed",
+        exit_code=13, fill=True,
+    )], concurrency=1)
+    monkeypatch.setattr(conductor, "_worktree_live_pid", lambda _p: None)
+
+    got = conductor._recover_retry_worktrees(cfg, runs, busy_issues=set())
+    assert got == {conductor.FILL_KEY_BASE + 22: str(wt)}
+
+
+def test_recovers_stalled_refine_checkpoint_for_later_human_requeue(
+    cfg, tmp_path, monkeypatch,
+):
+    from marathon.review.state import IssueState, ReviewState, save_state
+
+    runs = tmp_path / "runs"
+    wt = runs / "wt-i22-20260710-120000"
+    wd = runs / "wd-i22-20260710-120000"
+    wt.mkdir(parents=True)
+    wd.mkdir(parents=True)
+    save_state(
+        cfg,
+        ReviewState(
+            issues={
+                22: IssueState(
+                    status="stalled",
+                    verdict_ts="2026-07-10T12:00:00+00:00",
+                    notes="keep trying",
+                    attempts=3,
+                )
+            }
+        ),
+    )
+    conductor.write_jobs_snapshot(cfg.repo_dir, [conductor.ConductorJob(
+        issue_num=22, chapter=14, target="Demo/Chapter14",
+        worktree=str(wt), workdir=str(wd),
+        branch="marathon/refine-c14-i22", pid=999999, status="stalled",
+        exit_code=13,
+    )], concurrency=1)
+    monkeypatch.setattr(conductor, "_worktree_live_pid", lambda _p: None)
+
+    got = conductor._recover_retry_worktrees(cfg, runs, busy_issues=set())
+    assert got == {22: str(wt)}
 
 
 def test_stall_notifies_once_and_keeps_worktree(e2e):
@@ -515,8 +622,35 @@ def test_fill_failure_never_mutates_verified_state(cfg, subprocess_calls, monkey
     assert job.status == "failed"
     assert state_path(cfg).read_text() == before  # verified state untouched
     assert not_before[22] == 1000.0 + conductor.FILL_RETRY_BACKOFF_SECONDS
-    assert kept[22] == job.worktree               # worktree kept for debugging
+    assert kept[conductor.FILL_KEY_BASE + 22] == job.worktree
     assert subprocess_calls == []                 # no gh notification, no removal
+
+
+def test_fill_reattach_transport_retry_does_not_consume_dispatch_budget(cfg):
+    from marathon.refine import EXIT_REATTACH_TRANSIENT
+
+    job = conductor.ConductorJob(
+        issue_num=22,
+        chapter=14,
+        target="Demo/Chapter14",
+        worktree=str(cfg.repo_dir.parent / "runs" / "wt-i22-x"),
+        workdir=str(cfg.repo_dir.parent / "runs" / "wd-i22-x"),
+        branch="marathon/proof-c14-i22",
+        status="running",
+        fill=True,
+        proc=SimpleNamespace(poll=lambda: EXIT_REATTACH_TRANSIENT),
+    )
+    attempts = {22: 1}
+    conductor._reap_finished(
+        cfg,
+        [job],
+        {},
+        {},
+        max_attempts=3,
+        fill_attempts=attempts,
+    )
+    assert attempts[22] == 0
+    assert job.status == "failed"
 
 
 def test_fill_success_no_requeue_no_iteration(cfg, subprocess_calls, monkeypatch):
@@ -715,6 +849,37 @@ def test_lock_released_after_run(e2e):
     e2e.popen.script = {22: {"rc": 0, "polls": 1}}
     assert run_once(e2e) == 0
     assert not conductor.conductor_lock_path(e2e.cfg).exists()
+
+
+def test_concurrent_processes_cannot_both_acquire_conductor_lock(tmp_path):
+    """The singleton decision is atomic, not a check-then-write PID race."""
+    cfg = make_cfg(tmp_path)
+    ctx = mp.get_context("spawn")
+    start = ctx.Event()
+    release = ctx.Event()
+    results = ctx.Queue()
+    workers = [
+        ctx.Process(
+            target=_conductor_lock_racer,
+            args=(cfg, start, release, results),
+        )
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    start.set()
+    try:
+        acquired = [results.get(timeout=15), results.get(timeout=15)]
+        assert acquired.count(True) == 1
+        assert acquired.count(False) == 1
+    finally:
+        release.set()
+        for worker in workers:
+            worker.join(timeout=15)
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=5)
+    assert all(worker.exitcode == 0 for worker in workers)
 
 
 # --- orphan reconciliation ---------------------------------------------------------

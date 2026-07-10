@@ -289,13 +289,18 @@ def _repo_merge_method(repo: str) -> Optional[str]:
 
 def _requeue_refined_issue(
     cfg: "ReviewConfig", head: Optional[str], pr_num: Optional[int] = None,
-    *, landed: bool = True,
+    *, landed: bool = True, expected_verdict_ts: Optional[str] = None,
 ) -> Optional[int]:
     """If ``head`` is a refine branch (``marathon/refine-c<N>-i<M>``), re-queue
     issue ``M`` for re-review: remove the ``review:rejected`` GitHub label AND
     clear the local verdict state, so the issue reads as unreviewed and the
     deck surfaces it as a ready card again. Returns the issue number it
-    re-queued, or None. Best-effort — a failure here never fails the merge.
+    re-queued, or None. The merge itself is never rolled back, but this
+    transition is deliberately ORDERED and CONFIRMED: GitHub's rejected label
+    must be observed absent before local state is cleared.  If either half
+    fails, the local rejected entry is retained so the conductor's
+    merged-rejection reconciliation can retry instead of losing its only
+    durable recovery anchor.
 
     ``landed`` (default True — Aristotle's fix actually MERGED) posts a
     RECOVERY comment that closes the notification loop and supersedes any
@@ -310,17 +315,107 @@ def _requeue_refined_issue(
         return None
     issue = int(m.group(1))
     rejected_label = getattr(getattr(cfg, "labels", None), "rejected", "review:rejected")
-    try:
-        gh("issue", "edit", str(issue), "--repo", cfg.github_repo,
-           "--remove-label", rejected_label, check=False)
-    except Exception:  # noqa: BLE001
-        pass
+
+    # A delayed job/PR completion must not clear a newer human verdict.  Check
+    # before the network transition, then enforce the same generation again in
+    # the locked local delete below (the second check closes the local race).
+    if expected_verdict_ts is None and hasattr(cfg, "repo_dir"):
+        from marathon.review.state import load_state
+
+        current = load_state(cfg).issues.get(issue)
+        if current is None or current.status != "rejected":
+            return None
+        expected_verdict_ts = current.verdict_ts
+    if expected_verdict_ts is not None:
+        from marathon.review.state import load_state
+
+        current = load_state(cfg).issues.get(issue)
+        if (
+            current is None
+            or current.status != "rejected"
+            or current.verdict_ts != expected_verdict_ts
+        ):
+            return None
+
+    # GitHub label state is what the shared deck / queue-from-github sees.  A
+    # ``gh issue edit`` can return zero yet leave the label unchanged (auth or
+    # transient API oddities); clearing state.json anyway creates the exact
+    # split-brain that stranded issues in Reject.  Retry + read back, just like
+    # cmd_verify's verified-label confirmation.
+    label_cleared = False
+    for _attempt in range(3):
+        try:
+            gh(
+                "issue", "edit", str(issue), "--repo", cfg.github_repo,
+                "--remove-label", rejected_label, check=False,
+            )
+            cp = gh(
+                "issue", "view", str(issue), "--repo", cfg.github_repo,
+                "--json", "labels", check=False,
+            )
+            if cp.returncode != 0:
+                continue
+            labels = {
+                item.get("name")
+                for item in (json.loads(cp.stdout or "{}").get("labels") or [])
+                if isinstance(item, dict)
+            }
+            if rejected_label not in labels:
+                label_cleared = True
+                break
+        except Exception:  # noqa: BLE001 — retry below; merge already landed
+            continue
+    if not label_cleared:
+        print(
+            f"  automerge: WARN — could not confirm removal of "
+            f"'{rejected_label}' from #{issue}; keeping local rejection state "
+            "so the conductor retries the requeue next cycle",
+            flush=True,
+        )
+        return None
+
     try:
         from marathon.review.state import requeue_for_rereview
 
-        requeue_for_rereview(cfg, issue)
-    except Exception:  # noqa: BLE001
-        pass
+        if expected_verdict_ts is None:
+            # Compatibility for non-state-backed embedding callers; production
+            # ReviewConfig always has repo_dir and therefore takes the CAS path.
+            removed = requeue_for_rereview(cfg, issue)
+        else:
+            removed = requeue_for_rereview(
+                cfg, issue, expected_verdict_ts=expected_verdict_ts
+            )
+        if expected_verdict_ts is not None and not removed:
+            # GitHub label removal happened before the local CAS. If a newer
+            # re-reject won that race, restore its remote rejected label so the
+            # shared GitHub queue does not lose the fresh verdict.
+            try:
+                current = load_state(cfg).issues.get(issue)
+                if (
+                    current is not None
+                    and current.status == "rejected"
+                    and current.verdict_ts != expected_verdict_ts
+                ):
+                    gh(
+                        "issue", "edit", str(issue), "--repo", cfg.github_repo,
+                        "--add-label", rejected_label, check=False,
+                    )
+            except Exception:  # noqa: BLE001 — later sync/reconcile also heals
+                pass
+            print(
+                f"  automerge: completion for #{issue} lost its verdict CAS; "
+                "leaving the newer local verdict untouched",
+                flush=True,
+            )
+            return None
+    except Exception as exc:  # noqa: BLE001 — keep state for the healing pass
+        print(
+            f"  automerge: WARN — GitHub label cleared for #{issue}, but "
+            f"local requeue failed ({exc}); conductor will retry from the "
+            "still-rejected local entry",
+            flush=True,
+        )
+        return None
     if landed:
         try:
             merged_in = f" (merged in PR #{pr_num})" if pr_num is not None else ""
@@ -353,6 +448,48 @@ def _merge_pr(repo: str, pr: int, method: str) -> tuple[bool, str]:
     if cp.returncode == 0:
         return True, f"merged ({method.lstrip('-')}) + deleted branch"
     return False, (cp.stderr or cp.stdout).strip()[:200]
+
+
+def _owned_refine_verdict(
+    cfg: "ReviewConfig",
+    head: str,
+    pr_head_sha: Optional[str],
+    expected_verdict_ts: Optional[str] = None,
+) -> tuple[bool, Optional[str], str]:
+    """Pre-merge ownership check for a per-issue refine branch."""
+    m = _REFINE_BRANCH_RE.match(head or "")
+    if not m or not hasattr(cfg, "repo_dir"):
+        return True, None, "not a state-backed refine branch"
+    from marathon.review.state import load_state
+
+    issue = int(m.group(1))
+    current = load_state(cfg).issues.get(issue)
+    if (
+        current is None
+        or current.status != "rejected"
+        or current.iteration_branch != head
+        or not pr_head_sha
+        or current.iteration_commit_sha != pr_head_sha
+        or (
+            expected_verdict_ts is not None
+            and current.verdict_ts != expected_verdict_ts
+        )
+    ):
+        return (
+            False,
+            None,
+            f"stale/unowned refine branch for #{issue}; current verdict does "
+            "not match this iteration",
+        )
+    return True, current.verdict_ts, "refine verdict ownership confirmed"
+
+
+def _pr_head_sha(pr: dict) -> Optional[str]:
+    commits = pr.get("commits") or []
+    if not isinstance(commits, list) or not commits:
+        return None
+    oid = commits[-1].get("oid") if isinstance(commits[-1], dict) else None
+    return oid if isinstance(oid, str) and oid else None
 
 
 def automerge(
@@ -411,6 +548,13 @@ def automerge(
         )
         if ok and scope == "infra":
             ok, reason = _infra_only(repo, num, reason)
+        owned_verdict_ts: Optional[str] = None
+        if ok:
+            ok, owned_verdict_ts, ownership_reason = _owned_refine_verdict(
+                cfg, head, _pr_head_sha(pr)
+            )
+            if not ok:
+                reason = ownership_reason
         if not ok:
             results.append(AutoMergeResult(num, head, title, "skipped", reason))
             continue
@@ -419,11 +563,33 @@ def automerge(
             continue
         if method is None:
             method = _repo_merge_method(repo) or "--merge"
+        if owned_verdict_ts is not None:
+            still_owned, _, ownership_reason = _owned_refine_verdict(
+                cfg,
+                head,
+                _pr_head_sha(pr),
+                expected_verdict_ts=owned_verdict_ts,
+            )
+            if not still_owned:
+                results.append(
+                    AutoMergeResult(num, head, title, "skipped", ownership_reason)
+                )
+                continue
         merged, detail = _merge_pr(repo, num, method)
         if merged:
-            requeued = _requeue_refined_issue(cfg, head, pr_num=num)
+            requeued = _requeue_refined_issue(
+                cfg,
+                head,
+                pr_num=num,
+                expected_verdict_ts=owned_verdict_ts,
+            )
             if requeued is not None:
                 detail += f"; re-queued #{requeued} for re-review"
+            elif _REFINE_BRANCH_RE.match(head):
+                detail += (
+                    "; WARNING: re-review requeue not confirmed "
+                    "(conductor will retry)"
+                )
         results.append(AutoMergeResult(
             num, head, title, "merged" if merged else "failed", detail
         ))

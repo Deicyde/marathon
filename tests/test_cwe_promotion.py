@@ -13,13 +13,21 @@ from pathlib import PurePosixPath
 from types import SimpleNamespace
 
 from aristotlelib import TaskStatus
+from aristotlelib import AristotleAPIError
 
 import marathon.refine as refine
 from marathon.post_pipeline import BuildResult, PipelineConfig
 from marathon.state import RefineState
 
 
-def _drive(monkeypatch, tmp_path, *, probe_ok: bool, changed=("Chapter1.A",)):
+def _drive(
+    monkeypatch,
+    tmp_path,
+    *,
+    probe_ok: bool,
+    changed=("Chapter1.A",),
+    pipeline_result=None,
+):
     """Run _run_refine_attempt with a CWE task; return (status, calls)."""
     calls: dict = {}
     repo = tmp_path / "repo"
@@ -51,7 +59,7 @@ def _drive(monkeypatch, tmp_path, *, probe_ok: bool, changed=("Chapter1.A",)):
 
     def fake_pipeline(**kw):
         calls.setdefault("pipeline", []).append(kw)
-        return {"push_ok": None, "pr_ok": None}
+        return pipeline_result or {"push_ok": None, "pr_ok": None}
 
     monkeypatch.setattr(refine, "run_post_pipeline", fake_pipeline)
 
@@ -60,6 +68,7 @@ def _drive(monkeypatch, tmp_path, *, probe_ok: bool, changed=("Chapter1.A",)):
     project = SimpleNamespace(project_id="p-1")
     state = RefineState(target_folder=str(repo / "Chapter1"))
     state.project_id = "p-1"
+    calls["state"] = state
 
     status = asyncio.run(refine._run_refine_attempt(
         prompt=None,
@@ -107,12 +116,12 @@ def test_no_lean_change_is_never_promoted(monkeypatch, tmp_path):
     assert "pipeline" not in calls                     # nothing landed
 
 
-def test_complete_with_red_post_pipeline_build_forces_fresh_retry(monkeypatch, tmp_path):
+def test_complete_with_red_post_pipeline_build_preserves_session(monkeypatch, tmp_path):
     """Aristotle COMPLETE is not success if Marathon's own `lake build` is red.
 
-    Return FAILED (retryable but not continuable) so the next attempt gets a
-    freshly staged bundle instead of continuing a possibly-incomplete Aristotle
-    project.
+    Return FAILED while preserving the current project for project.ask(), so
+    the next attempt keeps Aristotle's server-side context and local partial
+    commit instead of paying for a fresh session.
     """
     calls: dict = {}
     repo = tmp_path / "repo"
@@ -173,6 +182,106 @@ def test_complete_with_red_post_pipeline_build_forces_fresh_retry(monkeypatch, t
 
     assert status == TaskStatus.FAILED
     assert state.status == "POST_PIPELINE_BUILD_FAILED"
+    assert state.force_continuation is True
     assert "local lake build failed" in state.note
     assert len(calls.get("pipeline", [])) == 1
     assert "error: missing instance" in log_path.read_text()
+
+
+def test_gate_blocked_commit_is_retryable_on_same_session(monkeypatch, tmp_path):
+    status, calls = _drive(
+        monkeypatch,
+        tmp_path,
+        probe_ok=True,
+        pipeline_result={
+            "build": BuildResult(ok=True),
+            "push_ok": None,
+            "pr_ok": None,
+            "pr_blocked": "gate",
+        },
+    )
+    state = calls["state"]
+    assert status == TaskStatus.FAILED
+    assert state.status == "POST_PIPELINE_PR_BLOCKED"
+    assert state.force_continuation is True
+    assert state.pending_publication is None
+
+
+def test_force_continuation_overrides_terminal_complete_status(monkeypatch):
+    project = SimpleNamespace(project_id="p-1")
+    task = SimpleNamespace(
+        status=TaskStatus.COMPLETE,
+        agent_task_id="t-1",
+        output_summary="partial result",
+    )
+
+    async def reattach(**kwargs):
+        return project, task
+
+    monkeypatch.setattr(refine, "reattach_project_and_task", reattach)
+    state = RefineState(
+        target_folder="Chapter1",
+        project_id="p-1",
+        agent_task_id="t-1",
+        status="POST_PIPELINE_PR_BLOCKED",
+        force_continuation=True,
+    )
+    got_project, got_task, mode = asyncio.run(
+        refine._try_reattach_or_continue(state)
+    )
+    assert (got_project, got_task, mode) == (project, task, "continue")
+
+
+def test_transient_project_ask_failure_preserves_continuation_intent(
+    monkeypatch, tmp_path,
+):
+    async def fail_ask(project, prompt):
+        raise AristotleAPIError("temporary transport failure", status_code=503)
+
+    monkeypatch.setattr(refine, "continue_via_ask", fail_ask)
+    state = RefineState(
+        target_folder="Chapter1",
+        project_id="p-1",
+        agent_task_id="t-old",
+        force_continuation=True,
+    )
+    result = asyncio.run(
+        refine._submit_continuation_via_ask(
+            project=SimpleNamespace(project_id="p-1"),
+            prompt="fix the gate failure",
+            state=state,
+            state_path=tmp_path / "state.json",
+            attempt_idx=0,
+            max_retries=1,
+        )
+    )
+    assert result is None
+    assert state.status == "ASK_FAILED"
+    assert state.force_continuation is True
+    assert state.project_id == "p-1" and state.agent_task_id == "t-old"
+
+
+def test_download_failure_reattaches_terminal_task_instead_of_resubmitting(
+    monkeypatch,
+):
+    project = SimpleNamespace(project_id="p-1")
+    task = SimpleNamespace(
+        status=TaskStatus.COMPLETE,
+        agent_task_id="t-1",
+        output_summary=None,
+    )
+
+    async def reattach(**kwargs):
+        return project, task
+
+    monkeypatch.setattr(refine, "reattach_project_and_task", reattach)
+    state = RefineState(
+        target_folder="Chapter1",
+        project_id="p-1",
+        agent_task_id="t-1",
+        status="DOWNLOAD_FAILED",
+    )
+    got_project, got_task, mode = asyncio.run(
+        refine._try_reattach_or_continue(state)
+    )
+    assert (got_project, got_task, mode) == (project, task, "reattach")

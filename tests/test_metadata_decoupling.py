@@ -637,10 +637,16 @@ def reject_env(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path)
     monkeypatch.setattr(review, "load_config", lambda repo_dir=None: cfg)
     gh_calls: list = []
-    monkeypatch.setattr(
-        review, "gh", lambda *a, **kw: gh_calls.append(a) or
-        subprocess.CompletedProcess(a, 0, stdout="", stderr=""),
-    )
+    def fake_gh(*a, **kw):
+        gh_calls.append(a)
+        stdout = (
+            '{"labels":[{"name":"review:rejected"}]}'
+            if a[:2] == ("issue", "view")
+            else ""
+        )
+        return subprocess.CompletedProcess(a, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(review, "gh", fake_gh)
     return SimpleNamespace(cfg=cfg, gh=gh_calls)
 
 

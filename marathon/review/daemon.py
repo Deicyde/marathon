@@ -62,6 +62,7 @@ from typing import Optional
 from marathon.review.config import ReviewConfig, load_config
 from marathon.review.state import (
     hash_pending,
+    load_state,
     pending_rejections_needing_iteration,
     record_failed_attempt,
     record_iteration,
@@ -212,8 +213,11 @@ def run_one_refine(
         "--repo-dir", str(cfg.repo_dir),
         "--workdir", str(workdir),
         "--review-rejection", str(focus_issue),
-        *DEFAULT_REFINE_ARGS,
     ]
+    dispatch_state = load_state(cfg).issues.get(focus_issue)
+    if dispatch_state is not None:
+        cmd += ["--review-verdict-ts", dispatch_state.verdict_ts]
+    cmd += DEFAULT_REFINE_ARGS
     print(
         f"\n--- marathon refine starting (focus #{focus_issue}): "
         f"workdir={workdir.name} ---"
@@ -316,6 +320,9 @@ def _handle_refine_exit(
     max_attempts: int,
     interrupted: bool,
     failure_detail: Optional[str] = None,
+    expected_verdict_ts: Optional[str] = None,
+    pending_pr_branch: Optional[str] = None,
+    iteration_commit_sha: Optional[str] = None,
 ) -> int:
     """Apply the post-refine state transition for ``issue_num``; return
     the backoff (seconds) to sleep before the next dispatch (0 ⇒ none).
@@ -349,7 +356,13 @@ def _handle_refine_exit(
         return 0
 
     if exit_code == 0:
-        record_iteration(cfg, issue_num)
+        record_iteration(
+            cfg,
+            issue_num,
+            expected_verdict_ts=expected_verdict_ts,
+            pending_pr_branch=pending_pr_branch,
+            iteration_commit_sha=iteration_commit_sha,
+        )
         return 0
 
     # A CONFIGURATION failure (e.g. ARISTOTLE_API_KEY unset) aborted the
@@ -371,14 +384,47 @@ def _handle_refine_exit(
         )
         return 0
 
-    entry = record_failed_attempt(cfg, issue_num)
+    from marathon.refine import (
+        EXIT_REATTACH_TRANSIENT,
+        EXIT_REJECTION_CONTEXT_MISSING,
+    )
+
+    if exit_code == EXIT_REJECTION_CONTEXT_MISSING:
+        backoff = BACKOFF_BASE_SECONDS
+        print(
+            f"--- iteration for #{issue_num} had no authoritative rejection "
+            f"note (exit {exit_code}) — NOT counted as an attempt; retrying "
+            f"after {backoff}s without consuming the verdict.",
+            flush=True,
+        )
+        return backoff
+
+    if exit_code == EXIT_REATTACH_TRANSIENT:
+        backoff = BACKOFF_BASE_SECONDS
+        print(
+            f"--- iteration for #{issue_num} could not reattach to its saved "
+            f"Aristotle session (exit {exit_code}) — NOT counted as an "
+            f"attempt; preserving IDs/checkpoint and retrying after {backoff}s.",
+            flush=True,
+        )
+        return backoff
+
+    entry = record_failed_attempt(
+        cfg, issue_num, expected_verdict_ts=expected_verdict_ts
+    )
     if entry is None:
         # The entry vanished mid-iteration (e.g. a concurrent `verify`
         # cleared it). Nothing left to retry against.
         return 0
 
     if entry.attempts >= max_attempts:
-        record_stall(cfg, issue_num)
+        stalled = record_stall(
+            cfg, issue_num, expected_verdict_ts=expected_verdict_ts
+        )
+        if stalled is None:
+            # A fresh verify/re-reject won the race between the failed-attempt
+            # increment and stall transition.  The old dispatch owns nothing.
+            return 0
         print(
             f"--- iteration for #{issue_num} exited non-zero ({exit_code}); "
             f"attempt {entry.attempts}/{max_attempts} — STALLED. Posting "
@@ -518,6 +564,7 @@ def run_daemon(
                     exit_code,
                     max_attempts=max_attempts,
                     interrupted=interrupted,
+                    expected_verdict_ts=target_state.verdict_ts,
                 )
                 if once and iteration_count >= MAX_LOOPS_ONCE:
                     print(

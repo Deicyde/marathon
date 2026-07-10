@@ -573,7 +573,7 @@ def _github_ts_to_local(github_ts: "Optional[str]") -> str:
     dt = _parse_ts(github_ts)
     if dt is None:
         return review_state._now_iso()
-    return dt.astimezone().isoformat(timespec="seconds")
+    return dt.astimezone().isoformat(timespec="microseconds")
 
 
 def reconcile_github_rejection(
@@ -594,12 +594,6 @@ def reconcile_github_rejection(
     reject comment) feeds the refine; a MISSING note seeds the SYNC_REJECT_NOTES
     placeholder and PARKS the entry (marks it iterated) so no Aristotle run fires
     on placeholder text."""
-    state = load_state(cfg)
-    existing = state.issues.get(issue_num)
-    if existing is not None and not _ts_strictly_newer(
-        github_verdict_ts, existing.verdict_ts
-    ):
-        return  # the same (or older) reject we already track — don't touch it
     has_note = bool(note and note.strip())
     # Store verdict_ts as the TRUE GitHub reject instant, in the LOCAL-offset
     # format so needs_iteration()'s string compare against a local
@@ -607,16 +601,41 @@ def reconcile_github_rejection(
     # that would make the strictly-newer re-seed guard fire every tick. Instead
     # record_iteration records "at or after the verdict", so a once-refined entry
     # never re-satisfies needs_iteration — see state.record_iteration.)
-    vts = _github_ts_to_local(github_verdict_ts)
-    state.issues[issue_num] = review_state.IssueState(
-        status="rejected",
-        verdict_ts=vts,
-        notes=(note.strip() if has_note else SYNC_REJECT_NOTES),
-        # No real note recoverable → PARK by marking iterated AT the verdict
-        # (needs_iteration is then False — bulletproof regardless of clock), so
-        # the conductor never spends an Aristotle run on the placeholder; a later
-        # strictly-newer real re-reject un-parks it.
-        last_iteration_ts=None if has_note else vts,
-        attempts=0,
+    def mutate(
+        state: review_state.ReviewState,
+    ) -> tuple["Optional[review_state.IssueState]", bool]:
+        # This read occurs only after acquiring state.py's stable process lock.
+        # The old load-then-save gap let a concurrent local verify/reject be
+        # overwritten by a stale GitHub discovery result.
+        existing = state.issues.get(issue_num)
+        if existing is not None and not _ts_strictly_newer(
+            github_verdict_ts, existing.verdict_ts
+        ):
+            return None, False
+        vts = _github_ts_to_local(github_verdict_ts)
+        entry = review_state.IssueState(
+            status="rejected",
+            verdict_ts=vts,
+            notes=(note.strip() if has_note else SYNC_REJECT_NOTES),
+            # No real note recoverable → PARK by marking iterated AT the verdict
+            # (needs_iteration is then False — bulletproof regardless of clock),
+            # so the conductor never spends an Aristotle run on placeholder
+            # text; a later strictly-newer real re-reject un-parks it.
+            last_iteration_ts=None if has_note else vts,
+            attempts=0,
+            pending_pr_branch=None,
+        )
+        state.issues[issue_num] = entry
+        return entry, True
+
+    review_state._update_state(
+        cfg,
+        mutate,
+        # GitHub discovery is not a new local human verdict event, but keep the
+        # ledger's latest-issue row ordered with state.json under the same lock.
+        after_save=lambda entry: (
+            review_state._ledger_upsert(cfg, issue_num, entry)
+            if entry is not None
+            else None
+        ),
     )
-    review_state.save_state(cfg, state)

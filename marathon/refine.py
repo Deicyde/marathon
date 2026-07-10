@@ -21,6 +21,7 @@ include them in the Aristotle bundle.
 
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -35,6 +36,7 @@ from marathon.aristotle_runtime import (
     IN_FLIGHT_STATUS_VALUES,
     IN_FLIGHT_STATUSES,
     NON_RETRYABLE_FAILURE_STATUSES,
+    ReattachTransientError,
     RETRYABLE_STATUSES,
     continue_via_ask,
     download_result,
@@ -94,6 +96,21 @@ EXIT_ITERATION_FAILED = 13
 #: which raises it) and is re-exported above: an environment failure detected
 #: BEFORE any Aristotle work. The conductor treats it as attempt-free — see
 #: daemon._handle_refine_exit.
+
+#: A clean build + commit exists in the kept worktree, but its final push/PR
+#: failed.  This is neither an Aristotle failure nor a reason to reset the
+#: branch: conductor retries invoke the publication-only fast path recorded in
+#: ``RefineState.pending_publication``.
+EXIT_PUBLICATION_PENDING = 15
+
+#: A focused rejection was dispatched without its authoritative human note.
+#: Never fall through to generic Claude review: that spends a session on a
+#: different ask. The scheduler keeps the rejection queued and retries.
+EXIT_REJECTION_CONTEXT_MISSING = 16
+
+#: Saved Aristotle IDs exist, but a transient API/transport failure prevented
+#: reattachment. Retry later without clearing IDs or submitting fresh work.
+EXIT_REATTACH_TRANSIENT = 17
 
 
 def _load_additional_writable_paths(
@@ -303,6 +320,36 @@ def _load_pending_rejections_md(
             return body
         return f"- **Review #{focus_issue} REJECTED**\n\n{body}"
     return md
+
+
+def _load_dispatched_rejection_note(
+    path: Path,
+    issue_num: int,
+    expected_verdict_ts: Optional[str],
+) -> Optional[str]:
+    """Read the conductor's authoritative verbatim rejection-note handoff."""
+    try:
+        import json
+
+        payload = json.loads(path.read_text())
+        if int(payload.get("issue")) != issue_num:
+            return None
+        handed_ts = payload.get("verdict_ts")
+        if (
+            expected_verdict_ts is not None
+            and handed_ts is not None
+            and handed_ts != expected_verdict_ts
+        ):
+            return None
+        note = payload.get("notes")
+        if not isinstance(note, str) or not note.strip():
+            return None
+    except (OSError, ValueError, TypeError):
+        return None
+    body = note.strip()
+    if body.lstrip().startswith("- **"):
+        return body
+    return f"- **Review #{issue_num} REJECTED ({handed_ts or '?'})**\n\n{body}"
 
 
 def _read_latest_rating_note(workdir: Path) -> Optional[str]:
@@ -708,16 +755,24 @@ async def _try_reattach_or_continue(
         )
         return project, task, "reattach"
 
-    if state.status == "OUTPUT_FOLDER_MISSING":
+    if state.status in {"OUTPUT_FOLDER_MISSING", "DOWNLOAD_FAILED"}:
         # Prior task terminated but extraction failed; we want to re-extract,
         # not continue. Treat as reattach so the caller re-runs extraction
         # against the existing terminal task.
         print(
-            f"  reattaching (previous extraction failure) to project "
+            f"  reattaching (previous download/extraction failure) to project "
             f"project_id={state.project_id} task_id={task.agent_task_id} "
             f"status={task.status.value}"
         )
         return project, task, "reattach"
+
+    if continue_on_review and state.force_continuation:
+        print(
+            f"  continuing project_id={state.project_id} via project.ask() — "
+            "the prior completed result was rejected by Marathon's local "
+            "post-pipeline gate (session preserved server-side)"
+        )
+        return project, task, "continue"
 
     if continue_on_review and task.status in CONTINUABLE_STATUSES:
         print(
@@ -744,6 +799,7 @@ async def _submit_fresh_refine(
     bundle_context_text: Optional[str] = None,
 ) -> Optional[tuple[Project, AgentTask]]:
     state.attempts += 1
+    state.force_continuation = False
     state.output_path = None
     state.note = None
 
@@ -811,6 +867,9 @@ async def _submit_continuation_via_ask(
         save_refine_state(state_path, state)
         return None
 
+    # Clear the retry intent only after project.ask actually created the next
+    # task. A transient ask failure must retain the same project/session.
+    state.force_continuation = False
     state.agent_task_id = task.agent_task_id
     state.status = task.status.value if task.status else TaskStatus.QUEUED.value
     state.started_at = now_iso()
@@ -946,7 +1005,10 @@ async def _run_refine_attempt(
             try:
                 result_path = await download_result(project, download_path)
             except AristotleAPIError as e:
-                state.status = "POLL_FAILED"
+                # The task itself is terminal and reusable; a transient result
+                # download failure must reattach/re-download, not submit a new
+                # Aristotle project on the next process run.
+                state.status = "DOWNLOAD_FAILED"
                 state.note = f"download error (status {e.status_code}): {e}"
                 save_refine_state(state_path, state)
                 return None
@@ -1105,11 +1167,64 @@ async def _run_refine_attempt(
             if ok is False
         ]
         if failed:
-            sys.exit(
-                f"refine iteration {iteration_idx}: {' + '.join(failed)} FAILED "
-                "after a clean build/commit — the work is committed in this "
-                "worktree but did not land. Preserving the worktree for retry."
+            pending_publication = pipeline_result.get("pending_publication")
+            state.pending_publication = (
+                dict(pending_publication)
+                if isinstance(pending_publication, dict)
+                else {
+                    # Fail closed: even if an unexpected exception prevented
+                    # the pipeline from building its full recipe, retain a
+                    # marker so the next launch cannot enter branch reset /
+                    # Aristotle. Recovery will report missing metadata for
+                    # operator repair while preserving the clean commit.
+                    "kind": "unknown",
+                    "commit_sha": getattr(
+                        pipeline_result.get("commit"), "sha", None
+                    ),
+                }
             )
+            state.status = "PUBLICATION_PENDING"
+            state.note = (
+                f"{' + '.join(failed)} failed after clean build/commit; "
+                "retry publication only from the kept worktree"
+            )
+            save_refine_state(state_path, state)
+            print(
+                f"refine iteration {iteration_idx}: {' + '.join(failed)} FAILED "
+                "after a clean build/commit — saved publication-only recovery "
+                "state; preserving the branch/worktree without another "
+                "Aristotle session.",
+                flush=True,
+            )
+            raise SystemExit(EXIT_PUBLICATION_PENDING)
+        pr_blocked = pipeline_result.get("pr_blocked")
+        if pr_blocked:
+            state.pending_publication = None
+            state.force_continuation = True
+            state.preserve_local_branch = True
+            state.continuation_commit_sha = getattr(
+                pipeline_result.get("commit"), "sha", None
+            )
+            state.status = "POST_PIPELINE_PR_BLOCKED"
+            state.note = (
+                f"committed result blocked from PR by {pr_blocked}; continue "
+                "the same Aristotle project for a gate-clean revision"
+            )
+            save_refine_state(state_path, state)
+            if refine_log_path is not None:
+                _append_refine_system_log(
+                    refine_log_path,
+                    iteration_idx,
+                    attempt_idx,
+                    "post-pipeline PR blocked",
+                    (
+                        f"Marathon committed the result locally but blocked its "
+                        f"PR because `{pr_blocked}` failed. Continue from the "
+                        "current repo state and fix the gate finding; do not "
+                        "start over or discard the committed partial progress."
+                    ),
+                )
+            return TaskStatus.FAILED
         build_result = pipeline_result.get("build")
         if getattr(build_result, "ok", None) is False:
             tail = (getattr(build_result, "log_tail", None) or "").strip()
@@ -1139,12 +1254,26 @@ async def _run_refine_attempt(
                     body,
                 )
             state.status = "POST_PIPELINE_BUILD_FAILED"
+            state.force_continuation = True
+            state.preserve_local_branch = True
+            state.continuation_commit_sha = getattr(
+                pipeline_result.get("commit"), "sha", None
+            )
             state.note = (
                 "Aristotle returned COMPLETE, but Marathon's local lake build "
-                f"failed; retrying fresh instead of marking success ({summary})"
+                f"failed; continuing the same session instead of marking "
+                f"success ({summary})"
             )
             save_refine_state(state_path, state)
             return TaskStatus.FAILED
+
+        # A clean post-pipeline result supersedes any gate-blocked local base;
+        # normal future iterations may reset from origin again.
+        if state.preserve_local_branch:
+            state.force_continuation = False
+            state.preserve_local_branch = False
+            state.continuation_commit_sha = None
+            save_refine_state(state_path, state)
 
     return effective_status
 
@@ -1223,7 +1352,10 @@ async def _run_iteration(
             existing_task = None
             if (
                 continue_on_review
-                and last_status in CONTINUABLE_STATUS_VALUES
+                and (
+                    last_status in CONTINUABLE_STATUS_VALUES
+                    or state.force_continuation
+                )
                 and state.project_id is not None
             ):
                 # The previous attempt's project_id is still our project; reattach
@@ -1365,7 +1497,9 @@ async def _run_iteration(
         if status in RETRYABLE_STATUSES:
             last_status = status.value
             if attempt_idx < max_retries:
-                if continue_on_review and status in CONTINUABLE_STATUSES:
+                if continue_on_review and (
+                    status in CONTINUABLE_STATUSES or state.force_continuation
+                ):
                     print(
                         f"    {status.value} — will retry via project.ask() "
                         "continuation (session preserved)"
@@ -1474,6 +1608,44 @@ async def refine_command(args) -> None:
             f"not {str(target_folder)!r}. Move or delete that file before "
             "starting a new refine target."
         )
+    if (
+        state.pending_publication is None
+        and getattr(args, "review_verdict_ts", None)
+    ):
+        # A normal fresh/retry dispatch owns the verdict selected by its
+        # scheduler.  Publication recovery retains the generation already
+        # stored with the committed fix instead of adopting a newer re-reject.
+        state.review_verdict_ts = args.review_verdict_ts
+
+    # A prior run already completed Aristotle, extracted, built, and committed;
+    # only the network publication step failed. Recover BEFORE API-key lookup,
+    # rejection-context loading, or prepare_auto_pr_branch (which intentionally
+    # resets normal fresh iterations). This path therefore cannot hard-reset the
+    # clean commit or submit/continue an Aristotle task.
+    if state.pending_publication is not None:
+        from marathon.post_pipeline import retry_pending_publication
+
+        print(
+            "publication recovery: retrying the saved push/PR only from the "
+            "kept branch/worktree (no checkout/reset/build/Aristotle call)",
+            flush=True,
+        )
+        ok, message = retry_pending_publication(repo_dir, state.pending_publication)
+        if not ok:
+            state.status = "PUBLICATION_PENDING"
+            state.note = f"publication retry failed: {message}"
+            save_refine_state(state_path, state)
+            print(f"  publication recovery failed — {message}", flush=True)
+            raise SystemExit(EXIT_PUBLICATION_PENDING)
+        state.pending_publication = None
+        state.status = "COMPLETE"
+        state.note = f"publication recovered: {message}"
+        state.iterations_completed = max(
+            state.iterations_completed, state.current_iteration_idx
+        )
+        save_refine_state(state_path, state)
+        print(f"  publication recovery succeeded — {message}", flush=True)
+        return
 
     api_key = _ensure_api_key()
     print(f"using Aristotle API key: {_mask_key(api_key)}")
@@ -1556,42 +1728,93 @@ async def refine_command(args) -> None:
     # rejection notes here while state.json still reflects them, then
     # thread the value into the iteration via
     # ``prefetched_pending_rejections_md``.
-    prefetched_pending_rejections_md = (
-        _load_pending_rejections_md(
-            repo_dir, target_folder, focus_issue=review_issue_num,
-        )
-        if review_issue_num is not None
-        else None
-    )
+    prefetched_pending_rejections_md: Optional[str] = None
+    if review_issue_num is not None:
+        handed_note = getattr(args, "review_rejection_note_file", None)
+        if handed_note is not None:
+            prefetched_pending_rejections_md = _load_dispatched_rejection_note(
+                handed_note.resolve(),
+                review_issue_num,
+                getattr(args, "review_verdict_ts", None),
+            )
+        else:
+            prefetched_pending_rejections_md = _load_pending_rejections_md(
+                repo_dir, target_folder, focus_issue=review_issue_num,
+            )
+        if not prefetched_pending_rejections_md:
+            print(
+                f"focused rejection #{review_issue_num} has no authoritative "
+                "human note; refusing generic Claude/Aristotle fallback. The "
+                "scheduler will retry after the note handoff/GitHub read "
+                "recovers.",
+                flush=True,
+            )
+            raise SystemExit(EXIT_REJECTION_CONTEXT_MISSING)
 
     # When --auto-pr is set, prepare the dedicated marathon branch
     # BEFORE the iteration runs so the auto-commit lands on the right
     # branch. Refuses on a dirty working tree; fail-fast so the human
     # doesn't lose uncommitted work.
     if pipeline_config.auto_pr:
-        from marathon.post_pipeline import prepare_auto_pr_branch
+        from marathon.post_pipeline import (
+            _branch_name_for_issue,
+            prepare_auto_pr_branch,
+        )
         # ``chapter_label`` isn't bound in this function — the analog
         # is ``target_folder.name`` (e.g., "Chapter14"). The inner
         # iteration loop uses ``target_folder_name`` for the same
         # purpose (cf. run_post_pipeline calls in _run_iteration).
-        ok, branch_name, branch_msg = prepare_auto_pr_branch(
-            repo_dir=Path(args.repo_dir).resolve(),
-            chapter_label=target_folder.name,
-            issue_num=review_issue_num,
-            base=pipeline_config.auto_pr_base,
-            # A PROVE run lands proofs on the prover branch under a distinct
-            # `proof-` prefix; a REPAIR run lands build-fixes on main under
-            # `repair-`; a refine keeps `refine-`.
-            kind=(
-                "proof" if pipeline_config.fill_run
-                else "repair" if pipeline_config.repair_run
-                else "refine"
-            ),
-            # A repair CONTINUES its open branch head (a [build:FAIL] round's
-            # partial progress lives on the un-merged PR); resetting to
-            # origin/<base> would wipe it and the rounds would oscillate.
-            continue_remote_branch=pipeline_config.repair_run,
+        branch_kind = (
+            "proof" if pipeline_config.fill_run
+            else "repair" if pipeline_config.repair_run
+            else "refine"
         )
+        if state.preserve_local_branch:
+            branch_name = _branch_name_for_issue(
+                target_folder.name, review_issue_num, kind=branch_kind
+            )
+            branch_cp = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=str(repo_dir), capture_output=True, text=True, check=False,
+            )
+            head_cp = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(repo_dir), capture_output=True, text=True, check=False,
+            )
+            actual_branch = (branch_cp.stdout or "").strip()
+            actual_head = (head_cp.stdout or "").strip()
+            expected_head = state.continuation_commit_sha or ""
+            ok = (
+                branch_cp.returncode == 0
+                and head_cp.returncode == 0
+                and actual_branch == branch_name
+                and (
+                    not expected_head
+                    or actual_head.startswith(expected_head)
+                )
+            )
+            branch_msg = (
+                f"on {branch_name}; preserving gate-blocked local commit "
+                f"{actual_head[:12]} (no checkout/reset)"
+                if ok
+                else (
+                    "cannot safely preserve gate-blocked work: expected "
+                    f"{branch_name}@{expected_head or '?'}, found "
+                    f"{actual_branch or '?'}@{actual_head[:12] or '?'}"
+                )
+            )
+        else:
+            ok, branch_name, branch_msg = prepare_auto_pr_branch(
+                repo_dir=Path(args.repo_dir).resolve(),
+                chapter_label=target_folder.name,
+                issue_num=review_issue_num,
+                base=pipeline_config.auto_pr_base,
+                kind=branch_kind,
+                # A repair CONTINUES its open branch head (a [build:FAIL] round's
+                # partial progress lives on the un-merged PR); resetting to
+                # origin/<base> would wipe it and the rounds would oscillate.
+                continue_remote_branch=pipeline_config.repair_run,
+            )
         if not ok:
             print(f"  auto-pr: {branch_msg}", flush=True)
             print("  refusing to run iteration on the wrong branch.", flush=True)
@@ -1650,9 +1873,22 @@ async def refine_command(args) -> None:
         save_refine_state(state_path, state)
 
         continue_on_review = not getattr(args, "no_continue_on_review", False)
-        existing_project, existing_task, existing_mode = await _try_reattach_or_continue(
-            state, continue_on_review=continue_on_review,
-        )
+        try:
+            existing_project, existing_task, existing_mode = (
+                await _try_reattach_or_continue(
+                    state, continue_on_review=continue_on_review,
+                )
+            )
+        except ReattachTransientError as exc:
+            state.status = "REATTACH_RETRY"
+            state.note = str(exc)
+            save_refine_state(state_path, state)
+            print(
+                f"  Aristotle reattach temporarily unavailable: {exc}; "
+                "preserving project/task IDs for retry",
+                flush=True,
+            )
+            raise SystemExit(EXIT_REATTACH_TRANSIENT) from exc
 
         if existing_mode is None:
             print(f"\n=== iteration {iteration_idx}/{args.max_iterations} ===")
@@ -1676,35 +1912,46 @@ async def refine_command(args) -> None:
         else:
             print(f"\n=== iteration {iteration_idx}/{args.max_iterations} (resumed) ===")
 
-        ok = await _run_iteration(
-            iteration_idx=iteration_idx,
-            target_folder=target_folder,
-            repo_dir=repo_dir,
-            tex_path=tex_path,
-            workdir_log=workdir_log,
-            log_path=log_path,
-            expected_path=expected_path,
-            output_path_str=output_path_str,
-            polling_interval=args.polling_interval,
-            max_retries=args.max_retries,
-            max_iterations=args.max_iterations,
-            skeleton_mode=args.skeleton,
-            max_prompt_words=args.max_prompt_words,
-            pipeline_config=pipeline_config,
-            target_folder_name=target_folder.name,
-            state=state,
-            state_path=state_path,
-            existing_project=existing_project,
-            existing_task=existing_task,
-            existing_mode=existing_mode,
-            workdir=workdir,
-            cross_chapter=not args.no_cross_chapter,
-            watcher_factory=watcher_factory,
-            continue_on_review=continue_on_review,
-            review_rejection=getattr(args, "review_rejection", None),
-            focus_directive=getattr(args, "focus_directive", None),
-            prefetched_pending_rejections_md=prefetched_pending_rejections_md,
-        )
+        try:
+            ok = await _run_iteration(
+                iteration_idx=iteration_idx,
+                target_folder=target_folder,
+                repo_dir=repo_dir,
+                tex_path=tex_path,
+                workdir_log=workdir_log,
+                log_path=log_path,
+                expected_path=expected_path,
+                output_path_str=output_path_str,
+                polling_interval=args.polling_interval,
+                max_retries=args.max_retries,
+                max_iterations=args.max_iterations,
+                skeleton_mode=args.skeleton,
+                max_prompt_words=args.max_prompt_words,
+                pipeline_config=pipeline_config,
+                target_folder_name=target_folder.name,
+                state=state,
+                state_path=state_path,
+                existing_project=existing_project,
+                existing_task=existing_task,
+                existing_mode=existing_mode,
+                workdir=workdir,
+                cross_chapter=not args.no_cross_chapter,
+                watcher_factory=watcher_factory,
+                continue_on_review=continue_on_review,
+                review_rejection=getattr(args, "review_rejection", None),
+                focus_directive=getattr(args, "focus_directive", None),
+                prefetched_pending_rejections_md=prefetched_pending_rejections_md,
+            )
+        except ReattachTransientError as exc:
+            state.status = "REATTACH_RETRY"
+            state.note = str(exc)
+            save_refine_state(state_path, state)
+            print(
+                f"  Aristotle reattach temporarily unavailable: {exc}; "
+                "preserving project/task IDs for retry",
+                flush=True,
+            )
+            raise SystemExit(EXIT_REATTACH_TRANSIENT) from exc
 
         if not ok:
             msg = f"  iteration {iteration_idx} failed: {state.status}"

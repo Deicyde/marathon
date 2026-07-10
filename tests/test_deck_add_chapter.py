@@ -100,6 +100,11 @@ def test_add_chapter_routes_informal_source(tmp_path):
     server.intake = IntakeRegistry(runner=fake_runner)
     thread, base = _serve(server)
 
+    informal = cfg.repo_dir / "informal"
+    informal.mkdir()
+    (informal / "C17.md").write_text("chapter 17")
+    (informal / "C18.md").write_text("chapter 18")
+
     def start(chapter, payload):
         seen.clear()
         body = {"chapter": chapter}
@@ -131,6 +136,81 @@ def test_add_chapter_routes_informal_source(tmp_path):
         assert code == 400
         time.sleep(0.05)
         assert seen == []
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=5)
+
+
+def test_add_chapter_rejects_informal_file_escape(tmp_path):
+    """A deck collaborator cannot turn chapter intake into a host-file read.
+
+    Absolute paths, traversal, and a repo-local symlink pointing outside the
+    repo all fail before the intake worker sees a path.
+    """
+    cfg = _cfg(tmp_path)
+    outside = tmp_path / "secret.md"
+    outside.write_text("do not send me to a model")
+    (cfg.repo_dir / "escape.md").symlink_to(outside)
+    started = []
+
+    def fake_runner(_cfg, chapter, *, informal_path=None, use_tracker=False):
+        started.append(informal_path)
+        return IntakeResult(chapter, Path("x"), [], "", "m")
+
+    server = deck_server.make_server(cfg, port=0)
+    server.intake = IntakeRegistry(runner=fake_runner)
+    thread, base = _serve(server)
+    try:
+        attempts = [
+            str(outside),
+            "../secret.md",
+            "escape.md",
+        ]
+        for offset, path in enumerate(attempts):
+            code, body = _post(
+                base,
+                "/api/add-chapter",
+                {
+                    "chapter": 30 + offset,
+                    "informal_source": "file",
+                    "informal_statements": path,
+                },
+                server.token,
+            )
+            assert code == 400
+            assert "informal-statements" in body["error"]
+        assert started == []
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=5)
+
+
+def test_add_chapter_rejects_non_text_or_oversized_informal_file(tmp_path):
+    cfg = _cfg(tmp_path)
+    (cfg.repo_dir / "payload.bin").write_bytes(b"not text")
+    huge = cfg.repo_dir / "huge.md"
+    huge.write_bytes(b"x" * (deck_server.MAX_INFORMAL_SOURCE_BYTES + 1))
+    started = []
+
+    def fake_runner(_cfg, chapter, *, informal_path=None, use_tracker=False):
+        started.append(informal_path)
+        return IntakeResult(chapter, Path("x"), [], "", "m")
+
+    server = deck_server.make_server(cfg, port=0)
+    server.intake = IntakeRegistry(runner=fake_runner)
+    thread, base = _serve(server)
+    try:
+        for chapter, path in ((40, "payload.bin"), (41, "huge.md")):
+            code, _ = _post(
+                base,
+                "/api/add-chapter",
+                {
+                    "chapter": chapter,
+                    "informal_source": "file",
+                    "informal_statements": path,
+                },
+                server.token,
+            )
+            assert code == 400
+        assert started == []
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=5)
 

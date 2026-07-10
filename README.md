@@ -6,6 +6,10 @@ reviewed, merged Lean / Mathlib code: it drafts the formalization with Aristotle
 to verify or reject — and a **conductor** orchestrates Aristotle to refine the
 rejects and merge the fixes, concurrently and hands-off.
 
+See [docs/architecture.md](docs/architecture.md) for the current module map,
+state ownership, and safety invariants. The older v2 analysis documents are
+retained as design history rather than a description of the live harness.
+
 > Marathon began as a batch extractor (`skeleton` / `refine`). v2 is built around
 > the **review deck** and the **conductor**: a continuous review-and-refine loop
 > with a web UI, per-declaration verdicts, and a shared multi-user mode.

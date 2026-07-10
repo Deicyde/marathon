@@ -5,9 +5,9 @@
  *   The ready QUEUE is the ISSUE picker. Picking a ready issue opens its
  *   SUBDECK — one DECLARATION card at a time. You swipe each declaration
  *   (verify / reject / defer) which records a LOCAL per-decl verdict only.
- *   When every declaration has been reviewed, a confirm-and-SHIP summary
- *   card appears; shipping composes the whole issue's outcome and is the
- *   single irreversible action.
+ *   When every declaration has been reviewed — OR the first rejection pauses
+ *   the dependency-ordered review — a confirm-and-SHIP summary card appears;
+ *   shipping composes the issue outcome and is the single irreversible action.
  *
  * Codes to the SHARED API CONTRACT:
  *   GET  /api/queue?chapter=N           -> {cards:[CardSummary], building, landed_today}
@@ -190,10 +190,15 @@
           });
         }
         if (!r.ok || (data && data.ok === false)) {
-          throw new Error(
+          var requestError = new Error(
             (data && (data.message || data.reason || data.error)) ||
               "request failed (" + r.status + ")"
           );
+          // Preserve structured recovery data (notably Add Chapter's durable
+          // partial issue IDs) without changing the normal Promise API.
+          requestError.data = data || null;
+          requestError.status = r.status;
+          throw requestError;
         }
         return data;
       });
@@ -291,6 +296,11 @@
     // is purely local view state — pulling one back does NOT post anything.
     overrides: {},      // { issueNum: { declName: true } }
     apiPanelOpen: false, // the auto-approved panel's expand/collapse state
+    rejectComposerOpen: false, // inline/sidebar editor; never obscures source
+    // A rejected local predecessor makes verify/reject on its dependents a
+    // two-step choice.  Overrides are per issue+decl and live only in this tab.
+    dependencyOverrides: {},
+    subdeckRequestSeq: 0, // discards stale async GETs after issue/navigation changes
     activeTab: "review", // dashboard tab: review | status | issues | history
   };
   state.skipApi = readSkipApiPref();
@@ -324,6 +334,133 @@
       if (cards[i].name === name) return cards[i];
     }
     return null;
+  }
+
+  // Resolve the declarations in THIS issue that a card's elaborated kernel
+  // mentions.  The backend already gives every DeclCard its project-local
+  // kernel; using that data here keeps the review order definition-first even
+  // when the wire order is severity-first.  Exact qualified names win; a
+  // unique suffix match is a conservative fallback for older snapshots.
+  function localDependencyNames(card, cards) {
+    cards = cards || [];
+    var names = cards.map(function (c) { return c.name; });
+    var out = [];
+    ((card && card.kernel) || []).forEach(function (member) {
+      var raw = member && member.name;
+      if (!raw || raw === card.name) return;
+      var match = names.indexOf(raw) >= 0 ? raw : null;
+      if (!match) {
+        var suffixMatches = names.filter(function (name) {
+          return name === raw || name.slice(-(raw.length + 1)) === "." + raw ||
+            raw.slice(-(name.length + 1)) === "." + name;
+        });
+        if (suffixMatches.length === 1) match = suffixMatches[0];
+      }
+      if (match && out.indexOf(match) < 0) out.push(match);
+    });
+    return out;
+  }
+
+  // Stable topological sort of declarations within one issue.  Definitions
+  // therefore appear before the theorems that rely on them.  Independent
+  // declarations retain their backend order, and cycles retain their original
+  // order rather than disappearing from the review deck.
+  function dependencyOrder(cards) {
+    cards = (cards || []).slice();
+    var byName = {};
+    var originalIndex = {};
+    cards.forEach(function (card, i) {
+      byName[card.name] = card;
+      originalIndex[card.name] = i;
+    });
+    var indegree = {};
+    var dependents = {};
+    cards.forEach(function (card) {
+      var deps = localDependencyNames(card, cards);
+      indegree[card.name] = deps.length;
+      deps.forEach(function (dep) {
+        if (!dependents[dep]) dependents[dep] = [];
+        dependents[dep].push(card.name);
+      });
+    });
+    var ready = cards.filter(function (card) { return indegree[card.name] === 0; });
+    var out = [];
+    var placed = {};
+    function stableReadySort() {
+      ready.sort(function (a, b) {
+        return originalIndex[a.name] - originalIndex[b.name];
+      });
+    }
+    stableReadySort();
+    while (ready.length) {
+      var card = ready.shift();
+      if (placed[card.name]) continue;
+      placed[card.name] = true;
+      out.push(card);
+      (dependents[card.name] || []).forEach(function (name) {
+        indegree[name] -= 1;
+        if (indegree[name] === 0) ready.push(byName[name]);
+      });
+      stableReadySort();
+    }
+    cards.forEach(function (card) {
+      if (!placed[card.name]) out.push(card); // cyclic remainder
+    });
+    return out;
+  }
+
+  function normalizeSubdeck(sd) {
+    if (!sd) return sd;
+    sd.cards = dependencyOrder(sd.cards || []);
+    return sd;
+  }
+
+  function rejectedLocalDependencies(card) {
+    var cards = (state.subdeck && state.subdeck.cards) || [];
+    return localDependencyNames(card, cards).filter(function (name) {
+      var dep = findDecl(name);
+      return dep && dep.verdict === "rejected";
+    });
+  }
+
+  function dependencyOverrideKey(card) {
+    return String(state.issue) + "::" + ((card && card.name) || "");
+  }
+
+  // A partial reject has already produced a safe ship checkpoint, even if the
+  // reviewer explicitly continued into a later declaration. Keep that
+  // checkpoint reachable from every subsequent card so closing a dependency
+  // guard can never strand the reviewer away from SHIP.
+  function hasPausedReviewSummary() {
+    var sd = state.subdeck;
+    var rejected = (sd && sd.summary && sd.summary.rejected) || [];
+    return rejected.length > 0 && partialWaitCards().length > 0;
+  }
+
+  function returnToPausedReviewSummary() {
+    if (!hasPausedReviewSummary()) return;
+    if (state.rejectComposerOpen) {
+      flashToast("Finish or cancel the rejection note before leaving this declaration");
+      return;
+    }
+    closeReviewInspector();
+    state.showSummary = true;
+    state.currentDecl = null;
+    renderSubdeckStage();
+  }
+
+  function pausedSummaryButton() {
+    if (state.showSummary || !hasPausedReviewSummary()) return null;
+    return el("button", {
+      class: "btn btn-tiny paused-summary-btn",
+      type: "button",
+      "data-no-swipe": "true",
+      title: "Return to the partial KEEP/FIX/WAIT checkpoint and ship the upstream fix",
+      onclick: function (event) {
+        event.stopPropagation();
+        returnToPausedReviewSummary();
+      },
+    }, ["Return to paused review summary"]);
   }
 
   // === reconciliation read-model (PURE READ — never POSTs) =================
@@ -519,13 +656,81 @@
     s.textContent = txt;
     return s;
   }
-  function leanHighlight(src) {
+
+  function regexpEscape(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  // Map both qualified kernel names and unambiguous short names to their
+  // definitions.  Ambiguous short names are deliberately not clickable.
+  function kernelTermLookup(kernel) {
+    var lookup = {};
+    var short = {};
+    (kernel || []).forEach(function (member) {
+      if (!member || !member.name) return;
+      lookup[member.name] = member;
+      var bits = member.name.split(".");
+      var tail = bits[bits.length - 1];
+      if (!(tail in short)) short[tail] = member;
+      else short[tail] = null;
+    });
+    Object.keys(short).forEach(function (name) {
+      if (short[name] && !(name in lookup)) lookup[name] = short[name];
+    });
+    return lookup;
+  }
+
+  function leanReference(member, label) {
+    var ref = leanSpan("lh-ref", label);
+    ref.setAttribute("role", "button");
+    ref.setAttribute("tabindex", "0");
+    ref.setAttribute("data-no-swipe", "true");
+    ref.setAttribute("title", "Inspect " + member.name);
+    ref.setAttribute("aria-label", "Inspect definition of " + member.name);
+    ref.addEventListener("click", function (e) {
+      e.stopPropagation();
+      showKernelDefinition(member);
+    });
+    ref.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        showKernelDefinition(member);
+      }
+    });
+    return ref;
+  }
+
+  // Highlight references only in ordinary code text; comments and strings are
+  // emitted by leanHighlight as atomic spans and never receive fake links.
+  function leanPlainNodes(txt, kernel) {
+    var lookup = kernelTermLookup(kernel);
+    var keys = Object.keys(lookup).sort(function (a, b) { return b.length - a.length; });
+    if (!keys.length) return [document.createTextNode(txt)];
+    var pattern = keys.map(regexpEscape).join("|");
+    var re = new RegExp("(^|[^A-Za-z0-9_'.])(" + pattern + ")(?=[^A-Za-z0-9_'.]|$)", "g");
+    var nodes = [];
+    var last = 0;
+    var m;
+    while ((m = re.exec(txt))) {
+      if (m.index > last) nodes.push(document.createTextNode(txt.slice(last, m.index)));
+      if (m[1]) nodes.push(document.createTextNode(m[1]));
+      nodes.push(leanReference(lookup[m[2]], m[2]));
+      last = re.lastIndex;
+      if (re.lastIndex === m.index) re.lastIndex++;
+    }
+    if (last < txt.length) nodes.push(document.createTextNode(txt.slice(last)));
+    return nodes;
+  }
+
+  function leanHighlight(src, kernel) {
     var nodes = [];
     var last = 0;
     var m;
     LEAN_RE.lastIndex = 0;
     while ((m = LEAN_RE.exec(src))) {
-      if (m.index > last) nodes.push(document.createTextNode(src.slice(last, m.index)));
+      if (m.index > last) {
+        nodes = nodes.concat(leanPlainNodes(src.slice(last, m.index), kernel));
+      }
       if (m[1] || m[2]) nodes.push(leanSpan("lh-comment", m[1] || m[2]));
       else if (m[3]) nodes.push(leanSpan("lh-string", m[3]));
       else if (m[4]) nodes.push(leanSpan("lh-sorry", m[4]));
@@ -533,7 +738,7 @@
       last = LEAN_RE.lastIndex;
       if (LEAN_RE.lastIndex === m.index) LEAN_RE.lastIndex++;  // zero-width guard
     }
-    if (last < src.length) nodes.push(document.createTextNode(src.slice(last)));
+    if (last < src.length) nodes = nodes.concat(leanPlainNodes(src.slice(last), kernel));
     return nodes;
   }
 
@@ -555,6 +760,7 @@
       el("div", { class: "subdeck-progress" }, [
         el("div", { class: "subdeck-controls" }, [
           skipApiToggle(),
+          pausedSummaryButton(),
         ]),
         el("span", {
           class: "progress-pill",
@@ -584,6 +790,11 @@
     });
     box.checked = !!state.skipApi;
     box.addEventListener("change", function () {
+      if (state.rejectComposerOpen) {
+        box.checked = !!state.skipApi;
+        setSkipApi(state.skipApi); // guarded: explains why navigation is locked
+        return;
+      }
       // PURE VIEW CHANGE: persist the preference, then GET-refetch the deck.
       // No POST, no verdict, no ship.
       setSkipApi(box.checked);
@@ -600,6 +811,10 @@
   // the SOLE writer of the preference and the SOLE trigger of the view
   // refetch; it performs only a GET. (Binding safety: never a POST.)
   function setSkipApi(on) {
+    if (state.rejectComposerOpen) {
+      flashToast("Finish or cancel the rejection note before changing Skip API");
+      return;
+    }
     state.skipApi = !!on;
     writeSkipApiPref(state.skipApi);
     if (state.issue != null) refetchSubdeck();
@@ -619,7 +834,9 @@
       return !isOverridden(c.name);
     });
     var n = list.length;
-    var panel = el("section", { class: "api-panel", "aria-label": "API declarations to auto-approve" });
+    var paused = (((sd.summary || {}).rejected) || []).length > 0;
+    var panel = el("section", { class: "api-panel", "aria-label":
+      paused ? "API declarations waiting after rejection" : "API declarations to auto-approve" });
     var head = el("button", {
       class: "api-panel-head",
       type: "button",
@@ -627,9 +844,14 @@
     }, [
       el("span", { class: "api-panel-caret", text: state.apiPanelOpen ? "▾" : "▸" }),
       el("span", { class: "api-panel-title", text:
-        n + " API declaration" + (n === 1 ? "" : "s") + " will be auto-approved on ship" }),
+        n + " API declaration" + (n === 1 ? "" : "s") +
+        (paused ? " paused in WAIT after rejection" : " will be auto-approved on ship") }),
     ]);
     head.addEventListener("click", function () {
+      if (state.rejectComposerOpen) {
+        flashToast("Finish or cancel the rejection note before changing this panel");
+        return;
+      }
       state.apiPanelOpen = !state.apiPanelOpen;
       // Pure re-render of the same payload (no fetch, no POST).
       renderSubdeckStage();
@@ -639,10 +861,13 @@
     if (state.apiPanelOpen) {
       panel.appendChild(
         el("p", { class: "api-panel-note" }, [
-          "Skip-API ",
-          el("strong", { text: "auto-approves these declarations' STATEMENTS" }),
-          " — they are folded into KEEP on ship without individual review. " +
-          "Pull any one back to review it as a normal card.",
+          paused ? "Partial reject safety " : "Skip-API ",
+          el("strong", { text: paused
+            ? "suppresses auto-approval for these declarations"
+            : "auto-approves these declarations' STATEMENTS" }),
+          paused
+            ? " — they remain untouched in WAIT until the upstream fix returns. Pull one back only to review it explicitly."
+            : " — they are folded into KEEP on ship without individual review. Pull any one back to review it as a normal card.",
         ])
       );
       var ul = el("ul", { class: "api-list" });
@@ -681,6 +906,10 @@
   // MAIN `cards`); it POSTs nothing. We record the override locally so it
   // survives the refetch and is re-applied.
   function pullIntoReview(name) {
+    if (state.rejectComposerOpen) {
+      flashToast("Finish or cancel the rejection note before navigating away");
+      return;
+    }
     overrideSet()[name] = true;
     // Pull the served auto_approved card into the visible deck immediately so
     // the human can act without waiting on a round trip; a refetch would also
@@ -690,7 +919,7 @@
     if (sd && sd.auto_approved) {
       for (var i = 0; i < sd.auto_approved.length; i++) {
         if (sd.auto_approved[i].name === name) {
-          sd.cards = (sd.cards || []).concat([sd.auto_approved[i]]);
+          sd.cards = dependencyOrder((sd.cards || []).concat([sd.auto_approved[i]]));
           if (sd.progress) sd.progress.total = (sd.progress.total || 0) + 1;
           break;
         }
@@ -824,6 +1053,198 @@
     ]);
   }
 
+  // --- non-modal review inspector -----------------------------------------
+  // Reject notes, dependency maps, links, and term definitions live beside
+  // the source on wide screens (below it on narrow screens).  Unlike the old
+  // full-screen modal, this never hides the code the reviewer is commenting on.
+  function inspectorHost() {
+    return document.getElementById("review-inspector");
+  }
+
+  function setComposerNavigationLocked(locked) {
+    var selector = [
+      ".skip-api-box", ".paused-summary-btn", ".decl-lock-ctl",
+      ".api-panel-head", ".api-pull",
+    ].join(", ");
+    var controls = document.querySelectorAll(selector);
+    for (var i = 0; i < controls.length; i++) controls[i].disabled = !!locked;
+  }
+
+  function isReviewInspectorOpen() {
+    var host = inspectorHost();
+    return !!(host && !host.hasAttribute("hidden"));
+  }
+
+  function closeReviewInspector() {
+    var host = inspectorHost();
+    if (!host) return;
+    var onClose = host._marathonOnClose;
+    host._marathonOnClose = null;
+    host.setAttribute("hidden", "hidden");
+    host.innerHTML = "";
+    var card = document.getElementById("active-card");
+    if (card) card.classList.remove("has-inspector");
+    if (typeof onClose === "function") onClose();
+  }
+
+  function openReviewInspector(title, children, onClose) {
+    var host = inspectorHost();
+    if (!host) {
+      flashToast("Open a declaration card to use the review inspector");
+      return null;
+    }
+    // Replacing a reject composer would silently lose typed feedback.  Action
+    // buttons are disabled while it is open, but term links remain clickable,
+    // so guard that path as well.
+    if (state.rejectComposerOpen && !onClose) {
+      flashToast("Finish or cancel the rejection note first");
+      return null;
+    }
+    host.innerHTML = "";
+    host._marathonOnClose = onClose || null;
+    host.appendChild(el("div", { class: "inspector-head" }, [
+      el("h2", { class: "inspector-title", text: title }),
+      el("button", {
+        class: "inspector-close",
+        type: "button",
+        title: "Close inspector (Esc)",
+        "aria-label": "Close review inspector",
+        onclick: closeReviewInspector,
+      }, ["×"]),
+    ]));
+    (children || []).forEach(function (child) {
+      if (child) host.appendChild(child);
+    });
+    host.removeAttribute("hidden");
+    var card = document.getElementById("active-card");
+    if (card) card.classList.add("has-inspector");
+    return host;
+  }
+
+  function inspectorCode(label, value) {
+    var section = el("section", { class: "inspector-sec" }, [
+      el("h3", { class: "inspector-label", text: label }),
+    ]);
+    if (value) {
+      section.appendChild(el("pre", { class: "inspector-code mono" }, [value]));
+    } else {
+      section.appendChild(el("p", { class: "inspector-empty", text: "not available in this audit snapshot" }));
+    }
+    return section;
+  }
+
+  function showKernelDefinition(member) {
+    if (!member) return;
+    var meta = el("p", { class: "inspector-meta" }, [
+      member.kind ? el("span", { class: "decl-panel-kind", text: member.kind }) : null,
+      el("span", { class: "mono", text: member.name }),
+    ]);
+    openReviewInspector("Definition", [
+      meta,
+      inspectorCode("Elaborated type", member.type_pp),
+      inspectorCode("Definition body", member.value_pp),
+      el("p", { class: "inspector-hint", text:
+        "This is the audit snapshot's elaborated kernel entry. Click another highlighted term to inspect it." }),
+    ]);
+  }
+
+  function verdictGlyph(card) {
+    if (card.verdict === "verified") return "✓";
+    if (card.verdict === "rejected") return "✗";
+    if (card.verdict === "deferred") return "↺";
+    return "○";
+  }
+
+  function issuePermalink(issue) {
+    var current = state.subdeck && state.subdeck.permalink;
+    if (!current) return null;
+    return current.replace(/\/issues\/\d+(?:[/?#].*)?$/, "/issues/" + issue);
+  }
+
+  function openDependencyMap() {
+    var sd = state.subdeck;
+    if (!sd) return;
+    var cards = dependencyOrder(sd.cards || []);
+    var files = [];
+    cards.forEach(function (card) {
+      if (card.source_file && files.indexOf(card.source_file) < 0) files.push(card.source_file);
+    });
+    var intro = el("p", { class: "inspector-hint", text:
+      cards.length + " declarations" +
+      (files.length ? " across " + files.length + " source file" + (files.length === 1 ? "" : "s") : "") +
+      ". Arrows list local predecessors; click any node to inspect it." });
+    var graph = el("ol", { class: "dep-graph", "aria-label": "Declaration dependency order" });
+    cards.forEach(function (card, index) {
+      var deps = localDependencyNames(card, cards);
+      var row = el("li", {
+        class: "dep-node" + (state.currentDecl && state.currentDecl.name === card.name ? " is-current" : ""),
+      }, [
+        el("span", { class: "dep-node-order", text: String(index + 1) }),
+        el("button", {
+          class: "dep-node-open mono",
+          type: "button",
+          onclick: (function (name) { return function () { revisitDecl(name); }; })(card.name),
+        }, [card.name]),
+        el("span", { class: "dep-node-status dv-" + (card.verdict || "open"), text: verdictGlyph(card) }),
+        deps.length
+          ? el("div", { class: "dep-node-edges", text: "depends on " + deps.join(", ") })
+          : el("div", { class: "dep-node-edges dep-root", text: "root / no local predecessor" }),
+        card.source_file
+          ? el("div", { class: "dep-node-file mono", text: card.source_file })
+          : null,
+      ]);
+      graph.appendChild(row);
+    });
+
+    var external = el("section", { class: "inspector-sec" }, [
+      el("h3", { class: "inspector-label", text: "Predecessor issues" }),
+    ]);
+    var predecessors = sd.deps || [];
+    if (!predecessors.length) {
+      external.appendChild(el("p", { class: "inspector-empty", text: "none reported by the current payload" }));
+    } else {
+      var list = el("ul", { class: "deps-list" });
+      predecessors.forEach(function (dep) {
+        var url = issuePermalink(dep.id);
+        list.appendChild(el("li", { class: "dep-row" }, [
+          tierBadge(dep.tier),
+          el("span", { class: "dep-decl mono", text: dep.decl }),
+          url
+            ? el("a", { class: "dep-id", href: url, target: "_blank", rel: "noopener", text: "#" + dep.id })
+            : el("span", { class: "dep-id", text: "#" + dep.id }),
+        ]));
+      });
+      external.appendChild(list);
+    }
+    openReviewInspector("Dependency map", [intro, graph, external]);
+  }
+
+  function openResourceLinks() {
+    var sd = state.subdeck || {};
+    var card = state.currentDecl || {};
+    var links = [];
+    if (sd.permalink) {
+      links.push(el("a", {
+        class: "btn btn-primary resource-link",
+        href: sd.permalink,
+        target: "_blank",
+        rel: "noopener",
+      }, ["Open GitHub issue #" + sd.issue]));
+    }
+    openReviewInspector("Open source & issue", [
+      card.source_file
+        ? el("p", { class: "resource-file" }, [
+            el("strong", { text: "Source file" }),
+            el("span", { class: "mono", text: card.source_file }),
+          ])
+        : el("p", { class: "inspector-empty", text: "No source file was reported for this declaration." }),
+      links.length
+        ? el("div", { class: "resource-links" }, links)
+        : el("p", { class: "inspector-empty", text:
+            "No GitHub permalink was reported by this payload. The source path above can still be opened in your editor." }),
+    ]);
+  }
+
   // Render the current declaration card. Pure read render (no side effects).
   // The per-decl LOCK control on a review card: shows the current lock state
   // and toggles it. A LOCKED decl's signature is hard-frozen — no refine can
@@ -887,6 +1308,16 @@
         ]),
       ]));
     }
+    if (card.dependency_invalidated) {
+      panel.appendChild(el("div", { class: "changed-banner dependency-invalidated-banner", role: "alert" }, [
+        el("span", { class: "changed-icon", text: "↳" }),
+        el("div", {}, [
+          el("strong", { text: "Approval paused by an upstream rejection" }),
+          el("div", { class: "changed-sub", text:
+            "this declaration depends on a rejected definition and must be reviewed again after the upstream fix returns." }),
+        ]),
+      ]));
+    }
 
     var delta = semanticDeltaBanner(card.semantic_delta);
     if (delta) panel.appendChild(delta);
@@ -901,7 +1332,7 @@
         el("section", { class: "sec-source" }, [
           el("h3", { class: "sec-title" }, titleKids),
           el("pre", { class: "source-block" }, [
-            el("code", { class: "lean" }, leanHighlight(card.source_block)),
+            el("code", { class: "lean" }, leanHighlight(card.source_block, card.kernel)),
           ]),
         ])
       );
@@ -934,8 +1365,8 @@
     if (card.statement_pp) {
       panel.appendChild(
         el("section", { class: "statement" }, [
-          el("details", { class: "elab-type" }, [
-            el("summary", { text: "Elaborated type (what is actually proven)" }),
+          el("details", { class: "elab-type", "data-no-swipe": "true" }, [
+            el("summary", { text: "Elaborated type (what is actually proven)", "data-no-swipe": "true" }),
             el("pre", { class: "mono statement-pp" }, [prettyLeanType(card.statement_pp)]),
           ]),
         ])
@@ -953,7 +1384,16 @@
       ])
     );
 
-    article.appendChild(panel);
+    article.appendChild(el("div", { class: "review-body" }, [
+      panel,
+      el("aside", {
+        id: "review-inspector",
+        class: "review-inspector",
+        "data-no-swipe": "true",
+        "aria-label": "Review inspector",
+        hidden: "hidden",
+      }),
+    ]));
     return article;
   }
 
@@ -1257,6 +1697,11 @@
   // main-result cards (plus the auto_approved list) when it is ON. This is a
   // GET — it writes nothing and fires no verdict.
   function openIssue(issue) {
+    if (state.rejectComposerOpen) {
+      flashToast("Finish or cancel the rejection note before opening another issue");
+      return;
+    }
+    var requestSeq = ++state.subdeckRequestSeq;
     if (issue !== state.issue) state.apiPanelOpen = false; // fresh per issue
     state.issue = issue;
     state.showSummary = false;
@@ -1269,10 +1714,12 @@
     stage().appendChild(el("div", { class: "card card-loading", text: "loading declarations…" }));
     fetchSubdeck(issue, state.skipApi)
       .then(function (sd) {
-        state.subdeck = sd;
+        if (requestSeq !== state.subdeckRequestSeq || state.issue !== issue) return;
+        state.subdeck = normalizeSubdeck(sd);
         renderSubdeckStage();
       })
       .catch(function (err) {
+        if (requestSeq !== state.subdeckRequestSeq || state.issue !== issue) return;
         showErrorCard("Could not load issue #" + issue, err, function () {
           openIssue(issue);
         });
@@ -1283,28 +1730,38 @@
   // — a PURE READ used when the human flips the Skip-API toggle. It changes
   // only WHICH cards are shown; it POSTs nothing and ships nothing.
   function refetchSubdeck() {
+    if (state.rejectComposerOpen) {
+      flashToast("Finish or cancel the rejection note before refreshing the review");
+      return;
+    }
     var issue = state.issue;
     if (issue == null) return;
+    var requestSeq = ++state.subdeckRequestSeq;
     setActionsEnabled(false);
     stage().innerHTML = "";
     stage().appendChild(el("div", { class: "card card-loading", text: "loading declarations…" }));
     fetchSubdeck(issue, state.skipApi)
       .then(function (sd) {
-        state.subdeck = sd;
+        if (requestSeq !== state.subdeckRequestSeq || state.issue !== issue) return;
+        state.subdeck = normalizeSubdeck(sd);
         state.showSummary = false;
         renderSubdeckStage();
       })
       .catch(function (err) {
+        if (requestSeq !== state.subdeckRequestSeq || state.issue !== issue) return;
         showErrorCard("Could not load issue #" + issue, err, refetchSubdeck);
       });
   }
 
   function backToQueue() {
+    state.subdeckRequestSeq += 1;
     state.issue = null;
     state.subdeck = null;
     state.currentDecl = null;
     state.showSummary = false;
     state.apiPanelOpen = false;
+    state.rejectComposerOpen = false;
+    state.dependencyOverrides = {};
     // The skip-API preference persists per session; overrides are scoped per
     // issue and harmless to retain, but we drop them so a fresh open starts
     // from the backend's auto-approved classification.
@@ -1443,6 +1900,10 @@
   // LOCAL-ONLY; updates the local summary from the authoritative response and
   // re-renders the summary card so the lock badge reflects the new state.
   function toggleDeclLock(name, locked) {
+    if (state.rejectComposerOpen) {
+      flashToast("Finish or cancel the rejection note before changing the lock");
+      return;
+    }
     if (state.busy) return;
     state.busy = true;
     postDeclLock(state.issue, name, locked)
@@ -1473,15 +1934,50 @@
 
   // The entry points to a LOCAL per-decl verdict. Each is a deliberate user
   // action (button/key/swipe). verify/defer commit immediately; reject opens
-  // the required note modal. NONE of these ships anything.
+  // the required side-by-side note inspector. NONE of these ships anything.
+  function guardDependencyDecision() {
+    var card = state.currentDecl;
+    if (!card) return false;
+    var blockers = rejectedLocalDependencies(card);
+    var key = dependencyOverrideKey(card);
+    if (!blockers.length || state.dependencyOverrides[key]) return false;
+    var list = el("ul", { class: "blocked-deps" }, blockers.map(function (name) {
+      return el("li", { class: "mono", text: name });
+    }));
+    openReviewInspector("Upstream declaration rejected", [
+      el("p", { class: "inspector-warning", text:
+        "This declaration relies on a declaration you rejected. Accepting or rejecting it before Aristotle repairs the predecessor may waste the review." }),
+      list,
+      el("button", {
+        class: "btn dependency-override",
+        type: "button",
+        onclick: function () {
+          state.dependencyOverrides[key] = true;
+          closeReviewInspector();
+          flashToast("Dependency guard lifted for " + card.name + "; choose a verdict explicitly");
+        },
+      }, ["Review this declaration anyway"]),
+      el("button", {
+        class: "btn btn-primary return-paused-summary",
+        type: "button",
+        onclick: returnToPausedReviewSummary,
+      }, ["Return to paused review summary"]),
+      el("p", { class: "inspector-hint", text:
+        "No verdict was recorded. Close this panel to leave the guard in place." }),
+    ]);
+    return true;
+  }
+
   function actVerify() {
     if (state.informalActive) return approveInformal();
     if (!canAct()) return;
+    if (guardDependencyDecision()) return;
     commitDeclVerdict("verify", undefined);
   }
   function actReject() {
     if (state.informalActive) return openInformalRejectNote();
     if (!canAct()) return;
+    if (guardDependencyDecision()) return;
     openRejectNote();
   }
   function actDefer() {
@@ -1491,7 +1987,8 @@
   }
 
   function canAct() {
-    return !!state.currentDecl && !state.busy && !isModalOpen() && !state.showSummary;
+    return !!state.currentDecl && !state.busy && !isModalOpen() &&
+      !state.rejectComposerOpen && !state.showSummary;
   }
 
   // commitDeclVerdict — the sole caller of postDeclVerdict. Records the LOCAL
@@ -1509,6 +2006,10 @@
         state.busy = false;
         // Reflect the recorded verdict + progress back into our subdeck copy.
         applyDeclResult(decl, verdict, note, resp);
+        // Stop at the first bad declaration. A reject may be shipped partially:
+        // reviewed predecessors become KEEP, this declaration becomes FIX, and
+        // later declarations remain untouched for the post-Aristotle round.
+        if (verdict === "reject") state.showSummary = true;
         flashToast(verdictPastTense(verdict) + " " + decl + " (local)");
         renderSubdeckStage();
       })
@@ -1542,6 +2043,26 @@
         c.note = typeof note === "string" ? note : null;
       }
     });
+    if (resp && resp.summary) sd.summary = resp.summary;
+    var invalidated = {};
+    (((sd.summary || {}).invalidated) || []).forEach(function (name) {
+      invalidated[name] = true;
+    });
+    (sd.cards || []).forEach(function (card) {
+      if (invalidated[card.name]) {
+        if (!card.dependency_invalidated)
+          card.verdict_before_dependency_invalidation = card.verdict;
+        card.dependency_invalidated = true;
+        card.verdict = null;
+      } else if (card.dependency_invalidated) {
+        card.dependency_invalidated = false;
+        // The touched card's POSTed verdict wins. Restore the saved verdict
+        // only for a sibling whose upstream rejection was reversed.
+        if (card.name !== decl && card.verdict_before_dependency_invalidation)
+          card.verdict = card.verdict_before_dependency_invalidation;
+        delete card.verdict_before_dependency_invalidation;
+      }
+    });
     if (state.skipApi) {
       // Main-scoped recompute: a card counts as reviewed iff verified/rejected
       // (deferred does NOT count — it leaves the subdeck incomplete, matching
@@ -1551,7 +2072,6 @@
       if (resp && resp.progress) sd.progress = resp.progress;
       if (resp && typeof resp.complete === "boolean") sd.complete = resp.complete;
     }
-    if (resp && resp.summary) sd.summary = resp.summary;
   }
 
   // Recompute progress/complete over the visible MAIN `cards` (the skip-API
@@ -1574,15 +2094,57 @@
 
   // === confirm-and-ship summary card =======================================
 
-  // The API decls that WILL be auto-approved at ship under skip-API: the
-  // backend's auto_approved list MINUS any the human pulled back into review
-  // (those moved into the visible deck and are reviewed normally). Pure read.
-  function autoApprovedForShip() {
+  // The API declarations hidden by Skip-API, minus local review overrides.
+  function autoApprovedCandidates() {
     var sd = state.subdeck;
     if (!sd || !state.skipApi) return [];
     return (sd.auto_approved || []).filter(function (c) {
       return !isOverridden(c.name);
     });
+  }
+
+  // All declarations excluded from a partial reject decision. This includes
+  // ordinary unreviewed/deferred cards, dependency-invalidated verified cards
+  // (the POST response may leave the local card verdict stale), and every
+  // hidden Skip-API candidate whose auto-approval is suppressed after reject.
+  function partialWaitCards() {
+    var sd = state.subdeck;
+    if (!sd) return [];
+    var invalidated = {};
+    (((sd.summary || {}).invalidated) || []).forEach(function (name) {
+      invalidated[name] = true;
+    });
+    var out = [];
+    var seen = {};
+    function add(card, reason) {
+      if (!card || !card.name || seen[card.name]) return;
+      seen[card.name] = true;
+      out.push({
+        name: card.name,
+        verdict: card.verdict,
+        source_file: card.source_file,
+        wait_reason: reason,
+      });
+    }
+    (sd.cards || []).forEach(function (card) {
+      if (invalidated[card.name]) add(card, "dependency invalidated");
+      else if (card.verdict !== "verified" && card.verdict !== "rejected")
+        add(card, card.verdict === "deferred" ? "deferred" : "not reviewed");
+    });
+    var rejected = ((sd.summary || {}).rejected) || [];
+    if (rejected.length) {
+      autoApprovedCandidates().forEach(function (card) {
+        add(card, "Skip-API paused after rejection");
+      });
+    }
+    return out;
+  }
+
+  // API auto-approval is safe only for a non-partial review. Once anything is
+  // rejected, hidden API declarations join WAIT rather than KEEP.
+  function autoApprovedForShip() {
+    if (hasPausedReviewSummary()) return [];
+    return autoApprovedCandidates();
   }
 
   function renderSummaryCard() {
@@ -1592,6 +2154,8 @@
     var rejected = summary.rejected || [];
     var deferred = summary.deferred || [];
     var anyRejected = rejected.length > 0;
+    var pendingCards = partialWaitCards();
+    var partialReject = anyRejected && pendingCards.length > 0;
     // A flagged MISSING declaration (the issue is incomplete) also routes the
     // ship to Aristotle (with an ADD instruction) even if nothing was rejected.
     var missing = (sd && sd.missing) || "";
@@ -1603,7 +2167,9 @@
     var card = el("article", { class: "card summary-card", id: "active-card" });
     card.appendChild(subdeckHeader());
     card.appendChild(
-      el("h2", { class: "summary-title", text: "Review complete — confirm & ship issue #" + sd.issue })
+      el("h2", { class: "summary-title", text:
+        (partialReject ? "Review paused at first rejection" : "Review complete") +
+        " — confirm & ship issue #" + sd.issue })
     );
 
     // KEEP list (verified decls — kept exactly as written). Under skip-API the
@@ -1698,6 +2264,31 @@
     }
     card.appendChild(fixSec);
 
+    // WAIT list: after the first rejection we deliberately stop. These cards
+    // are neither KEEP nor FIX, and the partial ship note's footer leaves them
+    // untouched until Aristotle repairs the earlier declaration.
+    if (partialReject) {
+      var waitSec = el("section", { class: "summary-sec summary-wait" }, [
+        el("h3", { class: "sec-title", text:
+          "WAIT (" + pendingCards.length + ") — review after the upstream fix" }),
+        el("p", { class: "summary-wait-note", text:
+          "These declarations are not included in this decision. Aristotle is told to leave them untouched; they return for review after the rejected declaration is repaired." }),
+      ]);
+      var waitList = el("ul", { class: "summary-list" });
+      pendingCards.forEach(function (pending) {
+        waitList.appendChild(el("li", { class: "summary-row wait-row" }, [
+          el("span", { class: "mono", text: pending.name }),
+          el("span", {
+            class: "decl-verdict-tag " +
+              (pending.verdict === "deferred" ? "dv-deferred" : "dv-open"),
+            text: pending.wait_reason || "not reviewed",
+          }),
+        ]));
+      });
+      waitSec.appendChild(waitList);
+      card.appendChild(waitSec);
+    }
+
     // ADD section: flag that the issue is INCOMPLETE — a result its title
     // promises has no declaration. The note ships to Aristotle as an ADD
     // instruction (verbatim), routing to Aristotle even if all decls verified.
@@ -1722,7 +2313,7 @@
     }
     card.appendChild(addSec);
 
-    if (deferred.length) {
+    if (deferred.length && !partialReject) {
       card.appendChild(
         el("p", { class: "summary-deferred", text:
           "note: " + deferred.length + " decl(s) were deferred — review them before shipping." })
@@ -1742,10 +2333,12 @@
     card.appendChild(
       el("div", { class: "summary-actions" }, [
         el("button", { class: "btn", type: "button", onclick: function () {
-          // revisit: drop back into the deck at the first card to re-review.
-          var first = (sd.cards || [])[0];
-          if (first) revisitDecl(first.name);
-        } }, ["Revisit declarations"]),
+          // On a partial reject, continue at the first untouched card only by
+          // explicit choice; otherwise revisit the first card as before.
+          var first = partialReject ? pendingCards[0] : (sd.cards || [])[0];
+          if (first && findDecl(first.name)) revisitDecl(first.name);
+          else if (partialReject && state.skipApi) setSkipApi(false);
+        } }, [partialReject ? "Continue reviewing anyway" : "Revisit declarations"]),
         shipBtn,
       ])
     );
@@ -1753,7 +2346,9 @@
       el("p", { class: "ship-warn", text:
         "This is the ONLY irreversible action — " +
         (anyAristotle
-          ? "it dispatches Aristotle with your fix/add notes verbatim."
+          ? (partialReject
+              ? "it dispatches the fix now; WAIT declarations stay untouched for the next round."
+              : "it dispatches Aristotle with your fix/add notes verbatim.")
           : "it merges the marathon PR and marks the issue verified.") })
     );
 
@@ -1893,6 +2488,9 @@
   function confirmAndShip(anyRejected) {
     var autoApproved = autoApprovedForShip();
     var keptSurfaced = keptSurfacedForShip();
+    var rejected = (state.subdeck && state.subdeck.summary && state.subdeck.summary.rejected) || [];
+    var pending = partialWaitCards();
+    var partialReject = rejected.length > 0 && pending.length > 0;
     var kids = [
       el("h2", { class: "modal-title", text:
         (anyRejected ? "Ship to Aristotle" : "Mark issue verified") + " — #" + state.issue }),
@@ -1904,6 +2502,15 @@
           : " — it merges the marathon PR and flips the issue to VERIFIED.",
       ]),
     ];
+    if (partialReject) {
+      kids.push(
+        el("p", { class: "modal-sub modal-partial-warn" }, [
+          el("strong", { text: "Stop-at-first-reject: " }),
+          pending.length + " later declaration" + (pending.length === 1 ? " is" : "s are") +
+          " excluded from KEEP/FIX and will be left untouched for the next review round.",
+        ])
+      );
+    }
     // Skip-API: make the auto-approval explicit at the point of no return.
     if (autoApproved.length) {
       kids.push(
@@ -1963,6 +2570,7 @@
         var msg = (resp && resp.message) || ("issue #" + issue + " " + outcome);
         // The shipped issue left the ready queue.
         state.queue = state.queue.filter(function (c) { return c.id !== issue; });
+        state.subdeckRequestSeq += 1;
         state.subdeck = null;
         state.issue = null;
         state.showSummary = false;
@@ -2016,76 +2624,63 @@
       "aria-label": "Rejection note (required, composed into the issue's Aristotle fix instructions verbatim)",
     });
     var err = el("div", { class: "modal-err", hidden: "hidden" });
-    var panel = el("div", { class: "modal-panel" }, [
-      el("h2", { class: "modal-title", text: "Reject " + decl }),
-      el("p", { class: "modal-sub" }, [
+    var form = el("form", { class: "reject-composer", "data-no-swipe": "true" }, [
+      el("p", { class: "inspector-hint" }, [
         "Your note is ",
         el("strong", { text: "composed verbatim into the issue's fix instructions for Aristotle" }),
         " when you ship. A note is required. (Recording it now is LOCAL — nothing dispatches yet.)",
       ]),
       ta,
       err,
-      el("div", { class: "modal-actions" }, [
-        el("button", { class: "btn", type: "button", onclick: function () { closeModal(); } }, ["Cancel"]),
+      el("div", { class: "inspector-actions" }, [
+        el("button", { class: "btn", type: "button", onclick: closeReviewInspector }, ["Cancel"]),
         el("button", {
           class: "btn btn-danger",
-          type: "button",
-          onclick: function () {
-            var note = ta.value.trim();
-            if (!note) {
-              err.textContent = "A rejection note is required (it is composed into the Aristotle fix instructions).";
-              err.removeAttribute("hidden");
-              ta.focus();
-              return;
-            }
-            closeModal();
-            commitDeclVerdict("reject", note); // verbatim, no client rewrite
-          },
+          type: "submit",
         }, ["Reject declaration"]),
       ]),
     ]);
-    openModal(panel);
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var note = ta.value.trim();
+      if (!note) {
+        err.textContent = "A rejection note is required (it is composed into the Aristotle fix instructions).";
+        err.removeAttribute("hidden");
+        ta.focus();
+        return;
+      }
+      // Do not run the cancel callback while transitioning into the POST.
+      var host = inspectorHost();
+      if (host) host._marathonOnClose = null;
+      state.rejectComposerOpen = false;
+      setComposerNavigationLocked(false);
+      closeReviewInspector();
+      commitDeclVerdict("reject", note); // verbatim, no client rewrite
+    });
+    state.rejectComposerOpen = true;
+    setActionsEnabled(false);
+    var opened = openReviewInspector("Reject " + decl, [form], function () {
+      state.rejectComposerOpen = false;
+      setComposerNavigationLocked(false);
+      setActionsEnabled(true);
+    });
+    if (!opened) {
+      state.rejectComposerOpen = false;
+      setActionsEnabled(true);
+      return;
+    }
+    setComposerNavigationLocked(true);
     setTimeout(function () { ta.focus(); }, 0);
   }
 
   function openDeps() {
-    // Dependencies are shown at the issue level; the subdeck header already
-    // carries the parent issue. Here we surface the per-issue dep refs if the
-    // subdeck payload included them (best-effort — no extra fetch).
-    var deps = (state.subdeck && state.subdeck.deps) || [];
-    var list = el("ul", { class: "deps-list" });
-    if (!deps.length) {
-      list.appendChild(el("li", { class: "deps-empty", text: "no dependency predecessors (review predecessors first if any)" }));
-    } else {
-      deps.forEach(function (d) {
-        list.appendChild(
-          el("li", { class: "dep-row" }, [
-            tierBadge(d.tier),
-            el("span", { class: "dep-decl mono", text: d.decl }),
-            el("span", { class: "dep-id", text: "#" + d.id }),
-          ])
-        );
-      });
-    }
-    var panel = el("div", { class: "modal-panel" }, [
-      el("h2", { class: "modal-title", text: "Dependencies — review predecessors first" }),
-      list,
-      el("div", { class: "modal-actions" }, [
-        el("button", { class: "btn", type: "button", onclick: function () { closeModal(); } }, ["Close"]),
-      ]),
-    ]);
-    openModal(panel);
+    openDependencyMap();
   }
 
   function openDeepDive() {
-    var url = state.subdeck && state.subdeck.permalink;
-    if (url) {
-      // Opening the GitHub permalink / issue is a pure navigation, NOT a ship.
-      window.open(url, "_blank", "noopener");
-      flashToast("opened deep-dive (#" + state.issue + ")");
-    } else {
-      flashToast("no deep-dive link for this issue");
-    }
+    // Render a durable, normal anchor instead of relying on window.open (which
+    // popup blockers can discard with no visible result). Pure navigation.
+    openResourceLinks();
   }
 
   // === status strip ========================================================
@@ -2173,7 +2768,11 @@
   function setActionsEnabled(on) {
     ACTION_BTNS.forEach(function (id) {
       var b = document.getElementById(id);
-      if (b) b.disabled = !on;
+      // The leading informal card has no source/inspector host yet. Keep its
+      // verdict controls active, but do not present deps/open as clickable
+      // no-ops until a declaration card is on stage.
+      var needsDecl = id === "btn-deps" || id === "btn-deepdive";
+      if (b) b.disabled = !on || (needsDecl && state.informalActive);
     });
   }
 
@@ -2211,7 +2810,7 @@
       // is draggable; both route through actVerify/actReject on release.
       if (!card || !(canAct() || canActInformal())) return;
       // ignore drags that start on interactive children (buttons etc.)
-      if (e.target.closest("button, a, textarea, select")) return;
+      if (e.target.closest("button, a, textarea, select, details, summary, [data-no-swipe]")) return;
       dragging = true; target = card;
       startX = e.clientX; startY = e.clientY; dx = 0; dy = 0;
       card.setPointerCapture && card.setPointerCapture(e.pointerId);
@@ -2247,6 +2846,11 @@
         if (e.key === "Escape") closeModal();
         return; // don't fire actions while a modal is up
       }
+      if (e.key === "Escape" && isReviewInspectorOpen()) {
+        e.preventDefault();
+        closeReviewInspector();
+        return;
+      }
       // ignore typing into inputs
       if (e.target && /^(input|textarea|select)$/i.test(e.target.tagName)) return;
       // Tab switching (1-4) works from any tab; "?" help too.
@@ -2276,8 +2880,8 @@
         el("li", { text: "→ / drag right — verify this declaration (LOCAL — does not ship)" }),
         el("li", { text: "← / drag left — reject (requires a note, composed into the issue's Aristotle fix)" }),
         el("li", { text: "space / ↓ — defer this declaration" }),
-        el("li", { text: "d — dependencies (review predecessors first)" }),
-        el("li", { text: "o — open deep-dive (GitHub permalink)" }),
+        el("li", { text: "d — declaration dependency map + predecessor issues" }),
+        el("li", { text: "o — source path + GitHub issue link" }),
         el("li", { text: "? — this help" }),
       ]),
       el("p", { class: "modal-sub", text:
@@ -2288,11 +2892,12 @@
         "Swiping records a LOCAL per-declaration verdict. Nothing merges or " +
         "dispatches until you confirm SHIP on the completion summary." }),
       el("p", { class: "modal-sub", text:
-        "Reconciliation (automatic, read-only): citations the issue body makes " +
-        "that aren't in the current code are dropped into a footnote; decls " +
-        "found in the code but not cited are surfaced as cards. " +
-        "“Refresh issue body from code” (header) is the only way to push that " +
-        "drift back to GitHub — it EDITS the issue body and asks to confirm." }),
+        "Reconciliation: loading the deck only builds a read-only view — stale " +
+        "citations move to a footnote and uncited live declarations surface as " +
+        "cards. An explicit SHIP may add kept surfaced declarations to the issue. " +
+        "The conductor can also sync mechanically safe additions after code moves; " +
+        "rename/split candidates require human confirmation and deletions remain " +
+        "an explicit action." }),
       el("div", { class: "modal-actions" }, [
         el("button", { class: "btn", type: "button", onclick: function () { closeModal(); } }, ["Close"]),
       ]),
@@ -2471,6 +3076,19 @@
           st.innerHTML = "✅ Drafted " + (s.subissues || []).length +
             " sub-issues for Chapter " + chapter + ". Review them, then approve.";
           acRenderDrafts(chapter, s.subissues || []);
+        } else if (s.status === "approval-incomplete") {
+          var retained = s.created || [];
+          st.innerHTML = '<span class="warn">⚠️ A previous approval was interrupted. ' +
+            retained.length + " durable issue" + (retained.length === 1 ? " is" : "s are") +
+            " retained; review the restored snapshot below and resume.</span>" +
+            acCreatedList(retained);
+          acRenderDrafts(chapter, s.subissues || []);
+          var resume = acEl("ac-approve");
+          if (resume) resume.textContent = "Resume approval";
+        } else if (s.status === "approval-complete") {
+          st.innerHTML = "✅ Chapter " + chapter +
+            " was already approved and registered." + acCreatedList(s.created || []);
+          acEl("ac-drafts").innerHTML = "";
         } else if (s.status === "error") {
           st.innerHTML = '<span class="err">Intake failed: ' + acEsc(s.error || "unknown") + "</span>";
         } else {
@@ -2481,6 +3099,16 @@
         var st = acEl("ac-status");
         if (st) st.innerHTML = '<span class="err">' + acEsc(e.message) + "</span>";
       });
+  }
+
+  function acCreatedList(created) {
+    if (!created || !created.length) return "";
+    var html = '<ul class="ac-created">';
+    created.forEach(function (c) {
+      html += '<li>Draft ' + acEsc(c.index) + ': <a href="' + acEsc(c.url) +
+        '" target="_blank" rel="noopener">#' + acEsc(c.issue) + "</a></li>";
+    });
+    return html + "</ul>";
   }
 
   function acRenderDrafts(chapter, subs) {
@@ -2520,8 +3148,18 @@
         acEl("ac-status").innerHTML = "";
       })
       .catch(function (e) {
-        if (btn) { btn.disabled = false; btn.textContent = "Approve & open issues"; }
-        acEl("ac-status").innerHTML = '<span class="err">Approve failed: ' + acEsc(e.message) + "</span>";
+        var detail = (e && e.data) || {};
+        var retained = detail.created || [];
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = detail.retryable ? "Resume approval" : "Approve & open issues";
+        }
+        var recovery = retained.length
+          ? "<br><span class=\"warn\">These issue IDs were retained; retry will resume them, not create duplicates.</span>" +
+            acCreatedList(retained)
+          : "";
+        acEl("ac-status").innerHTML = '<span class="err">Approve failed: ' +
+          acEsc(e.message) + "</span>" + recovery;
       });
   }
 
@@ -2972,6 +3610,11 @@
     hasReconcileDrift: hasReconcileDrift,
     staleCitations: staleCitations,
     reconcileSummary: reconcileSummary,
+    // Pure review-model helpers used by the dependency map/order and source
+    // definition links. Exposed for deterministic smoke tests/debugging.
+    localDependencyNames: localDependencyNames,
+    dependencyOrder: dependencyOrder,
+    kernelTermLookup: kernelTermLookup,
     switchTab: switchTab,   // dashboard tab navigation (pure read)
     _state: state,
   };

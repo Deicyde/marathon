@@ -28,7 +28,8 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event, Lock, Thread
 
 import pytest
 
@@ -220,6 +221,77 @@ def test_clear_issue_drops_store(tmp_path):
     subdeck.clear_issue(cfg, 999)
 
 
+def test_concurrent_store_mutations_are_one_locked_read_modify_write(
+    tmp_path, monkeypatch
+):
+    """Two ThreadingHTTPServer-style writers cannot both save stale snapshots.
+
+    The first atomic save is held open while the second worker attempts its
+    write. Under the transaction lock the second cannot even reach save; after
+    release it reloads the first update and both declarations survive.
+    """
+    cfg = make_cfg(tmp_path)
+    real_save = subdeck._save_store_unlocked
+    first_at_save = Event()
+    release_first = Event()
+    second_at_save = Event()
+    count_lock = Lock()
+    save_count = 0
+
+    def controlled_save(actual_cfg, store):
+        nonlocal save_count
+        with count_lock:
+            save_count += 1
+            ordinal = save_count
+        if ordinal == 1:
+            first_at_save.set()
+            assert release_first.wait(5), "test did not release first writer"
+        else:
+            second_at_save.set()
+        real_save(actual_cfg, store)
+
+    monkeypatch.setattr(subdeck, "_save_store_unlocked", controlled_save)
+    start = Barrier(3)
+
+    def write(issue_num, decl):
+        start.wait()
+        return subdeck.record_decl_verdict(cfg, issue_num, decl, "verify")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(write, 30, "N.Left"),
+            pool.submit(write, 31, "N.Right"),
+        ]
+        start.wait()
+        assert first_at_save.wait(5)
+        try:
+            assert not second_at_save.wait(0.15), (
+                "a second writer reached save before the first transaction ended"
+            )
+        finally:
+            release_first.set()
+        for future in futures:
+            future.result(timeout=5)
+
+    assert second_at_save.is_set()
+    assert set(subdeck.issue_verdicts(cfg, 30)) == {"N.Left"}
+    assert set(subdeck.issue_verdicts(cfg, 31)) == {"N.Right"}
+
+
+def test_receipt_invalidation_failure_cannot_commit_new_verdict(
+    tmp_path, monkeypatch
+):
+    cfg = make_cfg(tmp_path)
+
+    def fail_clear(_cfg, _issue):
+        raise OSError("receipt is not writable")
+
+    monkeypatch.setattr(subdeck, "_clear_ship_receipt", fail_clear)
+    with pytest.raises(OSError, match="receipt is not writable"):
+        subdeck.record_decl_verdict(cfg, 30, "N.A", "verify")
+    assert subdeck.issue_verdicts(cfg, 30) == {}
+
+
 # ---------------------------------------------------------------------------
 # build_subdeck — overlay, ordering, progress / complete / summary
 # ---------------------------------------------------------------------------
@@ -236,6 +308,11 @@ def test_build_subdeck_overlays_and_orders(tmp_path, monkeypatch):
     assert sd["card_tier"] == "T0"
     assert sd["issue"] == 22
     assert sd["chapter"] == 14
+    # Navigation/dependency metadata survives CardDetail -> subdeck adaptation;
+    # the frontend's open/deps controls must not receive an empty shape merely
+    # because the UI switched from issue cards to per-declaration cards.
+    assert sd["permalink"] == f"https://github.com/{REPO_SLUG}/issues/22"
+    assert sd["deps"] == []
     # No verdicts yet → all cards unreviewed, ordered worst-tier first.
     assert all(c["verdict"] is None for c in sd["cards"])
     assert sd["cards"][0]["name"] == "Demo.Chapter14.Bar"  # T0 leads
@@ -366,6 +443,76 @@ def test_ship_refuses_when_a_decl_only_deferred(tmp_path, monkeypatch):
     assert calls == {}  # a deferred decl keeps the issue from shipping
 
 
+def test_ship_partial_reject_stops_before_later_declarations(tmp_path, monkeypatch):
+    """Once an upstream declaration is rejected, the fix can ship without
+    forcing decisions on later declarations whose meaning may change."""
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    calls = patch_no_verdict_handlers(monkeypatch)
+    subdeck.record_decl_verdict(cfg, 22, "Demo.Chapter14.Foo", "verify")
+    subdeck.record_decl_verdict(
+        cfg, 22, "Demo.Chapter14.Bar", "reject", note="wrong upstream definition"
+    )
+    # Baz is intentionally untouched.
+
+    out = subdeck.ship_issue(cfg, 22)
+
+    assert out["ok"] is True
+    assert out["outcome"] == "shipped"
+    assert out["partial"] is True
+    assert "stopped at first rejection" in out["message"]
+    assert "reject" in calls and "verify" not in calls
+    note = calls["reject"].notes
+    assert "- Demo.Chapter14.Foo" in note
+    assert "- Demo.Chapter14.Bar: wrong upstream definition" in note
+    assert "Demo.Chapter14.Baz" not in note
+    assert "Leave all other code untouched." in note
+    # Only the explicitly kept predecessor carries into the next round. The
+    # rejected and never-reviewed declarations both return for review.
+    assert out["carried_over"] == ["Demo.Chapter14.Foo"]
+    assert set(subdeck.issue_verdicts(cfg, 22)) == {"Demo.Chapter14.Foo"}
+
+
+def test_rejected_upstream_invalidates_verified_dependent_before_ship(
+    tmp_path, monkeypatch
+):
+    cfg = make_cfg(tmp_path)
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="def", value_pp="0"),
+        _decl("Demo.Chapter14.Bar", kind="def", value_pp="1"),
+        _decl(
+            "Demo.Chapter14.Baz", type_pp="Bar = Bar",
+            cone=["Demo.Chapter14.Bar"],
+        ),
+    ]))
+    patch_bulk(monkeypatch, {
+        22: {
+            "title": "#22 dependent bundle", "state": "OPEN",
+            "body": _bundle_body("Foo", "Bar", "Baz"), "labels": set(),
+        },
+    })
+    calls = patch_no_verdict_handlers(monkeypatch)
+    subdeck.record_decl_verdict(cfg, 22, "Demo.Chapter14.Foo", "verify")
+    subdeck.record_decl_verdict(cfg, 22, "Demo.Chapter14.Baz", "verify")
+    subdeck.record_decl_verdict(
+        cfg, 22, "Demo.Chapter14.Bar", "reject", note="wrong definition"
+    )
+
+    sd = subdeck.build_subdeck(cfg, 22)
+    baz = next(c for c in sd["cards"] if c["name"] == "Demo.Chapter14.Baz")
+    assert baz["verdict"] is None
+    assert baz["dependency_invalidated"] is True
+    assert sd["progress"] == {"reviewed": 2, "total": 3}
+    assert sd["complete"] is False
+    assert sd["summary"]["invalidated"] == ["Demo.Chapter14.Baz"]
+    assert "Demo.Chapter14.Baz" not in sd["summary"]["kept"]
+
+    out = subdeck.ship_issue(cfg, 22)
+    assert out["ok"] is True and out["partial"] is True
+    assert out["waiting"] == ["Demo.Chapter14.Baz"]
+    assert "Demo.Chapter14.Baz" not in calls["reject"].notes
+    assert out["carried_over"] == ["Demo.Chapter14.Foo"]
+
+
 def test_ship_all_verified_routes_cmd_verify(tmp_path, monkeypatch):
     cfg = make_bundle_cfg(tmp_path, monkeypatch)
     calls = patch_no_verdict_handlers(monkeypatch)
@@ -381,6 +528,52 @@ def test_ship_all_verified_routes_cmd_verify(tmp_path, monkeypatch):
     assert calls["verify"].close is False  # deck keeps the issue OPEN
     # The store is cleared on a successful ship.
     assert subdeck.issue_verdicts(cfg, 22) == {}
+
+
+def test_concurrent_ship_is_single_flight_and_second_response_is_duplicate(
+    tmp_path, monkeypatch
+):
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    for name in ("Foo", "Bar", "Baz"):
+        subdeck.record_decl_verdict(
+            cfg, 22, f"Demo.Chapter14.{name}", "verify"
+        )
+
+    from marathon.review import review as review_mod
+
+    call_lock = Lock()
+    call_count = 0
+    first_apply = Event()
+    release_apply = Event()
+
+    def verify_once(_args):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+        first_apply.set()
+        assert release_apply.wait(5), "test did not release ship side effect"
+
+    monkeypatch.setattr(review_mod, "cmd_verify", verify_once)
+    monkeypatch.setattr(
+        review_mod, "cmd_reject",
+        lambda _args: pytest.fail("all-verified ship must not reject"),
+    )
+    start = Barrier(3)
+
+    def ship():
+        start.wait()
+        return subdeck.ship_issue(cfg, 22)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(ship), pool.submit(ship)]
+        start.wait()
+        assert first_apply.wait(5)
+        release_apply.set()
+        results = [future.result(timeout=10) for future in futures]
+
+    assert call_count == 1
+    assert {result.get("duplicate") for result in results} == {False, True}
+    assert all(result["ok"] and result["outcome"] == "verified" for result in results)
 
 
 def test_ship_any_rejected_routes_cmd_reject_verbatim(tmp_path, monkeypatch):
@@ -667,6 +860,26 @@ def test_ship_endpoint_routes_through_verdict_path(running_server, monkeypatch):
     assert subdeck.issue_verdicts(cfg, 22) == {}
 
 
+def test_ship_endpoint_accepts_partial_reject(running_server, monkeypatch):
+    _server, base, token, cfg = running_server
+    calls = patch_no_verdict_handlers(monkeypatch)
+    subdeck.record_decl_verdict(cfg, 22, "Demo.Chapter14.Foo", "verify")
+    subdeck.record_decl_verdict(
+        cfg, 22, "Demo.Chapter14.Bar", "reject", note="repair the upstream def"
+    )
+
+    status, body = _post(
+        base + "/api/ship", {"issue": 22},
+        headers={deck_server.TOKEN_HEADER: token},
+    )
+
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["ok"] is True and payload["partial"] is True
+    assert "reject" in calls and "verify" not in calls
+    assert "Demo.Chapter14.Baz" not in calls["reject"].notes
+
+
 def test_ship_endpoint_incomplete_returns_ok_false(running_server, monkeypatch):
     server, base, token, cfg = running_server
     calls = patch_no_verdict_handlers(monkeypatch)
@@ -693,6 +906,67 @@ def test_decl_fingerprint_tracks_source():
     assert subdeck._decl_fingerprint(a) != subdeck._decl_fingerprint(a3)
 
 
+def test_decl_fingerprint_tracks_elaborated_kernel_dependencies():
+    base = {
+        "name": "N.Result",
+        "source_block": "theorem Result : P := proof",
+        "statement_pp": "P",
+        "kernel": [{
+            "name": "N.Upstream", "kind": "def",
+            "type_pp": "Nat", "value_pp": "0",
+        }],
+    }
+    changed = {
+        **base,
+        "kernel": [{
+            "name": "N.Upstream", "kind": "def",
+            "type_pp": "Nat", "value_pp": "1",
+        }],
+    }
+    assert subdeck._decl_fingerprint(base) != subdeck._decl_fingerprint(changed)
+
+
+def test_carried_verdict_reopens_when_only_upstream_kernel_value_changes(
+    tmp_path, monkeypatch
+):
+    cfg = make_cfg(tmp_path)
+
+    def snapshot(upstream_value):
+        return make_snapshot([
+            _decl(
+                "Demo.Chapter14.Upstream", kind="def", type_pp="Nat",
+                value_pp=upstream_value,
+            ),
+            _decl(
+                "Demo.Chapter14.Result", type_pp="Upstream = Upstream",
+                cone=["Demo.Chapter14.Upstream"],
+            ),
+        ])
+
+    patch_bulk(monkeypatch, {
+        22: {
+            "title": "#22 kernel carry", "state": "OPEN",
+            "body": _bundle_body("Upstream", "Result"), "labels": set(),
+        },
+    })
+    install_snapshot(cfg, snapshot("0"))
+    before = subdeck.build_subdeck(cfg, 22)
+    result = next(c for c in before["cards"] if c["name"].endswith(".Result"))
+    subdeck._save_store(cfg, {"22": {result["name"]: {
+        "verdict": "verify", "note": None, "ts": "t",
+        "fingerprint": subdeck._decl_fingerprint(result),
+    }}})
+
+    # Result's own source/type is unchanged; only an upstream definition's
+    # elaborated value in its transitive kernel changes.
+    install_snapshot(cfg, snapshot("1"))
+    after = subdeck.build_subdeck(cfg, 22)
+    reopened = next(c for c in after["cards"] if c["name"].endswith(".Result"))
+    assert reopened["verdict"] is None
+    assert reopened["changed_since_review"] is True
+    assert reopened["carried_over"] is False
+
+
 def test_persist_kept_verdicts_keeps_verified_drops_rejected(tmp_path, monkeypatch):
     cfg = make_bundle_cfg(tmp_path, monkeypatch)
     subdeck._save_store(cfg, {"22": {
@@ -711,7 +985,8 @@ def test_persist_kept_verdicts_keeps_verified_drops_rejected(tmp_path, monkeypat
     assert "Demo.Chapter14.Bar" not in store               # rejected dropped
     assert store["Demo.Chapter14.Foo"]["verdict"] == "verify"
     assert store["Demo.Chapter14.Foo"]["fingerprint"] == subdeck._decl_fingerprint(
-        {"source_block": "def Foo := 0"})
+        sd["cards"][0]
+    )
     assert subdeck.INFORMAL_KEY in store                   # informal kept
 
 

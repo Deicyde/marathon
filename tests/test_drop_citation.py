@@ -33,7 +33,12 @@ signature-body fixtures.
 from __future__ import annotations
 
 from marathon.deck import refresh as refresh_mod
-from marathon.deck.refresh import drop_stale_citation, SIGNATURES_HEADER
+from marathon.deck.refresh import (
+    auto_reconcile_issue,
+    drop_stale_citation,
+    live_chapter_decls,
+    SIGNATURES_HEADER,
+)
 from marathon.review.config import ChapterRegistry
 from marathon.review.verified_decls import extract_declarations_from_issue_body
 
@@ -235,3 +240,129 @@ def test_refuses_uncited_decl(tmp_path, monkeypatch):
     assert r["ok"] is False and r["dropped"] is False
     assert "does not cite" in r["message"]
     assert edits == []
+
+
+# ---------------------------------------------------------------------------
+# AUTOMATIC RECONCILE NEVER DROPS — disappearance still needs human intent
+# ---------------------------------------------------------------------------
+
+
+def _confirm_delete_diff(monkeypatch):
+    import marathon.review.verified_decls as vd
+
+    monkeypatch.setattr(
+        vd, "declarations_added_removed_in_diff",
+        lambda repo, old, new, paths: (set(), {_DEAD.rsplit(".", 1)[-1]}),
+    )
+
+
+def test_diff_confirmed_delete_stays_stale_in_declarations(
+    tmp_path, monkeypatch,
+):
+    """Git proves disappearance, not intentional redundancy.  Even alongside
+    another live card, automatic reconcile must preserve the citation."""
+    kept = "Demo.Chapter15.Tf.KeptResult.holds"
+    body = _decl_body(kept, _DEAD)
+    cfg, edits = _setup(tmp_path, monkeypatch, body=body)
+    _confirm_delete_diff(monkeypatch)
+
+    r = auto_reconcile_issue(cfg, 98, dry_run=True, diff_window=("OLD", "NEW"))
+
+    assert r["updated"] is False
+    assert _DEAD in r["kept_stale"]
+    assert _DEAD in extract_declarations_from_issue_body(body)
+    assert kept in extract_declarations_from_issue_body(body)
+    assert edits == []
+
+
+def test_diff_confirmed_delete_stays_stale_in_signatures_and_keeps_body(
+    tmp_path, monkeypatch,
+):
+    """Ch14-style signature blocks get the same conservative treatment."""
+    kept = "Demo.Chapter15.Tf.KeptResult.holds"
+    body = _sig_body(_DEAD, kept)  # dead FIRST exercises the old header-loss bug
+    cfg, edits = _setup(tmp_path, monkeypatch, body=body)
+    _confirm_delete_diff(monkeypatch)
+
+    r = auto_reconcile_issue(cfg, 98, dry_run=True, diff_window=("OLD", "NEW"))
+
+    assert r["updated"] is False
+    assert _DEAD in r["kept_stale"]
+    assert body.startswith(SIGNATURES_HEADER)
+    assert _DEAD in extract_declarations_from_issue_body(body)
+    assert kept in extract_declarations_from_issue_body(body)
+    assert edits == []
+
+
+def test_diff_confirmed_delete_of_sole_card_stays_stale(tmp_path, monkeypatch):
+    """A sole declaration disappearing is missing work, not housekeeping.  Keep
+    the citation loud so the issue cannot silently become a zero-card ghost."""
+    body = _decl_body(_DEAD)
+    cfg, edits = _setup(tmp_path, monkeypatch, body=body)
+    _confirm_delete_diff(monkeypatch)
+    import marathon.deck.cards as cards_mod
+    monkeypatch.setattr(cards_mod, "missing_suggestions_for_issue", lambda c, n: [])
+
+    r = auto_reconcile_issue(cfg, 98, dry_run=True, diff_window=("OLD", "NEW"))
+
+    assert r["updated"] is False
+    assert _DEAD in r["kept_stale"]
+    assert _DEAD in extract_declarations_from_issue_body(body)
+    assert edits == []
+
+
+def test_signature_sole_pair_different_leaf_is_only_a_human_proposal(
+    tmp_path, monkeypatch,
+):
+    """One removal + one addition in a commit does not prove a rename."""
+    new = "Demo.Chapter15.Tf.KeptResult.holds"
+    body = _sig_body(_DEAD)
+    cfg, edits = _setup(tmp_path, monkeypatch, body=body)
+    import marathon.review.verified_decls as vd
+    monkeypatch.setattr(
+        vd, "declarations_added_removed_in_diff",
+        lambda repo, old, head, paths: ({new.rsplit(".", 1)[-1]}, {"gone"}),
+    )
+
+    r = auto_reconcile_issue(cfg, 98, dry_run=True, diff_window=("OLD", "NEW"))
+
+    assert r["updated"] is False
+    assert r["proposed_renames"] == [{"old": _DEAD, "new": new}]
+    assert "human confirmation" in r["message"]
+    assert "new_body" not in r
+    assert edits == []
+
+
+def test_frozen_confirmed_delete_is_flagged_without_dropping(
+    tmp_path, monkeypatch,
+):
+    from marathon.review.state import IssueState, ReviewState, save_state
+
+    body = _decl_body(_DEAD)
+    cfg, edits = _setup(tmp_path, monkeypatch, body=body)
+    save_state(cfg, ReviewState(issues={
+        98: IssueState(status="verified", verdict_ts="2026-07-01T00:00:00Z"),
+    }))
+    _confirm_delete_diff(monkeypatch)
+    import marathon.deck.cards as cards_mod
+    monkeypatch.setattr(cards_mod, "missing_suggestions_for_issue", lambda c, n: [])
+
+    r = auto_reconcile_issue(cfg, 98, diff_window=("OLD", "NEW"))
+
+    assert r["updated"] is False
+    assert r["flagged_deletes"] == [_DEAD]
+    assert _DEAD in r["kept_stale"]
+    assert edits == []
+
+
+def test_live_decl_discovery_unions_source_ahead_of_stale_audit(tmp_path):
+    """A just-merged rename is visible before the async audit snapshot refresh;
+    otherwise reconcile records the new HEAD while still blind to the target."""
+    cfg = make_cfg(tmp_path)
+    cfg.chapters[15] = ChapterRegistry(chapter=15, entries=[(98, "Lemma 15.1")])
+    target = cfg.repo_dir / "Demo" / "Chapter15"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "Tf.lean").write_text(_SRC)
+    install_snapshot(cfg, make_snapshot([], cfg.repo_dir))  # deliberately stale
+
+    assert "Demo.Chapter15.Tf.KeptResult.holds" in live_chapter_decls(cfg, 15)

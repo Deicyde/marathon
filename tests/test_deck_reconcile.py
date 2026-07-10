@@ -1,18 +1,21 @@
-"""``auto_reconcile_issue`` — the SAFE hands-off replacement for the manual
-"refresh from code" button.
+"""``auto_reconcile_issue`` conservative citation reconciliation.
 
-Two safe edits, both minimal: ADD an uncited in-code decl that matches the
-issue's result-key (the #94 fix), and replace a stale citation ONLY when git
-proves a rename — never drop a stale citation on a guess, never re-pin an
-existing block's permalink. Offline: head_sha + issue_body are monkeypatched;
-the repo scan reads a real tmp .lean file; dry_run avoids the gh edit.
+It may append an uncited in-code declaration that matches the issue's result
+key (the #94 fix). Stale citations are preserved; rename/split relationships
+remain proposals because diff/name co-occurrence does not prove declaration
+identity. Existing blocks and permalinks are never silently rewritten. Offline:
+head_sha + issue_body are monkeypatched; dry_run avoids the GitHub edit.
 """
 
 from __future__ import annotations
 
 from marathon.review.config import ChapterRegistry
 from marathon.deck import refresh as refresh_mod
-from marathon.deck.refresh import auto_reconcile_issue, SIGNATURES_HEADER
+from marathon.deck.refresh import (
+    SIGNATURES_HEADER,
+    auto_reconcile_issue,
+    refresh_issue_signatures,
+)
 
 from tests.test_deck_source_fallback import (
     make_cfg, make_snapshot, install_snapshot, patch_bulk, _decl,
@@ -97,6 +100,46 @@ def test_keeps_unproven_stale_citation(tmp_path, monkeypatch):
     assert "ghost_renamed` at" in r["new_body"]
 
 
+def test_surfaced_append_never_drops_unrelated_stale_citation(
+    tmp_path, monkeypatch
+):
+    """SHIP's surfaced-decl write is append-only, not a hidden bulk delete."""
+    stale = "Demo.Chapter14.Tf.ghost_renamed"
+    cfg, body = _setup(
+        tmp_path,
+        monkeypatch,
+        title="Proposition 12.22 — tensor product & function multiplication",
+        cited=["Demo.Chapter14.Tf.tprod", stale],
+    )
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Tf.tprod", module="Demo.Chapter14.Tf"),
+        _decl(
+            "Demo.Chapter14.Tf.smul_of_contMDiff",
+            module="Demo.Chapter14.Tf",
+        ),
+    ], cfg.repo_dir))
+    written = {}
+    monkeypatch.setattr(
+        refresh_mod,
+        "_gh_edit_body",
+        lambda repo, issue, new_body: written.update(body=new_body),
+    )
+
+    result = refresh_issue_signatures(
+        cfg,
+        22,
+        only_surfaced={"Demo.Chapter14.Tf.smul_of_contMDiff"},
+    )
+
+    assert result["updated"] is True
+    assert result["dropped"] == []
+    assert result["preserved_stale"] == [stale]
+    assert result["added"] == ["Demo.Chapter14.Tf.smul_of_contMDiff"]
+    assert "ghost_renamed` at" in written["body"]
+    assert "smul_of_contMDiff` at" in written["body"]
+    assert "blob/OLDSHA" in written["body"]  # existing blocks untouched
+
+
 def test_noop_when_already_reconciled(tmp_path, monkeypatch):
     """When the issue already cites every in-code result-key decl and has no
     stale citation, nothing is written."""
@@ -155,3 +198,132 @@ def test_conductor_reconcile_pass_gating(tmp_path, monkeypatch):
     calls.clear()
     conductor._maybe_reconcile_signatures(cfg, None, exclude_issues=frozenset({22}))
     assert calls == []
+
+
+def test_conductor_reopens_frozen_drift_then_reconciles_current_body(
+    tmp_path, monkeypatch,
+):
+    """A suppressed ADD/flagged rename is a durable state transition, not a log
+    line that disappears when the HEAD cursor advances."""
+    from marathon import conductor
+    from marathon.deck import refresh as refresh_mod
+    import marathon.review.reverify as reverify_mod
+
+    cfg = make_cfg(tmp_path)
+    calls = []
+
+    def fake_reconcile(c, n, **kw):
+        calls.append((n, dict(kw)))
+        if not kw.get("allow_reopened"):
+            return {
+                "ok": True, "updated": False,
+                "flagged_renames": [{"old": "A.old", "new": "A.new"}],
+                "flagged_splits": [], "flagged_deletes": [],
+                "suppressed_adds": ["A.helper"],
+            }
+        return {"ok": True, "updated": True, "message": "current"}
+
+    reopened = []
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda d: "NEW")
+    monkeypatch.setattr(conductor, "reconcile_cursor_is_ancestor", lambda *a: True)
+    monkeypatch.setattr(refresh_mod, "auto_reconcile_issue", fake_reconcile)
+    monkeypatch.setattr(
+        reverify_mod, "unverify_for_rereview",
+        lambda c, n, reasons: reopened.append((n, reasons)) or True,
+    )
+
+    got = conductor._maybe_reconcile_signatures(
+        cfg, "OLD", exclude_issues=frozenset(),
+    )
+
+    assert got == "NEW"
+    assert reopened and "new card: A.helper" in reopened[0][1]
+    assert any("removed/renamed: A.old" in r for r in reopened[0][1])
+    assert calls[1][1]["allow_reopened"] is True
+    assert calls[1][1]["diff_window"] == ("OLD", "NEW")
+
+
+def test_conductor_keeps_old_cursor_when_unverify_not_confirmed(
+    tmp_path, monkeypatch,
+):
+    from marathon import conductor
+    from marathon.deck import refresh as refresh_mod
+    import marathon.review.reverify as reverify_mod
+
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda d: "NEW")
+    monkeypatch.setattr(conductor, "reconcile_cursor_is_ancestor", lambda *a: True)
+    monkeypatch.setattr(
+        refresh_mod, "auto_reconcile_issue",
+        lambda *a, **k: {
+            "ok": True, "updated": False, "flagged_renames": [],
+            "flagged_splits": [], "flagged_deletes": [],
+            "suppressed_adds": ["A.new"],
+        },
+    )
+    monkeypatch.setattr(reverify_mod, "unverify_for_rereview", lambda *a: False)
+
+    assert conductor._maybe_reconcile_signatures(
+        cfg, "OLD", exclude_issues=frozenset(),
+    ) == "OLD"
+
+
+def test_reconcile_cursor_round_trip(tmp_path):
+    from marathon import conductor
+
+    assert conductor.load_reconcile_cursor(tmp_path) is None
+    conductor.save_reconcile_cursor(tmp_path, "abc123")
+    assert conductor.load_reconcile_cursor(tmp_path) == "abc123"
+    assert (tmp_path / ".marathon/conductor/.gitignore").read_text() == "*\n"
+
+
+def test_reconcile_cursor_rejects_branch_switch_or_rebase(tmp_path):
+    """Only an ancestor cursor may become a git diff provenance window."""
+    from marathon import conductor
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    conductor._git(repo, "init", "-q", "-b", "main")
+    conductor._git(repo, "config", "user.email", "t@example.com")
+    conductor._git(repo, "config", "user.name", "T")
+    f = repo / "A"
+    f.write_text("base\n")
+    conductor._git(repo, "add", "A")
+    conductor._git(repo, "commit", "-q", "-m", "base")
+    base = conductor._git(repo, "rev-parse", "HEAD").stdout.strip()
+    f.write_text("old branch\n")
+    conductor._git(repo, "commit", "-qam", "old branch")
+    old_branch = conductor._git(repo, "rev-parse", "HEAD").stdout.strip()
+    conductor._git(repo, "checkout", "-q", "-b", "rebased", base)
+    f.write_text("new branch\n")
+    conductor._git(repo, "commit", "-qam", "new branch")
+    current = conductor._git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    assert conductor.reconcile_cursor_is_ancestor(repo, base, current)
+    assert not conductor.reconcile_cursor_is_ancestor(repo, old_branch, current)
+    assert not conductor.reconcile_cursor_is_ancestor(repo, "deadbeef", current)
+
+
+def test_invalid_persisted_cursor_is_discarded_without_diff_window(
+    tmp_path, monkeypatch,
+):
+    from marathon import conductor
+    from marathon.deck import refresh as refresh_mod
+
+    cfg = make_cfg(tmp_path)
+    conductor.save_reconcile_cursor(cfg.repo_dir, "OLD")
+    calls = []
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda d: "NEW")
+    monkeypatch.setattr(conductor, "reconcile_cursor_is_ancestor", lambda *a: False)
+    monkeypatch.setattr(
+        refresh_mod, "auto_reconcile_issue",
+        lambda c, n, **kw: calls.append(kw) or {"ok": True, "updated": False},
+    )
+
+    got = conductor._maybe_reconcile_signatures(
+        cfg, "OLD", exclude_issues=frozenset(),
+    )
+
+    assert got == "NEW"
+    assert calls == [{"diff_window": None}]
+    assert not conductor.reconcile_cursor_path(cfg.repo_dir).exists()

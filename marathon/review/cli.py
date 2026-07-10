@@ -348,9 +348,12 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
 
     p_status = cv_sub.add_parser(
         "refine-status",
-        help="Report whether a refine daemon is active for the chapter.",
+        help=(
+            "Report the global conductor; --chapter optionally filters the "
+            "displayed jobs (it does not select a separate daemon)."
+        ),
     )
-    p_status.add_argument("--chapter", type=int, required=True)
+    p_status.add_argument("--chapter", type=int, required=False, default=None)
     p_status.set_defaults(func=r.cmd_refine_status)
 
     p_start = cv_sub.add_parser(
@@ -367,11 +370,11 @@ def add_subparser(subparsers: argparse._SubParsersAction) -> None:
     p_stop = cv_sub.add_parser(
         "refine-stop",
         help=(
-            "Stop the refine daemon for this chapter (SIGTERM); current "
-            "marathon iteration finishes first."
+            "Stop the global conductor (SIGTERM). Running Aristotle jobs are "
+            "not canceled; --chapter is accepted for compatibility only."
         ),
     )
-    p_stop.add_argument("--chapter", type=int, required=True)
+    p_stop.add_argument("--chapter", type=int, required=False, default=None)
     p_stop.set_defaults(func=r.cmd_refine_stop)
 
     # The daemon is normally launched indirectly via ``reject`` or

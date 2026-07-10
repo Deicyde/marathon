@@ -37,15 +37,29 @@ Three responsibilities, all here:
 BINDING SAFETY: per-decl verdicts (:func:`record_decl_verdict`) are LOCAL
 ONLY — no GitHub, no Aristotle, no ledger. The single irreversible action
 lives in :func:`ship_issue`, which fires only on an explicit, token-checked
-``POST /api/ship``, and only when every declaration has been reviewed.
+``POST /api/ship``. An all-verify ship requires every declaration to be
+reviewed; a reject ship may stop early, sending only explicit KEEP/FIX choices
+and leaving later declarations untouched for the next review round.
 """
 
 from __future__ import annotations
 
 import json
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional, TypeVar
+
+try:  # POSIX advisory locks (Linux/macOS).
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised on non-POSIX hosts
+    _fcntl = None
+
+try:  # Windows advisory byte-range locks.
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - exercised on non-Windows hosts
+    _msvcrt = None
 
 if TYPE_CHECKING:  # pragma: no cover — type-only
     from marathon.review.config import ReviewConfig
@@ -96,6 +110,22 @@ _VERDICT_WIRE = {"verify": "verified", "reject": "rejected", "defer": "deferred"
 #: :func:`next_unreviewed_card` which inspects the already-serialized cards.
 _REVIEWED_WIRE_VERDICTS = frozenset({"verified", "rejected"})
 
+_MutationResult = TypeVar("_MutationResult")
+
+# ThreadingHTTPServer may execute verdict/lock/missing handlers concurrently.
+# The RLock serializes those writers within this process; it is deliberately
+# reentrant because ship cleanup and future composite mutations may call store
+# helpers while already inside a transaction.
+_STORE_RLOCK = threading.RLock()
+_STORE_LOCK_LOCAL = threading.local()
+
+# SHIP is keyed per issue: unrelated issues may ship concurrently, while two
+# requests for the same issue share one in-process + cross-process critical
+# section around authoritative rebuild, external side effect, and cleanup.
+_ISSUE_LOCKS_GUARD = threading.Lock()
+_ISSUE_LOCKS: dict[str, threading.RLock] = {}
+_ISSUE_LOCK_LOCAL = threading.local()
+
 
 # ---------------------------------------------------------------------------
 # Per-(issue,decl) verdict store (LOCAL — no Aristotle, no GitHub, no ledger)
@@ -106,7 +136,166 @@ def _store_path(cfg: "ReviewConfig") -> Path:
     return Path(cfg.repo_dir) / SUBDECK_RELPATH
 
 
-def _load_store(cfg: "ReviewConfig") -> dict:
+def _store_lock_path(cfg: "ReviewConfig") -> Path:
+    """A stable lock inode beside the atomically-replaced JSON store.
+
+    Locking the JSON file itself would be incorrect: :func:`Path.replace`
+    changes its inode, allowing another process to lock the new file while the
+    first still holds a lock on the old one.
+    """
+    path = _store_path(cfg)
+    return path.with_name(path.name + ".lock")
+
+
+def _issue_lock_path(cfg: "ReviewConfig", issue_num: int) -> Path:
+    return (
+        Path(cfg.repo_dir) / ".marathon" / "review" / "deck-ship-locks"
+        / f"{issue_num}.lock"
+    )
+
+
+def _ship_receipt_path(cfg: "ReviewConfig", issue_num: int) -> Path:
+    return (
+        Path(cfg.repo_dir) / ".marathon" / "review" / "deck-ship-receipts"
+        / f"{issue_num}.json"
+    )
+
+
+def _lock_file(handle) -> None:
+    """Acquire an exclusive advisory lock when the platform provides one."""
+    if _fcntl is not None:
+        _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX)
+        return
+    if _msvcrt is not None:  # pragma: no cover - Windows-only branch
+        # msvcrt.locking locks a byte range; ensure byte zero exists.
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        _msvcrt.locking(handle.fileno(), _msvcrt.LK_LOCK, 1)
+
+
+def _unlock_file(handle) -> None:
+    """Release the advisory lock acquired by :func:`_lock_file`."""
+    if _fcntl is not None:
+        _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+        return
+    if _msvcrt is not None:  # pragma: no cover - Windows-only branch
+        handle.seek(0)
+        _msvcrt.locking(handle.fileno(), _msvcrt.LK_UNLCK, 1)
+
+
+@contextmanager
+def _store_mutation_lock(cfg: "ReviewConfig"):
+    """Serialize one complete store mutation in-process and cross-process.
+
+    The separate lock file remains stable while ``deck-subdecks.json`` is
+    atomically replaced. Nested acquisition for the same store reuses the
+    already-held advisory lock instead of opening and flocking it again.
+    """
+    lock_path = _store_lock_path(cfg)
+    key = str(lock_path.resolve())
+    with _STORE_RLOCK:
+        held = getattr(_STORE_LOCK_LOCAL, "held", None)
+        if held is None:
+            held = {}
+            _STORE_LOCK_LOCAL.held = held
+        existing = held.get(key)
+        if existing is not None:
+            existing["depth"] += 1
+            try:
+                yield
+            finally:
+                existing["depth"] -= 1
+            return
+
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        try:
+            _lock_file(handle)
+            held[key] = {"depth": 1, "handle": handle}
+            try:
+                yield
+            finally:
+                held.pop(key, None)
+                _unlock_file(handle)
+        finally:
+            handle.close()
+
+
+def _issue_thread_lock(key: str) -> threading.RLock:
+    with _ISSUE_LOCKS_GUARD:
+        return _ISSUE_LOCKS.setdefault(key, threading.RLock())
+
+
+@contextmanager
+def _issue_operation_lock(cfg: "ReviewConfig", issue_num: int):
+    """Reentrant keyed lock for one issue's mutations and irreversible SHIP."""
+    lock_path = _issue_lock_path(cfg, issue_num)
+    key = str(lock_path.resolve())
+    with _issue_thread_lock(key):
+        held = getattr(_ISSUE_LOCK_LOCAL, "held", None)
+        if held is None:
+            held = {}
+            _ISSUE_LOCK_LOCAL.held = held
+        existing = held.get(key)
+        if existing is not None:
+            existing["depth"] += 1
+            try:
+                yield
+            finally:
+                existing["depth"] -= 1
+            return
+
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        try:
+            _lock_file(handle)
+            held[key] = {"depth": 1, "handle": handle}
+            try:
+                yield
+            finally:
+                held.pop(key, None)
+                _unlock_file(handle)
+        finally:
+            handle.close()
+
+
+def _load_ship_receipt(cfg: "ReviewConfig", issue_num: int) -> Optional[dict]:
+    path = _ship_receipt_path(cfg, issue_num)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) and isinstance(data.get("response"), dict) else None
+
+
+def _save_ship_receipt(
+    cfg: "ReviewConfig", issue_num: int, response: dict
+) -> None:
+    """Persist a per-issue idempotency receipt; caller holds the issue lock."""
+    path = _ship_receipt_path(cfg, issue_num)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    payload = {
+        "issue": issue_num,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "response": response,
+    }
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    tmp.replace(path)
+
+
+def _clear_ship_receipt(cfg: "ReviewConfig", issue_num: int) -> None:
+    """A new human mutation starts a fresh shippable review generation."""
+    try:
+        _ship_receipt_path(cfg, issue_num).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _load_store_unlocked(cfg: "ReviewConfig") -> dict:
     """The whole subdeck store ``{num(str): {decl: {...}}}``, or ``{}``. A
     missing/corrupt file is "nothing recorded", never an error."""
     path = _store_path(cfg)
@@ -126,15 +315,58 @@ def _load_store(cfg: "ReviewConfig") -> dict:
     return out
 
 
-def _save_store(cfg: "ReviewConfig", store: dict) -> None:
+def _load_store(cfg: "ReviewConfig") -> dict:
+    """Read the current atomic snapshot.
+
+    Readers do not need the writer lock: replacement means they observe either
+    the complete old file or the complete new file, never a partial write.
+    """
+    return _load_store_unlocked(cfg)
+
+
+def _save_store_unlocked(cfg: "ReviewConfig", store: dict) -> None:
     """Persist the store atomically (tmp write + replace). Lives in the
     same ``.marathon/review`` dir as ``state.json`` / ``deck-defers.json``
-    (the gitignored ``.marathon`` convention), created on first write."""
+    (the gitignored ``.marathon`` convention), created on first write.
+
+    Caller MUST hold :func:`_store_mutation_lock`.
+    """
     path = _store_path(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(store, indent=2, sort_keys=True) + "\n")
     tmp.replace(path)
+
+
+def _mutate_store(
+    cfg: "ReviewConfig",
+    mutation: Callable[[dict], tuple[_MutationResult, bool]],
+) -> _MutationResult:
+    """Run one locked read-modify-write transaction.
+
+    ``mutation`` receives the latest whole store and returns ``(result,
+    changed)``. When changed, the same transaction writes via atomic replace
+    before releasing either lock. This seam prevents callers from accidentally
+    taking separate load/save locks and recreating a lost-update window.
+    """
+    with _store_mutation_lock(cfg):
+        store = _load_store_unlocked(cfg)
+        result, changed = mutation(store)
+        if changed:
+            _save_store_unlocked(cfg, store)
+        return result
+
+
+def _save_store(cfg: "ReviewConfig", store: dict) -> None:
+    """Replace the complete store under the mutation lock (test/setup helper)."""
+    replacement = dict(store)
+
+    def replace(current: dict) -> tuple[None, bool]:
+        current.clear()
+        current.update(replacement)
+        return None, True
+
+    _mutate_store(cfg, replace)
 
 
 def issue_verdicts(cfg: "ReviewConfig", issue_num: int) -> dict:
@@ -173,22 +405,25 @@ def record_decl_verdict(
             "note carried verbatim to Aristotle)"
         )
 
-    store = _load_store(cfg)
-    decls = store.setdefault(str(issue_num), {})
-    prev = decls.get(decl) or {}
-    entry = {
-        "verdict": verdict,
-        "note": str(note) if note is not None else None,
-        "ts": datetime.now(timezone.utc).isoformat(),
-    }
-    # The hard-freeze LOCK is a modifier on a verify: carry it over on a
-    # re-verify, but DROP it when the verdict changes to reject/defer (a decl
-    # the human now wants changed must not be frozen).
-    if verdict == "verify" and prev.get("locked"):
-        entry["locked"] = True
-    decls[decl] = entry
-    _save_store(cfg, store)
-    return entry
+    def mutate(store: dict) -> tuple[dict, bool]:
+        decls = store.setdefault(str(issue_num), {})
+        prev = decls.get(decl) or {}
+        entry = {
+            "verdict": verdict,
+            "note": str(note) if note is not None else None,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        # The hard-freeze LOCK is a modifier on a verify: carry it over on a
+        # re-verify, but DROP it when the verdict changes to reject/defer (a decl
+        # the human now wants changed must not be frozen).
+        if verdict == "verify" and prev.get("locked"):
+            entry["locked"] = True
+        decls[decl] = entry
+        return entry, True
+
+    with _issue_operation_lock(cfg, issue_num):
+        _clear_ship_receipt(cfg, issue_num)
+        return _mutate_store(cfg, mutate)
 
 
 def set_decl_lock(
@@ -202,22 +437,27 @@ def set_decl_lock(
     may re-type it and the change re-surfaces for review. Locking implies KEEP,
     so an unreviewed decl is recorded ``verify`` when first locked. LOCAL ONLY —
     the sidecar; the freeze is realized at :func:`ship_issue`."""
-    store = _load_store(cfg)
-    decls = store.setdefault(str(issue_num), {})
-    entry = decls.get(decl)
-    if entry is None or entry.get("verdict") not in ("verify", "reject", "defer"):
-        entry = {
-            "verdict": "verify",
-            "note": None,
-            "ts": datetime.now(timezone.utc).isoformat(),
-        }
-        decls[decl] = entry
-    if locked:
-        entry["locked"] = True
-    else:
-        entry.pop("locked", None)
-    _save_store(cfg, store)
-    return entry
+    def mutate(store: dict) -> tuple[dict, bool]:
+        decls = store.setdefault(str(issue_num), {})
+        entry = decls.get(decl)
+        if entry is None or entry.get("verdict") not in (
+            "verify", "reject", "defer"
+        ):
+            entry = {
+                "verdict": "verify",
+                "note": None,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+            decls[decl] = entry
+        if locked:
+            entry["locked"] = True
+        else:
+            entry.pop("locked", None)
+        return entry, True
+
+    with _issue_operation_lock(cfg, issue_num):
+        _clear_ship_receipt(cfg, issue_num)
+        return _mutate_store(cfg, mutate)
 
 
 def record_missing(
@@ -229,32 +469,39 @@ def record_missing(
     empty/None ``note`` clears the flag. Returns the stored record (or None when
     cleared). LOCAL ONLY — writes the sidecar; the irreversible step is
     :func:`ship_issue`, where a present note routes the outcome to Aristotle."""
-    store = _load_store(cfg)
-    decls = store.setdefault(str(issue_num), {})
     text = (note or "").strip()
-    if not text:
-        decls.pop(MISSING_KEY, None)
-        if not decls:
-            store.pop(str(issue_num), None)
-        _save_store(cfg, store)
-        return None
-    decls[MISSING_KEY] = {
-        "verdict": "missing",
-        "note": text,
-        "ts": datetime.now(timezone.utc).isoformat(),
-    }
-    _save_store(cfg, store)
-    return decls[MISSING_KEY]
+
+    def mutate(store: dict) -> tuple[Optional[dict], bool]:
+        decls = store.setdefault(str(issue_num), {})
+        if not text:
+            decls.pop(MISSING_KEY, None)
+            if not decls:
+                store.pop(str(issue_num), None)
+            return None, True
+        entry = {
+            "verdict": "missing",
+            "note": text,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        decls[MISSING_KEY] = entry
+        return entry, True
+
+    with _issue_operation_lock(cfg, issue_num):
+        _clear_ship_receipt(cfg, issue_num)
+        return _mutate_store(cfg, mutate)
 
 
 def clear_issue(cfg: "ReviewConfig", issue_num: int) -> None:
     """Drop an issue's whole subdeck store (called after a successful VERIFY
     ship so a finished issue's local review state never lingers). No-op when
     absent."""
-    store = _load_store(cfg)
-    if str(issue_num) in store:
+    def mutate(store: dict) -> tuple[None, bool]:
+        if str(issue_num) not in store:
+            return None, False
         store.pop(str(issue_num))
-        _save_store(cfg, store)
+        return None, True
+
+    _mutate_store(cfg, mutate)
 
 
 def _persist_kept_verdicts(
@@ -265,35 +512,45 @@ def _persist_kept_verdicts(
     :func:`_decl_fingerprint` — plus the informal approval; everything else
     (the rejected decls Aristotle will fix) is dropped. So when the refined
     issue returns, the kept decls are already verified (no re-review) UNLESS
-    their source changed (then the fingerprint mismatch re-opens them). Returns
-    the decl names carried over. The store is wiped if nothing is kept."""
-    store = _load_store(cfg)
-    old = store.get(str(issue_num), {})
-    card_by_name = {c.get("name"): c for c in subdeck.get("cards", [])}
-    new_entry: dict = {}
-    carried: list[str] = []
-    for name in kept_names:
-        rec = old.get(name)
-        if not rec or rec.get("verdict") != "verify":
-            continue
-        card = card_by_name.get(name)
-        new_entry[name] = {
-            "verdict": "verify",
-            "note": rec.get("note"),
-            "ts": rec.get("ts"),
-            "fingerprint": _decl_fingerprint(card) if card else None,
-        }
-        carried.append(name)
-    # The informal approval is issue-level (the body marker was flipped at ship)
-    # — keep it so the human is not re-asked to approve the same statement.
-    if INFORMAL_KEY in old:
-        new_entry[INFORMAL_KEY] = old[INFORMAL_KEY]
-    if new_entry:
-        store[str(issue_num)] = new_entry
-    else:
-        store.pop(str(issue_num), None)
-    _save_store(cfg, store)
-    return carried
+    their source changed (then the fingerprint mismatch re-opens them). Rejected,
+    deferred, and not-yet-reviewed declarations are all absent from the rewritten
+    store and therefore return for review. Returns the decl names carried over.
+    The store is wiped if nothing is kept."""
+    card_by_name = {
+        c.get("name"): c
+        for c in [
+            *subdeck.get("cards", []),
+            *subdeck.get("auto_approved", []),
+        ]
+    }
+
+    def mutate(store: dict) -> tuple[list[str], bool]:
+        old = store.get(str(issue_num), {})
+        new_entry: dict = {}
+        carried: list[str] = []
+        for name in kept_names:
+            rec = old.get(name)
+            if not rec or rec.get("verdict") != "verify":
+                continue
+            card = card_by_name.get(name)
+            new_entry[name] = {
+                "verdict": "verify",
+                "note": rec.get("note"),
+                "ts": rec.get("ts"),
+                "fingerprint": _decl_fingerprint(card) if card else None,
+            }
+            carried.append(name)
+        # The informal approval is issue-level (the body marker was flipped at
+        # ship) — keep it so the human is not re-asked to approve the same text.
+        if INFORMAL_KEY in old:
+            new_entry[INFORMAL_KEY] = old[INFORMAL_KEY]
+        if new_entry:
+            store[str(issue_num)] = new_entry
+        else:
+            store.pop(str(issue_num), None)
+        return carried, True
+
+    return _mutate_store(cfg, mutate)
 
 
 # ---------------------------------------------------------------------------
@@ -302,23 +559,65 @@ def _persist_kept_verdicts(
 
 
 def _decl_fingerprint(view_or_card) -> str:
-    """A stable content hash of a declaration — its ``.lean`` source if we have
-    it, else the elaborated type, else the name. Used to PIN a carried-over
-    verdict: an approved decl stays approved across a reject→refine→re-review
-    cycle ONLY while this hash is unchanged (i.e. Aristotle did not alter it).
-    Accepts a DeclView (object) or a serialized card (dict) — same basis either
-    way, so a fingerprint taken at ship matches the one taken at re-review."""
+    """Hash a declaration plus the elaborated dependency context it relies on.
+
+    Source text alone is insufficient: a theorem can remain byte-for-byte
+    unchanged while an upstream definition changes meaning. Include the
+    elaborated statement and stable kernel member identity/type/value so such a
+    dependency change invalidates a carried approval. Accepts a DeclView object
+    or its serialized card and produces the same canonical hash for either.
+    """
     import hashlib
 
+    def field(obj, name):
+        return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+    kernel = []
+    for member in field(view_or_card, "kernel") or []:
+        kernel.append({
+            "name": field(member, "name") or "",
+            "kind": field(member, "kind") or "",
+            "type_pp": field(member, "type_pp"),
+            "value_pp": field(member, "value_pp"),
+        })
+    kernel.sort(key=lambda item: (
+        item["name"], item["kind"], item["type_pp"] or "", item["value_pp"] or ""
+    ))
+    basis = {
+        "name": field(view_or_card, "name") or "",
+        "kind": field(view_or_card, "kind") or "",
+        "source_block": field(view_or_card, "source_block"),
+        "statement_pp": field(view_or_card, "statement_pp"),
+        "kernel": kernel,
+    }
+    encoded = json.dumps(
+        basis, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _decl_name_matches(left: str, right: str) -> bool:
+    """Conservative qualified/unqualified declaration-name equivalence."""
+    return (
+        left == right
+        or left.endswith("." + right)
+        or right.endswith("." + left)
+    )
+
+
+def _depends_on_any(view_or_card, declarations: set[str]) -> bool:
+    """Whether a card's transitive audit kernel contains any named decl."""
+    if not declarations:
+        return False
     if isinstance(view_or_card, dict):
-        basis = (view_or_card.get("source_block")
-                 or view_or_card.get("statement_pp")
-                 or view_or_card.get("name") or "")
+        kernel = view_or_card.get("kernel") or []
     else:
-        basis = (getattr(view_or_card, "source_block", None)
-                 or getattr(view_or_card, "statement_pp", None)
-                 or getattr(view_or_card, "name", None) or "")
-    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+        kernel = getattr(view_or_card, "kernel", None) or []
+    for member in kernel:
+        name = member.get("name") if isinstance(member, dict) else member.name
+        if name and any(_decl_name_matches(name, rejected) for rejected in declarations):
+            return True
+    return False
 
 
 def _decl_card(view, record: Optional[dict], carry: Optional[str] = None) -> dict:
@@ -342,6 +641,7 @@ def _decl_card(view, record: Optional[dict], carry: Optional[str] = None) -> dic
     card["locked"] = bool((record or {}).get("locked"))
     card["carried_over"] = carry == "carried_over"
     card["changed_since_review"] = carry == "changed"
+    card["dependency_invalidated"] = carry == "dependency_invalidated"
     return card
 
 
@@ -408,7 +708,9 @@ def build_subdeck(
       (only when ``skip_api``; ``[]`` otherwise);
     * ``progress`` — ``{reviewed, total}`` (deferred does NOT count reviewed);
     * ``complete`` — every reviewable card carries a verify/reject verdict;
-    * ``summary`` — ``{kept, rejected:[{name,note}], deferred}``.
+    * ``summary`` — ``{kept, rejected:[{name,note}], deferred, invalidated}``;
+      ``invalidated`` are previously-verified dependents of a rejected
+      declaration, excluded from KEEP until the upstream fix is re-reviewed.
 
     When ``skip_api`` is truthy this is the SKIP-API view: ``cards`` holds
     ONLY the MAIN-result decls (the human reviews these), ``auto_approved``
@@ -490,15 +792,33 @@ def build_subdeck(
 
     eff = {v.name: _effective(v.name) for v in reconciled_views}
 
-    # Partition the views into MAIN vs API. An explicit human reject of an API
-    # decl pulls it back to MAIN (the human chose to review it), so it always
-    # shows in ``cards`` and never silently auto-approves.
+    # Mask a verified declaration when its transitive audit kernel contains a
+    # declaration rejected in this same review round. Keeping the stored record
+    # untouched lets a changed-mind reject→verify restore it, but every read
+    # model treats it as unreviewed until then. This MUST happen before
+    # partition/cards/progress so it appears in WAIT and makes the deck partial.
+    rejected_effective = {
+        view.name for view in reconciled_views
+        if (eff[view.name][0] or {}).get("verdict") == "reject"
+    }
+    dependency_invalidated: list[str] = []
+    for view in reconciled_views:
+        rec, _carry = eff[view.name]
+        if ((rec or {}).get("verdict") == "verify"
+                and _depends_on_any(view, rejected_effective)):
+            dependency_invalidated.append(view.name)
+            eff[view.name] = (None, "dependency_invalidated")
+
+    # Partition the views into MAIN vs API. ANY explicit human verdict pulls an
+    # API declaration back into MAIN: verify must not be counted twice, defer
+    # must not disappear after reload, and a changed/invalidated carried verdict
+    # must be reviewed rather than silently auto-approved. Only declarations
+    # with no store record at all are eligible for Skip-API auto-approval.
     main_views = []
     api_views = []
     for view in reconciled_views:
-        rec = eff[view.name][0]
-        rejected_by_human = (rec or {}).get("verdict") == "reject"
-        if skip_api and view.api and not rejected_by_human:
+        explicitly_reviewed = records.get(view.name) is not None
+        if skip_api and view.api and not explicitly_reviewed:
             api_views.append(view)
         else:
             main_views.append(view)
@@ -551,12 +871,18 @@ def build_subdeck(
         "title": detail.title,
         "chapter": detail.chapter,
         "card_tier": detail.tier,
+        # Read-only navigation/dependency metadata from CardDetail.  These were
+        # previously dropped while adapting the issue card into a subdeck,
+        # leaving the frontend's "deps" and "open" controls with no data.
+        "permalink": detail.permalink,
+        "deps": [dep.to_json() for dep in detail.deps],
         "cards": cards,
         "auto_approved": auto_approved,
         "progress": {"reviewed": reviewed, "total": total},
         "complete": complete,
         "summary": {"kept": kept, "locked": locked,
-                    "rejected": rejected, "deferred": deferred},
+                    "rejected": rejected, "deferred": deferred,
+                    "invalidated": dependency_invalidated},
         # The leading informal-approval card's data: the issue's ONE top-level
         # informal statement (### Informal Statement) + the human's single
         # approval verdict, or None when there is no informal text. One approval
@@ -658,7 +984,7 @@ def _next_ready_issue(cfg: "ReviewConfig", just_shipped: int) -> Optional[int]:
     return None
 
 
-def ship_issue(
+def _ship_issue_once(
     cfg: "ReviewConfig", issue_num: int, *, skip_api: bool = False
 ) -> dict:
     """Compose and SHIP the per-issue outcome from the subdeck — the single
@@ -666,9 +992,15 @@ def ship_issue(
 
     Reads the LOCAL per-decl store and:
 
-    * refuses if the subdeck is NOT complete (some reviewable declaration is
+    * refuses an incomplete ALL-VERIFY outcome (some reviewable declaration is
       unreviewed or merely deferred) → ``{ok: False, reason}`` with NO side
       effect;
+    * once ANY declaration is rejected, permits a PARTIAL reject ship: verified
+      declarations go to KEEP, rejected declarations go to FIX, and untouched /
+      deferred declarations are deliberately absent from both sections (the
+      note's footer tells Aristotle to leave all other code untouched).  This
+      lets the UI stop at the first bad upstream declaration and re-review its
+      dependents only after Aristotle repairs it;
     * if EVERY declaration is verified → routes
       :func:`marathon.deck.verdicts.apply_verdict` ``"verify"`` (marks the
       issue VERIFIED, merges the marathon PR, flips the tracker — NO
@@ -680,8 +1012,10 @@ def ship_issue(
       verbatim). Outcome ``"shipped"``.
 
     SKIP-API auto-approval (realized ONLY here, at this explicit token-bearing
-    ship): when ``skip_api`` is truthy, every API decl WITHOUT an explicit
-    human verdict is AUTO-APPROVED — folded into KEEP in the composed outcome.
+    ship): on a COMPLETE non-partial review, when ``skip_api`` is truthy, every
+    API decl WITHOUT an explicit human verdict is AUTO-APPROVED — folded into
+    KEEP in the composed outcome. A PARTIAL reject suppresses auto-approval;
+    hidden API cards join WAIT and remain untouched for the next round.
     A human's explicit REJECT of an API decl overrides (it stays a MAIN decl
     and goes to FIX). The result ``message`` (and, when there's a reject, the
     composed note's KEEP list) states the auto-approved names. Auto-approval
@@ -693,7 +1027,13 @@ def ship_issue(
     from marathon.deck.verdicts import apply_verdict
 
     subdeck = build_subdeck(cfg, issue_num, skip_api=skip_api)
-    if not subdeck["complete"]:
+    summary = subdeck["summary"]
+    invalidated = list(summary.get("invalidated", []))
+    auto_candidates = [c["name"] for c in subdeck.get("auto_approved", [])]
+    partial_reject = bool(summary["rejected"]) and (
+        not subdeck["complete"] or bool(invalidated) or bool(auto_candidates)
+    )
+    if not subdeck["complete"] and not partial_reject:
         progress = subdeck["progress"]
         unreviewed = progress["total"] - progress["reviewed"]
         return {
@@ -705,12 +1045,11 @@ def ship_issue(
             ),
         }
 
-    summary = subdeck["summary"]
     # Fold the auto-approved API decls (skip_api: API decls with no explicit
     # verdict) into KEEP — the realization of auto-approval, at this explicit
     # ship only. ``auto_approved`` is [] when skip_api is false, so this is a
     # no-op in the default path.
-    auto_names = [c["name"] for c in subdeck.get("auto_approved", [])]
+    auto_names = [] if partial_reject else auto_candidates
     kept = list(summary["kept"]) + auto_names
     composed_summary = {
         "kept": kept,
@@ -724,6 +1063,14 @@ def ship_issue(
             f"; auto-approved {len(auto_names)} API declaration(s): "
             + ", ".join(auto_names)
         )
+
+    waiting = [
+        card["name"] for card in subdeck.get("cards", [])
+        if card.get("verdict") not in _REVIEWED_WIRE_VERDICTS
+    ]
+    for name in [*invalidated, *(auto_candidates if partial_reject else [])]:
+        if name not in waiting:
+            waiting.append(name)
 
     # The issue's "something is MISSING" note (a result the title promises but no
     # decl covers). When present it routes to Aristotle with an ADD section EVEN
@@ -766,6 +1113,12 @@ def ship_issue(
             f"#{issue_num} shipped: {len(kept)} kept, "
             + " + ".join(bits) + f" (note verbatim){auto_clause}"
         )
+        if partial_reject:
+            message += (
+                f"; stopped at first rejection — {len(waiting)} pending "
+                "declaration(s) "
+                "left untouched for the next review round"
+            )
     else:
         apply_verdict(cfg, issue_num, "verify")
         outcome = "verified"
@@ -843,5 +1196,38 @@ def ship_issue(
         "added_to_issue": added_to_issue,
         "informal_verified": informal_verified,
         "carried_over": carried_over,
+        "partial": partial_reject,
+        "waiting": waiting if partial_reject else [],
         "advanced_to_issue": _next_ready_issue(cfg, issue_num),
     }
+
+
+def ship_issue(
+    cfg: "ReviewConfig", issue_num: int, *, skip_api: bool = False
+) -> dict:
+    """Single-flight, idempotent wrapper around the irreversible ship.
+
+    The keyed issue lock spans authoritative subdeck rebuild, external verdict
+    application, and local cleanup, but does NOT hold the global store lock
+    during external GitHub/Aristotle work. Human mutations take the same keyed
+    lock and invalidate the receipt, defining the next review generation.
+    """
+    with _issue_operation_lock(cfg, issue_num):
+        receipt = _load_ship_receipt(cfg, issue_num)
+        if receipt is not None:
+            duplicate = dict(receipt["response"])
+            duplicate["duplicate"] = True
+            duplicate["message"] = (
+                f"duplicate ship suppressed for #{issue_num}; "
+                + str(duplicate.get("message") or "already shipped")
+            )
+            return duplicate
+
+        # Rebuild only after winning single-flight: no stale pre-lock decision
+        # can cross the irreversible boundary.
+        response = _ship_issue_once(cfg, issue_num, skip_api=skip_api)
+        if response.get("ok"):
+            response = dict(response)
+            response["duplicate"] = False
+            _save_ship_receipt(cfg, issue_num, response)
+        return response

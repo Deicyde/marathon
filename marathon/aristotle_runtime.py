@@ -97,6 +97,15 @@ TERMINAL_TASK_STATUSES: frozenset[TaskStatus] = (
 RESUMABLE_SUCCESS_STATUS_VALUES: frozenset[str] = frozenset({TaskStatus.COMPLETE.value})
 
 
+class ReattachTransientError(RuntimeError):
+    """A saved Aristotle project/task could not be checked due to a transient API error."""
+
+
+def _confirmed_absent(exc: AristotleAPIError) -> bool:
+    """True only when Aristotle affirmatively says the saved object is gone."""
+    return exc.status_code in {404, 410}
+
+
 # --- Watcher contract --------------------------------------------------------
 
 
@@ -233,8 +242,10 @@ async def reattach_project_and_task(
 ) -> tuple[Optional[Project], Optional[AgentTask]]:
     """Reattach to a prior project + latest task.
 
-    Returns ``(None, None)`` if the project can't be loaded (API error /
-    deleted). If the project loads but no task can be found, returns
+    Returns ``(None, None)`` only when the project is confirmed absent/deleted.
+    Transient transport/5xx errors raise :class:`ReattachTransientError` so a
+    caller cannot mistake uncertainty for permission to submit fresh. If the
+    project loads but the task is confirmed absent, returns
     ``(project, None)`` so the caller can decide whether to start a new
     task via ``project.ask(...)``.
 
@@ -244,8 +255,12 @@ async def reattach_project_and_task(
     try:
         project = await Project.from_id(project_id)
         await project.refresh()
-    except AristotleAPIError:
-        return None, None
+    except AristotleAPIError as exc:
+        if _confirmed_absent(exc):
+            return None, None
+        raise ReattachTransientError(
+            f"temporary failure reattaching project {project_id}: {exc}"
+        ) from exc
 
     task: Optional[AgentTask] = None
     try:
@@ -254,7 +269,14 @@ async def reattach_project_and_task(
             await task.refresh()
         else:
             task = await get_latest_task(project)
-    except (AristotleAPIError, RuntimeError):
+    except AristotleAPIError as exc:
+        if not _confirmed_absent(exc):
+            raise ReattachTransientError(
+                f"temporary failure reattaching task {agent_task_id or '<latest>'}: "
+                f"{exc}"
+            ) from exc
+        task = None
+    except RuntimeError:
         task = None
 
     return project, task

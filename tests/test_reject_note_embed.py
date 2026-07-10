@@ -42,7 +42,12 @@ def test_cmd_reject_embeds_note_in_github_comment(monkeypatch):
 
     def fake_gh(*a, **k):
         calls.append(a)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        stdout = (
+            '{"labels":[{"name":"review:rejected"}]}'
+            if a[:2] == ("issue", "view")
+            else ""
+        )
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
     recorded = {}
     monkeypatch.setattr(review, "gh", fake_gh)
@@ -66,6 +71,53 @@ def test_cmd_reject_embeds_note_in_github_comment(monkeypatch):
     assert "marathon-reject-note" in bodies[0]          # embedded marker
     assert "- A: do X" in bodies[0]                      # verbatim note
     assert recorded["note"] == note                      # still recorded locally
+
+
+def test_cmd_reject_does_not_record_mixed_verified_rejected_labels(monkeypatch):
+    from types import SimpleNamespace
+
+    import pytest
+    import marathon.review.review as review
+
+    def fake_gh(*a, **k):
+        stdout = (
+            '{"labels":[{"name":"review:rejected"},'
+            '{"name":"review:verified"}]}'
+            if a[:2] == ("issue", "view")
+            else ""
+        )
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(review, "gh", fake_gh)
+    monkeypatch.setattr(
+        review,
+        "record_rejection",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("local reject must wait for rejected-only labels")
+        ),
+    )
+    monkeypatch.setattr(review, "_ensure_conductor", lambda cfg: None)
+    monkeypatch.setattr(
+        review,
+        "load_config",
+        lambda: SimpleNamespace(
+            github_repo="o/r",
+            labels=SimpleNamespace(
+                rejected="review:rejected", verified="review:verified"
+            ),
+            state_path="/tmp/state.json",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="rejected-only"):
+        review.cmd_reject(
+            SimpleNamespace(
+                issue_num=7,
+                notes="fix it",
+                comment=None,
+                no_refine=False,
+            )
+        )
 
 
 def test_embed_extract_roundtrip_with_arrow_in_note():

@@ -1084,6 +1084,64 @@ def open_or_update_pr(
     return True, url
 
 
+def retry_pending_publication(
+    repo_dir: Path, pending: dict,
+) -> tuple[bool, str]:
+    """Retry only the final push/PR for an already-committed iteration.
+
+    This deliberately performs no checkout, reset, build, commit, Claude call,
+    or Aristotle call.  It also verifies that the kept worktree is still on the
+    recorded branch/commit before publishing, so recovery can never push an
+    unrelated operator checkout after a path mix-up.
+    """
+    kind = pending.get("kind")
+    expected_head = str(pending.get("commit_sha") or "")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_dir),
+        capture_output=True, text=True, check=False,
+    )
+    actual_head = (head.stdout or "").strip()
+    if (
+        head.returncode != 0
+        or not expected_head
+        or not actual_head.startswith(expected_head)
+    ):
+        return False, (
+            "kept worktree HEAD no longer matches the committed fix "
+            f"({actual_head[:12] or '?'} != {expected_head[:12] or '?'})"
+        )
+
+    expected_branch = pending.get("branch")
+    if expected_branch:
+        branch_cp = subprocess.run(
+            ["git", "branch", "--show-current"], cwd=str(repo_dir),
+            capture_output=True, text=True, check=False,
+        )
+        actual_branch = (branch_cp.stdout or "").strip()
+        if branch_cp.returncode != 0 or actual_branch != expected_branch:
+            return False, (
+                "kept worktree branch no longer matches the committed fix "
+                f"({actual_branch or '?'} != {expected_branch})"
+            )
+
+    if kind == "push":
+        return run_git_push(repo_dir)
+    if kind == "pr":
+        required = ("branch", "base", "repo", "title", "body")
+        missing = [key for key in required if not pending.get(key)]
+        if missing:
+            return False, "pending PR metadata missing: " + ", ".join(missing)
+        return open_or_update_pr(
+            repo_dir=repo_dir,
+            branch=str(pending["branch"]),
+            base=str(pending["base"]),
+            repo=str(pending["repo"]),
+            title=str(pending["title"]),
+            body=str(pending["body"]),
+        )
+    return False, f"unknown pending publication kind: {kind!r}"
+
+
 def _compute_iteration_diff(
     repo_dir: Path,
     target_path: Path,
@@ -1407,6 +1465,13 @@ def run_post_pipeline(
         # keeps the worktree and retries instead of reaping the only copy.
         "push_ok": None,
         "pr_ok": None,
+        # Durable recipe for retrying ONLY publication from the committed kept
+        # worktree. Set iff a requested push/PR actually fails.
+        "pending_publication": None,
+        # A local enforce gate / repair-faithfulness jury deliberately refused
+        # to publish the committed result. The caller must keep the worktree and
+        # continue the same Aristotle session for a better result.
+        "pr_blocked": None,
     }
 
     # --- statement-immutability guard (HARD) ---------------------------
@@ -1680,6 +1745,16 @@ def run_post_pipeline(
         if config.auto_push and c.sha and not config.auto_pr:
             ok, push_msg = run_git_push(repo_dir)
             out["push_ok"] = ok
+            if not ok:
+                branch_cp = subprocess.run(
+                    ["git", "branch", "--show-current"], cwd=str(repo_dir),
+                    capture_output=True, text=True, check=False,
+                )
+                out["pending_publication"] = {
+                    "kind": "push",
+                    "commit_sha": c.sha,
+                    "branch": (branch_cp.stdout or "").strip() or None,
+                }
             print(f"  push: {('ok (' + push_msg + ')') if ok else ('failed — ' + push_msg)}")
 
 
@@ -1872,6 +1947,9 @@ def run_post_pipeline(
                     and not config.gate_override
                 )
                 if gate_blocked or faithfulness_blocked:
+                    out["pr_blocked"] = (
+                        "repair_faithfulness" if faithfulness_blocked else "gate"
+                    )
                     if faithfulness_blocked:
                         weak = "; ".join(
                             f"{w.get('decl', '?')}: {w.get('reason', '')}"
@@ -1930,6 +2008,19 @@ def run_post_pipeline(
                             gate_report, out["jury"], override_reason
                         ),
                     )
+                    publication = {
+                        "kind": "pr",
+                        "commit_sha": out["commit"].sha,
+                        "branch": branch,
+                        "base": config.auto_pr_base,
+                        "repo": repo,
+                        "title": pr_title,
+                        "body": pr_body,
+                    }
+                    # Persist the recovery recipe in the result *before* the
+                    # network call so an exception is as recoverable as a
+                    # normal ``(False, message)`` return.
+                    out["pending_publication"] = publication
                     pr_ok, pr_msg = open_or_update_pr(
                         repo_dir=repo_dir,
                         branch=branch,
@@ -1940,6 +2031,7 @@ def run_post_pipeline(
                     )
                     out["pr_ok"] = pr_ok
                     if pr_ok:
+                        out["pending_publication"] = None
                         print(f"  pr: {pr_msg}")
                     else:
                         print(f"  pr: failed — {pr_msg}")

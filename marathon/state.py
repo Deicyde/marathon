@@ -76,6 +76,23 @@ class RefineState:
     attempts: int = 0
     output_path: Optional[str] = None
     note: Optional[str] = None
+    # CAS generation of the human rejection this refine was dispatched for.
+    # Completion bookkeeping may only mutate that exact still-rejected verdict.
+    review_verdict_ts: Optional[str] = None
+    # The previous Aristotle task completed, but a local post-pipeline gate
+    # (build/gate/faithfulness) rejected the result. Retry via project.ask on
+    # the same server-side session instead of submitting a fresh project.
+    force_continuation: bool = False
+    # Keep the current local branch/commit while a gate-blocked result is being
+    # improved. Normal fresh iterations reset to origin/base; this flag forbids
+    # that destructive reset until a clean post-pipeline result supersedes it.
+    preserve_local_branch: bool = False
+    continuation_commit_sha: Optional[str] = None
+    # A clean build/commit whose final push or PR publication failed.  This
+    # carries every deterministic argument needed to retry publication from the
+    # kept branch/worktree without resetting the branch or asking Aristotle
+    # again.  Additive/optional for backward-compatible state loading.
+    pending_publication: Optional[dict] = None
 
 
 def load_refine_state(path: Path) -> Optional[RefineState]:

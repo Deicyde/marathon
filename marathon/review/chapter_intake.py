@@ -19,6 +19,8 @@ existing ``parse_drafts`` → ``create_subissues_from_drafts`` apply path.
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -26,7 +28,6 @@ from typing import Optional
 from marathon.claude_proc import run_claude
 from marathon.review.chapter_sessions import (
     _common_decision_rubric_section,
-    _common_output_format_section,
 )
 from marathon.review.config import ReviewConfig
 from marathon.review.drafts import parse_drafts
@@ -53,6 +54,342 @@ INTAKE_MAX_OUTPUT_TOKENS_DEFAULT = "64000"
 
 #: Generous ceiling for one intake completion (single-shot, large context).
 INTAKE_TIMEOUT_SECONDS = 1800.0
+
+# A headless intake draft is durable review infrastructure, not disposable LLM
+# prose.  Chapter 14's hand-curated issues established the useful contract: the
+# reader sees the exact Lean signatures first, then the informal statement,
+# mechanical checks, and explicit questions.  The first headless implementation
+# accidentally embedded ``_common_output_format_section("bootstrap")`` instead;
+# that helper describes the *chat proposal* (TL;DR + a list of titles), not an
+# issue body.  Because ``parse_drafts`` only checks the section header + title,
+# the much thinner Chapter-15 bodies were accepted silently.  Keep the durable
+# body contract here and validate it before a drafts file can be written.
+REQUIRED_DRAFT_SECTIONS = (
+    "### Lean signatures",
+    "### Informal Statement",
+    "### Mechanical accuracy",
+    "### Verification questions",
+)
+_SOURCE_LINK_RE = re.compile(r"\[[^\]]*\.lean(?::L?\d+(?:-L?\d+)?)?\]\([^\n)]*\.lean#L\d+")
+_SIGNATURE_CITATION_RE = re.compile(
+    r"```lean[ \t]*\n(?P<code>.*?)\n```[ \t]*\n"
+    r"\[`(?P<link_name>[^`\n]+)` at "
+    r"(?P<path>[^\]\n]+?\.lean):L(?P<start>\d+)"
+    r"(?:-L(?P<end>\d+))?\]\((?P<url>[^)\n]+)\)",
+    re.DOTALL,
+)
+_TRACKER_ENTRY_RE = re.compile(r"^\s*\d+\.\s+\S", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class _SourceDecl:
+    identity: str
+    spelling: str
+    path: str
+    line: int
+    signature: str
+
+
+def _source_decl_index(sources: list[tuple[str, str]]) -> list[_SourceDecl]:
+    """Namespace-aware declaration sites supplied verbatim to intake."""
+    from marathon.formalization import scan_lean_source
+    from marathon.review.approved_statements import extract_signature
+
+    out: list[_SourceDecl] = []
+    for path, text in sources:
+        sites, _orphans = scan_lean_source(text)
+        lines = text.splitlines()
+        for index, site in enumerate(sites):
+            if site.name and site.qualified:
+                # Start at the scanner-proven declaration line, not at the
+                # first regex occurrence of this name in the whole file.  The
+                # latter could select a commented-out example before the real
+                # declaration even though ``scan_lean_source`` correctly
+                # ignored it.
+                end_line = (
+                    sites[index + 1].line - 1
+                    if index + 1 < len(sites)
+                    else len(lines)
+                )
+                block = "\n".join(lines[site.line - 1:end_line])
+                signature = extract_signature(block, site.name)
+                if signature is not None:
+                    out.append(_SourceDecl(
+                        site.qualified, site.name, path, site.line, signature,
+                    ))
+    return out
+
+
+def _resolve_source_decl(raw: str, sites: list[_SourceDecl]) -> list[_SourceDecl]:
+    """Resolve one cited spelling without allowing a fake namespace by leaf.
+
+    Fully-qualified names must match a source identity (or the exact spelling
+    written on a declaration line).  Only a genuinely bare name may use a leaf
+    shorthand, and even then exactly one source site must match.
+    """
+    raw = raw.strip()
+    exact = [s for s in sites if raw == s.identity]
+    if exact:
+        return exact
+    written = [s for s in sites if raw == s.spelling]
+    if written:
+        return written
+    if "." not in raw:
+        return [s for s in sites if s.identity.rsplit(".", 1)[-1] == raw]
+    return []
+
+
+def _canonical_signature(signature: str, declared_name: str) -> str:
+    """Normalize only the local/qualified declaration spelling for comparison."""
+    return signature.replace(declared_name, "<DECL>", 1)
+
+
+def _chapter_sources_dirty(
+    repo_dir: Path, sources: list[tuple[str, str]],
+) -> Optional[bool]:
+    """Dirty status of intake source paths; ``None`` outside a git checkout."""
+    try:
+        probe = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"], cwd=str(repo_dir),
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return None
+    if probe.returncode != 0 or probe.stdout.strip() != "true":
+        return None
+    try:
+        cp = subprocess.run(
+            ["git", "status", "--porcelain", "--", *[p for p, _ in sources]],
+            cwd=str(repo_dir), capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return None
+    return True if cp.returncode != 0 else bool(cp.stdout.strip())
+
+
+def _repo_head_sha(repo_dir: Path) -> Optional[str]:
+    """Current commit SHA for pinned intake links; ``None`` off-git.
+
+    Intake remains usable in an unpacked fixture, but a real repository always
+    gets commit-pinned source links rather than the stale floating links seen in
+    the degraded issue bodies.
+    """
+    try:
+        cp = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(repo_dir),
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return None
+    return cp.stdout.strip() if cp.returncode == 0 and cp.stdout.strip() else None
+
+
+def _draft_body_contract(
+    chapter: int,
+    *,
+    github_repo: str,
+    parent_issue: int,
+    source_sha: Optional[str],
+) -> str:
+    """The exact markdown contract the headless model must emit per issue."""
+    sha = source_sha or "<CURRENT_HEAD_SHA>"
+    return f"""## Durable issue-body contract (REQUIRED for EVERY draft)
+
+Each ``## N/<total> — ...`` section is the complete future GitHub issue body,
+not a one-line proposal.  Match the Chapter-14 review quality bar.  Use this
+section order exactly:
+
+1. ``**Title**: `<short issue title>` ``
+2. ``**Parent**: #{parent_issue} — **LeeSM ref**: <page/result> — **Status**: 🟠``
+3. ``### Lean signatures``.  For EVERY key declaration, quote its COMPLETE
+   declaration header from the verbatim source in its own ````lean`` fence
+   (all binders, hypotheses, and result type; omit only the proof/body), then a
+   pinned link of this exact shape:
+   ``[`<qualified declaration>` at <path>:L<a>-L<b>](https://github.com/{github_repo}/blob/{sha}/<path>#L<a>-L<b>)``.
+   Do not use a bare declaration-name bullet in place of the signature.
+4. ``### Informal Statement``.  Preserve the supplied wording/roadmap marker
+   exactly as instructed above, then explain the full mathematical statement
+   only when a human-provided statement supplies it.  A tracker title alone is
+   not permission to invent details.
+5. ``### Mechanical accuracy`` with concrete bullets about the actual Lean
+   encoding: quantifiers/hypotheses, direction/sign conventions, typeclass
+   assumptions, whether bodies contain ``sorry``, and named downstream
+   consumers visible in the supplied source.  Never write generic filler such
+   as "looks correct".
+6. ``### Verification questions`` with the unresolved, declaration-specific
+   questions a human should answer.  If none remain, say why the signature is
+   mechanically settled; the section must still exist.
+7. Optional ``### Scaffolding folded`` naming non-card helpers assigned to this
+   result.  Never put a key declaration here.
+8. ``**Verdict**: _(VERIFIED 🟡 / REJECTED ❌)_`` as the final line.
+
+The exact Lean signature and pinned source link are load-bearing.  Never cite a
+declaration absent from the supplied Chapter {chapter} source.  A declaration
+may be a key card in at most one draft.  Do not copy generated structure-field
+accessors or ``_apply`` plumbing into key cards merely to make a section longer.
+"""
+
+
+def _section_text(body: str, header: str) -> Optional[str]:
+    """Body text under ``header`` up to the next level-3 heading / EOF."""
+    m = re.search(
+        rf"(?ms)^{re.escape(header)}\s*\n(?P<body>.*?)(?=^###\s|\Z)", body,
+    )
+    return m.group("body").strip() if m else None
+
+
+def _validate_drafts(
+    parsed: dict[int, tuple[str, str]],
+    *,
+    sources: list[tuple[str, str]],
+    github_repo: str,
+    source_sha: Optional[str],
+    expected_count: Optional[int] = None,
+) -> list[str]:
+    """Return structural/grounding errors for parsed headless drafts.
+
+    This is deliberately deterministic and fail-closed.  It does not judge the
+    mathematics; it prevents a malformed or hallucinated issue body from being
+    approved merely because ``parse_drafts`` found a title.
+    """
+    errors: list[str] = []
+    indices = sorted(parsed)
+    if indices != list(range(1, len(indices) + 1)):
+        errors.append(f"draft indices are not contiguous from 1: {indices}")
+    if expected_count is not None and len(parsed) != expected_count:
+        errors.append(
+            f"tracker has {expected_count} roadmap result(s), but intake "
+            f"returned {len(parsed)} draft(s)"
+        )
+
+    # Ground each fenced signature + permalink pair against one namespace-aware
+    # source site.  Leaf-only validation let ``TotallyWrong.foo`` pass whenever
+    # any source namespace happened to contain a ``foo``.
+    from marathon.fill import _extract_decls_from_text
+    source_sites = _source_decl_index(sources)
+    owners: dict[str, int] = {}
+    for idx, (_title, body) in sorted(parsed.items()):
+        prefix = f"draft {idx}"
+        for header in REQUIRED_DRAFT_SECTIONS:
+            section = _section_text(body, header)
+            if section is None:
+                errors.append(f"{prefix}: missing required `{header}` section")
+            elif not section:
+                errors.append(f"{prefix}: `{header}` section is empty")
+
+        sigs = _section_text(body, "### Lean signatures") or ""
+        if "```lean" not in sigs:
+            errors.append(f"{prefix}: Lean signatures has no ```lean fenced signature")
+        if not _SOURCE_LINK_RE.search(sigs):
+            errors.append(f"{prefix}: Lean signatures has no clickable .lean#L source link")
+        if "**Parent**:" not in body or "**Status**:" not in body:
+            errors.append(f"{prefix}: missing Parent/LeeSM-ref/Status header")
+        if "**Verdict**:" not in body:
+            errors.append(f"{prefix}: missing Verdict footer")
+        informal = _section_text(body, "### Informal Statement") or ""
+        if not any(marker in informal for marker in ("✅", "⚠️", "📋")):
+            errors.append(f"{prefix}: Informal Statement lacks provenance marker")
+
+        citations = list(_SIGNATURE_CITATION_RE.finditer(sigs))
+        fence_count = len(re.findall(r"(?m)^```lean[ \t]*$", sigs))
+        if fence_count != len(citations):
+            errors.append(
+                f"{prefix}: every Lean signature fence must have its own matching "
+                "qualified-name permalink"
+            )
+        if not citations:
+            errors.append(f"{prefix}: no key declaration is extractable from Lean signatures")
+
+        seen_here: set[str] = set()
+        for citation in citations:
+            code_names = _extract_decls_from_text(citation.group("code"))
+            if len(code_names) != 1:
+                errors.append(
+                    f"{prefix}: each Lean signature fence must declare exactly "
+                    "one key declaration"
+                )
+                continue
+            code_name = code_names[0]
+            link_name = citation.group("link_name").strip()
+            code_matches = _resolve_source_decl(code_name, source_sites)
+            link_matches = _resolve_source_decl(link_name, source_sites)
+            if not code_matches:
+                errors.append(
+                    f"{prefix}: cited declaration `{code_name}` is absent from source"
+                )
+                continue
+            if len(code_matches) != 1:
+                errors.append(
+                    f"{prefix}: cited declaration `{code_name}` is ambiguous in source"
+                )
+                continue
+            if not link_matches:
+                errors.append(
+                    f"{prefix}: cited declaration `{link_name}` is absent from source"
+                )
+                continue
+            if len(link_matches) != 1:
+                errors.append(
+                    f"{prefix}: cited declaration `{link_name}` is ambiguous in source"
+                )
+                continue
+            code_site = code_matches[0]
+            link_site = link_matches[0]
+            if code_site != link_site:
+                errors.append(
+                    f"{prefix}: signature `{code_name}` and permalink "
+                    f"`{link_name}` identify different source declarations"
+                )
+                continue
+            from marathon.review.approved_statements import extract_signature
+
+            shown_signature = extract_signature(citation.group("code"), code_name)
+            if shown_signature is None or _canonical_signature(
+                shown_signature, code_name,
+            ) != _canonical_signature(code_site.signature, code_site.spelling):
+                errors.append(
+                    f"{prefix}: fenced signature for `{link_name}` does not "
+                    "exactly match the complete source declaration header"
+                )
+                continue
+            start = int(citation.group("start"))
+            end = int(citation.group("end") or start)
+            if citation.group("path") != code_site.path or not (
+                start <= code_site.line <= end
+            ):
+                errors.append(
+                    f"{prefix}: permalink for `{link_name}` does not point to its "
+                    "source declaration"
+                )
+                continue
+            expected_url = (
+                f"https://github.com/{github_repo}/blob/{source_sha}/"
+                f"{code_site.path}#L{start}-L{end}"
+                if source_sha else None
+            )
+            if expected_url is not None and citation.group("url") != expected_url:
+                errors.append(
+                    f"{prefix}: permalink URL for `{link_name}` must pin the exact "
+                    "repository, HEAD SHA, source path, and displayed line range"
+                )
+                continue
+
+            identity = code_site.identity
+            if identity in seen_here:
+                errors.append(
+                    f"{prefix}: key declaration `{identity}` is cited more than once"
+                )
+                continue
+            seen_here.add(identity)
+            prior = owners.get(identity)
+            if prior is not None and prior != idx:
+                errors.append(
+                    f"draft {idx}: key declaration `{identity}` is already owned by "
+                    f"draft {prior}"
+                )
+            else:
+                owners[identity] = idx
+    return errors
 
 
 @dataclass
@@ -190,9 +527,27 @@ def _build_intake_prompt(
     inventory: list[str],
     informal_text: Optional[str],
     informal_kind: Optional[str] = None,
+    *,
+    github_repo: str = "<owner/repo>",
+    parent_issue: int = 1,
+    source_sha: Optional[str] = None,
 ) -> str:
-    rubric = _common_decision_rubric_section()
-    output = _common_output_format_section("bootstrap")
+    rubric = _common_decision_rubric_section().replace(
+        "list EVERY one in the issue's `### Lean declarations` section",
+        "quote EVERY one in the issue's `### Lean signatures` section as a "
+        "complete fenced header with its pinned link",
+    )
+    # ``_common_output_format_section`` is the interactive session's CHAT
+    # summary format, not a durable issue-body schema.  The old headless prompt
+    # used it here and then contradicted it by asking for drafts markdown; Claude
+    # improvised thin Chapter-15 bodies and the permissive parser accepted them.
+    # Give the headless path its own exact issue contract instead.
+    body_contract = _draft_body_contract(
+        chapter,
+        github_repo=github_repo,
+        parent_issue=parent_issue,
+        source_sha=source_sha,
+    )
 
     if informal_text is not None and informal_kind == "tracker":
         informal_directive = (
@@ -203,8 +558,9 @@ def _build_intake_prompt(
             "marker — ignore it). Open EXACTLY ONE sub-issue per roadmap line — "
             "never split a line into multiple sub-issues. List that result's KEY "
             "declarations (the substantive lemmas/definitions/predicates that "
-            "realize it — e.g. forward + converse + roundtrip) in its `### Lean "
-            "declarations` section; the deck turns each into a review card, and "
+            "realize it — e.g. forward + converse + roundtrip) as complete fenced "
+            "headers with pinned links in its `### Lean signatures` section; the "
+            "deck turns each into a review card, and "
             "trivial helpers go under `### Scaffolding folded`. Quote the roadmap "
             "line VERBATIM (minus the status emoji) "
             "in each Informal Statement section and open it with `*📋 Anchored to the "
@@ -272,7 +628,7 @@ roadmap line as "out of inventory scope".
 
 {src_block}
 {informal_block}
-{output}
+{body_contract}
 
 ## Output discipline (CRITICAL)
 
@@ -310,6 +666,17 @@ def run_chapter_intake(
             error=f"no .lean files under {cfg.target_path(chapter)} — "
             "formalize the chapter (e.g. `marathon skeleton`) before intake",
         )
+    source_sha = _repo_head_sha(cfg.repo_dir)
+    dirty = _chapter_sources_dirty(cfg.repo_dir, sources)
+    if dirty is True or (dirty is False and source_sha is None):
+        return IntakeResult(
+            chapter, dpath, [], "", model_label,
+            error=(
+                "chapter Lean source is not pinned by the current git HEAD; "
+                "commit the chapter source before intake so every generated "
+                "signature permalink is truthful"
+            ),
+        )
 
     informal_text: Optional[str] = None
     informal_kind: Optional[str] = None
@@ -336,7 +703,10 @@ def run_chapter_intake(
             )
 
     prompt = _build_intake_prompt(
-        chapter, sources, _chapter_inventory(cfg, chapter), informal_text, informal_kind
+        chapter, sources, _chapter_inventory(cfg, chapter), informal_text, informal_kind,
+        github_repo=cfg.github_repo,
+        parent_issue=cfg.parent_issue,
+        source_sha=source_sha,
     )
     try:
         runner_kw = {"model": model, "timeout": timeout}
@@ -367,6 +737,24 @@ def run_chapter_intake(
         return IntakeResult(
             chapter, dpath, [], raw, model_label,
             error="claude output had no parseable `## N/total — …` draft sections",
+        )
+
+    expected_count = (
+        len(_TRACKER_ENTRY_RE.findall(informal_text or ""))
+        if informal_kind == "tracker"
+        else None
+    )
+    validation_errors = _validate_drafts(
+        parsed, sources=sources, github_repo=cfg.github_repo,
+        source_sha=source_sha, expected_count=expected_count,
+    )
+    if validation_errors:
+        shown = "; ".join(validation_errors[:8])
+        if len(validation_errors) > 8:
+            shown += f"; … and {len(validation_errors) - 8} more"
+        return IntakeResult(
+            chapter, dpath, [], raw, model_label,
+            error=f"intake drafts failed structural validation: {shown}",
         )
 
     dpath.parent.mkdir(parents=True, exist_ok=True)

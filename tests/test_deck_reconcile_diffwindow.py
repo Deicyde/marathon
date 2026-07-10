@@ -7,9 +7,9 @@ lemmas, the #166 shape) — the stale parent stayed cited and the new sublemmas
 never appeared. This drives the reconcile from the refine's git diff window
 (removed/added decls) instead, classifying:
 
-* RENAME — one added decl replaces the stale one (shared leaf, or the sole
-  removed/added pair);
-* SPLIT — two+ added decls replace it (only once EVERY target is live);
+* RENAME — exact same-leaf namespace moves are safe to apply;
+* heuristic rename/split — token-overlap/sole-pair proposals are flagged for a
+  human and never rewrite the issue body;
 * DELETE — removed with no replacement (left STALE, never auto-dropped on a guess
   — the deck footnotes it);
 * ADD — leftover window-added decls the issue should also cite.
@@ -47,13 +47,14 @@ def test_leaves_related():
 # ---------------------------------------------------------------------------
 
 
-def test_classify_rename_same_leaf():
+def test_classify_same_leaf_namespace_move_is_still_a_proposal():
     cls = classify_diff_window(
         ["A.foo"], {"foo"}, {"A.foo"},
         live_names=["B.foo"], orphaned=["B.foo"], cited_set=set(),
     )
-    assert cls["renames"] == [{"old": "A.foo", "new": "B.foo"}]
-    assert cls["splits"] == [] and cls["deletes"] == [] and cls["kept_stale"] == []
+    assert cls["renames"] == []
+    assert cls["heuristic_renames"] == [{"old": "A.foo", "new": "B.foo"}]
+    assert cls["splits"] == [] and cls["deletes"] == []
 
 
 def test_classify_split_166():
@@ -65,8 +66,9 @@ def test_classify_split_166():
         orphaned=["Exercise_15_13_a_imp_c", "Exercise_15_13_c_imp_a"],
         cited_set=set(),
     )
-    assert len(cls["splits"]) == 1
-    sg = cls["splits"][0]
+    assert cls["splits"] == []
+    assert len(cls["heuristic_splits"]) == 1
+    sg = cls["heuristic_splits"][0]
     assert sg["old"] == "Exercise_15_13_a_iff_c"
     assert set(sg["targets"]) == {
         "Exercise_15_13_a_imp_c", "Exercise_15_13_c_imp_a"}
@@ -108,13 +110,16 @@ def test_classify_stale_not_in_window_kept():
 
 
 def test_classify_sole_pair_rename_leaf_changed():
-    # Leaf changed entirely, but exactly one decl out + one in this window -> the
-    # addition is the rename target by provenance.
+    # A sole pair is useful evidence but not identity proof: an unrelated helper
+    # can disappear in the same commit that a new result is added.
     cls = classify_diff_window(
         ["A.old_name"], {"brand_new"}, {"A.old_name"},
         live_names=["A.brand_new"], orphaned=["A.brand_new"], cited_set=set(),
     )
-    assert cls["renames"] == [{"old": "A.old_name", "new": "A.brand_new"}]
+    assert cls["renames"] == []
+    assert cls["heuristic_renames"] == [
+        {"old": "A.old_name", "new": "A.brand_new"}
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -219,19 +224,14 @@ def _setup_split(tmp_path, monkeypatch, *, labels=None):
     return cfg, body
 
 
-def test_split_166_end_to_end(tmp_path, monkeypatch):
+def test_split_166_is_human_proposal_not_automatic_edit(tmp_path, monkeypatch):
     cfg, _body = _setup_split(tmp_path, monkeypatch)
     r = auto_reconcile_issue(cfg, 166, dry_run=True, diff_window=("OLD", "NEW"))
-    assert len(r["splits"]) == 1
-    nb = r["new_body"]
-    # both directional sublemmas now cited
-    assert "Exercise_15_13_a_imp_c`" in nb
-    assert "Exercise_15_13_c_imp_a`" in nb
-    # the stale iff parent is dropped
-    assert "Exercise_15_13_a_iff_c`" not in nb
-    # every other section preserved verbatim
-    assert "### Informal Statement\n\ntext\n" in nb
-    assert "Prose with an unrelated `token`." in nb
+    assert r["updated"] is False
+    assert len(r["proposed_splits"]) == 1
+    assert "human confirmation" in r["message"]
+    assert "new_body" not in r
+    assert "Exercise_15_13_a_iff_c`" in _body
 
 
 def test_split_166_verified_no_write(tmp_path, monkeypatch):
@@ -252,4 +252,5 @@ def test_split_166_verified_no_write(tmp_path, monkeypatch):
     r = auto_reconcile_issue(cfg, 166, diff_window=("OLD", "NEW"))
     assert r["updated"] is False
     assert len(r["flagged_splits"]) == 1
-    assert "verified/frozen" in r["message"]
+    assert r["proposed_splits"]
+    assert "human confirmation" in r["message"]

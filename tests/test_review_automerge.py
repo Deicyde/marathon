@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 import marathon.review.automerge as am
+import marathon.review.state as review_state
 
 
 def _cfg(base="main"):
@@ -174,7 +175,9 @@ def test_eligibility_require_build_ok_false_allows_untagged_but_not_red():
 
 # --- automerge() (one cycle, gh mocked) ------------------------------------
 
-def _install_gh(monkeypatch, prs, *, merge_rc=0, methods=None):
+def _install_gh(
+    monkeypatch, prs, *, merge_rc=0, methods=None, label_remove_ok=True,
+):
     # default repo: squash-only (mirrors GeometricAnalysis, which disallows
     # merge commits — the bug that made the live merge fail).
     methods = methods or {
@@ -184,6 +187,7 @@ def _install_gh(monkeypatch, prs, *, merge_rc=0, methods=None):
     }
     calls = {"merged": [], "list": 0, "method_flags": [], "unlabeled": [],
              "comments": []}
+    issue_label_state = {}
 
     def fake_gh(*args, check=True, capture=True):
         if args[:2] == ("repo", "view"):
@@ -199,8 +203,18 @@ def _install_gh(monkeypatch, prs, *, merge_rc=0, methods=None):
             return _cp(returncode=merge_rc, stderr="boom" if merge_rc else "")
         if args[:2] == ("issue", "edit"):
             # capture the re-queue relabel: (issue, --remove-label, <label>)
-            calls["unlabeled"].append(int(args[2]))
+            issue = int(args[2])
+            calls["unlabeled"].append(issue)
+            labels = issue_label_state.setdefault(issue, {"review:rejected"})
+            if label_remove_ok and "--remove-label" in args:
+                labels.discard(args[list(args).index("--remove-label") + 1])
             return _cp()
+        if args[:2] == ("issue", "view"):
+            issue = int(args[2])
+            labels = issue_label_state.setdefault(issue, {"review:rejected"})
+            return _cp(stdout=json.dumps({
+                "labels": [{"name": name} for name in sorted(labels)]
+            }))
         if args[:2] == ("issue", "comment"):
             # capture the recovery comment: (issue, ..., --body, <body>)
             calls["comments"].append(
@@ -243,6 +257,40 @@ def test_automerge_refuses_build_fail_head(monkeypatch):
     assert calls["merged"] == [10]
     assert any(r.pr == 11 and r.action == "skipped"
                and "build fail" in r.reason.lower() for r in results)
+
+
+def test_automerge_refuses_refine_pr_owned_by_older_verdict(monkeypatch, tmp_path):
+    head = "marathon/refine-c15-i166"
+    cfg = SimpleNamespace(
+        repo_dir=tmp_path,
+        github_repo="o/r",
+        auto_pr_base="main",
+        labels=SimpleNamespace(rejected="review:rejected"),
+    )
+    # Per-issue branch names are reused. The current verdict owns the same
+    # branch but a DIFFERENT commit; the old remote PR must not be mistaken for
+    # the new no-diff iteration and merged before cleanup CAS gets a say.
+    review_state.save_state(
+        cfg,
+        review_state.ReviewState(
+            issues={
+                166: review_state.IssueState(
+                    status="rejected",
+                    verdict_ts="2026-07-10T12:00:00+00:00",
+                    notes="new verdict",
+                    iteration_branch=head,
+                    iteration_commit_sha="new-current-commit",
+                )
+            }
+        ),
+    )
+    calls = _install_gh(monkeypatch, [_pr(10, head=head, build="OK")])
+
+    [result] = am.automerge(cfg)
+
+    assert calls["merged"] == []
+    assert result.action == "skipped"
+    assert "stale/unowned" in result.reason
 
 
 def test_pr_fields_include_commits():
@@ -350,6 +398,38 @@ def test_requeue_landed_false_posts_no_recovery_comment(monkeypatch):
     assert n == 93
     assert calls["unlabeled"] == [93]        # still re-queued
     assert calls["comments"] == []           # but NO false "fix landed" comment
+
+
+def test_requeue_keeps_local_anchor_when_label_removal_silently_fails(
+    monkeypatch, capsys,
+):
+    """The old ordering cleared state.json even when GitHub kept Reject, so no
+    automatic pass had enough information to heal the split-brain."""
+    import marathon.review.state as state_mod
+
+    requeued = []
+    monkeypatch.setattr(
+        state_mod, "requeue_for_rereview",
+        lambda cfg, issue: requeued.append(issue) or True,
+    )
+    cfg = SimpleNamespace(
+        github_repo="o/r", auto_pr_base="main",
+        labels=SimpleNamespace(rejected="review:rejected"),
+    )
+    calls = _install_gh(
+        monkeypatch,
+        [_pr(109, head="marathon/refine-c12-i93", build="OK")],
+        label_remove_ok=False,
+    )
+
+    [result] = am.automerge(cfg)
+
+    assert calls["merged"] == [109]           # merge itself still lands
+    assert calls["unlabeled"] == [93, 93, 93]  # bounded confirmation retries
+    assert requeued == []                      # local rejected state PRESERVED
+    assert calls["comments"] == []             # no false recovery claim
+    assert "requeue not confirmed" in result.reason
+    assert "keeping local rejection state" in capsys.readouterr().out
 
 
 def test_automerge_non_refine_pr_does_not_requeue(monkeypatch):

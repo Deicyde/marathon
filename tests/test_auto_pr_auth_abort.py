@@ -28,6 +28,8 @@ import marathon.conductor as conductor
 import marathon.post_pipeline as post_pipeline
 import marathon.refine as refine
 import marathon.review.daemon as daemon
+from marathon.state import RefineState, save_refine_state
+from marathon.aristotle_runtime import ReattachTransientError
 from marathon.post_pipeline import _is_git_auth_error, prepare_auto_pr_branch
 
 from tests.test_conductor import make_cfg, seed_rejections  # reuse fixtures' helpers
@@ -126,6 +128,8 @@ def _make_refine_args(repo_dir, target, workdir):
         max_prompt_words=None,
         no_cross_chapter=True,
         review_rejection=156,
+        review_verdict_ts="2026-07-10T10:00:00+00:00",
+        review_rejection_note_file=None,
         auto_build=False,
         auto_commit=False,
         auto_push=False,
@@ -158,7 +162,7 @@ def test_refine_auto_pr_abort_exits_nonzero(monkeypatch, tmp_path):
 
     monkeypatch.setattr(refine, "_ensure_api_key", lambda: "sk-test")
     monkeypatch.setattr(refine, "_load_pending_rejections_md",
-                        lambda *a, **k: None)
+                        lambda *a, **k: "- **Review #156 REJECTED**\n\nfix it")
     # prepare_auto_pr_branch is imported lazily INSIDE refine_command from
     # marathon.post_pipeline — patch it on that module.
     monkeypatch.setattr(
@@ -173,6 +177,105 @@ def test_refine_auto_pr_abort_exits_nonzero(monkeypatch, tmp_path):
     # Distinguished, non-zero — and exactly the code the conductor keys on.
     assert exc.value.code == refine.EXIT_AUTO_PR_BRANCH_ABORT
     assert exc.value.code != 0
+
+
+def test_force_continuation_preserves_local_branch_without_reset(
+    monkeypatch, tmp_path,
+):
+    repo_dir = tmp_path / "repo"
+    target = repo_dir / "Demo" / "Chapter14"
+    target.mkdir(parents=True)
+    (repo_dir / ".git").mkdir()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    save_refine_state(
+        workdir / refine.REFINE_STATE_FILENAME,
+        RefineState(
+            target_folder=str(target),
+            force_continuation=True,
+            preserve_local_branch=True,
+            continuation_commit_sha="abc12345",
+        ),
+    )
+    monkeypatch.setattr(refine, "_ensure_api_key", lambda: "sk-test")
+    monkeypatch.setattr(
+        refine,
+        "_load_pending_rejections_md",
+        lambda *a, **k: "- **Review #156 REJECTED**\n\nfix it",
+    )
+    monkeypatch.setattr(
+        post_pipeline,
+        "prepare_auto_pr_branch",
+        lambda **k: (_ for _ in ()).throw(
+            AssertionError("must not checkout/reset a gate-blocked local commit")
+        ),
+    )
+
+    def fake_git(cmd, **kwargs):
+        if cmd[:3] == ["git", "branch", "--show-current"]:
+            return SimpleNamespace(
+                returncode=0, stdout="marathon/refine-c14-i156\n", stderr=""
+            )
+        if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+            return SimpleNamespace(
+                returncode=0, stdout="abc12345deadbeef\n", stderr=""
+            )
+        raise AssertionError(f"unexpected git mutation/query: {cmd}")
+
+    monkeypatch.setattr(refine.subprocess, "run", fake_git)
+    args = _make_refine_args(repo_dir, target, workdir)
+    args.dry_run = True
+
+    asyncio.run(refine.refine_command(args))
+
+    after = refine.load_refine_state(workdir / refine.REFINE_STATE_FILENAME)
+    assert after is not None and after.preserve_local_branch is True
+    assert after.continuation_commit_sha == "abc12345"
+
+
+def test_transient_reattach_exits_attempt_free_and_preserves_ids(
+    monkeypatch, tmp_path,
+):
+    repo_dir = tmp_path / "repo"
+    target = repo_dir / "Demo" / "Chapter14"
+    target.mkdir(parents=True)
+    (repo_dir / ".git").mkdir()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    save_refine_state(
+        workdir / refine.REFINE_STATE_FILENAME,
+        RefineState(
+            target_folder=str(target),
+            current_iteration_idx=1,
+            project_id="p-saved",
+            agent_task_id="t-saved",
+            status="IN_PROGRESS",
+        ),
+    )
+    monkeypatch.setattr(refine, "_ensure_api_key", lambda: "sk-test")
+    monkeypatch.setattr(
+        refine,
+        "_load_pending_rejections_md",
+        lambda *a, **k: "- **Review #156 REJECTED**\n\nfix it",
+    )
+    monkeypatch.setattr(
+        post_pipeline,
+        "prepare_auto_pr_branch",
+        lambda **k: (True, "marathon/refine-c14-i156", "on branch"),
+    )
+
+    async def transient(*args, **kwargs):
+        raise ReattachTransientError("temporary 503")
+
+    monkeypatch.setattr(refine, "_try_reattach_or_continue", transient)
+    args = _make_refine_args(repo_dir, target, workdir)
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(refine.refine_command(args))
+    assert exc.value.code == refine.EXIT_REATTACH_TRANSIENT
+    after = refine.load_refine_state(workdir / refine.REFINE_STATE_FILENAME)
+    assert after is not None
+    assert after.project_id == "p-saved" and after.agent_task_id == "t-saved"
+    assert after.status == "REATTACH_RETRY"
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +334,11 @@ def test_refine_iteration_failure_exits_nonzero(monkeypatch, tmp_path):
     workdir.mkdir()
 
     monkeypatch.setattr(refine, "_ensure_api_key", lambda: "sk-test")
-    monkeypatch.setattr(refine, "_load_pending_rejections_md", lambda *a, **k: None)
+    monkeypatch.setattr(
+        refine,
+        "_load_pending_rejections_md",
+        lambda *a, **k: "- **Review #156 REJECTED**\n\nfix it",
+    )
     # branch prep SUCCEEDS so we reach the iteration loop...
     monkeypatch.setattr(
         post_pipeline, "prepare_auto_pr_branch",

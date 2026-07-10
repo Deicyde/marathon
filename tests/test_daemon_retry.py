@@ -342,6 +342,40 @@ def test_run_daemon_clean_exit_keeps_legacy_behavior(cfg, gh_calls, monkeypatch)
     assert gh_calls == []
 
 
+def test_missing_reject_note_exit_is_attempt_free_and_backed_off(cfg):
+    from marathon.refine import EXIT_REJECTION_CONTEXT_MISSING
+
+    rejected = record_rejection(cfg, ISSUE, "authoritative note")
+    backoff = daemon._handle_refine_exit(
+        cfg,
+        ISSUE,
+        EXIT_REJECTION_CONTEXT_MISSING,
+        max_attempts=3,
+        interrupted=False,
+        expected_verdict_ts=rejected.verdict_ts,
+    )
+    entry = load_state(cfg).issues[ISSUE]
+    assert backoff == daemon.BACKOFF_BASE_SECONDS
+    assert entry.attempts == 0 and entry.needs_iteration()
+
+
+def test_transient_reattach_exit_is_attempt_free_and_backed_off(cfg):
+    from marathon.refine import EXIT_REATTACH_TRANSIENT
+
+    rejected = record_rejection(cfg, ISSUE, "authoritative note")
+    backoff = daemon._handle_refine_exit(
+        cfg,
+        ISSUE,
+        EXIT_REATTACH_TRANSIENT,
+        max_attempts=3,
+        interrupted=False,
+        expected_verdict_ts=rejected.verdict_ts,
+    )
+    entry = load_state(cfg).issues[ISSUE]
+    assert backoff == daemon.BACKOFF_BASE_SECONDS
+    assert entry.attempts == 0 and entry.needs_iteration()
+
+
 def test_run_daemon_sigterm_mid_refine_records_nothing(cfg, gh_calls, monkeypatch):
     """A stop signal arriving while refine runs (simulated by the fake
     refine flipping the module flag, as the real handler would) must

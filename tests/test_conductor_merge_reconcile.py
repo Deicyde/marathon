@@ -27,9 +27,9 @@ def _patch_gh(monkeypatch, merged_prs):
 def _capture_requeue(monkeypatch):
     requeued = []
 
-    def fake(cfg, head):
+    def fake(cfg, head, *, expected_verdict_ts):
         n = int(head.rsplit("-i", 1)[1])
-        requeued.append(n)
+        requeued.append((n, expected_verdict_ts))
         return n
 
     monkeypatch.setattr(amod, "_requeue_refined_issue", fake)
@@ -53,7 +53,7 @@ def test_requeues_only_when_merge_is_after_the_rejection(monkeypatch):
 
     out = conductor._reconcile_merged_rejections(SimpleNamespace(github_repo="o/r"))
     assert out == [96]
-    assert requeued == [96]
+    assert requeued == [(96, "2026-06-21T00:00:00-04:00")]
 
 
 def test_no_gh_call_when_nothing_rejected(monkeypatch):

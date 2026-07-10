@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import pytest
 
 import marathon.conductor as conductor
+from marathon.refine import REFINE_STATE_FILENAME
+from marathon.state import RefineState, save_refine_state
 
 
 @pytest.fixture(autouse=True)
@@ -153,7 +155,7 @@ def test_reap_adopted_job_with_pr_marks_iterated(monkeypatch, tmp_path):
     calls = {"iterated": [], "removed": []}
     monkeypatch.setattr(c, "_branch_pr_exists", lambda cfg, b: True)
     monkeypatch.setattr(c, "record_iteration",
-                        lambda cfg, n: calls["iterated"].append(n))
+                        lambda cfg, n, **kw: calls["iterated"].append(n))
     monkeypatch.setattr(c, "_remove_worktree",
                         lambda repo, w: calls["removed"].append(str(w)))
     monkeypatch.setattr(c, "_regenerate_metadata_after_success", lambda cfg: None)
@@ -175,12 +177,150 @@ def test_reap_adopted_job_without_pr_requeues(monkeypatch, tmp_path):
     monkeypatch.setattr(c, "_requeue_if_no_pr_landed",
                         lambda cfg, job: calls["requeued"].append(job.issue_num))
     kept: dict = {}
-    job = _job(issue_num=42, worktree=str(tmp_path / "wt-i42"))
+    wd = tmp_path / "wd-i42"
+    wd.mkdir()
+    save_refine_state(
+        wd / REFINE_STATE_FILENAME,
+        RefineState(
+            target_folder="Demo/Chapter15",
+            current_iteration_idx=1,
+            iterations_completed=1,
+            status="COMPLETE",
+        ),
+    )
+    job = _job(
+        issue_num=42,
+        worktree=str(tmp_path / "wt-i42"),
+        workdir=str(wd),
+    )
     c._reap_adopted_job(SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True)
     assert job.status == "failed"
     assert calls["iterated"] == 0
     assert calls["requeued"] == [42]
     assert kept == {42: str(tmp_path / "wt-i42")}
+
+
+def test_adopted_fill_with_resumable_checkpoint_is_never_cleaned(
+    monkeypatch, tmp_path,
+):
+    wt = tmp_path / "wt-i42-x"
+    wd = tmp_path / "wd-i42-x"
+    wt.mkdir()
+    wd.mkdir()
+    save_refine_state(
+        wd / REFINE_STATE_FILENAME,
+        RefineState(
+            target_folder="Demo/Chapter15",
+            force_continuation=True,
+            status="POST_PIPELINE_PR_BLOCKED",
+        ),
+    )
+    job = _job(issue_num=42, worktree=str(wt), workdir=str(wd), fill=True)
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("resumable fill worktree must not be removed")
+        ),
+    )
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+    assert job.status == "failed"
+    assert kept == {conductor.FILL_KEY_BASE + 42: str(wt)}
+
+
+def test_adopted_fill_generic_failure_without_completion_is_retained(
+    monkeypatch, tmp_path,
+):
+    wt = tmp_path / "wt-i42-x"
+    wd = tmp_path / "wd-i42-x"
+    wt.mkdir()
+    wd.mkdir()
+    save_refine_state(
+        wd / REFINE_STATE_FILENAME,
+        RefineState(
+            target_folder="Demo/Chapter15",
+            current_iteration_idx=1,
+            iterations_completed=0,
+            status="SUBMIT_FAILED",
+            project_id="p-existing",
+        ),
+    )
+    job = _job(issue_num=42, worktree=str(wt), workdir=str(wd), fill=True)
+    monkeypatch.setattr(conductor, "_branch_pr_exists", lambda *a, **k: False)
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("generic failed fill must not be inferred successful")
+        ),
+    )
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+    assert job.status == "failed"
+    assert kept == {conductor.FILL_KEY_BASE + 42: str(wt)}
+
+
+def test_adopted_fill_with_completed_iteration_can_be_cleaned(monkeypatch, tmp_path):
+    wt = tmp_path / "wt-i42-x"
+    wd = tmp_path / "wd-i42-x"
+    wt.mkdir()
+    wd.mkdir()
+    save_refine_state(
+        wd / REFINE_STATE_FILENAME,
+        RefineState(
+            target_folder="Demo/Chapter15",
+            current_iteration_idx=1,
+            iterations_completed=1,
+            status="COMPLETE",
+        ),
+    )
+    job = _job(issue_num=42, worktree=str(wt), workdir=str(wd), fill=True)
+    removed = []
+    monkeypatch.setattr(
+        conductor, "_remove_worktree", lambda repo, path: removed.append(path)
+    )
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+    assert job.status == "succeeded"
+    assert removed == [wt]
+    assert kept == {}
+
+
+def test_adopted_refine_pending_publication_is_not_no_pr_requeued(
+    monkeypatch, tmp_path,
+):
+    wt = tmp_path / "wt-i42-x"
+    wd = tmp_path / "wd-i42-x"
+    wt.mkdir()
+    wd.mkdir()
+    save_refine_state(
+        wd / REFINE_STATE_FILENAME,
+        RefineState(
+            target_folder="Demo/Chapter15",
+            pending_publication={"kind": "pr", "commit_sha": "abc123"},
+        ),
+    )
+    job = _job(issue_num=42, worktree=str(wt), workdir=str(wd))
+    monkeypatch.setattr(
+        conductor,
+        "_branch_pr_exists",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("checkpoint must be inspected before no-PR query")
+        ),
+    )
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+    assert job.status == "publication_pending"
+    assert kept == {42: str(wt)}
 
 
 def test_pid_marker_write_is_self_ignoring(tmp_path):

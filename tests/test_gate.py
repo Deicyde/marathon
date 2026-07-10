@@ -477,3 +477,25 @@ def test_scan_lean_source_attributes_sorries_to_decls():
     assert orphans == 0
     counts = {d.name: d.sorry_count for d in decls}
     assert counts == {"withSorry": 1, "twoSorries": 2}
+
+
+def test_scan_lean_source_ignores_nested_block_comments_and_strings():
+    decls, orphans = formalization.scan_lean_source(
+        textwrap.dedent(
+            '''\
+            /-
+            theorem commented : False := by sorry
+            /- lemma nested : False := by sorry -/
+            -/
+            def message : String := "theorem stringFake : False := by sorry"
+            theorem live : True := by
+              -- sorry and theorem lineFake : False are comments
+              trivial
+            '''
+        )
+    )
+    assert orphans == 0
+    assert [(d.name, d.sorry_count) for d in decls] == [
+        ("message", 0),
+        ("live", 0),
+    ]

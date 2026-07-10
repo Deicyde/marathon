@@ -116,6 +116,55 @@ _CONTENT_TYPES = {
 # huge body is either a bug or an attack — refuse it, never buffer it).
 MAX_POST_BYTES = 256 * 1024
 
+# Files selected by the Add Chapter UI are copied into a model prompt.  Keep
+# that read capability deliberately narrower than the deck process's ambient
+# filesystem permissions: repo-local, regular, modest-sized text only.
+MAX_INFORMAL_SOURCE_BYTES = 5 * 1024 * 1024
+INFORMAL_SOURCE_SUFFIXES = frozenset({".md", ".markdown", ".txt"})
+
+
+def _repo_informal_source(repo_dir: Path, raw: str) -> Path:
+    """Resolve a user-selected informal source without granting an arbitrary
+    host-file read primitive.
+
+    The HTTP caller must name an existing, repo-relative text file.  Resolving
+    both sides before the containment check also closes symlink escapes.
+    ``ValueError`` carries the safe message returned as HTTP 400.
+    """
+    supplied = Path(raw)
+    if supplied.is_absolute():
+        raise ValueError("informal-statements path must be repo-relative")
+    repo = Path(repo_dir).resolve()
+    try:
+        candidate = (repo / supplied).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(
+            f"informal-statements file does not exist or cannot be resolved: {raw}"
+        ) from exc
+    try:
+        candidate.relative_to(repo)
+    except ValueError as exc:
+        raise ValueError(
+            "informal-statements path must stay inside the repository"
+        ) from exc
+    if not candidate.is_file():
+        raise ValueError("informal-statements path must name a regular file")
+    if candidate.suffix.lower() not in INFORMAL_SOURCE_SUFFIXES:
+        raise ValueError(
+            "informal-statements file must be Markdown or plain text "
+            "(.md, .markdown, or .txt)"
+        )
+    try:
+        size = candidate.stat().st_size
+    except OSError as exc:
+        raise ValueError("could not inspect informal-statements file") from exc
+    if size > MAX_INFORMAL_SOURCE_BYTES:
+        raise ValueError(
+            "informal-statements file is too large "
+            f"(maximum {MAX_INFORMAL_SOURCE_BYTES // (1024 * 1024)} MiB)"
+        )
+    return candidate
+
 
 def _truthy_flag(value) -> bool:
     """Interpret a ``skip_api`` flag from a query string (``"1"``/``"0"``/
@@ -598,6 +647,38 @@ class DeckHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST,
                 f"bad or missing chapter {data.get('chapter')!r}",
             )
+        # An explicit Approve click may already have opened part of the remote
+        # batch before this deck process restarted. Restore that exact reviewed
+        # snapshot; never rerun Claude and risk a different manifest being
+        # spliced into the durable transaction.
+        from marathon.review.subissues import chapter_approval_snapshot
+
+        try:
+            interrupted = chapter_approval_snapshot(self.cfg, chapter)
+        except Exception as exc:  # noqa: BLE001 — malformed journal is explicit
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                f"cannot resume chapter {chapter} approval: {exc}",
+            )
+        if interrupted is not None:
+            return self._send_json(interrupted)
+        # Legacy chapters may predate approval journals. They still get the
+        # same fail-fast guard: do not spend a model call drafting a chapter
+        # that the authoritative registry already contains.
+        from marathon.review.config import load_config
+
+        try:
+            already_registered = chapter in load_config(
+                repo_dir=self.cfg.repo_dir
+            ).chapters
+        except SystemExit:
+            already_registered = False
+        if already_registered:
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                f"chapter {chapter} is already registered — refusing to start "
+                "a duplicate intake",
+            )
         source = str(data.get("informal_source") or "").strip().lower()
         raw = str(data.get("informal_statements") or "").strip()
         # Back-compat: a legacy client that sends only a path (no informal_source)
@@ -616,8 +697,10 @@ class DeckHandler(BaseHTTPRequestHandler):
                     HTTPStatus.BAD_REQUEST,
                     "informal source 'file' selected but no path was given",
                 )
-            p = Path(raw)
-            informal_path = p if p.is_absolute() else self.cfg.repo_dir / p
+            try:
+                informal_path = _repo_informal_source(self.cfg.repo_dir, raw)
+            except ValueError as exc:
+                return self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
         else:
             return self._send_error_json(
                 HTTPStatus.BAD_REQUEST,
@@ -640,6 +723,17 @@ class DeckHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST,
                 f"bad or missing chapter {data.get('chapter')!r}",
             )
+        from marathon.review.subissues import chapter_approval_snapshot
+
+        try:
+            interrupted = chapter_approval_snapshot(self.cfg, chapter)
+        except Exception as exc:  # noqa: BLE001 — surface durable-state damage
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                f"cannot resume chapter {chapter} approval: {exc}",
+            )
+        if interrupted is not None:
+            return self._send_json(interrupted)
         snap = self.server.intake.status(chapter) or {
             "chapter": chapter, "status": "none",
         }
@@ -647,8 +741,9 @@ class DeckHandler(BaseHTTPRequestHandler):
 
     def _api_approve_chapter(self) -> None:
         """Apply a READY intake: open the GitHub sub-issues + register the
-        chapter in ``config.toml``. Guarded against a double-approve creating
-        duplicate issues (an already-registered chapter is refused)."""
+        chapter in ``config.toml``. Approval is a durable, per-chapter
+        single-flight transaction: partial GitHub success is journalled and a
+        retry resumes the same issue IDs rather than opening duplicates."""
         data = self._read_guarded_body()
         if data is None:
             return
@@ -664,66 +759,73 @@ class DeckHandler(BaseHTTPRequestHandler):
                 f"bad or missing chapter {data.get('chapter')!r}",
             )
         res = self.server.intake.result(chapter)
-        if res is None or not res.ok:
-            return self._send_error_json(
-                HTTPStatus.CONFLICT,
-                f"no ready intake for chapter {chapter} to approve — start one "
-                "and wait for it to finish",
-            )
 
-        from marathon.review.config import (
-            RegistryEditError,
-            load_config,
-            register_chapter,
+        from marathon.review.subissues import (
+            ChapterApprovalConflict,
+            ChapterApprovalError,
+            approve_chapter_drafts,
         )
-        from marathon.review.subissues import create_subissues_from_drafts
 
-        # Persistent double-approve guard: an already-registered chapter was
-        # already applied, so opening its issues again would duplicate them.
-        try:
-            already = chapter in getattr(
-                load_config(repo_dir=self.cfg.repo_dir), "chapters", {}
-            )
-        except SystemExit:
-            already = False
-        if already:
-            return self._send_error_json(
-                HTTPStatus.CONFLICT,
-                f"chapter {chapter} is already registered — it was already "
-                "approved (skipping to avoid duplicate issues)",
-            )
-
-        try:
-            created = create_subissues_from_drafts(self.cfg, res.drafts_path)
-        except Exception as e:  # noqa: BLE001 — surface, never crash the loop
-            return self._send_error_json(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                f"creating sub-issues failed: {e}",
-            )
-
-        # entries: [issue_num, tracker_substring] in draft order — use the draft
-        # titles the human just reviewed as the substrings.
-        titles = {s.index: s.title for s in res.subissues}
-        entries = [[num, titles.get(idx, f"entry {idx}")] for idx, num, _u in created]
+        # Approve the in-memory snapshot the human actually reviewed, not a
+        # drafts file that could have changed between preview and this POST. If
+        # the process restarted, ``None`` resumes the exact snapshot already
+        # persisted by the original Approve click; it never reruns intake.
+        reviewed = (
+            {s.index: (s.title, s.body) for s in res.subissues}
+            if res is not None and res.ok
+            else None
+        )
         target = self.cfg.target_path(chapter)
         try:
-            target = target.relative_to(self.cfg.repo_dir)
-        except ValueError:
-            pass
-        registry_error = None
-        if entries:
-            try:
-                register_chapter(self.cfg.repo_dir, chapter, target, entries)
-            except RegistryEditError as e:
-                registry_error = str(e)
-        # The issues were created, so this is a success even if the registry
-        # write warned (the human can fix config.toml by hand); ok=True keeps
-        # the created list visible in the UI instead of throwing it away.
+            result = approve_chapter_drafts(
+                self.cfg, chapter, reviewed, target=target
+            )
+        except ChapterApprovalConflict as exc:
+            return self._send_json(
+                {
+                    "ok": False,
+                    "chapter": chapter,
+                    "error": str(exc),
+                    "retryable": False,
+                    "created": [
+                        {"index": i, "issue": n, "url": u}
+                        for i, n, u in exc.created
+                    ],
+                },
+                status=HTTPStatus.CONFLICT,
+            )
+        except ChapterApprovalError as exc:
+            # A retryable partial failure is not thrown away: the response and
+            # durable journal both expose IDs that already exist on GitHub.
+            return self._send_json(
+                {
+                    "ok": False,
+                    "chapter": chapter,
+                    "error": str(exc),
+                    "incomplete": True,
+                    "retryable": exc.retryable,
+                    "created": [
+                        {"index": i, "issue": n, "url": u}
+                        for i, n, u in exc.created
+                    ],
+                },
+                status=HTTPStatus.BAD_GATEWAY,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface, never kill handler
+            return self._send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"chapter approval failed: {exc}",
+            )
+
         self._send_json({
             "ok": True,
             "chapter": chapter,
-            "created": [{"index": i, "issue": n, "url": u} for i, n, u in created],
-            "registry_error": registry_error,
+            "created": [
+                {"index": i, "issue": n, "url": u}
+                for i, n, u in result.created
+            ],
+            "resumed": result.resumed,
+            "registry_error": None,
         })
 
     def _api_decl_verdict(self) -> None:
@@ -870,8 +972,10 @@ class DeckHandler(BaseHTTPRequestHandler):
         endpoint besides /api/verdict that fires an irreversible action.
         Composes the per-issue outcome from the LOCAL subdeck and routes it
         through the committed verdict path (verify, or reject with the
-        composed note carried verbatim). An incomplete subdeck returns
-        ``{ok:false, reason}`` with NO side effect."""
+        composed note carried verbatim). An incomplete all-verify subdeck
+        returns ``{ok:false, reason}`` with NO side effect; a partial subdeck
+        with an explicit rejection may ship that fix while leaving later
+        declarations untouched."""
         data = self._read_guarded_body()
         if data is None:
             return  # the guard already sent the 4xx (origin / body / token)
@@ -1024,7 +1128,11 @@ class DeckHandler(BaseHTTPRequestHandler):
                 {"ok": False, "requeued": False,
                  "message": "re-queue is not available in demo mode"}
             )
-        from marathon.review.state import load_state, record_rejection
+        from marathon.review.state import (
+            load_state,
+            record_rejection_if_absent,
+            record_rejection_if_current,
+        )
 
         st = load_state(self.cfg).issues.get(issue_num)
         if st is not None:
@@ -1070,9 +1178,54 @@ class DeckHandler(BaseHTTPRequestHandler):
                     f"#{issue_num}: rejected on GitHub but its reject note "
                     "could not be recovered — re-reject it in the deck"
                 )
+        # External projection first, then an exact local compare-and-swap. If a
+        # concurrent verify/new rejection wins after our initial read, the CAS
+        # refuses to overwrite it and we repair GitHub to the winner below.
+        from marathon.review.review import (
+            _ensure_conductor,
+            _ensure_rejected_label,
+            _ensure_unreviewed_labels,
+            _ensure_verified_label,
+        )
+
+        if not _ensure_rejected_label(self.cfg, issue_num):
+            return self._send_error_json(
+                HTTPStatus.BAD_GATEWAY,
+                f"#{issue_num}: could not confirm rejected-only GitHub labels; "
+                "nothing was re-queued locally",
+            )
         try:
-            record_rejection(self.cfg, issue_num, note)
-            from marathon.review.review import _ensure_conductor
+            if st is None:
+                recorded = record_rejection_if_absent(
+                    self.cfg, issue_num, note
+                )
+            else:
+                recorded = record_rejection_if_current(
+                    self.cfg,
+                    issue_num,
+                    note,
+                    expected_status=st.status,
+                    expected_verdict_ts=st.verdict_ts,
+                )
+            if recorded is None:
+                # A concurrent verdict/state transition won. Restore the remote
+                # labels to that winner instead of leaving the rejected label
+                # from our failed requeue attempt behind.
+                winner = load_state(self.cfg).issues.get(issue_num)
+                if winner is None:
+                    repaired = _ensure_unreviewed_labels(self.cfg, issue_num)
+                elif winner.status == "verified":
+                    repaired = _ensure_verified_label(self.cfg, issue_num)
+                else:
+                    repaired = _ensure_rejected_label(self.cfg, issue_num)
+                detail = "GitHub labels repaired" if repaired else (
+                    "GitHub label repair could not be confirmed"
+                )
+                return self._send_error_json(
+                    HTTPStatus.CONFLICT,
+                    f"#{issue_num}: verdict changed while re-queuing; "
+                    f"the newer state was preserved ({detail})",
+                )
             _ensure_conductor(self.cfg)
         except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
             return self._send_error_json(

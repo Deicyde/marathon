@@ -220,6 +220,75 @@ class LeanDeclSite:
     sorry_count: int = 0
 
 
+def _mask_lean_comments_and_strings(text: str) -> str:
+    """Replace Lean comments and string literals with spaces, preserving all
+    newlines and character offsets.
+
+    Lean block comments nest, so a regular expression is not sufficient.  This
+    small lexer intentionally recognizes only the constructs the declaration
+    scanner must ignore: ``--`` line comments, nested ``/- ... -/`` comments,
+    and escaped double-quoted strings.  Keeping offsets stable means scanner
+    line citations still point at the original source.
+    """
+    out = list(text)
+    i = 0
+    n = len(text)
+    block_depth = 0
+    in_string = False
+    escaped = False
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+
+        if block_depth:
+            if c == "/" and nxt == "-":
+                if c != "\n":
+                    out[i] = " "
+                out[i + 1] = " "
+                block_depth += 1
+                i += 2
+                continue
+            if c == "-" and nxt == "/":
+                out[i] = out[i + 1] = " "
+                block_depth -= 1
+                i += 2
+                continue
+            if c != "\n":
+                out[i] = " "
+            i += 1
+            continue
+
+        if in_string:
+            if c != "\n":
+                out[i] = " "
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if c == "/" and nxt == "-":
+            out[i] = out[i + 1] = " "
+            block_depth = 1
+            i += 2
+            continue
+        if c == "-" and nxt == "-":
+            out[i] = out[i + 1] = " "
+            i += 2
+            while i < n and text[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        if c == '"':
+            out[i] = " "
+            in_string = True
+        i += 1
+    return "".join(out)
+
+
 def scan_lean_source(text: str) -> tuple[list[LeanDeclSite], int]:
     """Walk Lean source line by line; return ``(decl_sites,
     orphan_sorry_count)``.
@@ -228,8 +297,9 @@ def scan_lean_source(text: str) -> tuple[list[LeanDeclSite], int]:
     declaration-keyword line; sorries seen before any declaration are
     counted as orphans (they count toward file totals but belong to no
     decl). Namespace nesting is tracked so ``qualified`` names are
-    usable with ``#print axioms``; line comments (``--``) are skipped;
-    block comments and strings are NOT excluded (see module note above).
+    usable with ``#print axioms``. Line comments, nested block comments, and
+    string literals are masked before scanning, so commented examples cannot
+    become declarations and prose cannot inflate sorry counts.
     """
     decls: list[LeanDeclSite] = []
     orphans = 0
@@ -237,12 +307,8 @@ def scan_lean_source(text: str) -> tuple[list[LeanDeclSite], int]:
     # section/mutual frames are empty so an ``end`` pops symmetrically.
     stack: list[list[str]] = []
     current: Optional[LeanDeclSite] = None
-    for lineno, line in enumerate(text.splitlines(), start=1):
-        # Skip line comments; we don't try to detect block comments,
-        # which would require a tokenizer.
-        stripped = line.lstrip()
-        if stripped.startswith("--"):
-            continue
+    masked = _mask_lean_comments_and_strings(text)
+    for lineno, line in enumerate(masked.splitlines(), start=1):
         ns = _NAMESPACE_RE.match(line)
         if ns:
             stack.append(ns.group(1).split("."))

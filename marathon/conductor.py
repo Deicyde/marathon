@@ -76,6 +76,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field, fields
 from datetime import datetime
@@ -87,11 +88,15 @@ from marathon.post_pipeline import _branch_name_for_issue
 from marathon.refine import (
     EXIT_AUTO_PR_BRANCH_ABORT,
     EXIT_CONFIG_ERROR,
+    EXIT_PUBLICATION_PENDING,
+    EXIT_REATTACH_TRANSIENT,
     REFINE_STATE_FILENAME,
 )
 from marathon.review.config import ReviewConfig, load_config
 from marathon.review.state import (
+    clear_pending_pr_check,
     load_state,
+    pending_pr_checks,
     pending_rejections_needing_iteration,
     record_iteration,
 )
@@ -125,6 +130,13 @@ PROVER_BASE_BRANCH = "marathon/proving"
 # ``REPAIR_KEY_BASE + chapter`` in the shared not_before/kept_worktrees dicts so
 # a repair's bookkeeping can never collide with a real issue number.
 REPAIR_KEY_BASE = 1_000_000
+# Fill worktrees must not collide with a later rejection refine for the same
+# GitHub issue in the shared kept-worktree map (proof branch/session ≠ refine).
+FILL_KEY_BASE = 2_000_000
+
+
+def _kept_worktree_key(issue_num: int, *, fill: bool) -> int:
+    return FILL_KEY_BASE + issue_num if fill else issue_num
 
 
 def _tex_args(cfg, chapter: int) -> list[str]:
@@ -158,6 +170,9 @@ WORKTREE_DEFER_SECONDS = 60
 # next dispatch. Retries are already hard-bounded by the dispatch-time
 # `max_fill_attempts` cap; this only stops a tight re-dispatch loop.
 FILL_RETRY_BACKOFF_SECONDS = 300
+# Publication-only retries are cheap network operations and must not burn the
+# Aristotle failure budget. Keep a modest delay to avoid hammering GitHub.
+PUBLISH_RETRY_BACKOFF_SECONDS = 60
 # Safety valve for --once mode: with per-issue backoffs the queue can
 # stay non-empty for a long time without being stuck; cap the tick
 # count rather than the dispatch count so retries aren't starved.
@@ -228,7 +243,8 @@ class ConductorJob:
     started_ts: Optional[str] = None         # ISO 8601
     finished_ts: Optional[str] = None        # ISO 8601
     status: str = "running"                  # running | succeeded | failed |
-                                             # stalled | interrupted
+                                             # stalled | interrupted |
+                                             # publication_pending
     exit_code: Optional[int] = None
     error: Optional[str] = None              # log tail of a FAILED job (for the
                                              # snapshot/deck + the stall comment)
@@ -236,6 +252,11 @@ class ConductorJob:
     aristotle_status: Optional[str] = None   # TaskStatus.value from the checkpoint
     fill: bool = False                       # a PROVE job (marathon fill) vs a refine
     repair: bool = False                     # a REPAIR job (marathon repair, → main)
+    # Human-verdict generation this job was dispatched against. Completion
+    # callbacks CAS this exact timestamp + rejected status; an old process can
+    # never consume/attempt/stall a later re-reject or a verified issue.
+    expected_verdict_ts: Optional[str] = None
+    rejection_note: Optional[str] = None
     proc: Optional[object] = field(default=None, repr=False, compare=False)
     log_handle: Optional[object] = field(default=None, repr=False, compare=False)
 
@@ -267,31 +288,111 @@ def conductor_lock_path(cfg: ReviewConfig) -> Path:
     return cfg.runner_lock_dir / CONDUCTOR_LOCK_FILENAME
 
 
-def acquire_conductor_lock(cfg: ReviewConfig) -> bool:
-    """Returns False if another *live* conductor already holds the lock."""
-    cfg.runner_lock_dir.mkdir(parents=True, exist_ok=True)
-    lock = conductor_lock_path(cfg)
-    if lock.is_file():
+_CONDUCTOR_GUARDS: dict[Path, object] = {}
+_CONDUCTOR_GUARDS_LOCK = threading.RLock()
+
+
+def _conductor_guard_path(lock: Path) -> Path:
+    """Stable inode used for the lifetime lock.
+
+    The adjacent PID file remains the human/dashboard status surface and can be
+    removed on clean shutdown.  This guard must never be unlinked: unlinking a
+    locked inode allows a second process to create and lock a different inode at
+    the same path.
+    """
+    return lock.with_name(lock.name + ".guard")
+
+
+def _try_lock_guard(handle) -> bool:
+    try:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    except ImportError:  # pragma: no cover - Windows fallback
+        import msvcrt
+
         try:
-            existing_pid = int(lock.read_text().strip())
-            if daemon.process_alive(existing_pid):
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+
+def _unlock_guard(handle) -> None:
+    try:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except ImportError:  # pragma: no cover - Windows fallback
+        import msvcrt
+
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+
+
+def acquire_conductor_lock(cfg: ReviewConfig) -> bool:
+    """Atomically acquire the repo's lifetime conductor lock.
+
+    The previous read-PID/delete/write sequence allowed two simultaneous web
+    rejects to both observe no lock and both launch billed conductors.  A
+    non-blocking advisory lock on a stable guard inode makes the decision atomic
+    across processes; the PID file is written only after that lock is held.
+    """
+    cfg.runner_lock_dir.mkdir(parents=True, exist_ok=True)
+    lock = conductor_lock_path(cfg).resolve()
+    guard_path = _conductor_guard_path(lock)
+    with _CONDUCTOR_GUARDS_LOCK:
+        if lock in _CONDUCTOR_GUARDS:
+            return False
+        guard = open(guard_path, "a+b")
+        if not _try_lock_guard(guard):
+            guard.close()
+            return False
+
+        # Compatibility with a conductor from an older Marathon process that
+        # owns only the PID file and predates the guard inode.
+        try:
+            existing_pid = int(lock.read_text().strip()) if lock.is_file() else None
+            if existing_pid is not None and daemon.process_alive(existing_pid):
+                _unlock_guard(guard)
+                guard.close()
                 return False
         except (ValueError, OSError):
             pass
         lock.unlink(missing_ok=True)
-    lock.write_text(str(os.getpid()))
-    return True
+        try:
+            lock.write_text(str(os.getpid()))
+        except OSError:
+            _unlock_guard(guard)
+            guard.close()
+            raise
+        _CONDUCTOR_GUARDS[lock] = guard
+        return True
 
 
 def release_conductor_lock(cfg: ReviewConfig) -> None:
-    lock = conductor_lock_path(cfg)
-    try:
-        if lock.is_file():
-            stored_pid = int(lock.read_text().strip())
-            if stored_pid == os.getpid():
-                lock.unlink()
-    except (ValueError, OSError):
-        pass
+    lock = conductor_lock_path(cfg).resolve()
+    with _CONDUCTOR_GUARDS_LOCK:
+        guard = _CONDUCTOR_GUARDS.pop(lock, None)
+        if guard is None:
+            return
+        try:
+            if lock.is_file():
+                stored_pid = int(lock.read_text().strip())
+                if stored_pid == os.getpid():
+                    lock.unlink()
+        except (ValueError, OSError):
+            pass
+        finally:
+            _unlock_guard(guard)
+            guard.close()
 
 
 # --- Concurrency + run-parent resolution -----------------------------------------
@@ -320,6 +421,115 @@ def default_runs_parent(repo_dir: Path) -> Path:
     the repo (see module docstring) and namespaced by repo name so two
     consumer repos never share leftovers."""
     return Path.home() / "Desktop" / "marathon-runs" / "conductor" / repo_dir.name
+
+
+def _paired_retry_workdir(
+    runs_parent: Path, issue_num: int, worktree: Path,
+) -> Optional[Path]:
+    """The workdir created alongside ``worktree`` for this issue, if present.
+
+    A conductor retry historically reused the failed workTREE but allocated a
+    brand-new ``wd-i...`` directory.  That discarded ``marathon-refine-state``
+    (the Aristotle project/task ids) and ``marathon-refine-log.md``, so the next
+    machine retry opened a new Aristotle session instead of continuing the
+    resumable one.  Worktree/workdir names share the same timestamp by design;
+    recover the exact pair without another state file.
+    """
+    prefix = f"wt-i{issue_num}-"
+    if not worktree.name.startswith(prefix):
+        return None
+    try:
+        if worktree.parent.resolve() != runs_parent.resolve():
+            return None
+    except OSError:
+        return None
+    suffix = worktree.name[len(prefix):]
+    candidate = runs_parent / f"wd-i{issue_num}-{suffix}"
+    return candidate if candidate.is_dir() else None
+
+
+def _recover_retry_worktrees(
+    cfg: ReviewConfig,
+    runs_parent: Path,
+    *,
+    busy_issues: "set[int]",
+) -> dict[int, str]:
+    """Recover dead/failed prior jobs from ``jobs.json`` across a restart.
+
+    Only currently-pending rejected issues qualify, and a worktree with a live
+    job is never adopted here (``_adopt_inherited_jobs`` owns it).  The paired
+    workdir must still exist, which is the proof that the Aristotle checkpoint
+    can be continued.  This closes the second session-loss door: a conductor
+    restart between retry attempts no longer reaps the worktree/checkpoint and
+    starts the paid proof search from scratch.
+    """
+    pending = {
+        n for n, _st in pending_rejections_needing_iteration(cfg, None)
+        if n not in busy_issues
+    }
+    # A stalled verdict is intentionally not dispatchable, but its kept
+    # worktree/checkpoint must survive restart so a later human requeue can
+    # continue the same Aristotle session instead of orphan-reaping it.
+    stalled = {
+        n
+        for n, st in load_state(cfg).issues.items()
+        if st.status == "stalled" and n not in busy_issues
+    }
+    recovered: dict[int, str] = {}
+    snap = load_jobs_snapshot(cfg.repo_dir)
+    rows = list((snap or {}).get("jobs", []))
+    # Newest row wins if an old snapshot somehow contains duplicate attempts.
+    for raw in reversed(rows):
+        autonomous = bool(raw.get("fill") or raw.get("repair"))
+        try:
+            issue = int(raw.get("issue_num"))
+        except (TypeError, ValueError):
+            continue
+        recovery_key = _kept_worktree_key(issue, fill=bool(raw.get("fill")))
+        if (
+            not autonomous
+            and issue not in pending
+            and issue not in stalled
+        ) or recovery_key in recovered:
+            continue
+        worktree_raw = raw.get("worktree")
+        if not worktree_raw:
+            continue
+        worktree = Path(worktree_raw)
+        if not worktree.is_dir():
+            continue
+        if _worktree_live_pid(str(worktree)) is not None:
+            continue
+        paired = _paired_retry_workdir(runs_parent, issue, worktree)
+        if paired is None:
+            continue
+        if autonomous:
+            try:
+                checkpoint = load_refine_state(paired / REFINE_STATE_FILENAME)
+            except Exception:  # noqa: BLE001
+                checkpoint = None
+            resumable = (
+                raw.get("status")
+                in {"running", "failed", "interrupted", "publication_pending"}
+                or (
+                    checkpoint is not None
+                    and (
+                        checkpoint.pending_publication is not None
+                        or checkpoint.force_continuation
+                        or checkpoint.preserve_local_branch
+                    )
+                )
+            )
+            if not resumable:
+                continue
+        _clear_worktree_pid_marker(str(worktree))
+        recovered[recovery_key] = str(worktree)
+        print(
+            f"  recovered retry checkpoint for #{issue}: {worktree} "
+            "(worktree + Aristotle session will be continued)",
+            flush=True,
+        )
+    return recovered
 
 
 # --- Scheduler --------------------------------------------------------------------
@@ -431,7 +641,9 @@ def _reconcile_merged_rejections(cfg: ReviewConfig) -> list[int]:
         branch, merged_at = merged[issue_num]
         if not _ts_strictly_newer(merged_at, getattr(st, "verdict_ts", None)):
             continue  # merge predates this rejection — a fresh reject, not a stuck one
-        n = _requeue_refined_issue(cfg, branch)
+        n = _requeue_refined_issue(
+            cfg, branch, expected_verdict_ts=st.verdict_ts
+        )
         if n is not None:
             reconciled.append(n)
     if reconciled:
@@ -1012,6 +1224,24 @@ def _dispatch_job(
     A FILL job proves on the SEPARATE prover branch: it branches from
     ``origin/<prover_branch>`` under a ``proof-`` name and its PR targets
     the prover branch, so proofs never touch ``main``."""
+    expected_verdict_ts: Optional[str] = None
+    rejection_note: Optional[str] = None
+    if not fill and not repair:
+        current = load_state(cfg).issues.get(issue_num)
+        # Missing is tolerated for low-level/manual callers and older tests;
+        # the production scheduler only calls us for state-backed rejections.
+        # A present non-rejected entry means a verify won after queue-pick — do
+        # not spend an Aristotle session on a verdict that no longer exists.
+        if current is not None and current.status != "rejected":
+            print(
+                f"--- deferring #{issue_num}: current verdict is "
+                f"{current.status!r}, not rejected ---",
+                flush=True,
+            )
+            return None
+        if current is not None:
+            expected_verdict_ts = current.verdict_ts
+            rejection_note = current.notes
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     if repair:
         # Chapter-scoped repair branch (no review issue): marathon/repair-c<N>.
@@ -1038,10 +1268,19 @@ def _dispatch_job(
         branch = _branch_name_for_issue(f"Chapter{chapter}", issue_num, kind="refine")
         start_point = WORKTREE_START_POINT
 
-    reuse = kept_worktrees.get(issue_num)
+    kept_key = _kept_worktree_key(issue_num, fill=fill)
+    reuse = kept_worktrees.get(kept_key)
+    retry_workdir: Optional[Path] = None
     if reuse and Path(reuse).is_dir():
         worktree = Path(reuse)
+        retry_workdir = _paired_retry_workdir(runs_parent, issue_num, worktree)
         print(f"--- reusing kept worktree for #{issue_num}: {worktree} ---")
+        if retry_workdir is not None:
+            print(
+                f"--- continuing kept Aristotle checkpoint for #{issue_num}: "
+                f"{retry_workdir} ---",
+                flush=True,
+            )
         # A kept worktree from a FAILED attempt may already have Mathlib built
         # (the failure was mid-refine, not mid-build); only prime when it isn't,
         # so retries don't pay a redundant decompress.
@@ -1087,8 +1326,26 @@ def _dispatch_job(
         # means a slower (normal) build; it never blocks the dispatch.
         _prime_mathlib_cache(worktree)
 
-    workdir = runs_parent / f"wd-i{issue_num}-{ts}"
+    # Reuse BOTH halves of a failed attempt.  Reusing only the worktree keeps
+    # extracted code but throws away the project/task ids needed for
+    # ``project.ask()`` continuation, forcing an unnecessary new Aristotle
+    # session on every conductor-level retry.
+    workdir = retry_workdir or (runs_parent / f"wd-i{issue_num}-{ts}")
     workdir.mkdir(parents=True, exist_ok=True)
+    if not fill and not repair:
+        # A publication-only retry belongs to the OLD committed verdict even if
+        # the human has since re-rejected.  Recover its persisted CAS token so
+        # publishing that old commit can never consume the newer verdict.
+        try:
+            checkpoint = load_refine_state(workdir / REFINE_STATE_FILENAME)
+        except Exception:  # noqa: BLE001 — malformed checkpoint fails in child
+            checkpoint = None
+        if (
+            checkpoint is not None
+            and checkpoint.pending_publication is not None
+            and checkpoint.review_verdict_ts
+        ):
+            expected_verdict_ts = checkpoint.review_verdict_ts
     target = worktree / _target_relpath(cfg, chapter)
     # The exact per-issue dispatch the daemon uses, flag-for-flag:
     # DEFAULT_REFINE_ARGS is imported, never forked. The conductor adds
@@ -1157,6 +1414,21 @@ def _dispatch_job(
         log_path = workdir / "conductor-fill.log"
         cmd += _tex_args(cfg, chapter)
     else:
+        rejection_note_file: Optional[Path] = None
+        if rejection_note and rejection_note.strip():
+            rejection_note_file = workdir / "review-rejection.json"
+            rejection_note_file.write_text(
+                json.dumps(
+                    {
+                        "issue": issue_num,
+                        "verdict_ts": expected_verdict_ts,
+                        "notes": rejection_note,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n"
+            )
         cmd = [
             sys.executable, "-m", "marathon", "refine",
             str(target),
@@ -1164,8 +1436,12 @@ def _dispatch_job(
             "--workdir", str(workdir),
             "--review-rejection", str(issue_num),
             "--no-metadata-commit",
-            *daemon.DEFAULT_REFINE_ARGS,
         ]
+        if expected_verdict_ts is not None:
+            cmd += ["--review-verdict-ts", expected_verdict_ts]
+        if rejection_note_file is not None:
+            cmd += ["--review-rejection-note-file", str(rejection_note_file)]
+        cmd += daemon.DEFAULT_REFINE_ARGS
         log_path = workdir / "conductor-refine.log"
         cmd += _tex_args(cfg, chapter)
     log_handle = log_path.open("ab")
@@ -1175,10 +1451,10 @@ def _dispatch_job(
         log_handle.close()
         # The worktree exists and holds the branch now; remember it so
         # the retry reuses it instead of tripping its own branch guard.
-        kept_worktrees[issue_num] = str(worktree)
+        kept_worktrees[kept_key] = str(worktree)
         print(f"--- deferring #{issue_num}: could not spawn refine ({e}) ---")
         return None
-    kept_worktrees.pop(issue_num, None)
+    kept_worktrees.pop(kept_key, None)
     # Live-job marker: lets a FUTURE conductor process (after a restart) tell
     # this worktree is in use, so its reap guard defers instead of destroying
     # a running (billed) job.
@@ -1203,6 +1479,8 @@ def _dispatch_job(
         status="running",
         fill=fill,
         repair=repair,
+        expected_verdict_ts=expected_verdict_ts,
+        rejection_note=rejection_note,
         proc=popen,
         log_handle=log_handle,
     )
@@ -1354,16 +1632,81 @@ def _reap_adopted_job(
     A fill/repair is autonomous (no rejection state) → just clean up."""
     job.finished_ts = now_iso()
     _clear_worktree_pid_marker(job.worktree)
+    try:
+        checkpoint = load_refine_state(
+            Path(job.workdir) / REFINE_STATE_FILENAME
+        )
+    except Exception:  # noqa: BLE001 — malformed checkpoint uses legacy path
+        checkpoint = None
+    if checkpoint is not None and (
+        checkpoint.pending_publication is not None
+        or checkpoint.force_continuation
+        or checkpoint.preserve_local_branch
+    ):
+        # Exit code is unavailable after conductor restart, but the durable
+        # checkpoint proves this is NOT a clean terminal job. Preserve the
+        # committed worktree/session for publication-only or project.ask retry.
+        job.status = (
+            "publication_pending"
+            if checkpoint.pending_publication is not None
+            else "failed"
+        )
+        kept_worktrees[
+            _kept_worktree_key(job.issue_num, fill=job.fill)
+        ] = job.worktree
+        print(
+            f"--- adopted #{job.issue_num} exited with resumable checkpoint "
+            f"({job.status}); kept worktree/session: {job.worktree} ---",
+            flush=True,
+        )
+        return
     if job.fill or job.repair:
-        job.status = "succeeded"
-        _remove_worktree(cfg.repo_dir, Path(job.worktree))
-        print(f"    adopted autonomous job #{job.issue_num} finished; cleaned up",
-              flush=True)
+        completed_cleanly = bool(
+            checkpoint is not None
+            and checkpoint.current_iteration_idx > 0
+            and checkpoint.iterations_completed >= checkpoint.current_iteration_idx
+        )
+        if completed_cleanly:
+            job.status = "succeeded"
+            _remove_worktree(cfg.repo_dir, Path(job.worktree))
+            print(
+                f"    adopted autonomous job #{job.issue_num} has affirmative "
+                "completion evidence; cleaned up",
+                flush=True,
+            )
+        else:
+            # No exit code after restart and no affirmative completion/PR:
+            # SUBMIT/POLL/download/branch failures all land here. Preserve the
+            # checkpoint and retry; never infer success from process death.
+            job.status = "failed"
+            kept_worktrees[
+                _kept_worktree_key(job.issue_num, fill=job.fill)
+            ] = job.worktree
+            print(
+                f"--- adopted autonomous job #{job.issue_num} exited without "
+                f"completion evidence; kept worktree/session for retry: "
+                f"{job.worktree} ---",
+                flush=True,
+            )
         return
     has_pr = _branch_pr_exists(cfg, job.branch) if job.branch else None
     if has_pr:
         job.status = "succeeded"
-        record_iteration(cfg, job.issue_num)  # iterated → not re-dispatched
+        if job.expected_verdict_ts is None:
+            record_iteration(
+                cfg,
+                job.issue_num,
+                iteration_branch=job.branch,
+                iteration_commit_sha=_job_head_sha(job),
+            )
+        else:
+            record_iteration(
+                cfg,
+                job.issue_num,
+                expected_verdict_ts=job.expected_verdict_ts,
+                iteration_branch=job.branch,
+                iteration_commit_sha=_job_head_sha(job),
+            )
         _remove_worktree(cfg.repo_dir, Path(job.worktree))
         _regenerate_metadata_after_success(cfg)
         print(f"--- adopted #{job.issue_num} refine (prior conductor) finished "
@@ -1371,10 +1714,25 @@ def _reap_adopted_job(
               "it ---", flush=True)
     else:
         # No PR (or gh down): keep the worktree; requeue-if-no-PR handles the
-        # no-diff stuck case; a real failure stays rejected to retry fresh.
+        # no-diff stuck case ONLY when the checkpoint proves refine_command
+        # completed its iteration. Without an exit code, absence of that proof
+        # means failure/missing-note/etc. and must stay queued for retry.
         job.status = "failed"
         kept_worktrees[job.issue_num] = job.worktree
-        if reconcile:
+        completed_cleanly = bool(
+            checkpoint is not None
+            and checkpoint.current_iteration_idx > 0
+            and checkpoint.iterations_completed >= checkpoint.current_iteration_idx
+        )
+        if has_pr is None and completed_cleanly:
+            kwargs = {
+                "pending_pr_branch": job.branch,
+                "iteration_commit_sha": _job_head_sha(job),
+            }
+            if job.expected_verdict_ts is not None:
+                kwargs["expected_verdict_ts"] = job.expected_verdict_ts
+            record_iteration(cfg, job.issue_num, **kwargs)
+        if reconcile and has_pr is False and completed_cleanly:
             try:
                 _requeue_if_no_pr_landed(cfg, job)
             except Exception as exc:  # noqa: BLE001 — never crash a reap
@@ -1398,17 +1756,83 @@ def _requeue_if_no_pr_landed(cfg: ReviewConfig, job: ConductorJob) -> None:
     if not _REFINE_BRANCH_RE.match(branch):
         return
     exists = _branch_pr_exists(cfg, branch)
-    if exists is None or exists:
-        return  # gh error (skip), or a PR exists (normal merge → requeue path)
+    expected_verdict_ts = getattr(job, "expected_verdict_ts", None)
+    if exists is None:
+        # record_iteration already persisted pending_pr_branch.  Leave it set:
+        # _retry_pending_pr_checks re-runs this cheap query on later ticks and
+        # across conductor restarts, without another Aristotle dispatch.
+        return
+    if exists:
+        if expected_verdict_ts is not None:
+            clear_pending_pr_check(
+                cfg,
+                job.issue_num,
+                branch,
+                expected_verdict_ts=expected_verdict_ts,
+            )
+        return  # normal merge → requeue path
     st = load_state(cfg).issues.get(job.issue_num)
-    if st is not None and getattr(st, "status", None) == "rejected":
+    if (
+        st is not None
+        and getattr(st, "status", None) == "rejected"
+        and (
+            expected_verdict_ts is None
+            or st.verdict_ts == expected_verdict_ts
+        )
+    ):
         # landed=False: NOTHING merged here (no diff → no PR). A 'fix landed'
         # recovery comment would be a public lie — this only re-surfaces the
         # unchanged issue for re-review.
-        n = _requeue_refined_issue(cfg, branch, landed=False)
+        kwargs = {"landed": False}
+        if expected_verdict_ts is not None:
+            kwargs["expected_verdict_ts"] = expected_verdict_ts
+        n = _requeue_refined_issue(cfg, branch, **kwargs)
         if n is not None:
             print(f"--- #{n} refine exited clean but landed no PR — requeued for "
                   f"re-review (was stuck 'rejected') ---", flush=True)
+
+
+def _retry_pending_pr_checks(cfg: ReviewConfig) -> int:
+    """Resolve durable rc=0 PR uncertainty from prior conductor ticks/runs.
+
+    ``record_iteration(..., pending_pr_branch=...)`` parks the rejection while
+    GitHub is uncertain.  This pass either clears the marker when a PR exists or
+    requeues unchanged code when no PR exists; transient failures leave the
+    marker untouched for the next tick. Returns the number resolved.
+    """
+    from marathon.review.automerge import _requeue_refined_issue
+
+    resolved = 0
+    for issue_num, entry in pending_pr_checks(cfg):
+        branch = entry.pending_pr_branch
+        if not branch:
+            continue
+        exists = _branch_pr_exists(cfg, branch)
+        if exists is None:
+            continue
+        if exists:
+            if clear_pending_pr_check(
+                cfg,
+                issue_num,
+                branch,
+                expected_verdict_ts=entry.verdict_ts,
+            ):
+                resolved += 1
+            continue
+        n = _requeue_refined_issue(
+            cfg,
+            branch,
+            landed=False,
+            expected_verdict_ts=entry.verdict_ts,
+        )
+        if n is not None:
+            resolved += 1
+            print(
+                f"--- #{n} durable no-PR check recovered — requeued for "
+                "re-review without another Aristotle session ---",
+                flush=True,
+            )
+    return resolved
 
 
 def _reap_fill_job(
@@ -1434,7 +1858,7 @@ def _reap_fill_job(
     against the audit snapshot by discovery, not by this exit code."""
     if interrupted:
         job.status = "interrupted"
-        kept_worktrees[job.issue_num] = job.worktree
+        kept_worktrees[_kept_worktree_key(job.issue_num, fill=True)] = job.worktree
         print(f"    worktree kept (fill interrupted): {job.worktree}", flush=True)
         return
     if rc == 0:
@@ -1444,10 +1868,22 @@ def _reap_fill_job(
         # (same completion hook as a clean refine).
         _regenerate_metadata_after_success(cfg)
         return
+    if rc == EXIT_PUBLICATION_PENDING:
+        job.status = "publication_pending"
+        kept_worktrees[_kept_worktree_key(job.issue_num, fill=True)] = job.worktree
+        _clear_worktree_pid_marker(job.worktree)
+        not_before[job.issue_num] = _now() + PUBLISH_RETRY_BACKOFF_SECONDS
+        print(
+            f"    autonomous job #{job.issue_num} has a clean committed fix "
+            f"awaiting publication; kept worktree, retrying push/PR only in "
+            f"{PUBLISH_RETRY_BACKOFF_SECONDS}s: {job.worktree}",
+            flush=True,
+        )
+        return
     # Non-zero: keep the worktree for debugging and back off (bounded by the
     # dispatch-time attempt cap). No rejection-state mutation.
     job.status = "failed"
-    kept_worktrees[job.issue_num] = job.worktree
+    kept_worktrees[_kept_worktree_key(job.issue_num, fill=True)] = job.worktree
     _clear_worktree_pid_marker(job.worktree)  # process gone → drop the marker
     not_before[job.issue_num] = _now() + FILL_RETRY_BACKOFF_SECONDS
     print(
@@ -1486,6 +1922,15 @@ def _job_log_tail(job: ConductorJob, max_lines: int = 12) -> Optional[str]:
         return None
 
 
+def _job_head_sha(job: ConductorJob) -> Optional[str]:
+    """Current committed HEAD of a finished job worktree, if readable."""
+    cp = _git(Path(job.worktree), "rev-parse", "HEAD")
+    if cp.returncode != 0:
+        return None
+    value = (cp.stdout or "").strip()
+    return value or None
+
+
 def _reap_finished(
     cfg: ReviewConfig,
     jobs: list[ConductorJob],
@@ -1494,6 +1939,8 @@ def _reap_finished(
     max_attempts: int,
     *,
     reconcile: bool = True,
+    fill_attempts: Optional[dict[int, int]] = None,
+    repair_attempts: Optional[dict[int, int]] = None,
 ) -> int:
     """Poll running jobs; apply the Phase-0 state machine to each exit.
 
@@ -1548,11 +1995,42 @@ def _reap_finished(
             # (→ prover branch) and a repair (→ main) are reaped identically:
             # never touch the review verdict ladder; the automerge + the
             # in-pipeline gates (build/axiom/faithfulness) decide what lands.
+            if rc in {EXIT_PUBLICATION_PENDING, EXIT_REATTACH_TRANSIENT}:
+                # These retries perform no new Aristotle work. Do not let
+                # transient network publication/reattach failures consume the
+                # autonomous dispatch budget.
+                if job.fill and fill_attempts is not None:
+                    fill_attempts[job.issue_num] = max(
+                        0, fill_attempts.get(job.issue_num, 0) - 1
+                    )
+                if job.repair and repair_attempts is not None:
+                    repair_attempts[job.chapter] = max(
+                        0, repair_attempts.get(job.chapter, 0) - 1
+                    )
             _reap_fill_job(cfg, job, rc, interrupted, kept_worktrees, not_before)
+            continue
+        if rc == EXIT_PUBLICATION_PENDING and not interrupted:
+            # Clean Aristotle/build/commit; only the final network publication
+            # failed.  Do NOT run the failure ladder (no attempt/stall), and do
+            # not remove/reset the only committed copy.  The paired workdir's
+            # RefineState drives a publication-only fast path on redispatch.
+            job.status = "publication_pending"
+            kept_worktrees[job.issue_num] = job.worktree
+            _clear_worktree_pid_marker(job.worktree)
+            not_before[job.issue_num] = _now() + PUBLISH_RETRY_BACKOFF_SECONDS
+            print(
+                f"    refine #{job.issue_num} committed cleanly but publication "
+                f"is pending; worktree kept and push/PR-only retry scheduled in "
+                f"{PUBLISH_RETRY_BACKOFF_SECONDS}s: {job.worktree}",
+                flush=True,
+            )
             continue
         backoff = daemon._handle_refine_exit(
             cfg, job.issue_num, rc, max_attempts=max_attempts,
             interrupted=interrupted, failure_detail=job.error,
+            expected_verdict_ts=job.expected_verdict_ts,
+            pending_pr_branch=(job.branch if rc == 0 and reconcile else None),
+            iteration_commit_sha=(_job_head_sha(job) if rc == 0 else None),
         )
         if backoff:
             not_before[job.issue_num] = _now() + backoff
@@ -1708,10 +2186,65 @@ def jobs_snapshot_path(repo_dir: Path) -> Path:
 #: tick. Lives in the self-ignoring .marathon/conductor/ runtime dir so it never
 #: leaks into an Aristotle bundle or dirties `git status`.
 PROVER_CONTROL_RELPATH = Path(".marathon/conductor/prover-control.json")
+# Durable (gitignored) HEAD cursor for declaration reconciliation.  Keeping it
+# only in a local variable lost the old..new diff window on every conductor
+# restart, exactly when a rename/split/delete most needs provenance.
+RECONCILE_CURSOR_RELPATH = Path(".marathon/conductor/reconcile-cursor.json")
 
 
 def prover_control_path(repo_dir: Path) -> Path:
     return Path(repo_dir) / PROVER_CONTROL_RELPATH
+
+
+def reconcile_cursor_path(repo_dir: Path) -> Path:
+    return Path(repo_dir) / RECONCILE_CURSOR_RELPATH
+
+
+def load_reconcile_cursor(repo_dir: Path) -> Optional[str]:
+    """Last fully-reconciled HEAD, preserved across conductor restarts."""
+    try:
+        data = json.loads(reconcile_cursor_path(repo_dir).read_text())
+        value = data.get("head")
+        return value if isinstance(value, str) and value.strip() else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def save_reconcile_cursor(repo_dir: Path, head: str) -> None:
+    """Atomically persist a successfully reconciled HEAD (best-effort)."""
+    path = reconcile_cursor_path(repo_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        gitignore = path.parent / ".gitignore"
+        if not gitignore.is_file():
+            gitignore.write_text("*\n")
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps({"head": head, "updated_ts": now_iso()}, indent=2) + "\n")
+        tmp.replace(path)
+    except OSError as exc:
+        print(f"  warning: could not persist reconcile cursor ({exc})", flush=True)
+
+
+def reconcile_cursor_is_ancestor(repo_dir: Path, old: str, current: str) -> bool:
+    """Whether ``old..current`` is a valid forward reconciliation window.
+
+    Persisted SHAs can outlive rebases and branch switches.  Diffing from an
+    unrelated endpoint can manufacture bogus rename/split evidence, so require
+    the old object to remain a commit and an ancestor of the current HEAD.
+    """
+    if _git(repo_dir, "cat-file", "-e", f"{old}^{{commit}}").returncode != 0:
+        return False
+    return _git(
+        repo_dir, "merge-base", "--is-ancestor", old, current,
+    ).returncode == 0
+
+
+def discard_reconcile_cursor(repo_dir: Path) -> None:
+    """Best-effort removal of a stale/unrelated persisted cursor."""
+    try:
+        reconcile_cursor_path(repo_dir).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def read_prover_control(repo_dir: Path) -> Optional[bool]:
@@ -1958,12 +2491,27 @@ def _maybe_reconcile_signatures(
         return last_sha
     if not cur or cur == last_sha:
         return last_sha
+    if last_sha and not reconcile_cursor_is_ancestor(cfg.repo_dir, last_sha, cur):
+        print(
+            f"  warning: reconcile cursor {last_sha[:8]} is missing or not an "
+            f"ancestor of HEAD {cur[:8]}; discarding it and reconciling "
+            "conservatively",
+            flush=True,
+        )
+        discard_reconcile_cursor(cfg.repo_dir)
+        last_sha = None
     try:
         nums = sorted({n for ch in cfg.chapters.values() for (n, _t) in ch.entries})
     except Exception:  # noqa: BLE001
         return cur
+    retry_needed = False
+    diff_window = (last_sha, cur) if last_sha else None
     for num in nums:
         if num in exclude_issues:
+            # Do not advance past a HEAD while one affected issue is in-flight;
+            # replay the same window once its job exits.  The old code skipped
+            # it but still consumed the cursor, permanently losing its rename.
+            retry_needed = True
             continue
         try:
             # The HEAD move since last_sha IS the refine's diff window — it tells
@@ -1972,13 +2520,67 @@ def _maybe_reconcile_signatures(
             # the reconcile falls back to leaf-match.
             r = auto_reconcile_issue(
                 cfg, num,
-                diff_window=((last_sha, cur) if last_sha else None),
+                diff_window=diff_window,
             )
+            # A verified/frozen issue cannot be silently rewritten.  But merely
+            # returning "flagged/suppressed" and advancing the HEAD cursor loses
+            # the event forever: the body never gains the new card, and its old
+            # signature fence can mask a rename from verified_staleness.  Make
+            # the state transition explicit: confirm-unverify, then mechanically
+            # reconcile under the preserved manifest, so the CURRENT shape
+            # returns to the human queue.
+            flags = (
+                list(r.get("flagged_renames") or [])
+                + list(r.get("flagged_splits") or [])
+            )
+            flagged_deletes = list(r.get("flagged_deletes") or [])
+            suppressed_adds = list(r.get("suppressed_adds") or [])
+            if flags or flagged_deletes or suppressed_adds:
+                reasons: list[str] = []
+                for item in r.get("flagged_renames") or []:
+                    reasons.append(
+                        f"removed/renamed: {item.get('old')} → {item.get('new')}"
+                    )
+                for item in r.get("flagged_splits") or []:
+                    targets = ", ".join(item.get("targets") or [])
+                    reasons.append(
+                        f"removed/renamed: {item.get('old')} → {targets}"
+                    )
+                reasons.extend(
+                    f"removed/renamed: {name}" for name in flagged_deletes
+                )
+                reasons.extend(f"new card: {name}" for name in suppressed_adds)
+
+                from marathon.review.reverify import unverify_for_rereview
+
+                if not unverify_for_rereview(cfg, num, reasons):
+                    retry_needed = True
+                    print(
+                        f"  warning: reconcile #{num} needs re-review but "
+                        "unverify was not confirmed; retaining the old "
+                        "reconcile cursor to retry",
+                        flush=True,
+                    )
+                    continue
+                r = auto_reconcile_issue(
+                    cfg, num, diff_window=diff_window, allow_reopened=True,
+                )
+                if not r.get("ok", True):
+                    retry_needed = True
+                    print(
+                        f"  warning: reconcile #{num} reopened but body "
+                        "reconciliation failed; retaining cursor to retry",
+                        flush=True,
+                    )
+                    continue
             if r.get("updated"):
                 print(f"--- reconciled #{num}: {r.get('message', '')} ---", flush=True)
         except Exception as e:  # noqa: BLE001 — one issue's failure isn't fatal
             print(f"  warning: reconcile #{num} failed: {e}", flush=True)
-    return cur
+            retry_needed = True
+    # Failures/partial frozen transitions retry against the SAME HEAD next tick;
+    # never advance the only diff window past unresolved work.
+    return last_sha if retry_needed else cur
 
 
 def _maybe_reopen_stale_verified(
@@ -2186,7 +2788,9 @@ def run_conductor(
     prover_branch_ready = False
     ticks = 0
     last_automerge = float("-inf")  # run the merge orchestrator on tick 1, then ~once/min
-    last_reconcile_sha: Optional[str] = None  # reconcile only when HEAD changes
+    # Durable across restarts so an Aristotle rename/split/delete retains its
+    # exact old..new provenance instead of degrading to a leaf-name guess.
+    last_reconcile_sha: Optional[str] = load_reconcile_cursor(cfg.repo_dir)
     # Auto re-audit tracking: the HEAD our last audit covered (init to the
     # current HEAD so we don't audit at startup — only after a change lands) and
     # the throttle clock.
@@ -2200,6 +2804,11 @@ def run_conductor(
     try:
         if prune:
             prune_worktrees(cfg.repo_dir, runs_parent)
+        else:
+            kept_worktrees.update(_recover_retry_worktrees(
+                cfg, runs_parent,
+                busy_issues={j.issue_num for j in jobs if j.status == "running"},
+            ))
         _report_orphans(cfg, _known_project_ids(cfg.repo_dir))
         # Warm the shared Mathlib olean store ONCE before dispatching any
         # worktree, so each worktree's `lake exe cache get` is a pure OFFLINE
@@ -2230,7 +2839,17 @@ def run_conductor(
             _reap_finished(
                 cfg, jobs, not_before, kept_worktrees, max_attempts,
                 reconcile=reconcile,
+                fill_attempts=fill_attempts,
+                repair_attempts=repair_attempts,
             )
+            # A clean rc=0 whose PR-presence query hit a transient gh failure is
+            # parked durably in review state. Retry that cheap query every tick
+            # (and after restart) before scheduling any new Aristotle work.
+            if reconcile:
+                try:
+                    _retry_pending_pr_checks(cfg)
+                except Exception as exc:  # noqa: BLE001 — never crash conductor loop
+                    print(f"  pending PR reconciliation failed: {exc}", flush=True)
             # Land eligible PRs (the merge orchestrator) so infra/registration
             # stays on main across all chapters. Throttled to ~once/min so the
             # short tick cadence does not hammer `gh`; best-effort (a failure
@@ -2263,12 +2882,18 @@ def run_conductor(
             # tracks, so there is nothing to do between merges. Skips issues with
             # a running job (a live refine may be editing that body). Best-effort.
             if reconcile and not _STOP_REQUESTED:
+                prior_reconcile_sha = last_reconcile_sha
                 last_reconcile_sha = _maybe_reconcile_signatures(
                     cfg, last_reconcile_sha,
                     exclude_issues=frozenset(
                         j.issue_num for j in jobs if j.status == "running"
                     ),
                 )
+                if (
+                    last_reconcile_sha
+                    and last_reconcile_sha != prior_reconcile_sha
+                ):
+                    save_reconcile_cursor(cfg.repo_dir, last_reconcile_sha)
             # Keep the audit snapshot honest: when main has moved (a change
             # landed) and the tree is clean, auto-refresh it so a DOWNSTREAM
             # break — e.g. a frozen upstream signature change breaking a consumer

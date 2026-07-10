@@ -421,29 +421,33 @@ def cmd_lock(args) -> None:
 
 def _ensure_verified_label(cfg: "ReviewConfig", num: int) -> bool:
     """Add ``review:verified`` (and drop ``review:rejected``), CONFIRMING the
-    add landed on GitHub. Retries once and prints a LOUD warning if it still
-    isn't present — the deck's verified-status keys off this label, so a silent
-    write failure re-surfaces the issue. Never raises: a persistent failure is a
-    visible WARN, not an abort (the local verdict + T2 already landed)."""
-    # Drop a stale rejected label best-effort (it may not be present — a never-
-    # rejected issue like #23 has none, and that must not block the add).
-    gh("issue", "edit", str(num), "--repo", cfg.github_repo,
-       "--remove-label", cfg.labels.rejected, check=False)
+    *entire final label state* landed on GitHub. Retries once and prints a loud
+    warning unless verified is present AND rejected is absent. A mixed label
+    state is not success: queue status gives rejection precedence, so recording
+    a local verification while ``review:rejected`` remains would strand the
+    issue in a split brain."""
     for _ in (1, 2):
+        # Removal may transiently fail independently of the add, so converge
+        # both sides on every attempt and confirm both by read-back.
+        gh("issue", "edit", str(num), "--repo", cfg.github_repo,
+           "--remove-label", cfg.labels.rejected, check=False)
         gh("issue", "edit", str(num), "--repo", cfg.github_repo,
            "--add-label", cfg.labels.verified, check=False)
         try:
             cp = gh("issue", "view", str(num), "--repo", cfg.github_repo,
                     "--json", "labels", check=True)
             names = [lbl.get("name") for lbl in json.loads(cp.stdout).get("labels", [])]
-            if cfg.labels.verified in names:
+            if (cfg.labels.verified in names
+                    and cfg.labels.rejected not in names):
                 return True
         except (RuntimeError, ValueError, KeyError, OSError):
             pass
     print(
-        f"  ⚠ label: could NOT confirm '{cfg.labels.verified}' on #{num} after "
-        "2 attempts — the deck will re-surface it. Add it manually: "
-        f"gh issue edit {num} --add-label '{cfg.labels.verified}'"
+        f"  ⚠ label: could NOT confirm the final verified-only label state on "
+        f"#{num} after 2 attempts — no local verification was recorded. "
+        "Repair it manually: "
+        f"gh issue edit {num} --add-label '{cfg.labels.verified}' "
+        f"--remove-label '{cfg.labels.rejected}'"
     )
     return False
 
@@ -473,7 +477,17 @@ def cmd_verify(args) -> None:
     # issue verified-locally (T2 ledger, tracker flipped) but UNLABELED → the
     # deck re-surfaces it for review with no explanation, and the human
     # re-verifies into the same silent failure (the #23/#24 re-surfacing bug).
-    _ensure_verified_label(cfg, num)
+    if not _ensure_verified_label(cfg, num):
+        # This exception intentionally crosses the deck/apply_verdict boundary:
+        # SHIP remains retryable and its local subdeck is not cleared.  The
+        # previous behavior continued into record_verification despite a failed
+        # GitHub transition, making local state say verified while the queue's
+        # rejected label kept the issue permanently rejected.
+        raise RuntimeError(
+            f"verification of #{num} was not recorded because GitHub labels "
+            "did not converge to verified-only; retry after connectivity "
+            "recovers"
+        )
     # Clear any prior rejection queue entry for this issue. Idempotent
     # if there was no prior rejection. This also fires capture_on_verify
     # (freezes the verified statements into the approved-statements
@@ -745,6 +759,75 @@ def _maybe_merge_marathon_pr(cfg: ReviewConfig, issue_num: int) -> None:
 # --- reject ------------------------------------------------------------------
 
 
+def _ensure_rejected_label(cfg: "ReviewConfig", num: int) -> bool:
+    """Converge GitHub to rejected-present/verified-absent and confirm it."""
+    for _ in (1, 2):
+        gh(
+            "issue", "edit", str(num), "--repo", cfg.github_repo,
+            "--remove-label", cfg.labels.verified, check=False,
+        )
+        gh(
+            "issue", "edit", str(num), "--repo", cfg.github_repo,
+            "--add-label", cfg.labels.rejected, check=False,
+        )
+        try:
+            cp = gh(
+                "issue", "view", str(num), "--repo", cfg.github_repo,
+                "--json", "labels", check=True,
+            )
+            names = {
+                item.get("name")
+                for item in json.loads(cp.stdout or "{}").get("labels", [])
+                if isinstance(item, dict)
+            }
+            if cfg.labels.rejected in names and cfg.labels.verified not in names:
+                return True
+        except (RuntimeError, ValueError, KeyError, OSError):
+            pass
+    print(
+        f"  ⚠ label: could NOT confirm the final rejected-only label state "
+        f"on #{num}; no local rejection was recorded or dispatched. Retry "
+        "after GitHub connectivity recovers."
+    )
+    return False
+
+
+def _ensure_unreviewed_labels(cfg: "ReviewConfig", num: int) -> bool:
+    """Converge GitHub to neither verdict label and confirm it.
+
+    This is the compensation path when a requeue's label transition wins but
+    its local CAS loses to a concurrent merge/review that removed the state
+    entry. Without compensation the issue would look rejected on GitHub while
+    being unreviewed locally.
+    """
+    for _ in (1, 2):
+        for label in (cfg.labels.rejected, cfg.labels.verified):
+            gh(
+                "issue", "edit", str(num), "--repo", cfg.github_repo,
+                "--remove-label", label, check=False,
+            )
+        try:
+            cp = gh(
+                "issue", "view", str(num), "--repo", cfg.github_repo,
+                "--json", "labels", check=True,
+            )
+            names = {
+                item.get("name")
+                for item in json.loads(cp.stdout or "{}").get("labels", [])
+                if isinstance(item, dict)
+            }
+            if (cfg.labels.rejected not in names
+                    and cfg.labels.verified not in names):
+                return True
+        except (RuntimeError, ValueError, KeyError, OSError):
+            pass
+    print(
+        f"  ⚠ label: could NOT confirm unreviewed labels on #{num}; "
+        "repair the GitHub labels before reviewing it again"
+    )
+    return False
+
+
 def cmd_reject(args) -> None:
     cfg = load_config()
     num = args.issue_num
@@ -770,13 +853,11 @@ def cmd_reject(args) -> None:
 
     comment = f"{comment}\n\n{embed_reject_note(notes_text)}"
     gh("issue", "comment", str(num), "--repo", cfg.github_repo, "--body", comment)
-    gh(
-        "issue", "edit", str(num),
-        "--repo", cfg.github_repo,
-        "--add-label", cfg.labels.rejected,
-        "--remove-label", cfg.labels.verified,
-        check=False,
-    )
+    if not _ensure_rejected_label(cfg, num):
+        raise RuntimeError(
+            f"rejection of #{num} was not recorded because GitHub labels did "
+            "not converge to rejected-only; retry after connectivity recovers"
+        )
     record_rejection(cfg, num, notes_text)
     print(f"  recorded rejection at {cfg.state_path}")
     print(f"❌ #{num} rejected and queued for refinement.")
@@ -804,8 +885,8 @@ def _live_conductor_pid(cfg: ReviewConfig) -> Optional[int]:
     """PID of a live repo-level conductor, or None. The lock location is
     the conductor's own (imported, not re-derived) and the liveness
     semantics mirror its stale-lock handling — a dead PID reads as
-    'no conductor', so rejections fall back to the per-chapter daemon
-    exactly as before Phase 3."""
+    'no conductor', so the next rejection/start can relaunch the one global
+    orchestrator."""
     from marathon.conductor import conductor_lock_path
     lock = conductor_lock_path(cfg)
     if not lock.is_file():
@@ -815,10 +896,6 @@ def _live_conductor_pid(cfg: ReviewConfig) -> Optional[int]:
     except (ValueError, OSError):
         return None
     return pid if _process_alive(pid) else None
-
-
-def _runner_lock_path(cfg: ReviewConfig, chapter: int) -> Path:
-    return cfg.runner_lock_dir / f"refine-c{chapter}.lock"
 
 
 def _ensure_conductor(cfg: ReviewConfig) -> None:
@@ -878,24 +955,44 @@ def _ensure_conductor(cfg: ReviewConfig) -> None:
 
 
 def cmd_refine_status(args) -> None:
+    """Report the GLOBAL conductor started by :func:`cmd_refine_start`.
+
+    ``--chapter`` is only a display filter for jobs.  The previous
+    implementation still inspected the retired ``refine-cN.lock``, so a
+    successful ``refine-start`` was immediately reported as "no daemon active".
+    """
     cfg = load_config()
-    chapter = args.chapter
-    lock = _runner_lock_path(cfg, chapter)
-    if not lock.is_file():
-        print(f"chapter {chapter}: no refine daemon active")
+    chapter = getattr(args, "chapter", None)
+    from marathon.conductor import conductor_lock_path, load_jobs_snapshot
+
+    lock = conductor_lock_path(cfg)
+    pid = _live_conductor_pid(cfg)
+    if pid is None:
+        if lock.is_file():
+            print("global conductor: stale/unreadable lock; removing")
+            lock.unlink(missing_ok=True)
+        else:
+            print("global conductor: not active")
         return
-    try:
-        pid = int(lock.read_text().strip())
-    except (ValueError, OSError):
-        print(f"chapter {chapter}: lock file unreadable; removing")
-        lock.unlink(missing_ok=True)
-        return
-    if not _process_alive(pid):
-        print(f"chapter {chapter}: stale lock (pid {pid} not alive); removing")
-        lock.unlink(missing_ok=True)
-        return
-    print(f"chapter {chapter}: refine daemon active (pid {pid})")
-    logs = sorted(cfg.runner_log_dir.glob(f"refine-c{chapter}-*.log"))
+
+    scope = f" (showing chapter {chapter})" if chapter is not None else ""
+    print(f"global conductor active (pid {pid}){scope}")
+    snapshot = load_jobs_snapshot(cfg.repo_dir) or {}
+    jobs = snapshot.get("jobs") or []
+    if chapter is not None:
+        jobs = [j for j in jobs if j.get("chapter") == chapter]
+    running = [j for j in jobs if j.get("status") == "running"]
+    if running:
+        for job in running:
+            print(
+                f"  #{job.get('issue_num')} chapter {job.get('chapter')}: "
+                f"{job.get('aristotle_status') or 'running'} "
+                f"(pid {job.get('pid') or '?'})"
+            )
+    else:
+        print("  no running refine jobs in this view")
+
+    logs = sorted(cfg.runner_log_dir.glob("conductor-*.log"))
     if logs:
         latest = logs[-1]
         print(f"  log: {latest}")
@@ -905,32 +1002,35 @@ def cmd_refine_status(args) -> None:
 
 
 def cmd_refine_stop(args) -> None:
+    """Stop the same GLOBAL conductor that ``refine-start`` launches."""
     import signal as _sig
     cfg = load_config()
-    chapter = args.chapter
-    lock = _runner_lock_path(cfg, chapter)
-    if not lock.is_file():
-        print(f"chapter {chapter}: no refine daemon active")
-        return
-    try:
-        pid = int(lock.read_text().strip())
-    except (ValueError, OSError):
-        print(f"chapter {chapter}: lock unreadable; removing")
-        lock.unlink(missing_ok=True)
-        return
-    if not _process_alive(pid):
-        print(f"chapter {chapter}: stale lock (pid {pid}); removing")
-        lock.unlink(missing_ok=True)
+    chapter = getattr(args, "chapter", None)
+    from marathon.conductor import conductor_lock_path
+
+    lock = conductor_lock_path(cfg)
+    pid = _live_conductor_pid(cfg)
+    if pid is None:
+        if lock.is_file():
+            print("global conductor: stale/unreadable lock; removing")
+            lock.unlink(missing_ok=True)
+        else:
+            print("global conductor: not active")
         return
     try:
         os.kill(pid, _sig.SIGTERM)
-        print(f"chapter {chapter}: sent SIGTERM to refine daemon pid {pid}")
+        suffix = (
+            f" (--chapter {chapter} is a compatibility argument; the global "
+            "conductor spans all chapters)"
+            if chapter is not None else ""
+        )
+        print(f"global conductor: sent SIGTERM to pid {pid}{suffix}")
         print(
-            f"  (the daemon will finish its current marathon iteration "
-            "before exiting; may take several minutes)"
+            "  no Aristotle jobs are canceled; the conductor stops new "
+            "dispatches and waits for running jobs to finish"
         )
     except (OSError, ProcessLookupError) as e:
-        print(f"chapter {chapter}: could not signal pid {pid}: {e}")
+        print(f"global conductor: could not signal pid {pid}: {e}")
 
 
 def cmd_refine_start(args) -> None:

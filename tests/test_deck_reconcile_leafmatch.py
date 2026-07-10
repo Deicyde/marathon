@@ -167,25 +167,22 @@ def _setup_sig(tmp_path, monkeypatch, *, cited, labels=None, body=None):
     return cfg, body
 
 
-def test_signatures_namespace_rename_caught(tmp_path, monkeypatch):
+def test_signatures_namespace_rename_requires_confirmation(tmp_path, monkeypatch):
     """The #98 case: the body cites ``…Tf.MixedTensorField.exists_of_tensorial``
     (gone); the live decl is ``…Tf.CovariantTensorField.exists_of_tensorial``
-    (same leaf). _proven_rename has no git proof here, so the leaf-match fallback
-    resolves it and the new name is written into the signatures."""
+    (same leaf). A unique orphan is useful evidence, but does not prove identity;
+    the stale citation is retained and the mapping is returned as a proposal."""
     cited = "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial"
     cfg, _body = _setup_sig(tmp_path, monkeypatch, cited=cited)
     r = auto_reconcile_issue(cfg, 98, dry_run=True)
-    assert r["renamed"] == [{
+    mapping = {
         "old": "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial",
         "new": "Demo.Chapter15.Tf.CovariantTensorField.exists_of_tensorial",
-    }]
-    assert r["kept_stale"] == []
-    nb = r["new_body"]
-    assert "CovariantTensorField.exists_of_tensorial` at" in nb
-    # the stale MixedTensorField citation is gone from the rewritten block
-    assert "MixedTensorField.exists_of_tensorial` at" not in nb
-    # other sections preserved
-    assert "### Informal Statement\n\ntext\n" in nb
+    }
+    assert r["renamed"] == []
+    assert r["proposed_renames"] == [mapping]
+    assert mapping["old"] in r["kept_stale"]
+    assert "new_body" not in r
 
 
 def test_verified_issue_flags_rename_no_write(tmp_path, monkeypatch):
@@ -236,30 +233,22 @@ def _decl_body(cited: str) -> str:
     )
 
 
-def test_declarations_format_token_swapped(tmp_path, monkeypatch):
+def test_declarations_format_leaf_match_is_proposal_only(tmp_path, monkeypatch):
     """A ``### Lean declarations`` body (no signatures section): the stale name
-    token is replaced by the leaf-matched new name WITHIN that section; every
-    other section is byte-identical."""
+    token is never silently replaced from leaf equality alone."""
     cited = "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial"
     new = "Demo.Chapter15.Tf.CovariantTensorField.exists_of_tensorial"
     body = _decl_body(cited)
     cfg, _b = _setup_sig(tmp_path, monkeypatch, cited="unused", body=body)
     r = auto_reconcile_issue(cfg, 98, dry_run=True)
-    assert r["renamed"] == [{"old": cited, "new": new}]
-    nb = r["new_body"]
-    assert f"`{new}`" in nb
-    assert f"`{cited}`" not in nb
-    # Everything before the declarations section is byte-identical…
-    assert nb.startswith(_OTHER_SECTIONS + "### Lean declarations")
-    # …and the trailing Informal Statement section is untouched.
-    assert nb.endswith("### Informal Statement\n\ntext\n")
-    # the unrelated prose backtick survived
-    assert "unrelated `backtick` token" in nb
+    assert r["renamed"] == []
+    assert r["proposed_renames"] == [{"old": cited, "new": new}]
+    assert cited in r["kept_stale"]
+    assert "new_body" not in r
 
 
-def test_declarations_format_keyword_shape_swapped(tmp_path, monkeypatch):
-    """The intake also emits the keyword shape `` `def Name` `` — only the name
-    part is swapped, the keyword preserved."""
+def test_declarations_keyword_shape_is_proposal_only(tmp_path, monkeypatch):
+    """Keyword-shaped citations receive the same fail-closed rename policy."""
     cited = "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial"
     new = "Demo.Chapter15.Tf.CovariantTensorField.exists_of_tensorial"
     body = (
@@ -269,22 +258,20 @@ def test_declarations_format_keyword_shape_swapped(tmp_path, monkeypatch):
     )
     cfg, _b = _setup_sig(tmp_path, monkeypatch, cited="unused", body=body)
     r = auto_reconcile_issue(cfg, 98, dry_run=True)
-    assert r["renamed"] == [{"old": cited, "new": new}]
-    assert f"`theorem {new}`" in r["new_body"]
-    assert cited not in r["new_body"]
+    assert r["renamed"] == []
+    assert r["proposed_renames"] == [{"old": cited, "new": new}]
+    assert "new_body" not in r
 
 
 @pytest.mark.parametrize("prefix", ["@[simp] theorem", "noncomputable def"])
-def test_declarations_format_attr_modifier_shape_swapped(
+def test_declarations_attr_modifier_shape_is_proposal_only(
     tmp_path, monkeypatch, prefix
 ):
     """MAJOR: the extractor's ``_DECL_RE`` accepts a leading ``@[…]`` attribute
     cluster and ``noncomputable/private/protected`` modifiers, so the intake can
     emit `` `@[simp] theorem Foo` `` / `` `noncomputable def Foo` ``. The swap
-    regex must match the SAME shapes — else the token is extracted+leaf-matched
-    but the in-place swap no-ops and the rename is silently dropped to
-    kept_stale. Only the NAME is rewritten; the attr+modifier+keyword run is
-    preserved verbatim."""
+    parser must still extract these shapes, but leaf equality cannot silently
+    rewrite either form."""
     cited = "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial"
     new = "Demo.Chapter15.Tf.CovariantTensorField.exists_of_tensorial"
     body = (
@@ -294,10 +281,10 @@ def test_declarations_format_attr_modifier_shape_swapped(
     )
     cfg, _b = _setup_sig(tmp_path, monkeypatch, cited="unused", body=body)
     r = auto_reconcile_issue(cfg, 98, dry_run=True)
-    assert r["renamed"] == [{"old": cited, "new": new}]
-    assert r["kept_stale"] == []
-    assert f"`{prefix} {new}`" in r["new_body"]
-    assert cited not in r["new_body"]
+    assert r["renamed"] == []
+    assert r["proposed_renames"] == [{"old": cited, "new": new}]
+    assert cited in r["kept_stale"]
+    assert "new_body" not in r
 
 
 # ---------------------------------------------------------------------------
@@ -548,12 +535,13 @@ def test_many_to_one_dedup_declarations(tmp_path, monkeypatch):
     monkeypatch.setattr(gh_mod, "issue_body", lambda n, repo: body)
 
     r = auto_reconcile_issue(cfg, 98, dry_run=True)
-    # Exactly ONE rename (the first stale), the other kept.
-    assert r["renamed"] == [{"old": stale_a, "new": target}]
+    # Exactly ONE proposal (the first stale), both citations remain until a
+    # human confirms identity.
+    assert r["renamed"] == []
+    assert r["proposed_renames"] == [{"old": stale_a, "new": target}]
+    assert stale_a in r["kept_stale"]
     assert stale_b in r["kept_stale"]
-    nb = r["new_body"]
-    # The target appears exactly once (no duplicate-collapse).
-    assert nb.count(f"`{target}`") == 1
+    assert "new_body" not in r
 
 
 # ---------------------------------------------------------------------------
@@ -561,9 +549,9 @@ def test_many_to_one_dedup_declarations(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_multi_section_declarations_all_spliced(tmp_path, monkeypatch):
+def test_multi_section_declarations_proposal_does_not_splice(tmp_path, monkeypatch):
     """MINOR: the extractor reads ALL `### Lean declarations` sections; a stale
-    token in a SECOND such section must be swapped too (not just the first)."""
+    token in a SECOND such section is detected but not silently rewritten."""
     cited = "Demo.Chapter15.Tf.MixedTensorField.exists_of_tensorial"
     new = "Demo.Chapter15.Tf.CovariantTensorField.exists_of_tensorial"
     body = (
@@ -576,13 +564,9 @@ def test_multi_section_declarations_all_spliced(tmp_path, monkeypatch):
     )
     cfg, _b = _setup_sig(tmp_path, monkeypatch, cited="unused", body=body)
     r = auto_reconcile_issue(cfg, 98, dry_run=True)
-    assert r["renamed"] == [{"old": cited, "new": new}]
-    nb = r["new_body"]
-    assert f"`{new}`" in nb
-    assert f"`{cited}`" not in nb
-    # The first section's unrelated token and the Notes prose survive verbatim.
-    assert "`Demo.Chapter15.Tf.unrelated`" in nb
-    assert "### Notes\n\nprose\n\n" in nb
+    assert r["renamed"] == []
+    assert r["proposed_renames"] == [{"old": cited, "new": new}]
+    assert "new_body" not in r
 
 
 # ---------------------------------------------------------------------------
@@ -786,7 +770,7 @@ def test_declarations_format_add_when_section_is_last_eof(tmp_path, monkeypatch)
     assert nb.endswith("\n")
 
 
-def test_declarations_format_rename_and_add_combined(tmp_path, monkeypatch):
+def test_declarations_format_rename_proposal_suppresses_duplicate_add(tmp_path, monkeypatch):
     """RENAME + ADD together: the body cites a STALE
     `Mixed.toPointwiseOrientation` (a namespace-rename of the orphaned
     `Orient.toPointwiseOrientation` — SAME leaf) which ALSO is the ADD candidate
@@ -811,13 +795,15 @@ def test_declarations_format_rename_and_add_combined(tmp_path, monkeypatch):
         extra_snapshot=[_decl(_ADD_CANDIDATE, module="Demo.Chapter15.Orient")],
     )
     r = auto_reconcile_issue(cfg, 98, dry_run=True)
-    # The stale is RENAMED onto the orphan; the orphan is NOT also ADDed.
-    assert r["renamed"] == [{"old": stale, "new": _ADD_CANDIDATE}]
+    # The stale mapping is proposed, not applied; its target is not also
+    # appended as an ADD while identity awaits confirmation.
+    assert r["renamed"] == []
+    assert r["proposed_renames"] == [
+        {"old": stale, "new": _ADD_CANDIDATE}
+    ]
     assert r["added"] == []
-    nb = r["new_body"]
-    # The renamed token appears exactly once — no duplicate ADD bullet.
-    assert nb.count(f"`{_ADD_CANDIDATE}`") == 1
-    assert stale not in nb
+    assert stale in r["kept_stale"]
+    assert "new_body" not in r
 
 
 # ---------------------------------------------------------------------------

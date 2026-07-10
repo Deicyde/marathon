@@ -75,6 +75,19 @@ def test_ship_with_a_rejection_composes_the_keep_fix_note():
     assert "Demo.MonoidHom.comp: fill the map_one sorry" in msg
 
 
+def test_demo_partial_reject_leaves_later_declarations_untouched():
+    demo.demo_record_verdict(9001, "Demo.MonoidHom", "verify")
+    demo.demo_record_verdict(
+        9001, "Demo.MonoidHom.comp", "reject", note="fill the map_one sorry"
+    )
+    # map_pow is intentionally not reviewed before the upstream fix ships.
+    res = demo.demo_ship(9001)
+    assert res["ok"] and res["outcome"] == "shipped"
+    assert res["partial"] is True
+    assert "Stopped at first rejection" in res["message"]
+    assert "Demo.MonoidHom.map_pow" not in res["message"]
+
+
 def test_ship_clears_the_issue_and_advances():
     for name in ("Demo.IsEven", "Demo.isEven_add"):
         demo.demo_record_verdict(9002, name, "verify")

@@ -14,9 +14,9 @@ The subdeck flow:
 * the human reviews ONE DECLARATION per card; each swipe records a LOCAL
   per-decl verdict (POST /api/decl-verdict — merges nothing, dispatches no
   Aristotle, writes no ledger verdict);
-* when every declaration is reviewed, a confirm-and-ship SUMMARY card
-  appears; SHIP (POST /api/ship) composes the per-issue outcome and is the
-  ONLY irreversible action.
+* when every declaration is reviewed — or the first rejection pauses a partial
+  review — a confirm-and-ship SUMMARY card appears; SHIP (POST /api/ship)
+  composes the per-issue outcome and is the ONLY irreversible action.
 
 What these tests enforce:
 
@@ -523,6 +523,174 @@ def test_kernel_section_removed_from_deck(app_js: str, style_css: str):
         assert cls not in style_css, f"stale kernel style {cls}"
 
 
+# --- dependency-aware review workspace -------------------------------------
+
+def test_subdeck_is_topologically_ordered_in_the_frontend(app_js: str):
+    """The backend wire order is severity-first; the human-facing order must
+    instead put local definitions before declarations whose kernel cites them."""
+    code = _strip_block_comments(app_js)
+    deps = _fn_body(code, "function localDependencyNames")
+    assert ".kernel" in deps and "member.name" in deps
+    order = _fn_body(code, "function dependencyOrder")
+    assert "indegree" in order and "dependents" in order
+    assert "cyclic remainder" in app_js
+    normalize = _fn_body(code, "function normalizeSubdeck")
+    assert "dependencyOrder" in normalize
+    # Both initial load and refetch adapt the wire payload before rendering.
+    for fn in ("function openIssue", "function refetchSubdeck"):
+        assert "normalizeSubdeck(sd)" in _fn_body(code, fn)
+
+
+def test_rejected_predecessor_guards_later_decisions(app_js: str):
+    code = _strip_block_comments(app_js)
+    guard = _fn_body(code, "function guardDependencyDecision")
+    assert "rejectedLocalDependencies" in guard
+    assert "No verdict was recorded" in guard
+    assert "dependencyOverrides" in guard
+    # Verify and reject are guarded; defer remains available as a non-decision.
+    assert "guardDependencyDecision()" in _fn_body(code, "function actVerify")
+    assert "guardDependencyDecision()" in _fn_body(code, "function actReject")
+    assert "guardDependencyDecision()" not in _fn_body(code, "function actDefer")
+
+
+def test_first_reject_pauses_at_partial_ship_summary(app_js: str, style_css: str):
+    code = _strip_block_comments(app_js)
+    commit = _fn_body(code, "function commitDeclVerdict")
+    assert 'if (verdict === "reject") state.showSummary = true' in commit
+    summary = _fn_body(code, "function renderSummaryCard")
+    assert "partialReject" in summary
+    assert "Review paused at first rejection" in summary
+    assert "WAIT (" in summary
+    assert "Continue reviewing anyway" in summary
+    confirm = _fn_body(code, "function confirmAndShip")
+    assert "partialReject" in confirm and "excluded from KEEP/FIX" in confirm
+    assert ".summary-wait" in style_css
+
+
+def test_continued_partial_review_can_return_to_paused_summary(
+    app_js: str, style_css: str
+):
+    """Continuing past a rejection must never strand the partial SHIP card."""
+    code = _strip_block_comments(app_js)
+    predicate = _fn_body(code, "function hasPausedReviewSummary")
+    assert "summary.rejected" in predicate
+    assert "partialWaitCards()" in predicate
+    wait = _fn_body(code, "function partialWaitCards")
+    assert 'card.verdict !== "verified"' in wait
+    assert 'card.verdict !== "rejected"' in wait
+    assert "summary || {}).invalidated" in wait
+    assert "autoApprovedCandidates()" in wait
+
+    go_back = _fn_body(code, "function returnToPausedReviewSummary")
+    assert "closeReviewInspector()" in go_back
+    assert "state.showSummary = true" in go_back
+    assert "renderSubdeckStage()" in go_back
+
+    header = _fn_body(code, "function subdeckHeader")
+    assert "pausedSummaryButton()" in header
+    guard = _fn_body(code, "function guardDependencyDecision")
+    assert "Return to paused review summary" in guard
+    assert "returnToPausedReviewSummary" in guard
+    assert ".paused-summary-btn" in style_css
+    assert ".return-paused-summary" in style_css
+
+
+def test_dependency_invalidation_reconciles_authoritative_post_response(app_js: str):
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function applyDeclResult")
+    assert "resp.summary" in body and "summary = resp.summary" in body
+    assert "dependency_invalidated" in body
+    assert "verdict_before_dependency_invalidation" in body
+    # An explicit new verdict on the touched card must beat any saved pre-mask
+    # verdict; restoration is only for untouched siblings.
+    assert "card.name !== decl" in body
+
+
+def test_partial_reject_suppresses_skip_api_autoapproval_in_ui(app_js: str):
+    code = _strip_block_comments(app_js)
+    auto = _fn_body(code, "function autoApprovedForShip")
+    assert "hasPausedReviewSummary()" in auto
+    assert "return []" in auto
+    wait = _fn_body(code, "function partialWaitCards")
+    assert "autoApprovedCandidates()" in wait
+    panel = _fn_body(code, "function autoApprovedPanel")
+    assert "paused in WAIT after rejection" in panel
+    assert "suppresses auto-approval" in panel
+
+
+def test_reject_composer_guards_all_destructive_navigation(app_js: str):
+    code = _strip_block_comments(app_js)
+    for fn in (
+        "function setSkipApi", "function refetchSubdeck", "function openIssue",
+        "function returnToPausedReviewSummary", "function pullIntoReview",
+        "function toggleDeclLock",
+    ):
+        assert "state.rejectComposerOpen" in _fn_body(code, fn), fn
+    reject = _fn_body(code, "function openRejectNote")
+    assert "setComposerNavigationLocked(true)" in reject
+    assert "setComposerNavigationLocked(false)" in reject
+
+
+def test_stale_subdeck_get_cannot_replace_newer_issue(app_js: str):
+    code = _strip_block_comments(app_js)
+    for fn in ("function openIssue", "function refetchSubdeck"):
+        body = _fn_body(code, fn)
+        assert "subdeckRequestSeq" in body
+        assert "requestSeq !== state.subdeckRequestSeq" in body
+        assert "state.issue !== issue" in body
+
+
+def test_reject_editor_is_non_modal_and_keeps_source_visible(app_js: str, style_css: str):
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function openRejectNote")
+    assert "openReviewInspector" in body
+    assert "reject-composer" in body
+    assert "openModal(" not in body
+    assert "setActionsEnabled(false)" in body
+    # Desktop layout is side-by-side; narrow screens naturally stack it below.
+    assert ".decl-card.has-inspector .review-body" in style_css
+    assert "grid-template-columns" in style_css
+    assert ".review-inspector[hidden]" in style_css
+
+
+def test_source_terms_open_kernel_definition_inspector(app_js: str, style_css: str):
+    code = _strip_block_comments(app_js)
+    lookup = _fn_body(code, "function kernelTermLookup")
+    assert "member.name" in lookup
+    ref = _fn_body(code, "function leanReference")
+    assert "showKernelDefinition" in ref
+    assert 'setAttribute("role", "button")' in ref
+    assert 'setAttribute("tabindex", "0")' in ref
+    plain = _fn_body(code, "function leanPlainNodes")
+    assert "regexpEscape" in plain and "leanReference" in plain
+    inspector = _fn_body(code, "function showKernelDefinition")
+    assert "type_pp" in inspector and "value_pp" in inspector
+    assert ".lh-ref" in style_css
+
+
+def test_deps_and_open_controls_have_durable_non_popup_surfaces(app_js: str):
+    code = _strip_block_comments(app_js)
+    assert "openDependencyMap()" in _fn_body(code, "function openDeps")
+    depmap = _fn_body(code, "function openDependencyMap")
+    for token in ("dependencyOrder", "localDependencyNames", "source_file", "sd.deps"):
+        assert token in depmap
+    deep = _fn_body(code, "function openDeepDive")
+    assert "openResourceLinks()" in deep
+    assert "window.open" not in deep
+    resources = _fn_body(code, "function openResourceLinks")
+    assert "sd.permalink" in resources
+    assert 'target: "_blank"' in resources and 'rel: "noopener"' in resources
+
+
+def test_elaborated_type_and_inspector_are_excluded_from_swipe(app_js: str, style_css: str):
+    code = _strip_block_comments(app_js)
+    card = _fn_body(code, "function renderDeclCard")
+    assert 'class: "elab-type", "data-no-swipe": "true"' in card
+    swipe = _fn_body(code, "function attachSwipe")
+    assert "details, summary, [data-no-swipe]" in swipe
+    assert ".elab-type { touch-action: auto; }" in style_css
+
+
 # --- the leading informal-approval card -------------------------------------
 
 def test_informal_warning_gated_on_approval(app_js: str):
@@ -688,7 +856,7 @@ def test_source_block_still_renders_when_present(app_js: str):
     code = _strip_block_comments(app_js)
     body = _fn_body(code, "function renderDeclCard")
     assert "if (card.source_block)" in body
-    assert "leanHighlight(card.source_block)" in body
+    assert "leanHighlight(card.source_block, card.kernel)" in body
     # the in_code===false branch is reached only when there is no source_block
     sb = body.find("if (card.source_block)")
     stale = body.find("in_code === false")

@@ -194,7 +194,7 @@ def unverify_for_rereview(
     """Re-open a verified issue for re-review because its reviewable content
     changed. Returns True on success.
 
-    Steps (each best-effort, none aborts the others):
+    Steps (ordered so a partial failure remains retryable):
 
     1. Remove the ``review:verified`` GitHub label (``gh issue edit
        --remove-label``).
@@ -212,23 +212,65 @@ def unverify_for_rereview(
     unreviewed.
     """
     from marathon.review.github import gh
-    from marathon.review.state import requeue_for_rereview
+    from marathon.review.state import load_state, requeue_for_rereview
 
-    # 1. Drop the verified label (best-effort: a label-edit failure must not
-    #    block the state deletion — the deck's read-side truth is state.json).
-    try:
-        gh(
-            "issue", "edit", str(issue_num),
-            "--repo", cfg.github_repo,
-            "--remove-label", cfg.labels.verified,
-            check=False,
+    current = load_state(cfg).issues.get(issue_num)
+    if current is None or current.status != "verified":
+        return True  # already reopened or superseded by another human verdict
+    expected_verdict_ts = current.verdict_ts
+
+    # 1. Drop AND CONFIRM the verified label before deleting local state.  The
+    # shared deck keys verified status off GitHub; clearing state.json after a
+    # silent label no-op creates a split-brain and the issue never actually
+    # reopens.  Retain local verified state on failure so the conductor retries
+    # this pass next cycle.
+    label_cleared = False
+    for _attempt in range(3):
+        try:
+            gh(
+                "issue", "edit", str(issue_num),
+                "--repo", cfg.github_repo,
+                "--remove-label", cfg.labels.verified,
+                check=False,
+            )
+            from marathon.review.github import issue_labels
+
+            labels = issue_labels(issue_num, cfg.github_repo)
+            if labels is not None and cfg.labels.verified not in labels:
+                label_cleared = True
+                break
+        except Exception:  # noqa: BLE001 — bounded retry below
+            continue
+    if not label_cleared:
+        print(
+            f"  reverify: WARN — could not confirm removal of "
+            f"'{cfg.labels.verified}' from #{issue_num}; keeping local "
+            "verified state so the conductor retries",
         )
-    except Exception as e:  # noqa: BLE001
-        print(f"  reverify: WARN — could not remove verified label from "
-              f"#{issue_num} ({e})")
+        return False
 
     # 2. Delete the state.json entry so the deck re-surfaces the issue.
-    removed = requeue_for_rereview(cfg, issue_num)
+    removed = requeue_for_rereview(
+        cfg,
+        issue_num,
+        expected_verdict_ts=expected_verdict_ts,
+        expected_status="verified",
+    )
+    if not removed:
+        # The network transition raced a newer verification. Restore its label;
+        # the locked CAS correctly kept the newer local verdict.
+        try:
+            latest = load_state(cfg).issues.get(issue_num)
+            if latest is not None and latest.status == "verified":
+                gh(
+                    "issue", "edit", str(issue_num),
+                    "--repo", cfg.github_repo,
+                    "--add-label", cfg.labels.verified,
+                    check=False,
+                )
+        except Exception:  # noqa: BLE001 — next reverify/sync pass retries
+            pass
+        return False
 
     # 3. Post one summary comment.
     try:
@@ -241,7 +283,9 @@ def unverify_for_rereview(
     except Exception as e:  # noqa: BLE001
         print(f"  reverify: WARN — could not comment on #{issue_num} ({e})")
 
-    return removed
+    # Absence was already the target state, so an already-absent local row is
+    # idempotent success (important when resuming a prior partial reopen).
+    return True
 
 
 # --- helpers ---------------------------------------------------------------

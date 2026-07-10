@@ -399,6 +399,11 @@ def demo_subdeck(issue_id: int, *, skip_api: bool = False) -> dict:
             "title": iss["title"],
             "chapter": iss["chapter"],
             "card_tier": _worst_tier(reviewable),
+            # Demo has no real GitHub repository or cross-issue planner, but it
+            # carries the same read-model keys as the live subdeck so controls
+            # can render an explicit unavailable/empty state.
+            "permalink": None,
+            "deps": [],
             "cards": _ordered_cards(issue_id, main),
             "auto_approved": _ordered_cards(issue_id, api) if skip_api else [],
             "progress": prog,
@@ -515,18 +520,25 @@ def demo_ship(issue_id: int, *, skip_api: bool = False) -> dict:
         reviewable, _stale, _rec = _reconcile(iss["decls"])
         main, api = _partition(issue_id, reviewable, skip_api)
         prog = _progress(issue_id, main)
-        if prog["reviewed"] < prog["total"] or prog["total"] == 0:
+        summary = _summary(issue_id, reviewable)
+        recs = _VERDICTS.get(issue_id, {})
+        auto_candidates = [
+            d["name"] for d in api if d["name"] not in recs
+        ] if skip_api else []
+        partial_reject = (
+            bool(summary["rejected"]) and (
+                prog["reviewed"] < prog["total"] or bool(auto_candidates)
+            )
+        )
+        incomplete = prog["reviewed"] < prog["total"] or prog["total"] == 0
+        if incomplete and not partial_reject:
             return {
                 "ok": False,
                 "reason": "subdeck not complete — review every declaration first",
             }
-        summary = _summary(issue_id, reviewable)
         # Auto-approved API decls (skip_api: an API decl with no stored verdict)
         # fold into KEEP — the realization, at the ship only.
-        recs = _VERDICTS.get(issue_id, {})
-        auto_names = [
-            d["name"] for d in api if d["name"] not in recs
-        ] if skip_api else []
+        auto_names = [] if partial_reject else auto_candidates
         kept = list(summary["kept"]) + auto_names
         composed = {
             "kept": kept,
@@ -567,8 +579,21 @@ def demo_ship(issue_id: int, *, skip_api: bool = False) -> dict:
                 "instruction would go verbatim to Aristotle:\n\n"
                 + note + auto_clause + add_clause + informal_clause
             )
+            if partial_reject:
+                waiting = [
+                    d["name"] for d in main
+                    if (recs.get(d["name"]) or {}).get("verdict") not in _REVIEWED
+                ] + auto_candidates
+                message += (
+                    f"\n\nStopped at first rejection; "
+                    f"{len(waiting)} pending declaration(s) "
+                    "would remain untouched for the next round."
+                )
+            else:
+                waiting = []
         else:
             outcome = "verified"
+            waiting = []
             message = (
                 "DEMO — issue would be marked VERIFIED (no Aristotle). "
                 "All declarations approved." + auto_clause + add_clause
@@ -592,6 +617,8 @@ def demo_ship(issue_id: int, *, skip_api: bool = False) -> dict:
             "auto_approved": auto_names,
             "added_to_issue": added_to_issue,
             "informal_verified": informal_verified,
+            "partial": partial_reject,
+            "waiting": waiting,
             "advanced_to_issue": nxt,
         }
 
