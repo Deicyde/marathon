@@ -259,6 +259,60 @@ def test_surfacing_recovers_a_split_result(tmp_path, monkeypatch):
     assert card22.ready is True
 
 
+def test_queue_split_surfacing_uses_one_bulk_issue_fetch(tmp_path, monkeypatch):
+    """Stale cards must reuse the queue's context instead of refetching their
+    chapter once per reconciliation attempt.
+
+    This is the production HTTP-524 regression: an all-chapter queue with many
+    stale citations used to call ``surfaced_decls_for_issue`` from its card
+    loop, and that public helper deliberately builds a fresh context.  One
+    split citation is enough to pin the contract: queue assembly performs one
+    bulk read total while retaining the recovered tier.
+    """
+    cfg = _cfg_two_issues(tmp_path)
+    source_dir = cfg.repo_dir / "Demo" / "Chapter14"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "Split.lean").write_text(_SPLIT_SRC)
+    install_snapshot(cfg, make_snapshot([
+        _decl("Prop_14_5_preserving", module="Demo.Chapter14"),
+        _decl("Prop_14_5_reversing", module="Demo.Chapter14"),
+        _decl("Prop_14_5_unrelated_helper", module="Demo.Chapter14"),
+        _decl("SiblingResult", module="Demo.Chapter14"),
+    ], cfg.repo_dir))
+    metadata = {
+        22: {
+            "title": "Proposition 14.5 — diffeomorphism invariance",
+            "state": "OPEN", "labels": set(),
+            "body": _bundle_body("Prop_14_5"),
+        },
+        23: {
+            "title": "Ch14 sibling", "state": "OPEN", "labels": set(),
+            "body": _bundle_body("SiblingResult"),
+        },
+    }
+    calls = []
+
+    def fake_bulk(nums, repo):
+        calls.append((tuple(nums), repo))
+        return {n: metadata[n] for n in nums if n in metadata}
+
+    import marathon.review.github as gh_mod
+
+    monkeypatch.setattr(gh_mod, "fetch_issues_bulk", fake_bulk)
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_rest_bulk",
+        lambda nums, repo: (_ for _ in ()).throw(
+            AssertionError("complete bulk result must not use REST")
+        ),
+    )
+
+    card22 = next(c for c in cards.build_queue(cfg, chapter=14).cards if c.id == 22)
+
+    assert card22.tier == "T1"
+    assert card22.ready is True
+    assert calls == [((22, 23), REPO_SLUG)]
+
+
 def test_repo_scan_finds_decl_absent_from_snapshot(tmp_path):
     cfg = make_cfg(tmp_path)
     _write_source(cfg)

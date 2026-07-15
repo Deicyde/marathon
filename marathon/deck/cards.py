@@ -382,6 +382,16 @@ class _DeckContext:
     issue_chapter: dict = field(default_factory=dict)  # {issue_num: chapter}
 
 
+# A whole-deck GraphQL failure must not turn one HTTP request into one slow REST
+# request per registered issue.  The REST helper already runs eight workers with
+# a ten-second per-issue timeout; limiting the deck fallback to one worker-pool
+# wave keeps the degraded path bounded while still recovering every metadata gap
+# in the normal (small/partial-failure) case.  Numbers beyond the cap remain
+# absent from ``issue_meta`` and therefore render as explicit ``#<num>`` /
+# no-evidence placeholders rather than pretending stale metadata is current.
+_DECK_REST_METADATA_FALLBACK_LIMIT = 8
+
+
 def _load_context(
     cfg: "ReviewConfig", issue_nums: list[int]
 ) -> _DeckContext:
@@ -401,12 +411,17 @@ def _load_context(
     except Exception:  # noqa: BLE001 - read-side GitHub outage degrades honestly
         issue_meta = {}
     # Preserve the one-call GraphQL fast path. REST is live, uncached, and only
-    # fills numbers GraphQL did not return (including whole-call failure).
+    # fills numbers GraphQL did not return (including whole-call failure). Bound
+    # the degraded path: a 76-card queue must not wait through ten waves of REST
+    # timeouts after the GraphQL request already consumed its own timeout.
     missing = [n for n in requested if n not in issue_meta]
     if missing:
         try:
             issue_meta.update(
-                fetch_issues_rest_bulk(missing, cfg.github_repo)
+                fetch_issues_rest_bulk(
+                    missing[:_DECK_REST_METADATA_FALLBACK_LIMIT],
+                    cfg.github_repo,
+                )
             )
         except Exception:  # noqa: BLE001 - metadata is optional deck context
             pass
@@ -883,7 +898,7 @@ def _gating_deps(deps: "dict[int, list[int]]") -> "dict[int, list[int]]":
 
 
 def _surfaced_issue_tier(
-    cfg: "ReviewConfig", ctx: _DeckContext, num: int
+    cfg: "ReviewConfig", ctx: _DeckContext, ledger, num: int
 ) -> "tuple[Optional[str], Optional[str]]":
     """``(tier, headline_decl)`` from the SURFACED (rename/split-recovered) decls
     of an issue whose cited decls are all stale (``_issue_tier`` → '-'), or
@@ -891,10 +906,17 @@ def _surfaced_issue_tier(
     subdeck reviews — e.g. #236 cites a stale ``Prop_16_1`` but the split
     ``Prop_16_1_preserving``/``_reversing`` surface as T1, so the card should read
     T1/ready, not '-'. Best-effort; only invoked on a '-' card so the extra
-    surfacing pass is rare."""
+    surfacing pass is rare.
+
+    Queue assembly already loaded every issue in scope.  Reuse that context and
+    the queue's shared ledger here: routing through the public
+    :func:`surfaced_decls_for_issue` entry point would reload the audit snapshot
+    and refetch the chapter from GitHub once for *every* stale card."""
     from marathon.audit.trust import TIER_ORDER
     try:
-        surfaced = surfaced_decls_for_issue(cfg, num, _decls_for_issue(ctx, num))
+        surfaced = _surfaced_decls_from_context(
+            cfg, ctx, ledger, num, _decls_for_issue(ctx, num)
+        )
     except Exception:  # noqa: BLE001
         return None, None
     matched = [
@@ -920,6 +942,18 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
     with the reason, bodies/titles still present)."""
     issue_nums = _chapter_issue_nums(cfg, chapter)
     ctx = _load_context(cfg, issue_nums)
+    # Rename/split recovery needs current audit declarations to establish a
+    # trustworthy tier.  When snapshot validation withheld every declaration
+    # (for example, main moved since the last audit), scanning all stale cards
+    # cannot promote one and only burns local git/source work.  Otherwise open
+    # one shared ledger for the whole queue.  A broken ledger keeps the read
+    # side fail-soft and simply disables surfacing.
+    surface_ledger = None
+    if getattr(ctx.snapshot, "decls", None):
+        try:
+            surface_ledger = _ledger(cfg)
+        except Exception:  # noqa: BLE001 — no ledger means no surfaced tier
+            pass
 
     decl_to_issues = _decl_to_issues(ctx, issue_nums)
     deps: dict[int, list[int]] = {
@@ -932,11 +966,13 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
     cards: list[CardSummary] = []
     for num in ordered:
         tier, qualifiers, decl = _issue_tier(ctx, num)
-        if tier == "-":
+        if tier == "-" and surface_ledger is not None:
             # All cited decls stale/absent → reflect the reconciled (surfaced)
             # set the subdeck reviews, so a split/rename-recovered issue (#236)
             # surfaces in the queue instead of reading '-'/not-ready.
-            s_tier, s_decl = _surfaced_issue_tier(cfg, ctx, num)
+            s_tier, s_decl = _surfaced_issue_tier(
+                cfg, ctx, surface_ledger, num
+            )
             if s_tier is not None:
                 tier, decl = s_tier, s_decl
         ready, blocked_reason = _readiness(ctx, num, tier, gating[num])
@@ -1601,6 +1637,31 @@ def surfaced_decls_for_issue(
         chapter_nums = [issue_num, *chapter_nums]
     ctx = _load_context(cfg, chapter_nums)
     ledger = _ledger(cfg)
+
+    return _surfaced_decls_from_context(
+        cfg, ctx, ledger, issue_num, cited_names
+    )
+
+
+def _surfaced_decls_from_context(
+    cfg: "ReviewConfig",
+    ctx: _DeckContext,
+    ledger,
+    issue_num: int,
+    cited_names: list[str],
+) -> list[DeclView]:
+    """Context-reusing core for :func:`surfaced_decls_for_issue`.
+
+    Callers must supply a context containing the issue's complete registered
+    chapter.  The public subdeck path constructs that context above; the queue
+    path already has it because queues are built for complete chapters.  Keeping
+    this split prevents queue assembly from turning stale citations into an
+    N+1 audit/GitHub reload while preserving the public helper's behavior.
+    """
+    chapter = cfg.chapter_of_issue(issue_num)
+    chapter_nums = _chapter_issue_nums(cfg, chapter)
+    if issue_num not in chapter_nums:
+        chapter_nums = [issue_num, *chapter_nums]
 
     # Decls cited by OTHER chapter issues — never surface a sibling result's
     # declarations into this subdeck. Resolved to snapshot names for matching.

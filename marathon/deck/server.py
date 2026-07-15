@@ -57,7 +57,9 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Sequence
+from threading import Event, Lock
+from time import monotonic
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 from urllib.parse import parse_qs, urlsplit
 
 if TYPE_CHECKING:  # pragma: no cover — type-only
@@ -131,6 +133,23 @@ MAX_POST_BYTES = 256 * 1024
 MAX_INFORMAL_SOURCE_BYTES = 5 * 1024 * 1024
 INFORMAL_SOURCE_SUFFIXES = frozenset({".md", ".markdown", ".txt"})
 MAX_REVIEW_SOURCE_BYTES = 2 * 1024 * 1024
+
+# Queue assembly may include GitHub and source/audit reads.  Keep its result
+# briefly so a browser refresh (or several tabs opening together) does not
+# repeat the same work.  This is deliberately an in-process cache only; every
+# recognized POST invalidates it, and the short TTL bounds drift caused by
+# external GitHub changes.
+QUEUE_CACHE_TTL_SECONDS = 5.0
+
+
+class _QueueFlight:
+    """One queue build shared by concurrent readers of the same chapter."""
+
+    def __init__(self, generation: int):
+        self.generation = generation
+        self.event = Event()
+        self.payload: Optional[dict] = None
+        self.error: Optional[BaseException] = None
 
 
 def _repo_informal_source(repo_dir: Path, raw: str) -> Path:
@@ -243,7 +262,80 @@ class DeckServer(ThreadingHTTPServer):
         from marathon.deck.intake_jobs import IntakeRegistry
 
         self.intake = IntakeRegistry()
+        # ThreadingHTTPServer gives every request its own thread.  Coalesce
+        # expensive queue reads by chapter instead of letting those threads
+        # stampede GitHub and the local audit store.  Builders run outside this
+        # lock; only the tiny cache/flight registry is protected by it.
+        self._queue_lock = Lock()
+        self._queue_cache: dict[Optional[int], tuple[float, dict]] = {}
+        self._queue_flights: dict[Optional[int], _QueueFlight] = {}
+        self._queue_generation = 0
         super().__init__(server_address, DeckHandler)
+
+    def queue_payload(
+        self, chapter: Optional[int], build: Callable[[], dict]
+    ) -> dict:
+        """Return a fresh-enough queue payload, sharing one concurrent build.
+
+        A failed build is never cached, but its exception is delivered to all
+        readers that joined that flight.  Invalidation detaches old flights so
+        a GET that starts after a mutation can build fresh immediately.
+        """
+        with self._queue_lock:
+            cached = self._queue_cache.get(chapter)
+            now = monotonic()
+            if cached is not None and cached[0] > now:
+                return cached[1]
+            if cached is not None:
+                self._queue_cache.pop(chapter, None)
+
+            flight = self._queue_flights.get(chapter)
+            owner = flight is None
+            if owner:
+                flight = _QueueFlight(self._queue_generation)
+                self._queue_flights[chapter] = flight
+
+        assert flight is not None
+        if not owner:
+            flight.event.wait()
+            if flight.error is not None:
+                raise flight.error
+            assert flight.payload is not None
+            return flight.payload
+
+        try:
+            payload = build()
+        except BaseException as exc:
+            with self._queue_lock:
+                flight.error = exc
+                if self._queue_flights.get(chapter) is flight:
+                    self._queue_flights.pop(chapter, None)
+                flight.event.set()
+            raise
+
+        with self._queue_lock:
+            flight.payload = payload
+            # A POST may have invalidated this build while it was running.  Its
+            # original callers may still receive their pre-mutation snapshot,
+            # but it must not repopulate the cache for later requests.
+            if flight.generation == self._queue_generation:
+                self._queue_cache[chapter] = (
+                    monotonic() + QUEUE_CACHE_TTL_SECONDS,
+                    payload,
+                )
+            if self._queue_flights.get(chapter) is flight:
+                self._queue_flights.pop(chapter, None)
+            flight.event.set()
+        return payload
+
+    def invalidate_queue_cache(self) -> None:
+        """Make every subsequent queue GET observe a post-mutation build."""
+        with self._queue_lock:
+            self._queue_generation += 1
+            self._queue_cache.clear()
+            # Do not cancel old builders: detach them.  Their existing callers
+            # still complete, while new readers start a fresh generation.
+            self._queue_flights.clear()
 
 
 class DeckHandler(BaseHTTPRequestHandler):
@@ -414,8 +506,10 @@ class DeckHandler(BaseHTTPRequestHandler):
         from marathon.deck.cards import build_queue
 
         chapter = self._chapter_from_query(query)
-        queue = build_queue(self.cfg, chapter)
-        self._send_json(queue.to_json())
+        payload = self.server.queue_payload(  # type: ignore[attr-defined]
+            chapter, lambda: build_queue(self.cfg, chapter).to_json()
+        )
+        self._send_json(payload)
 
     def _api_card(self, raw_id: str) -> None:
         from marathon.deck.cards import build_card_detail
@@ -717,6 +811,12 @@ class DeckHandler(BaseHTTPRequestHandler):
                     self._api_ship()
         except BrokenPipeError:
             return
+        finally:
+            # Conservatively invalidate after every recognized POST, including
+            # validation failures.  This keeps successful mutations exact and
+            # avoids a response-status bookkeeping seam; an unnecessary miss
+            # costs at most one new, coalesced build.
+            self.server.invalidate_queue_cache()  # type: ignore[attr-defined]
 
     def _read_guarded_body(self) -> Optional[dict]:
         """Shared POST preamble for every side-effecting route: the

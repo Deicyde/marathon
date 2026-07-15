@@ -24,7 +24,8 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock, Thread
 
 import pytest
 
@@ -181,6 +182,72 @@ def test_load_context_rest_fallback_only_fetches_partial_graphql_gaps(
 
     assert rest_calls == [[23]]
     assert ctx.issue_meta == metadata
+
+
+def test_load_context_large_metadata_gap_caps_rest_fallback(
+    tmp_path, monkeypatch,
+):
+    """A whole GraphQL outage gets one bounded REST worker-pool wave."""
+    cfg = make_cfg(tmp_path)
+    import marathon.review.github as gh_mod
+
+    issue_nums = list(
+        range(100, 100 + cards._DECK_REST_METADATA_FALLBACK_LIMIT + 4)
+    )
+    recovered = _bodies_for({n: f"Decl{n}" for n in issue_nums})
+    rest_calls = []
+    monkeypatch.setattr(gh_mod, "fetch_issues_bulk", lambda nums, repo: None)
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_rest_bulk",
+        lambda nums, repo: (
+            rest_calls.append(list(nums))
+            or {n: recovered[n] for n in nums}
+        ),
+    )
+
+    ctx = cards._load_context(cfg, issue_nums)
+
+    expected = issue_nums[:cards._DECK_REST_METADATA_FALLBACK_LIMIT]
+    assert rest_calls == [expected]
+    assert set(ctx.issue_meta) == set(expected)
+
+
+def test_large_queue_graphql_failure_keeps_unfetched_placeholders(
+    tmp_path, monkeypatch,
+):
+    """The cap never drops registry cards or invents metadata for them."""
+    cfg = make_cfg(tmp_path)
+    import marathon.review.github as gh_mod
+
+    issue_nums = list(
+        range(100, 100 + cards._DECK_REST_METADATA_FALLBACK_LIMIT + 2)
+    )
+    cfg.chapters[14] = ChapterRegistry(
+        chapter=14,
+        entries=[(n, f"Result {n}") for n in issue_nums],
+    )
+    recovered = _bodies_for({n: f"Decl{n}" for n in issue_nums})
+    rest_calls = []
+    monkeypatch.setattr(gh_mod, "fetch_issues_bulk", lambda nums, repo: None)
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_rest_bulk",
+        lambda nums, repo: (
+            rest_calls.append(list(nums))
+            or {n: recovered[n] for n in nums}
+        ),
+    )
+
+    queue = cards.build_queue(cfg, chapter=14)
+
+    expected_fetched = issue_nums[:cards._DECK_REST_METADATA_FALLBACK_LIMIT]
+    assert rest_calls == [expected_fetched]
+    assert [card.id for card in queue.cards] == issue_nums
+    placeholders = queue.cards[cards._DECK_REST_METADATA_FALLBACK_LIMIT:]
+    assert [(card.title, card.decl, card.tier) for card in placeholders] == [
+        (f"#{n}", "", "-") for n in issue_nums[len(expected_fetched):]
+    ]
+    assert all(card.ready is False for card in placeholders)
+    assert all("no audit snapshot" in card.blocked_reason for card in placeholders)
 
 
 def test_load_context_rest_failure_is_fail_soft(tmp_path, monkeypatch):
@@ -487,6 +554,25 @@ def test_queue_degrades_without_snapshot(tmp_path, monkeypatch):
         assert c.title
 
 
+def test_queue_skips_surfacing_when_validated_snapshot_is_empty(
+    tmp_path, monkeypatch,
+):
+    """A stale/empty audit has no evidence with which to promote stale cards."""
+    cfg = make_cfg(tmp_path)
+    install_snapshot(cfg, make_snapshot([]))
+    patch_bulk(monkeypatch, _bodies_for({22: "Foo", 23: "Bar", 24: "Baz"}))
+    monkeypatch.setattr(
+        cards,
+        "_ledger",
+        lambda cfg: pytest.fail("empty audit must skip queue surfacing"),
+    )
+
+    queue = cards.build_queue(cfg, chapter=14)
+
+    assert {c.id for c in queue.cards} == {22, 23, 24}
+    assert all(c.tier == "-" and c.ready is False for c in queue.cards)
+
+
 def test_card_detail_reuses_spec_card(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path)
     snapshot = make_snapshot([
@@ -683,6 +769,78 @@ def test_unknown_verdict_refused(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_queue_payload_coalesces_concurrent_builds_and_caches(tmp_path):
+    """Several ThreadingHTTPServer readers share one expensive queue build."""
+    server = deck_server.make_server(make_cfg(tmp_path), port=0)
+    started = Event()
+    release = Event()
+    count_lock = Lock()
+    calls = 0
+
+    def build():
+        nonlocal calls
+        with count_lock:
+            calls += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return {"version": 1}
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [
+                pool.submit(server.queue_payload, 14, build) for _ in range(8)
+            ]
+            assert started.wait(timeout=2)
+            release.set()
+            assert [future.result(timeout=2) for future in futures] == [
+                {"version": 1}
+            ] * 8
+
+        # A sequential refresh inside the short TTL is also served without a
+        # second GitHub/audit build.
+        assert server.queue_payload(
+            14, lambda: pytest.fail("unexpired queue cache must be reused")
+        ) == {"version": 1}
+        assert calls == 1
+    finally:
+        release.set()
+        server.server_close()
+
+
+def test_queue_invalidation_detaches_an_old_inflight_build(tmp_path):
+    """A post-mutation GET never joins or caches a pre-mutation flight."""
+    server = deck_server.make_server(make_cfg(tmp_path), port=0)
+    old_started = Event()
+    release_old = Event()
+
+    def build_old():
+        old_started.set()
+        assert release_old.wait(timeout=5)
+        return {"version": "old"}
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            old = pool.submit(server.queue_payload, 14, build_old)
+            assert old_started.wait(timeout=2)
+            server.invalidate_queue_cache()
+
+            # This build starts immediately in the new generation; it does not
+            # wait for the stale flight that was already in progress.
+            assert server.queue_payload(
+                14, lambda: {"version": "new"}
+            ) == {"version": "new"}
+            release_old.set()
+            assert old.result(timeout=2) == {"version": "old"}
+
+        # Completing the detached old flight must not overwrite the new cache.
+        assert server.queue_payload(
+            14, lambda: pytest.fail("old flight repopulated the queue cache")
+        ) == {"version": "new"}
+    finally:
+        release_old.set()
+        server.server_close()
+
+
 @pytest.fixture
 def running_server(tmp_path, monkeypatch):
     """A DeckServer on an ephemeral 127.0.0.1 port, with the bulk fetch
@@ -767,6 +925,29 @@ def test_get_queue_is_pure_no_verdict(running_server, monkeypatch):
     status, sbody = _get(base + "/api/status")
     assert status == 200
     assert "jobs" in json.loads(sbody)
+
+
+def test_successful_post_invalidates_queue_cache(running_server, monkeypatch):
+    """A mutation cannot leave the server-side queue snapshot cached."""
+    server, base, token = running_server
+    server.queue_payload(14, lambda: {"version": 1})
+
+    from marathon import conductor
+
+    monkeypatch.setattr(conductor, "set_prover_enabled", lambda repo, enabled: None)
+    status, raw = _post(
+        base + "/api/prover-toggle",
+        {"enabled": True},
+        headers={deck_server.TOKEN_HEADER: token},
+    )
+    assert status == 200
+    assert json.loads(raw)["ok"] is True
+
+    builds = []
+    assert server.queue_payload(
+        14, lambda: builds.append(1) or {"version": 2}
+    ) == {"version": 2}
+    assert builds == [1]
 
 
 def test_definition_lookup_and_term_index_routes(running_server):
