@@ -119,6 +119,47 @@ STATE_LOCK_RELPATH = Path(".marathon/review/runner-locks/state.lock")
 # in git, which this file makes a one-line auto-appended diff instead.
 VERDICTS_RELPATH = Path(".marathon/review/verdicts.jsonl")
 
+# A parked rejection can be recovered in several materially different ways.
+# Keep the choice beside the verdict generation so the conductor can apply it
+# with the same compare-and-swap ownership guarantees as every other refine.
+RECOVERY_RETRY_BUILD = "retry_build"
+RECOVERY_CONTINUE_PR = "continue_pr"
+RECOVERY_UPDATE_CONTINUE = "update_continue"
+RECOVERY_START_OVER = "start_over"
+RECOVERY_MODES = frozenset({
+    RECOVERY_RETRY_BUILD,
+    RECOVERY_CONTINUE_PR,
+    RECOVERY_UPDATE_CONTINUE,
+    RECOVERY_START_OVER,
+})
+
+
+def _validate_recovery_request(
+    mode: Optional[str],
+    recovery_id: Optional[str],
+    pr: Optional[int],
+    branch: Optional[str],
+    head_sha: Optional[str],
+    base: Optional[str],
+) -> None:
+    if mode is None:
+        if recovery_id is not None:
+            raise ValueError("recovery_id requires recovery_mode")
+        return
+    if mode not in RECOVERY_MODES:
+        raise ValueError(f"unknown recovery mode {mode!r}")
+    if not recovery_id:
+        raise ValueError("recovery_id must be non-empty")
+    supplied = (pr is not None, bool(branch), bool(head_sha))
+    if mode != RECOVERY_START_OVER and not all(supplied):
+        raise ValueError(f"{mode} requires PR, branch, and head SHA")
+    if any(supplied) and not all(supplied):
+        raise ValueError("recovery PR snapshot must be complete")
+    if base and not all(supplied):
+        raise ValueError("recovery_base requires a complete PR snapshot")
+    if pr is not None and (isinstance(pr, bool) or pr <= 0):
+        raise ValueError("recovery_pr must be positive")
+
 
 class CorruptReviewStateError(RuntimeError):
     """A mutation refused to overwrite an unparseable review state file."""
@@ -154,6 +195,16 @@ class IssueState:
     # verdict changes/requeues and lets automerge reject stale/unowned PRs.
     iteration_branch: Optional[str] = None
     iteration_commit_sha: Optional[str] = None
+    # Explicit recovery intent for a parked rejection.  ``None`` is the normal
+    # first-dispatch path.  PR-preserving modes pin the exact remote head that
+    # the human saw; publication later uses it as a force-with-lease token.
+    recovery_mode: Optional[str] = None
+    recovery_id: Optional[str] = None
+    recovery_requested_ts: Optional[str] = None
+    recovery_pr: Optional[int] = None
+    recovery_branch: Optional[str] = None
+    recovery_head_sha: Optional[str] = None
+    recovery_base: Optional[str] = None
 
     def needs_iteration(self) -> bool:
         """A rejection needs iteration iff status=='rejected' and either
@@ -218,6 +269,41 @@ class ReviewState:
                     **(
                         {"iteration_commit_sha": st.iteration_commit_sha}
                         if st.iteration_commit_sha is not None
+                        else {}
+                    ),
+                    **(
+                        {"recovery_mode": st.recovery_mode}
+                        if st.recovery_mode is not None
+                        else {}
+                    ),
+                    **(
+                        {"recovery_id": st.recovery_id}
+                        if st.recovery_id is not None
+                        else {}
+                    ),
+                    **(
+                        {"recovery_requested_ts": st.recovery_requested_ts}
+                        if st.recovery_requested_ts is not None
+                        else {}
+                    ),
+                    **(
+                        {"recovery_pr": st.recovery_pr}
+                        if st.recovery_pr is not None
+                        else {}
+                    ),
+                    **(
+                        {"recovery_branch": st.recovery_branch}
+                        if st.recovery_branch is not None
+                        else {}
+                    ),
+                    **(
+                        {"recovery_head_sha": st.recovery_head_sha}
+                        if st.recovery_head_sha is not None
+                        else {}
+                    ),
+                    **(
+                        {"recovery_base": st.recovery_base}
+                        if st.recovery_base is not None
                         else {}
                     ),
                 }
@@ -308,6 +394,43 @@ def _load_state_unlocked(
                 iteration_commit_sha, str
             ):
                 raise ValueError("iteration_commit_sha is not a string")
+            recovery_mode = val.get("recovery_mode")
+            if recovery_mode is not None and recovery_mode not in RECOVERY_MODES:
+                raise ValueError(f"unknown recovery_mode {recovery_mode!r}")
+            recovery_id = val.get("recovery_id")
+            if recovery_id is not None and not isinstance(recovery_id, str):
+                raise ValueError("recovery_id is not a string")
+            recovery_requested_ts = val.get("recovery_requested_ts")
+            if recovery_requested_ts is not None and not isinstance(
+                recovery_requested_ts, str
+            ):
+                raise ValueError("recovery_requested_ts is not a string")
+            recovery_pr = val.get("recovery_pr")
+            if recovery_pr is not None:
+                recovery_pr = int(recovery_pr)
+                if recovery_pr <= 0:
+                    raise ValueError("recovery_pr is not positive")
+            recovery_branch = val.get("recovery_branch")
+            if recovery_branch is not None and not isinstance(recovery_branch, str):
+                raise ValueError("recovery_branch is not a string")
+            recovery_head_sha = val.get("recovery_head_sha")
+            if recovery_head_sha is not None and not isinstance(
+                recovery_head_sha, str
+            ):
+                raise ValueError("recovery_head_sha is not a string")
+            recovery_base = val.get("recovery_base")
+            if recovery_base is not None and (
+                not isinstance(recovery_base, str) or not recovery_base.strip()
+            ):
+                raise ValueError("recovery_base is not a non-empty string")
+            _validate_recovery_request(
+                recovery_mode,
+                recovery_id,
+                recovery_pr,
+                recovery_branch,
+                recovery_head_sha,
+                recovery_base,
+            )
             issues[issue_num] = IssueState(
                 status=status,
                 verdict_ts=verdict_ts,
@@ -319,6 +442,13 @@ def _load_state_unlocked(
                 pending_pr_branch=pending_branch,
                 iteration_branch=iteration_branch,
                 iteration_commit_sha=iteration_commit_sha,
+                recovery_mode=recovery_mode,
+                recovery_id=recovery_id,
+                recovery_requested_ts=recovery_requested_ts,
+                recovery_pr=recovery_pr,
+                recovery_branch=recovery_branch,
+                recovery_head_sha=recovery_head_sha,
+                recovery_base=recovery_base,
             )
         except (KeyError, TypeError, ValueError) as e:
             print(f"  warning: {path} issue {key!r} malformed ({e}); skipping")
@@ -622,8 +752,24 @@ def record_rejection_if_absent(
     cfg: ReviewConfig,
     issue_num: int,
     notes: str,
+    *,
+    recovery_mode: Optional[str] = None,
+    recovery_id: Optional[str] = None,
+    recovery_pr: Optional[int] = None,
+    recovery_branch: Optional[str] = None,
+    recovery_head_sha: Optional[str] = None,
+    recovery_base: Optional[str] = None,
 ) -> Optional[IssueState]:
     """Create a rejected verdict only if the issue still has no local row."""
+    _validate_recovery_request(
+        recovery_mode,
+        recovery_id,
+        recovery_pr,
+        recovery_branch,
+        recovery_head_sha,
+        recovery_base,
+    )
+
     def mutate(state: ReviewState) -> tuple[Optional[IssueState], bool]:
         if issue_num in state.issues:
             return None, False
@@ -636,6 +782,13 @@ def record_rejection_if_absent(
             pending_pr_branch=None,
             iteration_branch=None,
             iteration_commit_sha=None,
+            recovery_mode=recovery_mode,
+            recovery_id=recovery_id,
+            recovery_requested_ts=(_now_iso() if recovery_id else None),
+            recovery_pr=recovery_pr,
+            recovery_branch=recovery_branch,
+            recovery_head_sha=recovery_head_sha,
+            recovery_base=recovery_base,
         )
         state.issues[issue_num] = entry
         return entry, True
@@ -649,6 +802,68 @@ def record_rejection_if_absent(
         _ledger_upsert(cfg, issue_num, entry, verdict_event="rejected")
 
     return _update_state(cfg, mutate, after_save=mirror)
+
+
+def request_recovery_if_current(
+    cfg: ReviewConfig,
+    issue_num: int,
+    *,
+    expected_status: str,
+    expected_verdict_ts: str,
+    expected_recovery_id: Optional[str] = None,
+    recovery_id: str,
+    recovery_mode: str,
+    recovery_pr: Optional[int] = None,
+    recovery_branch: Optional[str] = None,
+    recovery_head_sha: Optional[str] = None,
+    recovery_base: Optional[str] = None,
+) -> Optional[IssueState]:
+    """Queue an operational recovery without fabricating a human verdict.
+
+    Unlike re-rejecting, this deliberately preserves ``verdict_ts``, the note,
+    and the last published iteration identity.  It only makes the parked row
+    dispatchable again and attaches an exact recovery operation.  Completion
+    callbacks match ``recovery_id`` as well as the verdict generation, so an
+    old worker can never consume a newer recovery request.
+    """
+    _validate_recovery_request(
+        recovery_mode,
+        recovery_id,
+        recovery_pr,
+        recovery_branch,
+        recovery_head_sha,
+        recovery_base,
+    )
+
+    def mutate(state: ReviewState) -> tuple[Optional[IssueState], bool]:
+        current = state.issues.get(issue_num)
+        if (
+            current is None
+            or current.status != expected_status
+            or current.verdict_ts != expected_verdict_ts
+            or current.recovery_id != expected_recovery_id
+        ):
+            return None, False
+        current.status = "rejected"
+        current.last_iteration_ts = None
+        current.attempts = 0
+        current.pending_pr_branch = None
+        current.recovery_mode = recovery_mode
+        current.recovery_id = recovery_id
+        current.recovery_requested_ts = _now_iso()
+        current.recovery_pr = recovery_pr
+        current.recovery_branch = recovery_branch
+        current.recovery_head_sha = recovery_head_sha
+        current.recovery_base = recovery_base
+        return current, True
+
+    return _update_state(
+        cfg,
+        mutate,
+        after_save=lambda entry: (
+            _ledger_upsert(cfg, issue_num, entry) if entry is not None else None
+        ),
+    )
 
 
 def record_verification(cfg: ReviewConfig, issue_num: int) -> IssueState:
@@ -693,26 +908,38 @@ def record_verification(cfg: ReviewConfig, issue_num: int) -> IssueState:
     return entry
 
 
+_EXPECTED_RECOVERY_ID_UNSET = object()
+
+
 def requeue_for_rereview(
     cfg: ReviewConfig,
     issue_num: int,
     *,
     expected_verdict_ts: Optional[str] = None,
     expected_status: str = "rejected",
+    expected_recovery_id: object = _EXPECTED_RECOVERY_ID_UNSET,
 ) -> bool:
     """Drop an issue's local verdict so it RE-ENTERS the review queue — used
     after Aristotle's refine fix LANDS and the human must RE-REVIEW the result
     (reject -> refine -> merge -> re-review). Removes the ``state.json`` entry
     (the deck's read-side truth); paired with the caller removing the
     ``review:rejected`` GitHub label, the issue reads as unreviewed and becomes a
-    ready card again. Returns True iff an entry was removed. Best-effort — no
-    ledger / GitHub / verdicts.jsonl write of its own."""
+    ready card again. ``expected_recovery_id`` is a generation CAS; passing
+    ``None`` explicitly requires that no newer operational recovery has been
+    queued, while omitting it preserves compatibility for non-worker callers.
+    Returns True iff an entry was removed. Best-effort — no ledger / GitHub /
+    verdicts.jsonl write of its own."""
     def mutate(state: ReviewState) -> tuple[bool, bool]:
         entry = state.issues.get(issue_num)
         if entry is None:
             return False, False
         if expected_verdict_ts is not None and (
             entry.status != expected_status or entry.verdict_ts != expected_verdict_ts
+        ):
+            return False, False
+        if (
+            expected_recovery_id is not _EXPECTED_RECOVERY_ID_UNSET
+            and entry.recovery_id != expected_recovery_id
         ):
             return False, False
         del state.issues[issue_num]
@@ -722,7 +949,9 @@ def requeue_for_rereview(
 
 
 def _completion_matches(
-    entry: Optional[IssueState], expected_verdict_ts: Optional[str]
+    entry: Optional[IssueState],
+    expected_verdict_ts: Optional[str],
+    expected_recovery_id: Optional[str] = None,
 ) -> bool:
     """CAS predicate for daemon/conductor completion bookkeeping."""
     return (
@@ -732,6 +961,7 @@ def _completion_matches(
             expected_verdict_ts is None
             or entry.verdict_ts == expected_verdict_ts
         )
+        and entry.recovery_id == expected_recovery_id
     )
 
 
@@ -740,6 +970,7 @@ def record_iteration(
     issue_num: int,
     *,
     expected_verdict_ts: Optional[str] = None,
+    expected_recovery_id: Optional[str] = None,
     pending_pr_branch: Optional[str] = None,
     iteration_branch: Optional[str] = None,
     iteration_commit_sha: Optional[str] = None,
@@ -759,7 +990,9 @@ def record_iteration(
     refine crashes and made the human the retry logic)."""
     def mutate(state: ReviewState) -> tuple[Optional[IssueState], bool]:
         entry = state.issues.get(issue_num)
-        if not _completion_matches(entry, expected_verdict_ts):
+        if not _completion_matches(
+            entry, expected_verdict_ts, expected_recovery_id
+        ):
             print(
                 f"  warning: stale record_iteration(#{issue_num}) completion "
                 "does not own the current rejected verdict; skipping"
@@ -783,6 +1016,13 @@ def record_iteration(
         entry.pending_pr_branch = pending_pr_branch
         entry.iteration_branch = iteration_branch or pending_pr_branch
         entry.iteration_commit_sha = iteration_commit_sha
+        entry.recovery_mode = None
+        entry.recovery_id = None
+        entry.recovery_requested_ts = None
+        entry.recovery_pr = None
+        entry.recovery_branch = None
+        entry.recovery_head_sha = None
+        entry.recovery_base = None
         return entry, True
 
     return _update_state(
@@ -799,6 +1039,7 @@ def record_failed_attempt(
     issue_num: int,
     *,
     expected_verdict_ts: Optional[str] = None,
+    expected_recovery_id: Optional[str] = None,
 ) -> Optional[IssueState]:
     """Increment the failed-dispatch counter for ``issue_num`` after a
     refine subprocess exited non-zero (and was NOT interrupted by a
@@ -814,7 +1055,9 @@ def record_failed_attempt(
     mid-iteration."""
     def mutate(state: ReviewState) -> tuple[Optional[IssueState], bool]:
         entry = state.issues.get(issue_num)
-        if not _completion_matches(entry, expected_verdict_ts):
+        if not _completion_matches(
+            entry, expected_verdict_ts, expected_recovery_id
+        ):
             print(
                 f"  warning: stale record_failed_attempt(#{issue_num}) "
                 "completion does not own the current rejected verdict; skipping"
@@ -838,6 +1081,7 @@ def record_stall(
     issue_num: int,
     *,
     expected_verdict_ts: Optional[str] = None,
+    expected_recovery_id: Optional[str] = None,
 ) -> Optional[IssueState]:
     """Flip ``issue_num`` to status="stalled" after the daemon exhausted
     its retry budget (``--max-attempts`` consecutive failed dispatches).
@@ -850,7 +1094,9 @@ def record_stall(
     (with a warning) if no entry exists."""
     def mutate(state: ReviewState) -> tuple[Optional[IssueState], bool]:
         entry = state.issues.get(issue_num)
-        if not _completion_matches(entry, expected_verdict_ts):
+        if not _completion_matches(
+            entry, expected_verdict_ts, expected_recovery_id
+        ):
             print(
                 f"  warning: stale record_stall(#{issue_num}) completion "
                 "does not own the current rejected verdict; skipping"

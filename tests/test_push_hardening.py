@@ -202,7 +202,10 @@ def test_no_pr_and_still_rejected_requeues(monkeypatch):
     requeued = _capture_requeue(monkeypatch)
     cond._requeue_if_no_pr_landed(cfg, _job())
     # re-queued, and CRUCIALLY landed=False so no false "fix landed" comment
-    assert requeued == [("marathon/refine-c12-i98", {"landed": False})]
+    assert requeued == [(
+        "marathon/refine-c12-i98",
+        {"landed": False, "expected_recovery_id": None},
+    )]
 
 
 def test_pr_exists_does_not_requeue(monkeypatch):
@@ -235,6 +238,79 @@ def test_no_pr_but_not_rejected_does_not_requeue(monkeypatch):
 
 # --- committed publication recovery ----------------------------------------
 
+def test_pipeline_writes_exact_publication_journal_before_network(
+    monkeypatch, tmp_path,
+):
+    """The WAL must exist before push starts and survive a successful PR."""
+    repo = tmp_path / "repo"
+    target = repo / "Demo" / "Chapter14"
+    target.mkdir(parents=True)
+    events: list[tuple[str, object]] = []
+    journal: list[dict] = []
+
+    monkeypatch.setattr(
+        pp,
+        "run_git_commit",
+        lambda *a, **k: pp.CommitResult(sha="c" * 40),
+    )
+    monkeypatch.setattr(
+        pp.subprocess,
+        "run",
+        lambda args, **kw: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    def persist(recipe):
+        journal.append(dict(recipe))
+        events.append(("journal", recipe["commit_sha"]))
+
+    def publish(**kwargs):
+        events.append(("network", kwargs["local_commit_sha"]))
+        assert journal and journal[-1]["commit_sha"] == kwargs["local_commit_sha"]
+        return True, "https://github.com/o/r/pull/9"
+
+    monkeypatch.setattr(pp, "open_or_update_pr", publish)
+    config = pp.PipelineConfig(
+        auto_commit=True,
+        auto_pr=True,
+        auto_pr_repo="o/r",
+        auto_pr_branch="marathon/refine-c14-i22",
+        auto_pr_base="main",
+        auto_pr_expected_remote_oid="a" * 40,
+        recovery_operation_id="operation-22",
+        publication_journal=persist,
+        gate="off",
+        enforce_frozen_statements=False,
+        update_formalization=False,
+    )
+
+    result = pp.run_post_pipeline(
+        config,
+        repo,
+        target,
+        "Chapter14",
+        1,
+        "project",
+    )
+
+    assert [name for name, _ in events] == ["journal", "network"]
+    assert journal == [{
+        "schema_version": pp.PUBLICATION_JOURNAL_SCHEMA_VERSION,
+        "operation_id": "operation-22",
+        "kind": "pr",
+        "commit_sha": "c" * 40,
+        "branch": "marathon/refine-c14-i22",
+        "base": "main",
+        "repo": "o/r",
+        "title": result["pending_publication"]["title"],
+        "body": result["pending_publication"]["body"],
+        "expected_remote_oid": "a" * 40,
+    }]
+    # Success does not clear the WAL inside the pipeline; refine clears it in
+    # the same atomic save that records the iteration complete.
+    assert result["pr_ok"] is True
+    assert result["pending_publication"] == journal[0]
+
+
 def test_pr_only_retry_skips_push_already_at_committed_head(monkeypatch):
     """If the push landed but PR creation failed, retry only the REST PR step;
     the stale pre-push lease does not cause a second push or another session."""
@@ -243,7 +319,7 @@ def test_pr_only_retry_skips_push_already_at_committed_head(monkeypatch):
     monkeypatch.setattr(
         pp,
         "observe_remote_branch",
-        lambda *a, **k: (True, "abc12345deadbeef", "observed"),
+        lambda *a, **k: (True, "a" * 40, "observed"),
     )
     monkeypatch.setattr(
         pp.subprocess,
@@ -262,7 +338,7 @@ def test_pr_only_retry_skips_push_already_at_committed_head(monkeypatch):
         repo_dir=Path("/repo"), branch="marathon/refine-c14-i22",
         base="main", repo="o/r", title="t", body="b",
         expected_remote_oid="old-pre-push-oid",
-        local_commit_sha="abc12345",
+        local_commit_sha="a" * 40,
     )
 
     assert ok
@@ -458,6 +534,7 @@ def test_legacy_suppressed_no_pr_row_is_requeued_by_sha_audit(
         assert kwargs == {
             "landed": False,
             "expected_verdict_ts": verdict.verdict_ts,
+            "expected_recovery_id": None,
         }
         assert requeue_for_rereview(
             cfg_, 22, expected_verdict_ts=verdict.verdict_ts

@@ -279,6 +279,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     p_refine.add_argument(
+        "--auto-pr-expected-remote-oid",
+        default=None,
+        metavar="SHA",
+        help=argparse.SUPPRESS,
+    )
+    p_refine.add_argument(
+        "--auto-pr-continue-remote",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    p_refine.add_argument(
+        "--recovery-operation-id",
+        default=None,
+        metavar="UUID",
+        help=argparse.SUPPRESS,
+    )
+    p_refine.add_argument(
         "--review-rejection-note-file",
         type=Path,
         default=None,

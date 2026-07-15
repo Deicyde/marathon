@@ -49,6 +49,7 @@ BINDING SAFETY:
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import secrets
@@ -665,6 +666,7 @@ class DeckHandler(BaseHTTPRequestHandler):
         "/api/reconcile-proposal",
         "/api/decl-lock", "/api/missing", "/api/ship",
         "/api/refresh-issue", "/api/drop-citation", "/api/requeue",
+        "/api/recovery",
         "/api/add-chapter", "/api/chapter-intake-status", "/api/approve-chapter",
         "/api/prover-toggle",
     )
@@ -701,6 +703,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                     self._api_drop_citation()
                 elif parsed.path == "/api/requeue":
                     self._api_requeue()
+                elif parsed.path == "/api/recovery":
+                    self._api_recovery()
                 elif parsed.path == "/api/add-chapter":
                     self._api_add_chapter()
                 elif parsed.path == "/api/chapter-intake-status":
@@ -1562,47 +1566,141 @@ class DeckHandler(BaseHTTPRequestHandler):
         self._send_json({"issues": stuck_issues(self.cfg),
                          "repo": self.cfg.github_repo})
 
-    def _api_requeue(self) -> None:
-        """One-click RE-QUEUE of a parked rejection (POST /api/requeue) — re-issues
-        the issue's STORED rejection note so the conductor retries it. Token-gated
-        like every POST. Routes through ``record_rejection`` (bumps verdict_ts,
-        resets last_iteration_ts/attempts → ``needs_iteration`` True, un-stalls)
-        then ensures a conductor is running. Quiet by design: it re-issues the
-        SAME note (no fresh GitHub comment — the review:rejected label is already
-        on a parked issue). Refuses anything not genuinely parked, or with no
-        stored note (a re-queue needs the note to re-issue)."""
+    def _api_recovery(self) -> None:
+        """Queue one explicit, PR-preserving recovery operation."""
         data = self._read_guarded_body()
         if data is None:
             return  # the guard already sent the 4xx (origin / body / token)
+        DeckHandler._queue_recovery(
+            self, data, require_snapshot_token=True
+        )
+
+    def _api_requeue(self) -> None:
+        """Deprecated safe alias for cached clients.
+
+        Old JavaScript only sends ``{issue}``.  Never interpret that ambiguous
+        request as destructive start-over: recompute the server recommendation
+        and queue that action.  New clients use ``/api/recovery`` and name the
+        action explicitly.
+        """
+        data = self._read_guarded_body()
+        if data is None:
+            return
+        DeckHandler._queue_recovery(
+            self, data, require_snapshot_token=False
+        )
+
+    def _queue_recovery(
+        self, data: dict, *, require_snapshot_token: bool
+    ) -> None:
         issue_raw = data.get("issue")
         try:
+            if isinstance(issue_raw, bool):
+                raise ValueError
             issue_num = int(issue_raw)
+            if issue_num <= 0:
+                raise ValueError
         except (TypeError, ValueError):
             return self._send_error_json(
                 HTTPStatus.BAD_REQUEST, f"bad or missing issue {issue_raw!r}"
             )
         if self._demo:
             return self._send_json(
-                {"ok": False, "requeued": False,
-                 "message": "re-queue is not available in demo mode"}
+                {"ok": False, "accepted": False, "requeued": False,
+                 "message": "recovery is not available in demo mode"}
             )
+        from marathon.deck.dashboard import stuck_issues
+
+        row = next(
+            (r for r in stuck_issues(self.cfg) if r.get("num") == issue_num),
+            None,
+        )
+        if row is None:
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                f"#{issue_num} is no longer parked; recovery options changed",
+            )
+        supplied_token = str(data.get("recovery_token") or "")
+        if require_snapshot_token and not hmac.compare_digest(
+            supplied_token, str(row.get("recovery_token") or "")
+        ):
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                f"#{issue_num} changed since the recovery dialog opened; refresh",
+            )
+        # The deprecated endpoint has no snapshot token and historically sent
+        # only ``{issue}``. Never honor a named action supplied to that route:
+        # recompute the current recommendation so a cached/stale caller cannot
+        # smuggle a destructive choice across a changed PR snapshot.
+        action = (
+            data.get("action")
+            if require_snapshot_token
+            else row.get("recommended_action")
+        )
+        if not require_snapshot_token and action is None:
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                f"#{issue_num}: no safe recovery action is currently available",
+            )
+        if not isinstance(action, str):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "recovery action must be a string"
+            )
+        action_spec = (row.get("actions") or {}).get(action)
+        if not action_spec or not action_spec.get("enabled"):
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                f"#{issue_num}: recovery action {action!r} is unavailable — "
+                f"{(action_spec or {}).get('reason', 'refresh recovery options')}",
+            )
+        # Start-over always requires an explicit destructive confirmation.
+        # Even when the current lookup confirms no open PR, unpublished local
+        # work may exist; cached legacy clients therefore cannot trigger it.
+        if (
+            action == "start_over"
+            and data.get("confirm_destructive") is not True
+        ):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                "start_over requires confirm_destructive=true",
+            )
+
         from marathon.review.state import (
             load_state,
             record_rejection_if_absent,
-            record_rejection_if_current,
+            request_recovery_if_current,
         )
 
         st = load_state(self.cfg).issues.get(issue_num)
+        rendered_orphan = bool(row.get("orphaned"))
+        if rendered_orphan != (st is None):
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                f"#{issue_num}: recovery state changed after the snapshot was "
+                "validated; refresh",
+            )
         if st is not None:
+            if (
+                st.status != row.get("status")
+                or st.verdict_ts != row.get("verdict_ts")
+                or st.recovery_id != row.get("recovery_id")
+                or st.recovery_mode != row.get("recovery_mode")
+                or st.attempts != row.get("attempts")
+            ):
+                return self._send_error_json(
+                    HTTPStatus.CONFLICT,
+                    f"#{issue_num}: recovery state changed after the snapshot "
+                    "was validated; refresh",
+                )
             # A LIVE entry (any status): it needs a usable stored note AND a
             # parked status. A live entry with no note — e.g. a locally VERIFIED
             # issue still carrying a stale review:rejected label — is NOT an
             # orphan; refuse rather than silently re-reject a settled verdict.
             # (Orphan is defined as `st is None`, symmetric with stuck_issues.)
-            if not (st.notes or "").strip():
+            if not (st.notes or "").strip() and action != "retry_build":
                 return self._send_error_json(
                     HTTPStatus.BAD_REQUEST,
-                    f"#{issue_num}: no stored rejection note to re-queue"
+                    f"#{issue_num}: no stored rejection note to recover"
                 )
             is_stuck = st.status == "stalled" or (
                 st.status == "rejected" and not st.needs_iteration())
@@ -1610,9 +1708,9 @@ class DeckHandler(BaseHTTPRequestHandler):
                 return self._send_error_json(
                     HTTPStatus.CONFLICT,
                     f"#{issue_num} is not parked (status {st.status}) — "
-                    "nothing to re-queue"
+                    "nothing to recover"
                 )
-            note = st.notes
+            note = st.notes or ""
         else:
             # ORPHANED rejection — NO local state entry at all, because the
             # git-tracked state.json was reverted (e.g. a hard reset) while the
@@ -1627,7 +1725,7 @@ class DeckHandler(BaseHTTPRequestHandler):
             if not rejected or issue_num not in rejected:
                 return self._send_error_json(
                     HTTPStatus.BAD_REQUEST,
-                    f"#{issue_num}: no stored rejection note to re-queue"
+                    f"#{issue_num}: no stored rejection note to recover"
                 )
             note, _ts = fetch_reject_note(issue_num, self.cfg.github_repo)
             if not (note or "").strip():
@@ -1650,20 +1748,36 @@ class DeckHandler(BaseHTTPRequestHandler):
             return self._send_error_json(
                 HTTPStatus.BAD_GATEWAY,
                 f"#{issue_num}: could not confirm rejected-only GitHub labels; "
-                "nothing was re-queued locally",
+                 "nothing was queued locally",
             )
+        operation_id = secrets.token_hex(16)
+        recovery_kwargs = {
+            "recovery_mode": action,
+            "recovery_pr": row.get("fix_pr"),
+            "recovery_branch": row.get("fix_pr_branch"),
+            "recovery_head_sha": row.get("fix_pr_head_sha"),
+            "recovery_base": (
+                (row.get("fix_pr_base") or "main")
+                if row.get("fix_pr")
+                else None
+            ),
+        }
         try:
             if st is None:
                 recorded = record_rejection_if_absent(
-                    self.cfg, issue_num, note
+                    self.cfg, issue_num, note,
+                    recovery_id=operation_id,
+                    **recovery_kwargs,
                 )
             else:
-                recorded = record_rejection_if_current(
+                recorded = request_recovery_if_current(
                     self.cfg,
                     issue_num,
-                    note,
-                    expected_status=st.status,
-                    expected_verdict_ts=st.verdict_ts,
+                    expected_status=str(row.get("status")),
+                    expected_verdict_ts=str(row.get("verdict_ts")),
+                    expected_recovery_id=row.get("recovery_id"),
+                    recovery_id=operation_id,
+                    **recovery_kwargs,
                 )
             if recorded is None:
                 # A concurrent verdict/state transition won. Restore the remote
@@ -1681,17 +1795,52 @@ class DeckHandler(BaseHTTPRequestHandler):
                 )
                 return self._send_error_json(
                     HTTPStatus.CONFLICT,
-                    f"#{issue_num}: verdict changed while re-queuing; "
+                    f"#{issue_num}: verdict changed while queuing recovery; "
                     f"the newer state was preserved ({detail})",
                 )
-            _ensure_conductor(self.cfg)
         except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
             return self._send_error_json(
-                HTTPStatus.INTERNAL_SERVER_ERROR, f"re-queue failed: {exc}"
+                HTTPStatus.INTERNAL_SERVER_ERROR, f"recovery failed: {exc}"
             )
+        launch_error = None
+        try:
+            _ensure_conductor(self.cfg)
+        except Exception as exc:  # noqa: BLE001 — intent is already durable
+            # The recovery operation was successfully committed to state. A
+            # host launch failure must not turn that success into a misleading
+            # 500 (or encourage a duplicate click); report it as durably queued
+            # for an external/manually restarted conductor instead.
+            launch_error = str(exc)
+        from marathon.deck.dashboard import conductor_status
+
+        online = bool(conductor_status(self.cfg).get("alive"))
+        waiting = not online
+        message = (
+            f"Recovery queued for #{issue_num}; waiting for an external conductor"
+            if waiting and (
+                os.environ.get("MARATHON_NO_HOST_CONDUCTOR") or launch_error
+            )
+            else f"Recovery queued for #{issue_num}; waiting for the conductor"
+            if waiting
+            else f"Recovery queued for #{issue_num}; conductor will dispatch it"
+        )
         self._send_json(
-            {"ok": True, "requeued": True, "issue": issue_num,
-             "message": f"#{issue_num} re-queued — the conductor will retry it"}
+            {
+                "ok": True,
+                "accepted": True,
+                # Backward-compatibility for cached clients that only inspect
+                # this boolean before refreshing their view.
+                "requeued": True,
+                "operation_id": operation_id,
+                "action": action,
+                "issue": issue_num,
+                "pr": row.get("fix_pr"),
+                "queue_state": "waiting_for_conductor" if waiting else "queued",
+                "conductor_online": online,
+                "conductor_launch_error": launch_error,
+                "message": message,
+            },
+            status=HTTPStatus.ACCEPTED,
         )
 
     def _api_prover_toggle(self) -> None:

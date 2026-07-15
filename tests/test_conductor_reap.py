@@ -5,7 +5,9 @@ reaping under a running refine destroys a billed Aristotle run, the
 2026-07-07 #171 incident)."""
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -37,6 +39,18 @@ def test_reap_orphan_worktree_removes_the_branch_holder(monkeypatch, tmp_path):
     def fake_git(repo_dir, *args):
         if args[:2] == ("worktree", "list"):
             return SimpleNamespace(returncode=0, stdout=list_out, stderr="")
+        if args[:2] == ("status", "--porcelain"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[:2] == ("rev-parse", "HEAD"):
+            return SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+        if args[:2] == ("ls-remote", "--heads"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "abc123\trefs/heads/marathon/refine-c12-i96\n"
+                ),
+                stderr="",
+            )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     removed = []
@@ -72,6 +86,18 @@ def _fake_git_with_holder(worktree_path):
     def fake_git(repo_dir, *args):
         if args[:2] == ("worktree", "list"):
             return SimpleNamespace(returncode=0, stdout=list_out, stderr="")
+        if args[:2] == ("status", "--porcelain"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[:2] == ("rev-parse", "HEAD"):
+            return SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+        if args[:2] == ("ls-remote", "--heads"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "abc123\trefs/heads/marathon/refine-c12-i96\n"
+                ),
+                stderr="",
+            )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     return fake_git
@@ -109,6 +135,54 @@ def test_reap_guard_reaps_when_marker_pid_dead(monkeypatch, tmp_path):
     assert removed == [str(wt)]
 
 
+@pytest.mark.parametrize(
+    ("status", "local_sha", "remote_sha", "reason"),
+    [
+        (" M Demo/Chapter12/Foo.lean\n", "abc123", "abc123", "uncommitted"),
+        ("", "local-ahead", "published", "ahead of or diverged"),
+    ],
+)
+def test_reap_preserves_unpublished_orphan_worktree(
+    monkeypatch, tmp_path, status, local_sha, remote_sha, reason, capsys
+):
+    wt = tmp_path / "wt-i96-unpublished"
+    branch = "marathon/refine-c12-i96"
+    list_out = (
+        f"worktree {wt}\n"
+        f"HEAD {local_sha}\n"
+        f"branch refs/heads/{branch}\n"
+    )
+
+    def fake_git(repo_dir, *args):
+        if args[:2] == ("worktree", "list"):
+            return SimpleNamespace(returncode=0, stdout=list_out, stderr="")
+        if args[:2] == ("status", "--porcelain"):
+            return SimpleNamespace(returncode=0, stdout=status, stderr="")
+        if args[:2] == ("rev-parse", "HEAD"):
+            return SimpleNamespace(
+                returncode=0, stdout=f"{local_sha}\n", stderr=""
+            )
+        if args[:2] == ("ls-remote", "--heads"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{remote_sha}\trefs/heads/{branch}\n",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(conductor, "_git", fake_git)
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda *a: (_ for _ in ()).throw(
+            AssertionError("unpublished recovery worktree must be preserved")
+        ),
+    )
+
+    assert conductor._reap_orphan_worktree(tmp_path, branch) is False
+    assert reason in capsys.readouterr().out
+
+
 def test_reap_guard_refuses_inherited_running_row(monkeypatch, tmp_path):
     # No marker (job dispatched by a pre-marker conductor), but the startup
     # inherit captured its running row → still protected.
@@ -133,6 +207,29 @@ def _job(**kw):
                branch="marathon/refine-c15-i7", pid=1, status="running")
     base.update(kw)
     return conductor.ConductorJob(**base)
+
+
+def _write_update_marker(
+    job, *, phase: str, current_head: str, base_sha: str | None = None
+):
+    marker = {
+        "schema_version": conductor.UPDATE_RECOVERY_SCHEMA_VERSION,
+        "phase": phase,
+        "operation_id": job.expected_recovery_id,
+        "github_repo": "owner/repo",
+        "pr": job.recovery_pr,
+        "branch": job.branch,
+        "original_expected_head": job.recovery_head_sha,
+        "base_branch": job.recovery_base or "main",
+        "base_sha": base_sha or "c" * 40,
+        "current_local_head": current_head,
+        "target_path": str((Path(job.worktree) / job.target).resolve()),
+        "had_conflicts": phase
+        == conductor.UPDATE_RECOVERY_PHASE_FALLBACK_PREPARED,
+    }
+    path = Path(job.workdir) / conductor.UPDATE_RECOVERY_MARKER_FILENAME
+    path.write_text(json.dumps(marker) + "\n")
+    return marker
 
 
 def test_adopt_inherited_jobs_filters_by_status_and_liveness(monkeypatch, tmp_path):
@@ -352,6 +449,683 @@ def test_reap_adopted_job_with_pr_marks_iterated(monkeypatch, tmp_path):
     assert job.status == "succeeded"
     assert calls["iterated"] == [42]
     assert calls["removed"] == [str(tmp_path / "wt-i42")]
+
+
+def test_adopted_recovery_build_status_uses_exact_sha_and_latest_own_context(
+    monkeypatch
+):
+    import json
+
+    from marathon.review import github as github_mod
+    from marathon.review.automerge import TRUSTED_BUILD_CONTEXT
+
+    sha = "a" * 40
+
+    def fake_gh(*args, check=True, timeout=None):
+        assert args == ("api", f"repos/example/repo/commits/{sha}/statuses")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "id": 1,
+                        "context": TRUSTED_BUILD_CONTEXT,
+                        "state": "success",
+                        "created_at": "2026-07-14T10:00:00Z",
+                    },
+                    {
+                        "id": 99,
+                        "context": "unrelated/green",
+                        "state": "success",
+                        "created_at": "2026-07-14T12:00:00Z",
+                    },
+                    {
+                        "id": 2,
+                        "context": TRUSTED_BUILD_CONTEXT,
+                        "state": "failure",
+                        "created_at": "2026-07-14T11:00:00Z",
+                    },
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_mod, "gh", fake_gh)
+
+    assert conductor._adopted_recovery_build_status(
+        SimpleNamespace(github_repo="example/repo"), sha
+    ) == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "recovery_mode",
+    [
+        conductor.RECOVERY_RETRY_BUILD,
+        conductor.RECOVERY_UPDATE_CONTINUE,
+    ],
+)
+def test_adopted_recovery_does_not_treat_preexisting_pr_as_completion(
+    monkeypatch, tmp_path, recovery_mode
+):
+    """After restart, the old PR proves neither worker actually succeeded."""
+    worktree = tmp_path / "wt-i42-recovery"
+    workdir = tmp_path / "wd-i42-recovery"
+    worktree.mkdir()
+    workdir.mkdir()
+    job = _job(
+        issue_num=42,
+        branch="marathon/refine-c15-i42",
+        worktree=str(worktree),
+        workdir=str(workdir),
+        recovery_mode=recovery_mode,
+        expected_recovery_id="recovery-42-current",
+        recovery_pr=277,
+        recovery_head_sha="a" * 40,
+        recovery_base="main",
+    )
+    monkeypatch.setattr(conductor, "_job_head_sha", lambda job: "a" * 40)
+    monkeypatch.setattr(
+        conductor,
+        "_adopted_recovery_build_status",
+        lambda cfg, sha: None,
+        raising=False,
+    )
+    # This PR predates the recovery operation and therefore is deliberately
+    # not recovery-completion evidence.
+    monkeypatch.setattr(conductor, "_branch_pr_exists", lambda *a, **k: True)
+    iterated = []
+    monkeypatch.setattr(
+        conductor,
+        "record_iteration",
+        lambda *a, **k: iterated.append((a, k)),
+    )
+    removed = []
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda repo, path: removed.append(path),
+    )
+
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+
+    assert job.status == "failed"
+    assert iterated == []
+    assert removed == []
+    assert kept == {42: str(worktree)}
+
+
+def test_adopted_retry_build_green_status_and_exact_pr_complete(
+    monkeypatch, tmp_path
+):
+    worktree = tmp_path / "wt-i42-build-green"
+    workdir = tmp_path / "wd-i42-build-green"
+    worktree.mkdir()
+    workdir.mkdir()
+    head = "a" * 40
+    job = _job(
+        issue_num=42,
+        branch="marathon/refine-c15-i42",
+        worktree=str(worktree),
+        workdir=str(workdir),
+        recovery_mode=conductor.RECOVERY_RETRY_BUILD,
+        expected_recovery_id="recovery-42-current",
+        recovery_pr=277,
+        recovery_head_sha=head,
+        recovery_base="main",
+    )
+    monkeypatch.setattr(conductor, "_job_head_sha", lambda job: head)
+    queried = []
+    monkeypatch.setattr(
+        conductor,
+        "_adopted_recovery_build_status",
+        lambda cfg, sha: queried.append(sha) or "OK",
+        raising=False,
+    )
+    pr_queries = []
+    monkeypatch.setattr(
+        conductor,
+        "_branch_pr_exists",
+        lambda cfg, branch, expected: pr_queries.append(
+            (branch, expected)
+        ) or True,
+    )
+    iterated = []
+    monkeypatch.setattr(
+        conductor,
+        "record_iteration",
+        lambda cfg, issue, **kwargs: iterated.append((issue, kwargs)),
+    )
+    removed = []
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda repo, path: removed.append(path),
+    )
+    monkeypatch.setattr(
+        conductor, "_regenerate_metadata_after_success", lambda cfg: None
+    )
+
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+
+    assert queried == [head]
+    assert pr_queries == [("marathon/refine-c15-i42", head)]
+    assert job.status == "succeeded"
+    assert iterated[0][0] == 42
+    assert iterated[0][1]["expected_recovery_id"] == "recovery-42-current"
+    assert iterated[0][1]["iteration_branch"] == "marathon/refine-c15-i42"
+    assert iterated[0][1]["iteration_commit_sha"] == head
+    assert removed == [worktree]
+    assert kept == {}
+
+
+def test_adopted_retry_build_red_status_stalls_and_cleans_detached_tree(
+    monkeypatch, tmp_path
+):
+    worktree = tmp_path / "wt-i42-build-red"
+    workdir = tmp_path / "wd-i42-build-red"
+    worktree.mkdir()
+    workdir.mkdir()
+    head = "a" * 40
+    job = _job(
+        issue_num=42,
+        branch="marathon/refine-c15-i42",
+        worktree=str(worktree),
+        workdir=str(workdir),
+        recovery_mode=conductor.RECOVERY_RETRY_BUILD,
+        expected_recovery_id="recovery-42-current",
+        recovery_pr=277,
+        recovery_head_sha=head,
+        recovery_base="main",
+    )
+    monkeypatch.setattr(conductor, "_job_head_sha", lambda job: head)
+    monkeypatch.setattr(
+        conductor,
+        "_adopted_recovery_build_status",
+        lambda cfg, sha: "FAIL",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        conductor,
+        "_branch_pr_exists",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("red build evidence needs no pre-existing PR probe")
+        ),
+    )
+    stalls = []
+    monkeypatch.setattr(
+        conductor,
+        "record_stall",
+        lambda cfg, issue, **kwargs: stalls.append((issue, kwargs))
+        or SimpleNamespace(status="stalled"),
+    )
+    monkeypatch.setattr(
+        conductor,
+        "record_iteration",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("red recovery must not be marked iterated")
+        ),
+    )
+    removed = []
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda repo, path: removed.append(path),
+    )
+
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+
+    assert job.status == "stalled"
+    assert stalls[0][0] == 42
+    assert stalls[0][1]["expected_recovery_id"] == "recovery-42-current"
+    assert stalls[0][1].get("expected_verdict_ts") is None
+    assert removed == [worktree]
+    assert kept == {}
+
+
+@pytest.mark.parametrize("status", ["PENDING", None])
+def test_adopted_retry_build_ambiguous_status_preserves_for_recovery(
+    monkeypatch, tmp_path, status
+):
+    worktree = tmp_path / "wt-i42-build-ambiguous"
+    workdir = tmp_path / "wd-i42-build-ambiguous"
+    worktree.mkdir()
+    workdir.mkdir()
+    head = "a" * 40
+    job = _job(
+        issue_num=42,
+        branch="marathon/refine-c15-i42",
+        worktree=str(worktree),
+        workdir=str(workdir),
+        recovery_mode=conductor.RECOVERY_RETRY_BUILD,
+        expected_recovery_id="recovery-42-current",
+        recovery_pr=277,
+        recovery_head_sha=head,
+        recovery_base="main",
+    )
+    monkeypatch.setattr(conductor, "_job_head_sha", lambda job: head)
+    monkeypatch.setattr(
+        conductor,
+        "_adopted_recovery_build_status",
+        lambda cfg, sha: status,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        conductor,
+        "_branch_pr_exists",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("ambiguous status must fail closed before PR probe")
+        ),
+    )
+    monkeypatch.setattr(
+        conductor,
+        "record_iteration",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("ambiguous recovery must not be marked iterated")
+        ),
+    )
+    removed = []
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda repo, path: removed.append(path),
+    )
+
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+
+    assert job.status == "failed"
+    assert removed == []
+    assert kept == {42: str(worktree)}
+
+
+def test_adopted_update_fast_path_needs_green_current_head_and_exact_pr(
+    monkeypatch, tmp_path
+):
+    worktree = tmp_path / "wt-i42-update-green"
+    workdir = tmp_path / "wd-i42-update-green"
+    worktree.mkdir()
+    workdir.mkdir()
+    original = "a" * 40
+    updated = "b" * 40
+    job = _job(
+        issue_num=42,
+        branch="marathon/refine-c15-i42",
+        worktree=str(worktree),
+        workdir=str(workdir),
+        recovery_mode=conductor.RECOVERY_UPDATE_CONTINUE,
+        expected_recovery_id="recovery-42-current",
+        recovery_pr=277,
+        recovery_head_sha=original,
+        recovery_base="main",
+    )
+    _write_update_marker(
+        job,
+        phase=conductor.UPDATE_RECOVERY_PHASE_PUBLISHED,
+        current_head=updated,
+    )
+    monkeypatch.setattr(conductor, "_job_head_sha", lambda job: updated)
+    queried = []
+    monkeypatch.setattr(
+        conductor,
+        "_adopted_recovery_build_status",
+        lambda cfg, sha: queried.append(sha) or "OK",
+        raising=False,
+    )
+    pr_queries = []
+    monkeypatch.setattr(
+        conductor,
+        "_branch_pr_exists",
+        lambda cfg, branch, expected: pr_queries.append(
+            (branch, expected)
+        ) or True,
+    )
+    iterated = []
+    monkeypatch.setattr(
+        conductor,
+        "record_iteration",
+        lambda cfg, issue, **kwargs: iterated.append((issue, kwargs)),
+    )
+    removed = []
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda repo, path: removed.append(path),
+    )
+    monkeypatch.setattr(
+        conductor, "_regenerate_metadata_after_success", lambda cfg: None
+    )
+
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+
+    assert queried == [updated]
+    assert pr_queries == [("marathon/refine-c15-i42", updated)]
+    assert job.status == "succeeded"
+    assert iterated[0][1]["expected_recovery_id"] == "recovery-42-current"
+    assert iterated[0][1]["iteration_commit_sha"] == updated
+    assert removed == [worktree]
+    assert kept == {}
+
+
+def test_adopted_update_starting_ignores_old_green_original_head(
+    monkeypatch, tmp_path
+):
+    """A crash before merging cannot inherit an earlier retry-build success."""
+    worktree = tmp_path / "wt-i42-update-starting"
+    workdir = tmp_path / "wd-i42-update-starting"
+    worktree.mkdir()
+    workdir.mkdir()
+    original = "a" * 40
+    job = _job(
+        issue_num=42,
+        branch="marathon/refine-c15-i42",
+        worktree=str(worktree),
+        workdir=str(workdir),
+        recovery_mode=conductor.RECOVERY_UPDATE_CONTINUE,
+        expected_recovery_id="recovery-42-current",
+        recovery_pr=277,
+        recovery_head_sha=original,
+        recovery_base="main",
+    )
+    _write_update_marker(job, phase="starting", current_head=original)
+    monkeypatch.setattr(conductor, "_job_head_sha", lambda job: original)
+    monkeypatch.setattr(
+        conductor,
+        "_adopted_recovery_build_status",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("starting phase must ignore an old green status")
+        ),
+    )
+    monkeypatch.setattr(
+        conductor,
+        "_branch_pr_exists",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("starting phase must resume before PR probing")
+        ),
+    )
+    monkeypatch.setattr(
+        conductor,
+        "record_iteration",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("starting phase is not a completed recovery")
+        ),
+    )
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("starting phase worktree must be preserved")
+        ),
+    )
+
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+
+    assert job.status == "failed"
+    assert kept == {42: str(worktree)}
+
+
+@pytest.mark.parametrize(
+    ("recovery_mode", "local_head"),
+    [
+        (conductor.RECOVERY_RETRY_BUILD, "a" * 40),
+        (conductor.RECOVERY_UPDATE_CONTINUE, "b" * 40),
+    ],
+)
+def test_adopted_green_recovery_without_exact_head_pr_still_preserves(
+    monkeypatch, tmp_path, recovery_mode, local_head
+):
+    worktree = tmp_path / "wt-i42-green-no-pr"
+    workdir = tmp_path / "wd-i42-green-no-pr"
+    worktree.mkdir()
+    workdir.mkdir()
+    job = _job(
+        issue_num=42,
+        branch="marathon/refine-c15-i42",
+        worktree=str(worktree),
+        workdir=str(workdir),
+        recovery_mode=recovery_mode,
+        expected_recovery_id="recovery-42-current",
+        recovery_pr=277,
+        recovery_head_sha="a" * 40,
+        recovery_base="main",
+    )
+    monkeypatch.setattr(conductor, "_job_head_sha", lambda job: local_head)
+    monkeypatch.setattr(
+        conductor,
+        "_adopted_recovery_build_status",
+        lambda cfg, sha: "OK",
+    )
+    monkeypatch.setattr(conductor, "_branch_pr_exists", lambda *a, **k: False)
+    monkeypatch.setattr(
+        conductor,
+        "record_iteration",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("green status alone cannot prove PR publication")
+        ),
+    )
+    removed = []
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda repo, path: removed.append(path),
+    )
+
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+
+    assert job.status == "failed"
+    assert removed == []
+    assert kept == {42: str(worktree)}
+
+
+@pytest.mark.parametrize("status", ["FAIL", "PENDING", None])
+def test_adopted_update_fast_path_without_green_evidence_preserves(
+    monkeypatch, tmp_path, status
+):
+    worktree = tmp_path / "wt-i42-update-ambiguous"
+    workdir = tmp_path / "wd-i42-update-ambiguous"
+    worktree.mkdir()
+    workdir.mkdir()
+    original = "a" * 40
+    updated = "b" * 40
+    job = _job(
+        issue_num=42,
+        branch="marathon/refine-c15-i42",
+        worktree=str(worktree),
+        workdir=str(workdir),
+        recovery_mode=conductor.RECOVERY_UPDATE_CONTINUE,
+        expected_recovery_id="recovery-42-current",
+        recovery_pr=277,
+        recovery_head_sha=original,
+        recovery_base="main",
+    )
+    _write_update_marker(
+        job,
+        phase=conductor.UPDATE_RECOVERY_PHASE_PUBLISHED,
+        current_head=updated,
+    )
+    monkeypatch.setattr(conductor, "_job_head_sha", lambda job: updated)
+    monkeypatch.setattr(
+        conductor,
+        "_adopted_recovery_build_status",
+        lambda cfg, sha: status,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        conductor,
+        "_branch_pr_exists",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("non-green update must fail closed before PR probe")
+        ),
+    )
+    monkeypatch.setattr(
+        conductor,
+        "record_iteration",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("non-green update must not be marked iterated")
+        ),
+    )
+    removed = []
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda repo, path: removed.append(path),
+    )
+
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+
+    assert job.status == "failed"
+    assert removed == []
+    assert kept == {42: str(worktree)}
+
+
+def test_adopted_update_marker_preserves_prepared_fallback_before_pr_probe(
+    monkeypatch, tmp_path
+):
+    """A durable update fallback checkpoint is evidence to resume, not finish."""
+    wt = tmp_path / "wt-i42-update"
+    wd = tmp_path / "wd-i42-update"
+    wt.mkdir()
+    wd.mkdir()
+    save_refine_state(
+        wd / REFINE_STATE_FILENAME,
+        RefineState(
+            target_folder="Demo/Chapter15",
+            preserve_local_branch=True,
+            continuation_commit_sha="b" * 40,
+        ),
+    )
+    job = _job(
+        issue_num=42,
+        worktree=str(wt),
+        workdir=str(wd),
+        recovery_mode=conductor.RECOVERY_UPDATE_CONTINUE,
+        expected_recovery_id="recovery-42-current",
+        recovery_pr=277,
+        recovery_head_sha="a" * 40,
+        recovery_base="main",
+    )
+    _write_update_marker(
+        job,
+        phase=conductor.UPDATE_RECOVERY_PHASE_FALLBACK_PREPARED,
+        current_head="b" * 40,
+    )
+    monkeypatch.setattr(
+        conductor,
+        "_branch_pr_exists",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("prepared fallback must be resumed before PR probing")
+        ),
+    )
+    monkeypatch.setattr(
+        conductor,
+        "record_iteration",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("prepared fallback is not a completed recovery")
+        ),
+    )
+
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+
+    assert job.status == "failed"
+    assert kept == {42: str(wt)}
+
+
+def test_adopted_completed_update_fallback_uses_checkpoint_and_exact_pr(
+    monkeypatch, tmp_path
+):
+    wt = tmp_path / "wt-i42-update-complete"
+    wd = tmp_path / "wd-i42-update-complete"
+    wt.mkdir()
+    wd.mkdir()
+    updated = "b" * 40
+    save_refine_state(
+        wd / REFINE_STATE_FILENAME,
+        RefineState(
+            target_folder="Demo/Chapter15",
+            current_iteration_idx=1,
+            iterations_completed=1,
+            status="COMPLETE",
+        ),
+    )
+    job = _job(
+        issue_num=42,
+        branch="marathon/refine-c15-i42",
+        worktree=str(wt),
+        workdir=str(wd),
+        recovery_mode=conductor.RECOVERY_UPDATE_CONTINUE,
+        expected_recovery_id="recovery-42-current",
+        recovery_pr=277,
+        recovery_head_sha="a" * 40,
+        recovery_base="main",
+    )
+    _write_update_marker(
+        job,
+        phase=conductor.UPDATE_RECOVERY_PHASE_FALLBACK_PREPARED,
+        current_head=updated,
+    )
+    monkeypatch.setattr(conductor, "_job_head_sha", lambda job: updated)
+    monkeypatch.setattr(
+        conductor,
+        "_adopted_recovery_build_status",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("completed fallback uses its refine checkpoint")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        conductor, "_branch_pr_exists", lambda cfg, branch, head: head == updated
+    )
+    iterated = []
+    monkeypatch.setattr(
+        conductor,
+        "record_iteration",
+        lambda cfg, issue, **kwargs: iterated.append((issue, kwargs)),
+    )
+    removed = []
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda repo, path: removed.append(path),
+    )
+    monkeypatch.setattr(
+        conductor, "_regenerate_metadata_after_success", lambda cfg: None
+    )
+
+    kept = {}
+    conductor._reap_adopted_job(
+        SimpleNamespace(repo_dir=tmp_path), job, kept, reconcile=True
+    )
+
+    assert job.status == "succeeded"
+    assert iterated[0][1]["expected_recovery_id"] == "recovery-42-current"
+    assert iterated[0][1]["iteration_commit_sha"] == updated
+    assert removed == [wt]
+    assert kept == {}
 
 
 def test_reap_adopted_job_without_pr_requeues(monkeypatch, tmp_path):
@@ -608,10 +1382,67 @@ def test_prune_skips_live_worktree(monkeypatch, tmp_path):
     def fake_git(repo, *args):
         if args[:2] == ("worktree", "remove"):
             removed.append(args[-1])
-        from types import SimpleNamespace
+        if args[:2] == ("branch", "--show-current"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout="marathon/refine-c12-i99\n",
+                stderr="",
+            )
+        if args[:2] == ("status", "--porcelain"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[:2] == ("rev-parse", "HEAD"):
+            return SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+        if args[:2] == ("ls-remote", "--heads"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout="abc123\trefs/heads/marathon/refine-c12-i99\n",
+                stderr="",
+            )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(conductor, "_git", fake_git)
     conductor.prune_worktrees(tmp_path, runs)
     assert str(dead) in removed
     assert str(live) not in removed          # protected
+
+
+@pytest.mark.parametrize(
+    ("status", "local_sha", "remote_sha"),
+    [
+        ("?? scratch.lean\n", "abc123", "abc123"),
+        ("", "local-ahead", "published"),
+    ],
+)
+def test_prune_preserves_dirty_and_locally_ahead_worktrees(
+    monkeypatch, tmp_path, status, local_sha, remote_sha
+):
+    runs = tmp_path / "runs"
+    worktree = runs / "wt-i171-recovery"
+    worktree.mkdir(parents=True)
+    branch = "marathon/refine-c15-i171"
+    removed = []
+
+    def fake_git(repo, *args):
+        if args[:2] == ("branch", "--show-current"):
+            return SimpleNamespace(returncode=0, stdout=f"{branch}\n", stderr="")
+        if args[:2] == ("status", "--porcelain"):
+            return SimpleNamespace(returncode=0, stdout=status, stderr="")
+        if args[:2] == ("rev-parse", "HEAD"):
+            return SimpleNamespace(
+                returncode=0, stdout=f"{local_sha}\n", stderr=""
+            )
+        if args[:2] == ("ls-remote", "--heads"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{remote_sha}\trefs/heads/{branch}\n",
+                stderr="",
+            )
+        if args[:2] == ("worktree", "remove"):
+            removed.append(args[-1])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(conductor, "_git", fake_git)
+
+    conductor.prune_worktrees(tmp_path, runs)
+
+    assert removed == []

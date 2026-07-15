@@ -267,7 +267,7 @@ def _notify_stall(
     failure_detail: Optional[str] = None,
 ) -> None:
     """Post a one-time comment on the GitHub issue telling the human the
-    rejection stalled and how to re-queue it.
+    rejection stalled and how to recover it.
 
     Posted exactly once per stall: ``record_stall`` drops the entry from
     the dispatch queue, so the daemon never reaches this path again for
@@ -290,11 +290,13 @@ def _notify_stall(
         f"**Auto-refine stalled.** The review daemon failed to dispatch a "
         f"refine iteration for this rejection {attempts} times in a row and "
         f"has stopped retrying it.{detail}\n\n"
-        f"To re-queue it: open the deck — a stalled issue surfaces on the "
-        f"**⚠ needs attention** card in the review queue with a one-click "
-        f"**Re-queue** (also in the Issues tab's Stalled section). CLI "
-        f"fallback: re-rejecting (`marathon review reject {issue_num} ...`) "
-        f"resets the attempt counter and re-queues it."
+        f"To recover it, open the deck. The issue appears on the "
+        f"**⚠ needs attention** card and in the Issues tab's Parked section. "
+        f"Choose **Recover…** to retry only the build, continue the existing "
+        f"PR, or update it from main without throwing away its diff. "
+        f"**Archive & start over** is the explicit destructive fallback. "
+        f"Recover replaces the old **Re-queue** / re-reject workaround; do not "
+        f"submit a duplicate review verdict."
     )
     cmd = [
         "gh", "issue", "comment", str(issue_num),
@@ -325,6 +327,7 @@ def _handle_refine_exit(
     interrupted: bool,
     failure_detail: Optional[str] = None,
     expected_verdict_ts: Optional[str] = None,
+    expected_recovery_id: Optional[str] = None,
     pending_pr_branch: Optional[str] = None,
     iteration_commit_sha: Optional[str] = None,
 ) -> int:
@@ -364,6 +367,7 @@ def _handle_refine_exit(
             cfg,
             issue_num,
             expected_verdict_ts=expected_verdict_ts,
+            expected_recovery_id=expected_recovery_id,
             pending_pr_branch=pending_pr_branch,
             iteration_commit_sha=iteration_commit_sha,
         )
@@ -414,7 +418,10 @@ def _handle_refine_exit(
         return backoff
 
     entry = record_failed_attempt(
-        cfg, issue_num, expected_verdict_ts=expected_verdict_ts
+        cfg,
+        issue_num,
+        expected_verdict_ts=expected_verdict_ts,
+        expected_recovery_id=expected_recovery_id,
     )
     if entry is None:
         # The entry vanished mid-iteration (e.g. a concurrent `verify`
@@ -423,7 +430,10 @@ def _handle_refine_exit(
 
     if entry.attempts >= max_attempts:
         stalled = record_stall(
-            cfg, issue_num, expected_verdict_ts=expected_verdict_ts
+            cfg,
+            issue_num,
+            expected_verdict_ts=expected_verdict_ts,
+            expected_recovery_id=expected_recovery_id,
         )
         if stalled is None:
             # A fresh verify/re-reject won the race between the failed-attempt
@@ -432,7 +442,7 @@ def _handle_refine_exit(
         print(
             f"--- iteration for #{issue_num} exited non-zero ({exit_code}); "
             f"attempt {entry.attempts}/{max_attempts} — STALLED. Posting "
-            "notification; re-reject the issue to re-queue.",
+            "notification; choose a recovery path in the deck.",
             flush=True,
         )
         _notify_stall(cfg, issue_num, entry.attempts,
@@ -533,7 +543,16 @@ def run_daemon(
 
     try:
         while not _STOP_REQUESTED:
-            queue = pending_rejections_needing_iteration(cfg, chapter)
+            all_pending = pending_rejections_needing_iteration(cfg, chapter)
+            # Explicit recovery requests carry exact PR/SHA preservation
+            # semantics that only the repo-level conductor implements. The
+            # legacy per-chapter daemon must never reinterpret one as a normal
+            # reset-to-main refine.
+            queue = [
+                (issue, state)
+                for issue, state in all_pending
+                if state.recovery_mode is None
+            ]
             # Land eligible PRs first so infra/registration stays on main and the
             # refine that follows builds against an up-to-date base (best-effort).
             # Exclude the branches of issues queued for iteration THIS loop —
@@ -639,7 +658,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             "Consecutive failed refine dispatches tolerated per rejection "
             "before its queue entry is marked stalled and a notification "
             f"comment is posted on the issue (default {DEFAULT_MAX_ATTEMPTS}). "
-            "Re-rejecting a stalled issue resets the counter and re-queues it."
+            "Use Recover… in the deck to retry the build, continue the existing "
+            "PR, update from main, or explicitly archive and start over."
         ),
     )
     args = p.parse_args(argv)

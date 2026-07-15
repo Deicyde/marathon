@@ -26,10 +26,13 @@ import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 from urllib.parse import urlencode
 
 from marathon.claude_proc import run_claude
+
+
+PUBLICATION_JOURNAL_SCHEMA_VERSION = 1
 
 if TYPE_CHECKING:  # gate/jury are imported lazily at the call sites
     from marathon.gate import GateReport
@@ -113,6 +116,16 @@ class PipelineConfig:
     # ref was affirmatively absent; ``None`` is the legacy/unobserved mode.
     # Publication uses this as an explicit force-with-lease expectation.
     auto_pr_expected_remote_oid: Optional[str] = None
+    # Exact recovery request that owns this publication.  Recovery launches
+    # persist it in the write-ahead publication recipe so a conductor restart
+    # can distinguish this operation's already-pushed commit from unrelated
+    # remote movement.
+    recovery_operation_id: Optional[str] = None
+    # Refine supplies an atomic checkpoint writer.  The pipeline calls it
+    # immediately before the first push/PR network mutation and deliberately
+    # does not clear it: only refine's final iteration-completion save may do
+    # that.  ``None`` keeps non-refine callers backward compatible.
+    publication_journal: Optional[Callable[[dict], None]] = None
     # Sub-issue number this iteration is addressing. Set by refine
     # from ``--review-rejection N``. Used to (1) name the branch
     # deterministically per-issue and (2) link the PR back to the
@@ -214,7 +227,20 @@ class BuildResult:
 @dataclass
 class CommitResult:
     sha: Optional[str] = None
+    # Full, validated `rev-parse HEAD` used for publication identity.  ``sha``
+    # remains the historical 8-character display/audit value.
+    full_sha: Optional[str] = None
     skipped_reason: Optional[str] = None
+
+
+def _publication_commit_oid(commit: CommitResult) -> Optional[str]:
+    """Return a full exact Git OID suitable for a publication WAL."""
+    for candidate in (commit.full_sha, commit.sha):
+        if isinstance(candidate, str) and re.fullmatch(
+            r"[0-9a-fA-F]{40}", candidate
+        ):
+            return candidate
+    return None
 
 
 @dataclass
@@ -583,8 +609,16 @@ def run_git_commit(
         text=True,
         check=False,
     )
-    sha = sha_proc.stdout.strip()[:8] if sha_proc.returncode == 0 else None
-    return CommitResult(sha=sha)
+    candidate = sha_proc.stdout.strip() if sha_proc.returncode == 0 else ""
+    full_sha = (
+        candidate
+        if re.fullmatch(r"[0-9a-fA-F]{40}", candidate)
+        else None
+    )
+    return CommitResult(
+        sha=candidate[:8] if candidate else None,
+        full_sha=full_sha,
+    )
 
 
 def run_git_push(repo_dir: Path) -> tuple[bool, str]:
@@ -1162,7 +1196,8 @@ def open_or_update_pr(
     already_pushed = bool(
         observed_oid
         and local_commit_sha
-        and observed_oid.startswith(local_commit_sha)
+        and re.fullmatch(r"[0-9a-fA-F]{40}", local_commit_sha)
+        and observed_oid == local_commit_sha
     )
     if observed != expected and not already_pushed:
         return False, (
@@ -1238,10 +1273,20 @@ def retry_pending_publication(
         capture_output=True, text=True, check=False,
     )
     actual_head = (head.stdout or "").strip()
+    journal_version = pending.get("schema_version")
+    exact_journal = journal_version == PUBLICATION_JOURNAL_SCHEMA_VERSION
     if (
         head.returncode != 0
         or not expected_head
-        or not actual_head.startswith(expected_head)
+        or (
+            actual_head != expected_head
+            if exact_journal
+            else not actual_head.startswith(expected_head)
+        )
+        or (
+            exact_journal
+            and re.fullmatch(r"[0-9a-fA-F]{40}", expected_head) is None
+        )
     ):
         return False, (
             "kept worktree HEAD no longer matches the committed fix "
@@ -1280,7 +1325,10 @@ def retry_pending_publication(
                 if pending.get("expected_remote_oid") is not None
                 else None
             ),
-            local_commit_sha=expected_head,
+            # Use the checkout's verified full OID even when recovering a
+            # legacy short-SHA recipe.  Remote attestation is exact, never a
+            # prefix match that another commit could impersonate.
+            local_commit_sha=actual_head,
         )
     return False, f"unknown pending publication kind: {kind!r}"
 
@@ -1885,19 +1933,44 @@ def run_post_pipeline(
         # Skip the bare push when --auto-pr is on: the PR step below pushes the
         # marathon branch explicitly. Running both made the bare push fail on the
         # branch upstream mismatch — and that failure used to be silent.
-        if config.auto_push and c.sha and not config.auto_pr:
+        publication_oid = _publication_commit_oid(c)
+        if (
+            config.auto_push
+            and c.sha
+            and not config.auto_pr
+            and publication_oid is None
+        ):
+            out["push_ok"] = False
+            out["pending_publication"] = {
+                "kind": "unknown",
+                "commit_sha": c.sha,
+            }
+            print("  push: failed — committed HEAD is not a full Git OID")
+        if (
+            config.auto_push
+            and c.sha
+            and not config.auto_pr
+            and publication_oid is not None
+        ):
+            branch_cp = subprocess.run(
+                ["git", "branch", "--show-current"], cwd=str(repo_dir),
+                capture_output=True, text=True, check=False,
+            )
+            publication = {
+                "schema_version": PUBLICATION_JOURNAL_SCHEMA_VERSION,
+                "operation_id": config.recovery_operation_id,
+                "kind": "push",
+                "commit_sha": publication_oid,
+                "branch": (branch_cp.stdout or "").strip() or None,
+            }
+            out["pending_publication"] = publication
+            if config.publication_journal is not None:
+                # Write-ahead boundary: a kill after run_git_push starts can
+                # only observe a checkpoint that already contains the exact
+                # deterministic retry recipe.
+                config.publication_journal(dict(publication))
             ok, push_msg = run_git_push(repo_dir)
             out["push_ok"] = ok
-            if not ok:
-                branch_cp = subprocess.run(
-                    ["git", "branch", "--show-current"], cwd=str(repo_dir),
-                    capture_output=True, text=True, check=False,
-                )
-                out["pending_publication"] = {
-                    "kind": "push",
-                    "commit_sha": c.sha,
-                    "branch": (branch_cp.stdout or "").strip() or None,
-                }
             print(f"  push: {('ok (' + push_msg + ')') if ok else ('failed — ' + push_msg)}")
 
 
@@ -1994,6 +2067,15 @@ def run_post_pipeline(
         and out["commit"] is not None
         and out["commit"].sha is not None
     ):
+        publication_oid = _publication_commit_oid(out["commit"])
+        if publication_oid is None:
+            out["pr_ok"] = False
+            out["pending_publication"] = {
+                "kind": "unknown",
+                "commit_sha": out["commit"].sha,
+            }
+            print("  pr: failed — committed HEAD is not a full Git OID")
+            return out
         try:
             repo = config.auto_pr_repo or _infer_repo(repo_dir)
             if repo is None:
@@ -2159,8 +2241,10 @@ def run_post_pipeline(
                         ),
                     )
                     publication = {
+                        "schema_version": PUBLICATION_JOURNAL_SCHEMA_VERSION,
+                        "operation_id": config.recovery_operation_id,
                         "kind": "pr",
-                        "commit_sha": out["commit"].sha,
+                        "commit_sha": publication_oid,
                         "branch": branch,
                         "base": config.auto_pr_base,
                         "repo": repo,
@@ -2174,6 +2258,12 @@ def run_post_pipeline(
                     # network call so an exception is as recoverable as a
                     # normal ``(False, message)`` return.
                     out["pending_publication"] = publication
+                    if config.publication_journal is not None:
+                        # This save is the write-ahead publication boundary.
+                        # It must finish before git push or GitHub PR mutation
+                        # begins, and remains present even when this call
+                        # succeeds until refine records iteration completion.
+                        config.publication_journal(dict(publication))
                     pr_ok, pr_msg = open_or_update_pr(
                         repo_dir=repo_dir,
                         branch=branch,
@@ -2184,11 +2274,10 @@ def run_post_pipeline(
                         expected_remote_oid=(
                             config.auto_pr_expected_remote_oid
                         ),
-                        local_commit_sha=out["commit"].sha,
+                        local_commit_sha=publication_oid,
                     )
                     out["pr_ok"] = pr_ok
                     if pr_ok:
-                        out["pending_publication"] = None
                         print(f"  pr: {pr_msg}")
                     else:
                         print(f"  pr: failed — {pr_msg}")

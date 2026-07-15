@@ -24,16 +24,20 @@ def _pr(num, *, mergeable="MERGEABLE", state="CLEAN", draft=False,
     # `build="OK"/"FAIL"/"TIMEOUT"` synthesizes a head commit whose subject
     # carries the pipeline's [build:*] verdict tag; `commits` overrides outright.
     if commits is None:
-        commits = (
-            [{"messageHeadline": f"marathon: c1 iter for #{num} [build:{build}]",
-              "oid": f"sha{num}"}]
-            if build is not None else []
-        )
+        commits = [{
+            "messageHeadline": (
+                f"marathon: c1 iter for #{num} [build:{build}]"
+                if build is not None else f"ordinary change for #{num}"
+            ),
+            "oid": f"sha{num}",
+        }]
     return {
         "number": num,
         "title": title,
         "headRefName": head or f"branch-{num}",
+        "headRefOid": commits[-1]["oid"] if commits else None,
         "baseRefName": base,
+        "baseRefOid": f"base-sha-{base}",
         "isDraft": draft,
         "mergeable": mergeable,
         "mergeStateStatus": state,
@@ -50,7 +54,7 @@ def _cp(stdout="", returncode=0, stderr=""):
 
 @pytest.mark.parametrize("pr, ok, reason_has", [
     (_pr(1), True, "clean"),
-    (_pr(1, state="BEHIND"), True, "behind"),                  # mergeable, behind base
+    (_pr(1, state="BEHIND"), True, "behind"),                  # non-refine human PR
     (_pr(1, state="UNSTABLE"), True, "unstable"),              # mergeable, checks gate decides
     (_pr(1, draft=True), False, "draft"),
     (_pr(1, mergeable="CONFLICTING"), False, "conflict"),
@@ -137,6 +141,21 @@ def test_eligibility_build_ok_head_merges():
     assert ok is True and reason == "clean"
 
 
+def test_eligibility_refine_head_behind_base_requires_update():
+    ok, reason = am.eligibility(
+        _pr(
+            1,
+            head="marathon/refine-c15-i168",
+            state="BEHIND",
+            build="OK",
+        ),
+        base="main",
+    )
+
+    assert ok is False
+    assert "base moved" in reason.lower()
+
+
 def test_eligibility_untagged_refine_head_skipped():
     # a refine head with no [build:*] tag → unknown build → fail safe + retry.
     ok, reason = am.eligibility(
@@ -173,10 +192,76 @@ def test_eligibility_require_build_ok_false_allows_untagged_but_not_red():
     assert am.eligibility(red, base="main", require_build_ok=False)[0] is False
 
 
+def test_trusted_sha_bound_build_status_overrides_stale_failure_tag():
+    pr = _pr(
+        1,
+        head="marathon/refine-c1-i9",
+        build="FAIL",
+        checks=[{
+            "__typename": "StatusContext",
+            "context": am.TRUSTED_BUILD_CONTEXT,
+            "state": "SUCCESS",
+        }],
+    )
+
+    ok, reason = am.eligibility(pr, base="main")
+
+    assert ok is True
+    assert reason == "clean"
+
+
+def test_unrelated_green_status_cannot_override_stale_failure_tag():
+    pr = _pr(
+        1,
+        head="marathon/refine-c1-i9",
+        build="FAIL",
+        checks=[{
+            "__typename": "StatusContext",
+            "context": "ci/looks-similar-but-is-not-marathon",
+            "state": "SUCCESS",
+        }],
+    )
+
+    ok, reason = am.eligibility(pr, base="main")
+
+    assert ok is False
+    assert "build fail" in reason.lower()
+
+
+@pytest.mark.parametrize("conclusion", ["SUCCESS", "NEUTRAL", "SKIPPED"])
+def test_same_named_check_run_cannot_impersonate_build_status(conclusion):
+    pr = _pr(
+        1,
+        head="marathon/refine-c1-i9",
+        build="FAIL",
+        checks=[{
+            "__typename": "CheckRun",
+            "name": am.TRUSTED_BUILD_CONTEXT,
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+        }],
+    )
+
+    ok, reason = am.eligibility(pr, base="main")
+
+    assert ok is False
+    assert "build fail" in reason.lower()
+
+
 # --- automerge() (one cycle, gh mocked) ------------------------------------
 
 def _install_gh(
-    monkeypatch, prs, *, merge_rc=0, methods=None, label_remove_ok=True,
+    monkeypatch,
+    prs,
+    *,
+    merge_rc=0,
+    methods=None,
+    label_remove_ok=True,
+    live_head_overrides=None,
+    live_base_name_overrides=None,
+    live_base_overrides=None,
+    live_state_overrides=None,
+    on_merge=None,
 ):
     # default repo: squash-only (mirrors GeometricAnalysis, which disallows
     # merge commits — the bug that made the live merge fail).
@@ -185,9 +270,19 @@ def _install_gh(
         "mergeCommitAllowed": False,
         "rebaseMergeAllowed": False,
     }
-    calls = {"merged": [], "list": 0, "method_flags": [], "unlabeled": [],
-             "comments": []}
+    calls = {
+        "merged": [],
+        "list": 0,
+        "method_flags": [],
+        "matched_heads": [],
+        "unlabeled": [],
+        "comments": [],
+    }
     issue_label_state = {}
+    live_head_overrides = live_head_overrides or {}
+    live_base_name_overrides = live_base_name_overrides or {}
+    live_base_overrides = live_base_overrides or {}
+    live_state_overrides = live_state_overrides or {}
 
     def fake_gh(*args, check=True, capture=True):
         if args[:2] == ("repo", "view"):
@@ -195,11 +290,33 @@ def _install_gh(
         if args[:2] == ("pr", "list"):
             calls["list"] += 1
             return _cp(stdout=json.dumps(prs))
+        if args[:1] == ("api",) and "/pulls/" in args[1]:
+            number = int(args[1].rsplit("/", 1)[-1])
+            pr = next(row for row in prs if row["number"] == number)
+            return _cp(stdout=json.dumps({
+                "state": live_state_overrides.get(number, "open"),
+                "head": {"sha": live_head_overrides.get(
+                    number, pr["headRefOid"]
+                )},
+                "base": {
+                    "ref": live_base_name_overrides.get(
+                        number, pr["baseRefName"]
+                    ),
+                    "sha": live_base_overrides.get(
+                        number, pr["baseRefOid"]
+                    ),
+                },
+            }))
         if args[:2] == ("pr", "merge"):
             calls["merged"].append(int(args[2]))
+            calls["matched_heads"].append(
+                args[list(args).index("--match-head-commit") + 1]
+            )
             for flag in ("--squash", "--merge", "--rebase"):
                 if flag in args:
                     calls["method_flags"].append(flag)
+            if on_merge is not None:
+                on_merge()
             return _cp(returncode=merge_rc, stderr="boom" if merge_rc else "")
         if args[:2] == ("issue", "edit"):
             # capture the re-queue relabel: (issue, --remove-label, <label>)
@@ -239,10 +356,65 @@ def test_automerge_merges_only_eligible(monkeypatch):
     results = am.automerge(_cfg())
 
     assert calls["merged"] == [10, 14]
+    assert calls["matched_heads"] == ["sha10", "sha14"]
     merged = {r.pr for r in results if r.action == "merged"}
     skipped = {r.pr for r in results if r.action == "skipped"}
     assert merged == {10, 14}
     assert skipped == {11, 12, 13}
+
+
+@pytest.mark.parametrize(
+    "override, expected_reason",
+    [("head", "head moved"), ("base", "base moved")],
+)
+def test_automerge_refuses_revision_race_before_merge(
+    monkeypatch, override, expected_reason
+):
+    pr = _pr(10)
+    kwargs = (
+        {"live_head_overrides": {10: "different-head"}}
+        if override == "head"
+        else {"live_base_overrides": {10: "different-base"}}
+    )
+    calls = _install_gh(monkeypatch, [pr], **kwargs)
+
+    result = am.automerge(_cfg())
+
+    assert calls["merged"] == []
+    assert result[0].action == "failed"
+    assert expected_reason in result[0].reason.lower()
+
+
+def test_automerge_refuses_same_sha_base_retarget_before_merge(monkeypatch):
+    """A retarget can preserve ``base.sha`` when both branches share a tip."""
+    pr = _pr(10, base="main")
+    calls = _install_gh(
+        monkeypatch,
+        [pr],
+        live_base_name_overrides={10: "release"},
+        # Deliberately leave the live base SHA unchanged.
+    )
+
+    result = am.automerge(_cfg(base="main"))
+
+    assert calls["merged"] == []
+    assert result[0].action == "failed"
+    assert "base branch changed from main to release" in result[0].reason.lower()
+
+
+def test_automerge_refuses_pr_closed_after_eligibility_check(monkeypatch):
+    pr = _pr(10)
+    calls = _install_gh(
+        monkeypatch,
+        [pr],
+        live_state_overrides={10: "closed"},
+    )
+
+    result = am.automerge(_cfg())
+
+    assert calls["merged"] == []
+    assert result[0].action == "failed"
+    assert "no longer open" in result[0].reason.lower()
 
 
 def test_automerge_refuses_build_fail_head(monkeypatch):
@@ -291,6 +463,95 @@ def test_automerge_refuses_refine_pr_owned_by_older_verdict(monkeypatch, tmp_pat
     assert calls["merged"] == []
     assert result.action == "skipped"
     assert "stale/unowned" in result.reason
+
+
+def test_automerge_holds_old_pr_while_start_over_recovery_is_active(
+    monkeypatch, tmp_path
+):
+    from tests.test_conductor import make_cfg
+
+    cfg = make_cfg(tmp_path)
+    head = "marathon/refine-c12-i93"
+    pr = _pr(109, head=head, build="OK")
+    rejected = review_state.record_rejection(cfg, 93, "replace the old work")
+    review_state.record_iteration(
+        cfg,
+        93,
+        expected_verdict_ts=rejected.verdict_ts,
+        iteration_branch=head,
+        iteration_commit_sha=pr["headRefOid"],
+    )
+    queued = review_state.request_recovery_if_current(
+        cfg,
+        93,
+        expected_status="rejected",
+        expected_verdict_ts=rejected.verdict_ts,
+        expected_recovery_id=None,
+        recovery_id="start-over-b",
+        recovery_mode=review_state.RECOVERY_START_OVER,
+        recovery_pr=109,
+        recovery_branch=head,
+        recovery_head_sha=pr["headRefOid"],
+        recovery_base="main",
+    )
+    assert queued is not None
+    calls = _install_gh(monkeypatch, [pr])
+
+    [result] = am.automerge(cfg)
+
+    assert calls["merged"] == []
+    assert result.action == "skipped"
+    assert "recovery start_over is active" in result.reason
+    current = review_state.load_state(cfg).issues[93]
+    assert current.recovery_id == "start-over-b"
+
+
+def test_recovery_queued_inside_merge_cannot_be_consumed_by_old_completion(
+    monkeypatch, tmp_path
+):
+    """The pre-merge owner A must not adopt recovery B after GitHub merges."""
+    from tests.test_conductor import make_cfg
+
+    cfg = make_cfg(tmp_path)
+    head = "marathon/refine-c12-i93"
+    pr = _pr(109, head=head, build="OK")
+    rejected = review_state.record_rejection(cfg, 93, "repair the declaration")
+    review_state.record_iteration(
+        cfg,
+        93,
+        expected_verdict_ts=rejected.verdict_ts,
+        iteration_branch=head,
+        iteration_commit_sha=pr["headRefOid"],
+    )
+
+    def queue_recovery_b():
+        queued = review_state.request_recovery_if_current(
+            cfg,
+            93,
+            expected_status="rejected",
+            expected_verdict_ts=rejected.verdict_ts,
+            expected_recovery_id=None,
+            recovery_id="recovery-b",
+            recovery_mode=review_state.RECOVERY_START_OVER,
+            recovery_pr=109,
+            recovery_branch=head,
+            recovery_head_sha=pr["headRefOid"],
+            recovery_base="main",
+        )
+        assert queued is not None
+
+    calls = _install_gh(monkeypatch, [pr], on_merge=queue_recovery_b)
+
+    [result] = am.automerge(cfg)
+
+    assert calls["merged"] == [109]
+    # The operation-generation mismatch is detected before label removal.
+    assert calls["unlabeled"] == []
+    assert result.action == "merged"
+    assert "requeue not confirmed" in result.reason
+    current = review_state.load_state(cfg).issues[93]
+    assert current.recovery_id == "recovery-b"
+    assert current.recovery_mode == review_state.RECOVERY_START_OVER
 
 
 def test_pr_fields_include_commits():
@@ -398,6 +659,61 @@ def test_requeue_landed_false_posts_no_recovery_comment(monkeypatch):
     assert n == 93
     assert calls["unlabeled"] == [93]        # still re-queued
     assert calls["comments"] == []           # but NO false "fix landed" comment
+
+
+def test_no_pr_requeue_cannot_erase_recovery_queued_during_label_roundtrip(
+    monkeypatch, tmp_path
+):
+    """Old operation A must lose to recovery B queued after label removal."""
+    from tests.test_conductor import make_cfg
+
+    cfg = make_cfg(tmp_path)
+    rejected = review_state.record_rejection(cfg, 93, "repair the declaration")
+    review_state.record_iteration(
+        cfg,
+        93,
+        expected_verdict_ts=rejected.verdict_ts,
+        iteration_branch="marathon/refine-c12-i93",
+        iteration_commit_sha="a" * 40,
+    )
+    calls = {"removed": 0, "restored": 0}
+
+    def fake_gh(*args, **kwargs):
+        if args[:2] == ("issue", "edit") and "--remove-label" in args:
+            calls["removed"] += 1
+            return _cp()
+        if args[:2] == ("issue", "view"):
+            queued = review_state.request_recovery_if_current(
+                cfg,
+                93,
+                expected_status="rejected",
+                expected_verdict_ts=rejected.verdict_ts,
+                expected_recovery_id=None,
+                recovery_id="recovery-b",
+                recovery_mode=review_state.RECOVERY_START_OVER,
+            )
+            assert queued is not None
+            return _cp(stdout='{"labels": []}')
+        if args[:2] == ("issue", "edit") and "--add-label" in args:
+            calls["restored"] += 1
+            return _cp()
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(am, "gh", fake_gh)
+
+    result = am._requeue_refined_issue(
+        cfg,
+        "marathon/refine-c12-i93",
+        landed=False,
+        expected_verdict_ts=rejected.verdict_ts,
+        expected_recovery_id=None,
+    )
+
+    assert result is None
+    current = review_state.load_state(cfg).issues[93]
+    assert current.recovery_id == "recovery-b"
+    assert current.recovery_mode == review_state.RECOVERY_START_OVER
+    assert calls == {"removed": 1, "restored": 1}
 
 
 def test_requeue_keeps_local_anchor_when_label_removal_silently_fails(

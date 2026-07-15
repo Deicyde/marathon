@@ -83,7 +83,7 @@ def _install_boundaries(
                     claude_in_loop=False, extra_paths=None,
                     commit_metadata=True, metrics_shard=None):
         calls.setdefault("commit", []).append(message)
-        return CommitResult(sha="abc1234")
+        return CommitResult(sha="abc1234", full_sha="a" * 40)
 
     def fake_pr(*, repo_dir, branch, base, repo, title, body, **_publication):
         calls.setdefault("pr", []).append(

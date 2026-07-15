@@ -37,6 +37,19 @@ def _fake(cfg, body, demo=False):
     return fake, captured
 
 
+def _explicit_start_over_body(cfg, issue):
+    """Current client payload for no-PR recovery (legacy alias refuses it)."""
+    from marathon.deck.dashboard import stuck_issues
+
+    row = next(r for r in stuck_issues(cfg) if r["num"] == issue)
+    return {
+        "issue": issue,
+        "action": "start_over",
+        "recovery_token": row["recovery_token"],
+        "confirm_destructive": True,
+    }
+
+
 @pytest.fixture(autouse=True)
 def _no_conductor(monkeypatch):
     # A unit test must never actually spawn a conductor process.
@@ -44,6 +57,12 @@ def _no_conductor(monkeypatch):
     monkeypatch.setattr(review_mod, "_ensure_rejected_label", lambda cfg, num: True)
     monkeypatch.setattr(review_mod, "_ensure_verified_label", lambda cfg, num: True)
     monkeypatch.setattr(review_mod, "_ensure_unreviewed_labels", lambda cfg, num: True)
+    from marathon.deck import dashboard as dashboard_mod
+
+    monkeypatch.setattr(dashboard_mod, "_open_refine_prs", lambda cfg: {})
+    monkeypatch.setattr(
+        dashboard_mod, "conductor_status", lambda cfg: {"alive": False}
+    )
 
 
 def test_requeue_route_registered():
@@ -60,15 +79,20 @@ def test_requeue_recovers_orphaned_rejection_from_github(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         state_mod, "record_rejection_if_absent",
-        lambda c, num, note: recorded.update(num=num, note=note)
+        lambda c, num, note, **recovery: recorded.update(
+            num=num, note=note, **recovery
+        )
         or SimpleNamespace(verdict_ts="new"),
     )
 
-    fake, captured = _fake(cfg, {"issue": 171})
-    DeckHandler._api_requeue(fake)
+    fake, captured = _fake(cfg, _explicit_start_over_body(cfg, 171))
+    DeckHandler._api_recovery(fake)
 
     assert captured["json"]["requeued"] is True
-    assert recorded == {"num": 171, "note": "FIX foo (rejected): bar"}
+    assert recorded["num"] == 171
+    assert recorded["note"] == "FIX foo (rejected): bar"
+    assert recorded["recovery_mode"] == "start_over"
+    assert recorded["recovery_id"]
 
 
 def test_requeue_orphan_not_labeled_rejected_errors(tmp_path, monkeypatch):
@@ -76,8 +100,8 @@ def test_requeue_orphan_not_labeled_rejected_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(gh_mod, "list_rejected_issues", lambda c: [999])  # not 171
     fake, captured = _fake(cfg, {"issue": 171})
     DeckHandler._api_requeue(fake)
-    assert captured["err"][0] == HTTPStatus.BAD_REQUEST
-    assert "no stored rejection note" in captured["err"][1]
+    assert captured["err"][0] == HTTPStatus.CONFLICT
+    assert "no longer parked" in captured["err"][1]
     assert "json" not in captured
 
 
@@ -86,15 +110,15 @@ def test_requeue_orphan_gh_unavailable_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(gh_mod, "list_rejected_issues", lambda c: None)  # gh down
     fake, captured = _fake(cfg, {"issue": 171})
     DeckHandler._api_requeue(fake)
-    assert captured["err"][0] == HTTPStatus.BAD_REQUEST
+    assert captured["err"][0] == HTTPStatus.CONFLICT
 
 
 def test_requeue_orphan_unrecoverable_note_errors(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path)
     monkeypatch.setattr(gh_mod, "list_rejected_issues", lambda c: [171])
     monkeypatch.setattr(gh_mod, "fetch_reject_note", lambda num, repo: (None, None))
-    fake, captured = _fake(cfg, {"issue": 171})
-    DeckHandler._api_requeue(fake)
+    fake, captured = _fake(cfg, _explicit_start_over_body(cfg, 171))
+    DeckHandler._api_recovery(fake)
     assert captured["err"][0] == HTTPStatus.BAD_REQUEST
     assert "could not be recovered" in captured["err"][1]
 
@@ -105,23 +129,20 @@ def test_requeue_live_parked_entry_uses_stored_note(tmp_path, monkeypatch):
     record_iteration(cfg, 11)                # parked: needs_iteration False
     recorded: dict = {}
     monkeypatch.setattr(
-        state_mod, "record_rejection_if_current",
-        lambda c, num, note, **expected: recorded.update(
-            num=num, note=note, **expected
+        state_mod, "request_recovery_if_current",
+        lambda c, num, **expected: recorded.update(
+            num=num, **expected
         ) or SimpleNamespace(verdict_ts="new"),
     )
-    # A live entry must be handled WITHOUT consulting GitHub.
-    monkeypatch.setattr(
-        gh_mod, "list_rejected_issues",
-        lambda c: (_ for _ in ()).throw(AssertionError("gh must not be called")),
-    )
+    monkeypatch.setattr(gh_mod, "list_rejected_issues", lambda c: None)
 
-    fake, captured = _fake(cfg, {"issue": 11})
-    DeckHandler._api_requeue(fake)
+    fake, captured = _fake(cfg, _explicit_start_over_body(cfg, 11))
+    DeckHandler._api_recovery(fake)
 
     assert captured["json"]["requeued"] is True
-    assert recorded["num"] == 11 and recorded["note"] == "the stored note"
+    assert recorded["num"] == 11
     assert recorded["expected_status"] == "rejected"
+    assert recorded["recovery_mode"] == "start_over"
 
 
 def test_requeue_live_verified_with_stale_label_refused(tmp_path, monkeypatch):
@@ -132,22 +153,18 @@ def test_requeue_live_verified_with_stale_label_refused(tmp_path, monkeypatch):
 
     cfg = make_cfg(tmp_path)
     record_verification(cfg, 42)             # status=verified, notes=None
-    # A live entry must never consult GitHub, and never be re-recorded.
-    monkeypatch.setattr(
-        gh_mod, "list_rejected_issues",
-        lambda c: (_ for _ in ()).throw(AssertionError("gh must not be called")),
-    )
+    monkeypatch.setattr(gh_mod, "list_rejected_issues", lambda c: [42])
     recorded: dict = {}
     monkeypatch.setattr(
-        state_mod, "record_rejection_if_current",
-        lambda c, num, note, **expected: recorded.setdefault("hit", True),
+        state_mod, "request_recovery_if_current",
+        lambda c, num, **expected: recorded.setdefault("hit", True),
     )
 
     fake, captured = _fake(cfg, {"issue": 42})
     DeckHandler._api_requeue(fake)
 
-    assert captured["err"][0] == HTTPStatus.BAD_REQUEST
-    assert "no stored rejection note" in captured["err"][1]
+    assert captured["err"][0] == HTTPStatus.CONFLICT
+    assert "no longer parked" in captured["err"][1]
     assert "hit" not in recorded             # the verify verdict is untouched
 
 
@@ -157,7 +174,7 @@ def test_requeue_live_active_entry_conflicts(tmp_path):
     fake, captured = _fake(cfg, {"issue": 12})
     DeckHandler._api_requeue(fake)
     assert captured["err"][0] == HTTPStatus.CONFLICT
-    assert "not parked" in captured["err"][1]
+    assert "no longer parked" in captured["err"][1]
 
 
 def test_requeue_cas_loser_preserves_concurrent_verify_and_repairs_labels(
@@ -170,19 +187,19 @@ def test_requeue_cas_loser_preserves_concurrent_verify_and_repairs_labels(
     record_iteration(cfg, 13)
     repairs = []
 
-    def lose_to_verify(c, num, note, **expected):
+    def lose_to_verify(c, num, **expected):
         record_verification(c, num)
         return None
 
-    monkeypatch.setattr(state_mod, "record_rejection_if_current", lose_to_verify)
+    monkeypatch.setattr(state_mod, "request_recovery_if_current", lose_to_verify)
     monkeypatch.setattr(
         review_mod,
         "_ensure_verified_label",
         lambda c, num: repairs.append((num, "verified")) or True,
     )
 
-    fake, captured = _fake(cfg, {"issue": 13})
-    DeckHandler._api_requeue(fake)
+    fake, captured = _fake(cfg, _explicit_start_over_body(cfg, 13))
+    DeckHandler._api_recovery(fake)
 
     assert captured["err"][0] == HTTPStatus.CONFLICT
     assert state_mod.load_state(cfg).issues[13].status == "verified"
@@ -197,8 +214,8 @@ def test_requeue_label_failure_changes_no_local_state(tmp_path, monkeypatch):
         review_mod, "_ensure_rejected_label", lambda c, num: False
     )
 
-    fake, captured = _fake(cfg, {"issue": 14})
-    DeckHandler._api_requeue(fake)
+    fake, captured = _fake(cfg, _explicit_start_over_body(cfg, 14))
+    DeckHandler._api_recovery(fake)
 
     assert captured["err"][0] == HTTPStatus.BAD_GATEWAY
     after = state_mod.load_state(cfg).issues[14]
@@ -217,4 +234,4 @@ def test_requeue_demo_mode_no_op(tmp_path):
     cfg = make_cfg(tmp_path)
     fake, captured = _fake(cfg, {"issue": 171}, demo=True)
     DeckHandler._api_requeue(fake)
-    assert captured["json"]["requeued"] is False
+    assert captured["json"]["accepted"] is False

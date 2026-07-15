@@ -1227,6 +1227,10 @@ async def _run_refine_attempt(
             return TaskStatus.FAILED
         build_result = pipeline_result.get("build")
         if getattr(build_result, "ok", None) is False:
+            # A requested publication may already have succeeded, but this
+            # iteration is deliberately continuing for a build-clean revision.
+            # Do not turn that continuation into publication-only completion.
+            state.pending_publication = None
             tail = (getattr(build_result, "log_tail", None) or "").strip()
             summary = tail.splitlines()[-1][:180] if tail else "no build log tail"
             print(
@@ -1617,6 +1621,10 @@ async def refine_command(args) -> None:
         # stored with the committed fix instead of adopting a newer re-reject.
         state.review_verdict_ts = args.review_verdict_ts
 
+    requested_recovery_operation = getattr(
+        args, "recovery_operation_id", None
+    )
+
     # A prior run already completed Aristotle, extracted, built, and committed;
     # only the network publication step failed. Recover BEFORE API-key lookup,
     # rejection-context loading, or prepare_auto_pr_branch (which intentionally
@@ -1624,6 +1632,24 @@ async def refine_command(args) -> None:
     # clean commit or submit/continue an Aristotle task.
     if state.pending_publication is not None:
         from marathon.post_pipeline import retry_pending_publication
+
+        pending_operation = state.pending_publication.get("operation_id")
+        if (
+            pending_operation is not None
+            or requested_recovery_operation is not None
+        ) and pending_operation != requested_recovery_operation:
+            state.status = "PUBLICATION_PENDING"
+            state.note = (
+                "publication checkpoint belongs to a different recovery "
+                "operation; refusing to publish it"
+            )
+            save_refine_state(state_path, state)
+            print(
+                "  publication recovery refused — checkpoint operation "
+                "identity does not match this launch",
+                flush=True,
+            )
+            raise SystemExit(EXIT_PUBLICATION_PENDING)
 
         print(
             "publication recovery: retrying the saved push/PR only from the "
@@ -1684,6 +1710,16 @@ async def refine_command(args) -> None:
         else None
     )
 
+    def _persist_publication_journal(publication: dict) -> None:
+        """Atomically record the exact retry recipe before network mutation."""
+        state.pending_publication = dict(publication)
+        state.status = "PUBLICATION_PREPARED"
+        state.note = (
+            "clean commit prepared for publication; retry only the saved "
+            "push/PR if interrupted"
+        )
+        save_refine_state(state_path, state)
+
     pipeline_config = PipelineConfig(
         auto_build=args.auto_build,
         auto_commit=args.auto_commit,
@@ -1701,6 +1737,11 @@ async def refine_command(args) -> None:
         auto_pr=getattr(args, "auto_pr", False),
         auto_pr_repo=getattr(args, "auto_pr_repo", None),
         auto_pr_branch=getattr(args, "auto_pr_branch", None),
+        auto_pr_expected_remote_oid=getattr(
+            args, "auto_pr_expected_remote_oid", None
+        ),
+        recovery_operation_id=requested_recovery_operation,
+        publication_journal=_persist_publication_journal,
         auto_pr_review_issue=review_issue_num,
         auto_pr_base=getattr(args, "auto_pr_base", "main"),
         # Machine gate (phase-2). Mode follows --skeleton (skeleton
@@ -1782,9 +1823,21 @@ async def refine_command(args) -> None:
             print(f"  auto-pr: {remote_msg}", flush=True)
             print("  refusing to run without a safe remote-branch lease.", flush=True)
             sys.exit(EXIT_AUTO_PR_BRANCH_ABORT)
+        observed_oid = remote_oid or ""
+        handed_expected = getattr(args, "auto_pr_expected_remote_oid", None)
+        if handed_expected is not None and observed_oid != handed_expected:
+            print(
+                "  auto-pr: remote branch changed after recovery was requested "
+                f"({observed_oid[:12] or '<absent>'} != expected "
+                f"{handed_expected[:12] or '<absent>'}); refusing to overwrite it",
+                flush=True,
+            )
+            sys.exit(EXIT_AUTO_PR_BRANCH_ABORT)
         # Empty string is an affirmative "branch absent" lease expectation;
         # None is reserved for legacy callers that never observed the remote.
-        pipeline_config.auto_pr_expected_remote_oid = remote_oid or ""
+        pipeline_config.auto_pr_expected_remote_oid = (
+            handed_expected if handed_expected is not None else observed_oid
+        )
         if state.preserve_local_branch:
             branch_cp = subprocess.run(
                 ["git", "branch", "--show-current"],
@@ -1826,7 +1879,10 @@ async def refine_command(args) -> None:
                 # A repair CONTINUES its open branch head (a [build:FAIL] round's
                 # partial progress lives on the un-merged PR); resetting to
                 # origin/<base> would wipe it and the rounds would oscillate.
-                continue_remote_branch=pipeline_config.repair_run,
+                continue_remote_branch=(
+                    pipeline_config.repair_run
+                    or getattr(args, "auto_pr_continue_remote", False)
+                ),
                 branch_name=branch_name,
             )
         if not ok:
@@ -1983,6 +2039,10 @@ async def refine_command(args) -> None:
             # so the issue auto-retries and surfaces as STALLED instead of vanishing.
             sys.exit(EXIT_ITERATION_FAILED)
 
+        # Commit point for a successful iteration.  The write-ahead
+        # publication recipe remains present through push/PR success and is
+        # cleared only in this same state save that records completion.
+        state.pending_publication = None
         state.iterations_completed = iteration_idx
         save_refine_state(state_path, state)
         duration = format_duration(state.duration_seconds)

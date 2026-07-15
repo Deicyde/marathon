@@ -57,7 +57,7 @@ _REFINE_BRANCH_RE = re.compile(
 #: ``commits`` carries the head commit's ``[build:*]`` verdict tag (the only
 #: build signal on a CI-less repo) — it rides in this one ``gh pr list`` call.
 _PR_FIELDS = (
-    "number,title,headRefName,baseRefName,isDraft,mergeable,"
+    "number,title,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergeable,"
     "mergeStateStatus,statusCheckRollup,commits"
 )
 
@@ -131,6 +131,35 @@ def _check_summary(rollup: Optional[list]) -> tuple[int, int]:
 #: head), NOT the title (a human can rename it).
 _BUILD_TAG_RE = re.compile(r"\[build:(OK|FAIL|TIMEOUT)\]", re.IGNORECASE)
 
+# A build-only recovery must not rewrite a PR merely to replace an old
+# ``[build:TIMEOUT]`` commit subject.  It posts a SHA-bound GitHub commit status
+# instead.  Only this exact Marathon-owned context may override the immutable
+# head-commit tag; unrelated green checks never do.
+TRUSTED_BUILD_CONTEXT = "marathon/lake-build"
+
+
+def trusted_build_status(rollup: Optional[list]) -> Optional[str]:
+    """Return ``OK`` / ``FAIL`` / ``PENDING`` for our SHA-bound build status.
+
+    The recovery worker emits a legacy StatusContext with exact ``context`` and
+    ``state`` fields. Deliberately reject same-named CheckRuns: neutral/skipped
+    workflow conclusions are not evidence that Marathon's Lake build passed.
+    """
+    matched: Optional[str] = None
+    for raw in rollup or []:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("context") != TRUSTED_BUILD_CONTEXT:
+            continue
+        value = str(raw.get("state") or "").upper()
+        if value == "SUCCESS":
+            matched = "OK"
+        elif value in {"FAILURE", "ERROR"}:
+            matched = "FAIL"
+        else:
+            matched = "PENDING"
+    return matched
+
 
 def _head_build_verdict(commits: Optional[list]) -> Optional[str]:
     """The lake build verdict — ``"OK"`` / ``"FAIL"`` / ``"TIMEOUT"`` — parsed
@@ -184,6 +213,12 @@ def eligibility(
     if state not in _MERGEABLE_STATES:
         # An unrecognized / future mergeStateStatus — fail safe, retry next cycle.
         return False, f"unrecognized merge state {state} (retry next cycle)"
+    if state == "BEHIND" and _REFINE_BRANCH_RE.match(head):
+        # Marathon's local build attests to the PR head against the base SHA it
+        # observed. Once the base moves, GitHub's eventual merge tree is a
+        # different, untested integration. Route this through update-continue
+        # rather than merging a stale attestation.
+        return False, "base moved after build; update the refine PR and rebuild"
     failing, pending = _check_summary(pr.get("statusCheckRollup"))
     if failing:
         return False, f"{failing} check(s) failing"
@@ -196,7 +231,12 @@ def eligibility(
     # AFFIRMATIVELY carry [build:OK] (its absence = unknown build → fail safe and
     # retry), while a human/infra PR — legitimately untagged and NOT on a refine
     # branch — is left untouched.
-    verdict = _head_build_verdict(pr.get("commits"))
+    trusted = trusted_build_status(pr.get("statusCheckRollup"))
+    if trusted == "FAIL":
+        return False, f"trusted build status failed ({TRUSTED_BUILD_CONTEXT})"
+    if trusted == "PENDING":
+        return False, f"trusted build status pending ({TRUSTED_BUILD_CONTEXT})"
+    verdict = "OK" if trusted == "OK" else _head_build_verdict(pr.get("commits"))
     if verdict in ("FAIL", "TIMEOUT"):
         return False, f"build {verdict.lower()} (head tagged [build:{verdict}])"
     if require_build_ok and verdict is None and _REFINE_BRANCH_RE.match(head):
@@ -289,9 +329,15 @@ def _repo_merge_method(repo: str) -> Optional[str]:
     return None
 
 
+_EXPECTED_RECOVERY_ID_UNSET = object()
+
+
 def _requeue_refined_issue(
     cfg: "ReviewConfig", head: Optional[str], pr_num: Optional[int] = None,
-    *, landed: bool = True, expected_verdict_ts: Optional[str] = None,
+    *,
+    landed: bool = True,
+    expected_verdict_ts: Optional[str] = None,
+    expected_recovery_id: object = _EXPECTED_RECOVERY_ID_UNSET,
 ) -> Optional[int]:
     """If ``head`` is a refine branch (``marathon/refine-c<N>-i<M>``), re-queue
     issue ``M`` for re-review: remove the ``review:rejected`` GitHub label AND
@@ -321,21 +367,19 @@ def _requeue_refined_issue(
     # A delayed job/PR completion must not clear a newer human verdict.  Check
     # before the network transition, then enforce the same generation again in
     # the locked local delete below (the second check closes the local race).
-    if expected_verdict_ts is None and hasattr(cfg, "repo_dir"):
+    if hasattr(cfg, "repo_dir"):
         from marathon.review.state import load_state
 
         current = load_state(cfg).issues.get(issue)
         if current is None or current.status != "rejected":
             return None
-        expected_verdict_ts = current.verdict_ts
-    if expected_verdict_ts is not None:
-        from marathon.review.state import load_state
-
-        current = load_state(cfg).issues.get(issue)
+        if expected_verdict_ts is None:
+            expected_verdict_ts = current.verdict_ts
+        if expected_recovery_id is _EXPECTED_RECOVERY_ID_UNSET:
+            expected_recovery_id = current.recovery_id
         if (
-            current is None
-            or current.status != "rejected"
-            or current.verdict_ts != expected_verdict_ts
+            current.verdict_ts != expected_verdict_ts
+            or current.recovery_id != expected_recovery_id
         ):
             return None
 
@@ -379,14 +423,18 @@ def _requeue_refined_issue(
     try:
         from marathon.review.state import requeue_for_rereview
 
-        if expected_verdict_ts is None:
+        if (
+            expected_verdict_ts is None
+            and expected_recovery_id is _EXPECTED_RECOVERY_ID_UNSET
+        ):
             # Compatibility for non-state-backed embedding callers; production
             # ReviewConfig always has repo_dir and therefore takes the CAS path.
             removed = requeue_for_rereview(cfg, issue)
         else:
-            removed = requeue_for_rereview(
-                cfg, issue, expected_verdict_ts=expected_verdict_ts
-            )
+            kwargs = {"expected_verdict_ts": expected_verdict_ts}
+            if expected_recovery_id is not _EXPECTED_RECOVERY_ID_UNSET:
+                kwargs["expected_recovery_id"] = expected_recovery_id
+            removed = requeue_for_rereview(cfg, issue, **kwargs)
         if expected_verdict_ts is not None and not removed:
             # GitHub label removal happened before the local CAS. If a newer
             # re-reject won that race, restore its remote rejected label so the
@@ -396,7 +444,6 @@ def _requeue_refined_issue(
                 if (
                     current is not None
                     and current.status == "rejected"
-                    and current.verdict_ts != expected_verdict_ts
                 ):
                     gh(
                         "issue", "edit", str(issue), "--repo", cfg.github_repo,
@@ -437,13 +484,58 @@ def _requeue_refined_issue(
     return issue
 
 
-def _merge_pr(repo: str, pr: int, method: str) -> tuple[bool, str]:
+def _merge_pr(
+    repo: str,
+    pr: int,
+    method: str,
+    expected_head_sha: str,
+    expected_base_name: str,
+    expected_base_sha: str,
+) -> tuple[bool, str]:
     """Merge one PR with the repo's allowed ``method`` + delete the source
-    branch. Returns ``(ok, detail)``."""
+    branch. Returns ``(ok, detail)``.
+
+    Re-read the PR state and both immutable endpoints immediately before the
+    merge. The CLI's ``--match-head-commit`` makes the head check atomic at
+    GitHub; the base-name/SHA recheck prevents knowingly merging a different
+    integration than the local build tested. Checking the name as well as the
+    SHA closes the retarget race where two base branches point at one commit.
+    """
+    live = gh(
+        "api", f"repos/{repo}/pulls/{pr}", check=False
+    )
+    if live.returncode != 0:
+        return False, "could not revalidate PR state/head/base before merge"
+    try:
+        payload = json.loads(live.stdout or "{}")
+        live_state = payload["state"]
+        live_head = payload["head"]["sha"]
+        live_base_name = payload["base"]["ref"]
+        live_base_sha = payload["base"]["sha"]
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return False, "malformed PR state/head/base metadata before merge"
+    if not all(
+        isinstance(value, str)
+        for value in (live_state, live_head, live_base_name, live_base_sha)
+    ):
+        return False, "malformed PR state/head/base metadata before merge"
+    if live_state != "open":
+        return False, f"PR is no longer open ({live_state or '?'}); not merging"
+    if live_head != expected_head_sha:
+        return False, "PR head moved after eligibility check; retry next cycle"
+    if live_base_name != expected_base_name:
+        return (
+            False,
+            f"PR base branch changed from {expected_base_name} to "
+            f"{live_base_name}; retry eligibility",
+        )
+    if live_base_sha != expected_base_sha:
+        return False, "PR base moved after build; update/rebuild before merge"
     cp = gh(
         "pr", "merge", str(pr),
         "--repo", repo,
         method,
+        "--match-head-commit", expected_head_sha,
         "--delete-branch",
         check=False,
     )
@@ -457,11 +549,17 @@ def _owned_refine_verdict(
     head: str,
     pr_head_sha: Optional[str],
     expected_verdict_ts: Optional[str] = None,
-) -> tuple[bool, Optional[str], str]:
+    expected_recovery_id: object = _EXPECTED_RECOVERY_ID_UNSET,
+) -> tuple[bool, Optional[str], object, str]:
     """Pre-merge ownership check for a per-issue refine branch."""
     m = _REFINE_BRANCH_RE.match(head or "")
     if not m or not hasattr(cfg, "repo_dir"):
-        return True, None, "not a state-backed refine branch"
+        return (
+            True,
+            None,
+            _EXPECTED_RECOVERY_ID_UNSET,
+            "not a state-backed refine branch",
+        )
     from marathon.review.state import load_state
 
     issue = int(m.group(1))
@@ -476,17 +574,42 @@ def _owned_refine_verdict(
             expected_verdict_ts is not None
             and current.verdict_ts != expected_verdict_ts
         )
+        or (
+            expected_recovery_id is not _EXPECTED_RECOVERY_ID_UNSET
+            and current.recovery_id != expected_recovery_id
+        )
     ):
         return (
             False,
             None,
+            _EXPECTED_RECOVERY_ID_UNSET,
             f"stale/unowned refine branch for #{issue}; current verdict does "
             "not match this iteration",
         )
-    return True, current.verdict_ts, "refine verdict ownership confirmed"
+    if current.recovery_id is not None:
+        # A queued recovery owns the branch until its exact operation completes.
+        # In particular, start-over must be able to archive the old head instead
+        # of racing automerge, while retry/update workers must not have their
+        # branch merged+deleted out from under them before they record completion.
+        return (
+            False,
+            None,
+            current.recovery_id,
+            f"recovery {current.recovery_mode or '?'} is active for #{issue}; "
+            "recovery worker owns this refine branch",
+        )
+    return (
+        True,
+        current.verdict_ts,
+        current.recovery_id,
+        "refine verdict ownership confirmed",
+    )
 
 
 def _pr_head_sha(pr: dict) -> Optional[str]:
+    head_oid = pr.get("headRefOid")
+    if isinstance(head_oid, str) and head_oid:
+        return head_oid
     commits = pr.get("commits") or []
     if not isinstance(commits, list) or not commits:
         return None
@@ -537,6 +660,8 @@ def automerge(
         num = pr.get("number")
         head = pr.get("headRefName") or "?"
         title = (pr.get("title") or "")[:80]
+        pr_head_sha = _pr_head_sha(pr)
+        pr_base_sha = pr.get("baseRefOid")
         # A PR with no usable integer number can never be safely merged — skip
         # it loudly rather than crash the whole cycle on int(None).
         if not isinstance(num, int):
@@ -550,11 +675,19 @@ def automerge(
         )
         if ok and scope == "infra":
             ok, reason = _infra_only(repo, num, reason)
+        if ok and not pr_head_sha:
+            ok, reason = False, "PR head SHA unavailable; retry next cycle"
+        if ok and not isinstance(pr_base_sha, str):
+            ok, reason = False, "PR base SHA unavailable; retry next cycle"
         owned_verdict_ts: Optional[str] = None
+        owned_recovery_id: object = _EXPECTED_RECOVERY_ID_UNSET
         if ok:
-            ok, owned_verdict_ts, ownership_reason = _owned_refine_verdict(
-                cfg, head, _pr_head_sha(pr)
-            )
+            (
+                ok,
+                owned_verdict_ts,
+                owned_recovery_id,
+                ownership_reason,
+            ) = _owned_refine_verdict(cfg, head, pr_head_sha)
             if not ok:
                 reason = ownership_reason
         if not ok:
@@ -566,24 +699,35 @@ def automerge(
         if method is None:
             method = _repo_merge_method(repo) or "--merge"
         if owned_verdict_ts is not None:
-            still_owned, _, ownership_reason = _owned_refine_verdict(
+            still_owned, _, _, ownership_reason = _owned_refine_verdict(
                 cfg,
                 head,
-                _pr_head_sha(pr),
+                pr_head_sha,
                 expected_verdict_ts=owned_verdict_ts,
+                expected_recovery_id=owned_recovery_id,
             )
             if not still_owned:
                 results.append(
                     AutoMergeResult(num, head, title, "skipped", ownership_reason)
                 )
                 continue
-        merged, detail = _merge_pr(repo, num, method)
+        assert pr_head_sha is not None
+        assert isinstance(pr_base_sha, str)
+        merged, detail = _merge_pr(
+            repo,
+            num,
+            method,
+            pr_head_sha,
+            base,
+            pr_base_sha,
+        )
         if merged:
             requeued = _requeue_refined_issue(
                 cfg,
                 head,
                 pr_num=num,
                 expected_verdict_ts=owned_verdict_ts,
+                expected_recovery_id=owned_recovery_id,
             )
             if requeued is not None:
                 detail += f"; re-queued #{requeued} for re-review"

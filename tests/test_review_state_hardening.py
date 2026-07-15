@@ -161,6 +161,34 @@ def test_stale_unverify_cannot_delete_newer_verdict(tmp_path):
     assert state.load_state(cfg).issues[7].verdict_ts == fresh.verdict_ts
 
 
+def test_requeue_generation_cannot_delete_newer_recovery(tmp_path):
+    cfg = _cfg(tmp_path)
+    rejected = state.record_rejection(cfg, 7, "fix the declaration")
+    state.record_iteration(
+        cfg, 7, expected_verdict_ts=rejected.verdict_ts
+    )
+    queued = state.request_recovery_if_current(
+        cfg,
+        7,
+        expected_status="rejected",
+        expected_verdict_ts=rejected.verdict_ts,
+        expected_recovery_id=None,
+        recovery_id="recovery-b",
+        recovery_mode=state.RECOVERY_START_OVER,
+    )
+    assert queued is not None
+
+    assert not state.requeue_for_rereview(
+        cfg,
+        7,
+        expected_verdict_ts=rejected.verdict_ts,
+        expected_recovery_id=None,
+    )
+    current = state.load_state(cfg).issues[7]
+    assert current.recovery_id == "recovery-b"
+    assert current.recovery_mode == state.RECOVERY_START_OVER
+
+
 def test_cas_requeue_cannot_overwrite_concurrent_verify(tmp_path):
     cfg = _cfg(tmp_path)
     parked = state.record_rejection(cfg, 7, "old note")
@@ -184,6 +212,105 @@ def test_absent_cas_reject_cannot_overwrite_concurrent_verify(tmp_path):
     verified = state.record_verification(cfg, 7)
     assert state.record_rejection_if_absent(cfg, 7, "recovered note") is None
     assert state.load_state(cfg).issues[7].verdict_ts == verified.verdict_ts
+
+
+def test_operational_recovery_preserves_human_verdict_and_jsonl(tmp_path):
+    cfg = _cfg(tmp_path)
+    rejected = state.record_rejection(cfg, 7, "keep this exact note")
+    state.record_iteration(
+        cfg, 7, expected_verdict_ts=rejected.verdict_ts
+    )
+    verdicts = tmp_path / state.VERDICTS_RELPATH
+    before_jsonl = verdicts.read_bytes()
+
+    recovered = state.request_recovery_if_current(
+        cfg,
+        7,
+        expected_status="rejected",
+        expected_verdict_ts=rejected.verdict_ts,
+        recovery_id="recovery-7-a",
+        recovery_mode=state.RECOVERY_CONTINUE_PR,
+        recovery_pr=277,
+        recovery_branch="marathon/refine-c15-i171",
+        recovery_head_sha="abc123",
+        recovery_base="main",
+    )
+
+    assert recovered is not None
+    assert recovered.verdict_ts == rejected.verdict_ts
+    assert recovered.notes == "keep this exact note"
+    assert recovered.status == "rejected"
+    assert recovered.last_iteration_ts is None
+    assert recovered.recovery_id == "recovery-7-a"
+    assert recovered.recovery_mode == state.RECOVERY_CONTINUE_PR
+    assert recovered.recovery_pr == 277
+    assert recovered.recovery_base == "main"
+    # Recovery is an operational transition, not another human verdict.
+    assert verdicts.read_bytes() == before_jsonl
+
+
+def test_recovery_completion_requires_exact_operation_and_clears_it(tmp_path):
+    cfg = _cfg(tmp_path)
+    rejected = state.record_rejection(cfg, 7, "fix")
+    state.record_iteration(
+        cfg, 7, expected_verdict_ts=rejected.verdict_ts
+    )
+    recovery = state.request_recovery_if_current(
+        cfg,
+        7,
+        expected_status="rejected",
+        expected_verdict_ts=rejected.verdict_ts,
+        recovery_id="current-operation",
+        recovery_mode=state.RECOVERY_RETRY_BUILD,
+        recovery_pr=277,
+        recovery_branch="marathon/refine-c15-i171",
+        recovery_head_sha="abc123",
+        recovery_base="main",
+    )
+    assert recovery is not None
+
+    # A pre-recovery worker (None) and a superseded recovery worker are both
+    # stale even though they still carry the same human verdict generation.
+    assert state.record_iteration(
+        cfg, 7, expected_verdict_ts=rejected.verdict_ts
+    ) is None
+    assert state.record_failed_attempt(
+        cfg,
+        7,
+        expected_verdict_ts=rejected.verdict_ts,
+        expected_recovery_id="old-operation",
+    ) is None
+    assert state.record_stall(
+        cfg,
+        7,
+        expected_verdict_ts=rejected.verdict_ts,
+        expected_recovery_id="old-operation",
+    ) is None
+    untouched = state.load_state(cfg).issues[7]
+    assert untouched.recovery_id == "current-operation"
+    assert untouched.attempts == 0
+    assert untouched.status == "rejected"
+
+    completed = state.record_iteration(
+        cfg,
+        7,
+        expected_verdict_ts=rejected.verdict_ts,
+        expected_recovery_id="current-operation",
+        pending_pr_branch="marathon/refine-c15-i171",
+        iteration_commit_sha="abc123",
+    )
+    assert completed is not None
+    assert completed.verdict_ts == rejected.verdict_ts
+    assert completed.last_iteration_ts is not None
+    assert completed.pending_pr_branch == "marathon/refine-c15-i171"
+    assert completed.iteration_commit_sha == "abc123"
+    assert completed.recovery_mode is None
+    assert completed.recovery_id is None
+    assert completed.recovery_requested_ts is None
+    assert completed.recovery_pr is None
+    assert completed.recovery_branch is None
+    assert completed.recovery_head_sha is None
+    assert completed.recovery_base is None
 
 
 def test_github_reconcile_participates_in_same_transaction(tmp_path):

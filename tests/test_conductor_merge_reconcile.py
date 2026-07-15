@@ -13,8 +13,12 @@ import marathon.review.github as ghmod
 import marathon.review.state as statemod
 
 
-def _issue(status, verdict_ts):
-    return SimpleNamespace(status=status, verdict_ts=verdict_ts)
+def _issue(status, verdict_ts, *, recovery_id=None):
+    return SimpleNamespace(
+        status=status,
+        verdict_ts=verdict_ts,
+        recovery_id=recovery_id,
+    )
 
 
 def _patch_gh(monkeypatch, merged_prs):
@@ -27,9 +31,15 @@ def _patch_gh(monkeypatch, merged_prs):
 def _capture_requeue(monkeypatch):
     requeued = []
 
-    def fake(cfg, head, *, expected_verdict_ts):
+    def fake(
+        cfg,
+        head,
+        *,
+        expected_verdict_ts,
+        expected_recovery_id,
+    ):
         n = int(head.rsplit("-i", 1)[1])
-        requeued.append((n, expected_verdict_ts))
+        requeued.append((n, expected_verdict_ts, expected_recovery_id))
         return n
 
     monkeypatch.setattr(amod, "_requeue_refined_issue", fake)
@@ -42,18 +52,24 @@ def test_requeues_only_when_merge_is_after_the_rejection(monkeypatch):
         97: _issue("rejected", "2026-06-21T10:00:00-04:00"),  # 14:00Z — merge BEFORE → skip
         98: _issue("rejected", "2026-06-21T00:00:00-04:00"),  # no merged PR          → skip
         99: _issue("verified", "2026-06-21T00:00:00-04:00"),  # not rejected          → skip
+        100: _issue(
+            "rejected",
+            "2026-06-21T00:00:00-04:00",
+            recovery_id="start-over-b",
+        ),  # explicit recovery owns it → skip
     })
     monkeypatch.setattr(statemod, "load_state", lambda cfg: state)
     _patch_gh(monkeypatch, [
         {"headRefName": "marathon/refine-c12-i96", "mergedAt": "2026-06-21T05:00:00Z"},
         {"headRefName": "marathon/refine-c12-i97", "mergedAt": "2026-06-21T05:00:00Z"},
+        {"headRefName": "marathon/refine-c12-i100", "mergedAt": "2026-06-21T05:00:00Z"},
         {"headRefName": "feature/unrelated", "mergedAt": "2026-06-21T05:00:00Z"},
     ])
     requeued = _capture_requeue(monkeypatch)
 
     out = conductor._reconcile_merged_rejections(SimpleNamespace(github_repo="o/r"))
     assert out == [96]
-    assert requeued == [(96, "2026-06-21T00:00:00-04:00")]
+    assert requeued == [(96, "2026-06-21T00:00:00-04:00", None)]
 
 
 def test_no_gh_call_when_nothing_rejected(monkeypatch):

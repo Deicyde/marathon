@@ -11,7 +11,9 @@ Nothing here writes anything.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import subprocess
 import threading
@@ -171,6 +173,9 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
             "finished_ts": raw.get("finished_ts"),
             "branch": raw.get("branch"),
             "workdir": workdir,
+            "recovery_mode": raw.get("recovery_mode"),
+            "recovery_pr": raw.get("recovery_pr"),
+            "recovery_head_sha": raw.get("recovery_head_sha"),
         }
         # Live Aristotle progress + iteration for a running job (cheap workdir
         # reads; None for a finished/reaped job).
@@ -180,9 +185,24 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
         # The granular phase (proving NN% / building / committing / pushing /
         # opening PR) — so an Aristotle-COMPLETE-but-still-building job reads
         # "building", not a misleading "Complete".
-        job["phase"] = _job_phase(
-            workdir, status, raw.get("aristotle_status"), job.get("progress_pct")
-        )
+        if status and status.startswith("running") and raw.get(
+            "recovery_mode"
+        ) == "retry_build":
+            job["phase"] = "building exact PR head"
+        elif (
+            status
+            and status.startswith("running")
+            and raw.get("recovery_mode") == "update_continue"
+            and not raw.get("aristotle_status")
+        ):
+            job["phase"] = "updating from main / building"
+        else:
+            job["phase"] = _job_phase(
+                workdir,
+                status,
+                raw.get("aristotle_status"),
+                job.get("progress_pct"),
+            )
         jobs.append(job)
 
     # The prover toggle's state: the conductor publishes its EFFECTIVE proving
@@ -423,31 +443,56 @@ def _issue_status(
     return "pending"
 
 
-def _open_refine_prs(cfg) -> "dict[int, dict]":
-    """``{issue_num: {"pr": n, "build": "OK"|"FAIL"|None}}`` for OPEN marathon
-    refine PRs (one bounded gh call; ``{}`` on any failure). Lets the stuck
+def _open_refine_prs(cfg) -> "Optional[dict[int, dict]]":
+    """Structured metadata for open per-issue refine PRs.
+
+    ``{issue_num: {pr, branch, head_sha, base, build, mergeable,
+    merge_state}}`` is the server-authoritative recovery input.  The browser
+    receives actions derived from this snapshot and sends none of these refs
+    back as trusted values.
+
+    The legacy title build tag is only a fallback.  A SHA-bound
+    ``marathon/lake-build`` commit status from a build-only recovery overrides
+    it, matching automerge's gate.
+
+    OPEN marathon
+    refine PRs (one bounded paginated gh call; ``None`` on any failure). Lets the stuck
     surface say "fix PR #260 is open [build:FAIL held]" instead of the false
     "the fix never landed — the conductor can't reach them": a build-FAIL-held
     PR means the pipeline DID produce a fix and automerge is (correctly)
     refusing it — re-queuing spends a fresh billed run, so the reviewer should
     know one exists before clicking."""
+    from marathon.review.automerge import (
+        _REFINE_BRANCH_RE,
+        trusted_build_status,
+    )
     from marathon.review.github import gh
 
     try:
         cp = gh(
             "pr", "list", "--repo", cfg.github_repo, "--state", "open",
-            "--json", "number,headRefName,title", "--limit", "100",
+            "--json", (
+                "number,headRefName,headRefOid,baseRefName,title,mergeable,"
+                "mergeStateStatus,statusCheckRollup"
+            ), "--limit", "1000",
             check=False, timeout=20,
         )
     except Exception:  # noqa: BLE001 — gh missing/hung → no annotation
-        return {}
+        return None
     if cp.returncode != 0:
-        return {}
+        return None
     out: "dict[int, dict]" = {}
     try:
-        for pr in json.loads(cp.stdout or "[]"):
-            m = re.match(r"marathon/refine-c\d+-i(\d+)$",
-                         pr.get("headRefName") or "")
+        rows = json.loads(cp.stdout or "[]")
+        if not isinstance(rows, list):
+            return None
+        # ``gh pr list --limit`` paginates up to the requested bound. Hitting
+        # the bound means absence is not proven, so destructive recovery must
+        # remain disabled instead of treating a truncated list as complete.
+        if len(rows) >= 1000:
+            return None
+        for pr in rows:
+            m = _REFINE_BRANCH_RE.match(pr.get("headRefName") or "")
             if not m:
                 continue
             title = pr.get("title") or ""
@@ -458,10 +503,263 @@ def _open_refine_prs(cfg) -> "dict[int, dict]":
             build = ("OK" if "[build:OK]" in title
                      else "FAIL" if "[build:FAIL]" in title
                      else "TIMEOUT" if "[build:TIMEOUT]" in title else None)
-            out[int(m.group(1))] = {"pr": pr.get("number"), "build": build}
+            attested = trusted_build_status(pr.get("statusCheckRollup"))
+            if attested == "OK":
+                build = "OK"
+            elif attested == "FAIL":
+                build = "FAIL"
+            elif attested == "PENDING":
+                build = "PENDING"
+            info = {
+                "pr": pr.get("number"),
+                "build": build,
+            }
+            # Keep the old compact shape when ``gh``/a test double does not
+            # return the newer recovery fields.  Recovery actions then fail
+            # closed (no exact head SHA => no PR-preserving action).
+            optional = {
+                "branch": pr.get("headRefName"),
+                "head_sha": pr.get("headRefOid"),
+                "base": pr.get("baseRefName"),
+                "mergeable": (pr.get("mergeable") or "").upper() or None,
+                "merge_state": (
+                    (pr.get("mergeStateStatus") or "").upper() or None
+                ),
+            }
+            info.update({key: value for key, value in optional.items() if value})
+            issue_num = int(m.group(1))
+            if issue_num in out:
+                # Two open refine PRs for one issue make "the current work"
+                # ambiguous. Preserve that fact without selecting either head.
+                out[issue_num] = {"ambiguous": True}
+            else:
+                out[issue_num] = info
     except (ValueError, TypeError, KeyError):
-        return {}
+        return None
     return out
+
+
+def _recovery_token(row: dict) -> str:
+    """Opaque compare-and-swap token for one rendered recovery snapshot."""
+    bound = {
+        key: row.get(key)
+        for key in (
+            "num", "status", "verdict_ts", "attempts", "orphaned",
+            "recovery_id", "recovery_mode",
+            "fix_pr", "fix_pr_branch", "fix_pr_head_sha", "fix_pr_base",
+            "fix_pr_build", "fix_pr_mergeable", "fix_pr_merge_state",
+            "pr_lookup_known", "fix_pr_ambiguous",
+            "recovery_running",
+            "local_recovery_available", "local_recovery_head",
+        )
+    }
+    payload = json.dumps(bound, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _recovery_actions(row: dict) -> tuple[dict, Optional[str]]:
+    """Server-derived recovery capability matrix + safe recommendation."""
+    lookup_known = row.get("pr_lookup_known") is not False
+    ambiguous = bool(row.get("fix_pr_ambiguous"))
+    has_pr = bool(
+        lookup_known and not ambiguous
+        and row.get("fix_pr")
+        and row.get("fix_pr_branch")
+        and row.get("fix_pr_head_sha")
+    )
+    conflict = (
+        row.get("fix_pr_mergeable") == "CONFLICTING"
+        or row.get("fix_pr_merge_state") == "DIRTY"
+    )
+    needs_update = conflict or row.get("fix_pr_merge_state") == "BEHIND"
+    build = row.get("fix_pr_build")
+    recovery_running = bool(row.get("recovery_running"))
+    local_progress = bool(row.get("local_recovery_available"))
+    has_note = bool(row.get("has_note"))
+    live_local_state = not bool(row.get("orphaned"))
+    can_start_over = (
+        lookup_known
+        and not ambiguous
+        and not recovery_running
+        and has_note
+        and (not row.get("fix_pr") or has_pr)
+    )
+    unavailable_reason = (
+        "GitHub could not confirm the complete set of open PRs; retry after "
+        "the PR lookup recovers."
+        if not lookup_known
+        else "Multiple open Marathon PRs exist for this issue; resolve the "
+        "ambiguity before recovery."
+        if ambiguous
+        else "A recovery operation is already running for this issue."
+        if recovery_running
+        else None
+    )
+    retry_enabled = (
+        has_pr
+        and not needs_update
+        and build != "OK"
+        and not recovery_running
+        and (has_note or live_local_state)
+    )
+    retry_reason = unavailable_reason or (
+        "Runs build and gates on the exact PR head; no Aristotle call."
+        if retry_enabled
+        else "The orphaned rejection has no recoverable note to seed local state."
+        if not has_note and not live_local_state
+        else "Unavailable for a conflicted, actively building, or already-green PR."
+    )
+    continue_reason = unavailable_reason or (
+        "A stored rejection note is required before Aristotle can continue."
+        if not has_note
+        else
+        "Resumes the preserved local checkpoint and unpublished work."
+        if has_pr and local_progress
+        else "Keeps the existing PR diff and resumes its checkpoint when available."
+        if has_pr
+        else "No open Marathon PR was found to continue."
+    )
+    update_reason = unavailable_reason or (
+        "A stored rejection note is required before Aristotle can continue."
+        if not has_note
+        else
+        "Updates the existing PR from current main; Aristotle is used only "
+        "when the preserved work still needs repair."
+        if has_pr
+        else "No open Marathon PR was found to update."
+    )
+    start_reason = unavailable_reason or (
+        "Archives the current PR head, then regenerates from current main."
+        if has_pr
+        else "Regenerates from current main."
+        if can_start_over
+        else "A recoverable rejection note and complete PR lookup are required."
+    )
+    actions = {
+        "retry_build": {
+            "enabled": retry_enabled,
+            "reason": retry_reason,
+            "cost": "local build only",
+            "destructive": False,
+            "preserves_diff": True,
+        },
+        "continue_pr": {
+            "enabled": has_pr and has_note and not recovery_running,
+            "reason": continue_reason,
+            "cost": "uses Aristotle",
+            "destructive": False,
+            "preserves_diff": True,
+        },
+        "update_continue": {
+            "enabled": has_pr and has_note and not recovery_running,
+            "reason": update_reason,
+            "cost": "build first; Aristotle only if needed",
+            "destructive": False,
+            "preserves_diff": True,
+        },
+        "start_over": {
+            "enabled": can_start_over,
+            "reason": start_reason,
+            "cost": "new Aristotle run",
+            "destructive": True,
+            "preserves_diff": False,
+        },
+    }
+    if needs_update and actions["update_continue"]["enabled"]:
+        recommended = "update_continue"
+    elif local_progress and actions["continue_pr"]["enabled"]:
+        recommended = "continue_pr"
+    elif actions["retry_build"]["enabled"]:
+        recommended = "retry_build"
+    elif actions["continue_pr"]["enabled"]:
+        recommended = "continue_pr"
+    elif actions["start_over"]["enabled"]:
+        recommended = "start_over"
+    else:
+        recommended = None
+    return actions, recommended
+
+
+def _local_recovery_progress(cfg, row: dict) -> dict:
+    """Best-effort evidence of unpublished work/checkpoint for one PR.
+
+    This is intentionally read-only and fail-quiet. A local tree is considered
+    valuable when it is dirty, locally ahead/diverged from the rendered PR
+    head, or has a saved Aristotle project. That evidence changes only the
+    recommendation; every server-side action remains independently guarded.
+    """
+    branch = row.get("fix_pr_branch")
+    expected_head = row.get("fix_pr_head_sha")
+    if not branch or not expected_head:
+        return {}
+    candidates: list[tuple[Path, Optional[Path]]] = []
+    try:
+        from marathon.conductor import load_jobs_snapshot
+
+        snap = load_jobs_snapshot(Path(cfg.repo_dir)) or {}
+        for raw in reversed(list(snap.get("jobs") or [])):
+            if raw.get("issue_num") != row.get("num") or raw.get("branch") != branch:
+                continue
+            worktree = Path(str(raw.get("worktree") or ""))
+            workdir_raw = raw.get("workdir")
+            workdir = Path(str(workdir_raw)) if workdir_raw else None
+            if worktree.is_dir():
+                candidates.append((worktree, workdir))
+    except Exception:  # noqa: BLE001
+        pass
+    if not candidates:
+        try:
+            listed = subprocess.run(
+                ["git", "-C", str(cfg.repo_dir), "worktree", "list", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            current: Optional[Path] = None
+            for line in (listed.stdout or "").splitlines():
+                if line.startswith("worktree "):
+                    current = Path(line[len("worktree "):].strip())
+                elif line.strip() == f"branch refs/heads/{branch}" and current:
+                    candidates.append((current, None))
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+    for worktree, workdir in candidates:
+        try:
+            status = subprocess.run(
+                ["git", "-C", str(worktree), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            head = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            local_head = (head.stdout or "").strip() if head.returncode == 0 else None
+            dirty = status.returncode == 0 and bool((status.stdout or "").strip())
+            project_id = None
+            if workdir is not None:
+                checkpoint = workdir / "marathon-refine-state.json"
+                if checkpoint.is_file():
+                    project_id = (json.loads(checkpoint.read_text()) or {}).get(
+                        "project_id"
+                    )
+            if dirty or (local_head and local_head != expected_head) or project_id:
+                return {
+                    "local_recovery_available": True,
+                    "local_recovery_dirty": dirty,
+                    "local_recovery_head": local_head,
+                    "local_recovery_session": bool(project_id),
+                }
+        except Exception:  # noqa: BLE001
+            continue
+    return {}
 
 
 def _orphan_note_previews(cfg) -> "dict[int, str]":
@@ -507,13 +805,13 @@ def stuck_issues(cfg) -> "list[dict]":
         reverted by a hard reset / checkout (deck-subdecks.json, being untracked,
         survives — so the split is real): the conductor keys off ``state.json``
         and never refines it, while the swipe queue reads the label and hides it.
-        GitHub is the durable truth, so we surface it and let a one-click
-        re-queue re-record it (the note is recovered from the issue's reject
-        comment at re-queue time). Degrades to state.json-only when gh is down.
+        GitHub is the durable truth, so we surface it and let an explicit
+        recovery request restore its local row (the note is recovered from the
+        issue's reject comment). Degrades to state.json-only when gh is down.
 
-    Each row carries a rejection-note preview so the deck can show it and offer a
-    one-click re-queue (which re-issues that note via ``record_rejection`` →
-    ``needs_iteration`` True)."""
+    Each row carries a rejection-note preview plus a server-derived recovery
+    capability matrix. Recovery is operational state, not a duplicate human
+    rejection verdict."""
     from marathon.review.state import load_state
 
     state = load_state(cfg)
@@ -529,6 +827,11 @@ def stuck_issues(cfg) -> "list[dict]":
             "status": s.status,
             "verdict_ts": s.verdict_ts,
             "attempts": getattr(s, "attempts", 0),
+            # Internal recovery-generation fields are bound into the opaque
+            # snapshot token and rechecked by the POST handler. The frontend
+            # need not interpret them.
+            "recovery_id": getattr(s, "recovery_id", None),
+            "recovery_mode": getattr(s, "recovery_mode", None),
             "has_note": bool(note),
             "note_preview": (note[:240] + "…") if len(note) > 240 else note,
         })
@@ -550,8 +853,10 @@ def stuck_issues(cfg) -> "list[dict]":
                 "status": "rejected",
                 "verdict_ts": None,
                 "attempts": 0,
+                "recovery_id": None,
+                "recovery_mode": None,
                 # The note is recoverable from the GitHub reject comment at
-                # re-queue time even though state.json lost it.
+                # recovery time even though state.json lost it.
                 "has_note": True,
                 "orphaned": True,
                 "note_preview": previews.get(num, ""),
@@ -561,15 +866,45 @@ def stuck_issues(cfg) -> "list[dict]":
     # Annotate rows that ALREADY have an open fix PR (one bounded gh call,
     # only when something is stuck): "stalled" + an open [build:FAIL] PR means
     # the pipeline produced a fix and automerge is correctly holding it — the
-    # deck must not claim "the fix never landed", and Re-queue should warn
-    # (a re-queue spends a fresh billed Aristotle run).
+    # deck must not claim "the fix never landed". Recovery distinguishes a
+    # free rebuild from PR-preserving continuation and destructive start-over.
     if out:
         prs = _open_refine_prs(cfg)
+        lookup_known = prs is not None
         for row in out:
-            info = prs.get(row["num"])
+            row["pr_lookup_known"] = lookup_known
+            info = (prs or {}).get(row["num"])
             if info:
-                row["fix_pr"] = info["pr"]
-                row["fix_pr_build"] = info["build"]
+                if info.get("ambiguous"):
+                    row["fix_pr_ambiguous"] = True
+                    continue
+                mapping = {
+                    "fix_pr": "pr",
+                    "fix_pr_build": "build",
+                    "fix_pr_branch": "branch",
+                    "fix_pr_head_sha": "head_sha",
+                    "fix_pr_base": "base",
+                    "fix_pr_mergeable": "mergeable",
+                    "fix_pr_merge_state": "merge_state",
+                }
+                for row_key, info_key in mapping.items():
+                    if info_key in info:
+                        row[row_key] = info[info_key]
+    conductor = conductor_status(cfg)
+    running_recoveries = {
+        job.get("issue_num")
+        for job in conductor.get("jobs", [])
+        if job.get("status") == "running" and job.get("recovery_mode")
+    }
+    for row in out:
+        row.update(_local_recovery_progress(cfg, row))
+        row["conductor_online"] = bool(conductor.get("alive"))
+        row["recovery_running"] = row["num"] in running_recoveries
+        row["host_conductor_disabled"] = bool(
+            os.environ.get("MARATHON_NO_HOST_CONDUCTOR")
+        )
+        row["actions"], row["recommended_action"] = _recovery_actions(row)
+        row["recovery_token"] = _recovery_token(row)
     return out
 
 

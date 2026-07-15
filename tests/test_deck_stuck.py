@@ -27,6 +27,7 @@ def _offline_gh(monkeypatch):
 
     monkeypatch.setattr(gh_mod, "list_rejected_issues", lambda cfg: None)
     monkeypatch.setattr(dash_mod, "_open_refine_prs", lambda cfg: {})
+    monkeypatch.setattr(dash_mod, "conductor_status", lambda cfg: {"alive": False})
 
 
 def test_stuck_issues_lists_stalled_and_parked_only(tmp_path):
@@ -154,6 +155,9 @@ def test_open_refine_prs_parses_heads_and_build_tags(monkeypatch, tmp_path):
              "title": "marathon: Chapter16 iter for #238 [build:FAIL]"},
             {"number": 264, "headRefName": "marathon/refine-c15-i171",
              "title": "marathon: Chapter15 iter for #171 [build:OK]"},
+            {"number": 265,
+             "headRefName": "marathon/refine-c15-i172-v0123456789ab",
+             "title": "marathon: generation branch for #172 [build:FAIL]"},
             {"number": 263, "headRefName": "chore/register-ch16",
              "title": "registry"},                       # not a refine head
         ]))
@@ -162,8 +166,168 @@ def test_open_refine_prs_parses_heads_and_build_tags(monkeypatch, tmp_path):
     cfg = make_cfg(tmp_path)
     # the autouse fixture stubs the module attribute — call the REAL function
     got = _real_open_refine_prs(cfg)
-    assert got == {238: {"pr": 260, "build": "FAIL"},
-                   171: {"pr": 264, "build": "OK"}}
+    assert got == {
+        238: {
+            "pr": 260,
+            "branch": "marathon/refine-c16-i238",
+            "build": "FAIL",
+        },
+        171: {
+            "pr": 264,
+            "branch": "marathon/refine-c15-i171",
+            "build": "OK",
+        },
+        172: {
+            "pr": 265,
+            "branch": "marathon/refine-c15-i172-v0123456789ab",
+            "build": "FAIL",
+        },
+    }
+
+
+def _parked(cfg, issue=238):
+    rejected = record_rejection(cfg, issue, "fix it")
+    record_stall(cfg, issue, expected_verdict_ts=rejected.verdict_ts)
+
+
+def test_recovery_recommends_build_retry_for_exact_red_pr(tmp_path, monkeypatch):
+    from marathon.deck import dashboard as dash_mod
+
+    cfg = make_cfg(tmp_path)
+    _parked(cfg)
+    monkeypatch.setattr(
+        dash_mod,
+        "_open_refine_prs",
+        lambda cfg: {
+            238: {
+                "pr": 260,
+                "branch": "marathon/refine-c16-i238",
+                "head_sha": "a" * 40,
+                "base": "main",
+                "build": "FAIL",
+                "mergeable": "MERGEABLE",
+                "merge_state": "CLEAN",
+            }
+        },
+    )
+
+    row = stuck_issues(cfg)[0]
+
+    assert row["recommended_action"] == "retry_build"
+    assert row["actions"]["retry_build"]["enabled"] is True
+    assert row["actions"]["continue_pr"]["enabled"] is True
+    assert row["actions"]["update_continue"]["enabled"] is True
+    assert row["actions"]["start_over"]["destructive"] is True
+    assert len(row["recovery_token"]) == 32
+
+
+def test_recovery_recommends_update_for_conflicted_pr(tmp_path, monkeypatch):
+    from marathon.deck import dashboard as dash_mod
+
+    cfg = make_cfg(tmp_path)
+    _parked(cfg)
+    monkeypatch.setattr(
+        dash_mod,
+        "_open_refine_prs",
+        lambda cfg: {
+            238: {
+                "pr": 260,
+                "branch": "marathon/refine-c16-i238",
+                "head_sha": "b" * 40,
+                "base": "main",
+                "build": "FAIL",
+                "mergeable": "CONFLICTING",
+                "merge_state": "DIRTY",
+            }
+        },
+    )
+
+    row = stuck_issues(cfg)[0]
+
+    assert row["recommended_action"] == "update_continue"
+    assert row["actions"]["retry_build"]["enabled"] is False
+    assert row["actions"]["continue_pr"]["enabled"] is True
+    assert row["actions"]["update_continue"]["enabled"] is True
+
+
+def test_recovery_running_disables_every_overlapping_action():
+    from marathon.deck import dashboard as dash_mod
+
+    row = {
+        "num": 238,
+        "has_note": True,
+        "fix_pr": 260,
+        "fix_pr_branch": "marathon/refine-c16-i238",
+        "fix_pr_head_sha": "a" * 40,
+        "fix_pr_base": "main",
+        "fix_pr_build": "FAIL",
+        "fix_pr_mergeable": "MERGEABLE",
+        "fix_pr_merge_state": "CLEAN",
+        "recovery_running": True,
+    }
+
+    actions, recommended = dash_mod._recovery_actions(row)
+
+    assert recommended is None
+    assert all(not spec["enabled"] for spec in actions.values())
+    assert all("already running" in spec["reason"] for spec in actions.values())
+
+
+def test_behind_pr_with_local_checkpoint_still_recommends_update():
+    from marathon.deck import dashboard as dash_mod
+
+    row = {
+        "num": 238,
+        "has_note": True,
+        "fix_pr": 260,
+        "fix_pr_branch": "marathon/refine-c16-i238",
+        "fix_pr_head_sha": "a" * 40,
+        "fix_pr_base": "main",
+        "fix_pr_build": "FAIL",
+        "fix_pr_mergeable": "MERGEABLE",
+        "fix_pr_merge_state": "BEHIND",
+        "local_recovery_available": True,
+    }
+
+    actions, recommended = dash_mod._recovery_actions(row)
+
+    assert actions["update_continue"]["enabled"] is True
+    assert recommended == "update_continue"
+
+
+def test_recovery_without_exact_pr_only_offers_start_over(tmp_path):
+    cfg = make_cfg(tmp_path)
+    _parked(cfg)
+
+    row = stuck_issues(cfg)[0]
+
+    assert row["recommended_action"] == "start_over"
+    assert row["actions"]["retry_build"]["enabled"] is False
+    assert row["actions"]["continue_pr"]["enabled"] is False
+    assert row["actions"]["update_continue"]["enabled"] is False
+    assert row["actions"]["start_over"]["enabled"] is True
+
+
+def test_recovery_token_changes_with_exact_pr_head(tmp_path, monkeypatch):
+    from marathon.deck import dashboard as dash_mod
+
+    cfg = make_cfg(tmp_path)
+    _parked(cfg)
+    pr = {
+        "pr": 260,
+        "branch": "marathon/refine-c16-i238",
+        "head_sha": "c" * 40,
+        "base": "main",
+        "build": "FAIL",
+        "mergeable": "MERGEABLE",
+        "merge_state": "CLEAN",
+    }
+    monkeypatch.setattr(dash_mod, "_open_refine_prs", lambda cfg: {238: pr})
+    first = stuck_issues(cfg)[0]["recovery_token"]
+    pr["head_sha"] = "d" * 40
+    second = stuck_issues(cfg)[0]["recovery_token"]
+
+    assert first != second
 
 
 def test_stuck_issues_degrades_when_gh_unavailable(tmp_path):

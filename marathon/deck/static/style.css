@@ -552,8 +552,56 @@ html, body {
 .modal-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1rem; }
 .btn { background: var(--panel-2); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 0.45rem 0.9rem; cursor: pointer; font: inherit; }
 .btn:hover { background: #222a3a; }
+.btn:disabled { opacity: 0.48; cursor: not-allowed; }
 .btn-primary { background: var(--accent); color: #07101f; border-color: var(--accent); font-weight: 600; }
 .btn-danger { background: var(--reject); color: #fff; border-color: var(--reject); font-weight: 600; }
+
+/* Explicit recovery chooser for parked rejections. The option card following
+   the checked radio owns the visual selection, avoiding a JS-only state class. */
+.recovery-modal { max-width: 660px; max-height: min(90vh, 760px); overflow-y: auto; }
+.recovery-title { margin-bottom: 0.35rem; }
+.recovery-context { overflow-wrap: anywhere; }
+.recovery-sha { color: var(--muted); }
+.recovery-conductor-note {
+  margin: 0.7rem 0; padding: 0.6rem 0.75rem; border: 1px solid #d2992266;
+  border-left: 3px solid var(--warn); border-radius: 8px; color: var(--warn);
+  background: #d2992212; font-size: 0.82rem; line-height: 1.45;
+}
+.recovery-options { display: grid; gap: 0.55rem; margin-top: 0.8rem; }
+.recovery-option { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.65rem; align-items: start; cursor: pointer; }
+.recovery-option.is-disabled { cursor: not-allowed; opacity: 0.5; }
+.recovery-radio { margin-top: 0.9rem; accent-color: var(--accent); }
+.recovery-choice-body {
+  display: block; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--panel-2); padding: 0.65rem 0.75rem;
+}
+.recovery-option:hover:not(.is-disabled) .recovery-choice-body { border-color: #6ea8fe88; }
+.recovery-radio:checked + .recovery-choice-body {
+  border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent);
+  background: #6ea8fe12;
+}
+.recovery-radio:focus-visible + .recovery-choice-body { outline: 2px solid var(--accent); outline-offset: 2px; }
+.recovery-choice-head { display: flex; align-items: center; justify-content: space-between; gap: 0.55rem; }
+.recovery-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.3rem; }
+.recovery-badge {
+  color: var(--muted); border: 1px solid var(--line); border-radius: 999px;
+  padding: 0.08rem 0.4rem; font-size: 0.64rem; font-weight: 600;
+}
+.recovery-badge-recommended { color: var(--accent); border-color: #6ea8fe66; }
+.recovery-badge-danger { color: var(--reject); border-color: #d1374b66; }
+.recovery-choice-reason, .recovery-choice-preservation { display: block; font-size: 0.78rem; line-height: 1.4; margin-top: 0.25rem; }
+.recovery-choice-reason { color: var(--ink); }
+.recovery-choice-preservation { color: var(--muted); }
+.recovery-destructive-confirm {
+  margin-top: 0.8rem; padding: 0.65rem 0.75rem; border: 1px solid #d1374b66;
+  border-left: 3px solid var(--reject); border-radius: 8px; background: #d1374b12;
+  color: var(--ink); font-size: 0.8rem; line-height: 1.45;
+}
+.recovery-destructive-confirm label { display: flex; align-items: flex-start; gap: 0.55rem; cursor: pointer; }
+.recovery-destructive-confirm input { margin-top: 0.2rem; accent-color: var(--reject); }
+.recovery-status { min-height: 1.25rem; margin-top: 0.7rem; font-size: 0.82rem; line-height: 1.4; color: var(--muted); }
+.recovery-status.is-error { color: var(--reject); }
+.recovery-status.is-success { color: var(--ok); }
 
 .deps-list { list-style: none; margin: 0; padding: 0; }
 .dep-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0; border-bottom: 1px solid var(--line); }
@@ -656,10 +704,10 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .issue-tier { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 0.3rem; }
 .issue-row.is-ready { cursor: pointer; }
 .issue-row.is-ready:hover { border-color: var(--accent); }
-/* --- stalled / needs-re-reject surface --- */
+/* --- parked-rejection recovery surface --- */
 .stuck-block .chap-title { color: var(--warn); }
 .stuck-block .stuck-row { border-color: #d2992255; }
-.issue-requeue { margin-left: auto; flex: none; }
+.issue-requeue, .issue-recover { margin-left: auto; flex: none; }
 
 /* attention card on the swipe stage (empty queue but stranded rejections) */
 .stuck-attention-list {
@@ -670,6 +718,13 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
   overflow-y: auto;
 }
 .stuck-attention-list .stuck-row { border-color: #d2992255; }
+
+@media (max-width: 560px) {
+  .recovery-choice-head { align-items: flex-start; flex-direction: column; }
+  .recovery-badges { justify-content: flex-start; }
+  .stuck-row { flex-wrap: wrap; }
+  .stuck-row .issue-recover { margin-left: 0; }
+}
 
 /* --- history timeline --- */
 .hist-row { display: flex; align-items: baseline; gap: 0.6rem; padding: 0.45rem 0.7rem; border-left: 2px solid var(--line); margin-left: 0.3rem; font-size: 0.86rem; }

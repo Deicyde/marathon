@@ -71,8 +71,10 @@ chapter-keyed and the daemon must stay untouched this phase).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -86,7 +88,17 @@ from typing import Optional
 from urllib.parse import urlencode
 
 import marathon.review.daemon as daemon
-from marathon.post_pipeline import _branch_name_for_issue
+from marathon.post_pipeline import (
+    PUBLICATION_JOURNAL_SCHEMA_VERSION,
+    _branch_name_for_issue,
+)
+from marathon.recovery import (
+    UPDATE_RECOVERY_MARKER_FILENAME,
+    UPDATE_RECOVERY_PHASE_FALLBACK_PREPARED,
+    UPDATE_RECOVERY_PHASE_PUBLISHED,
+    UPDATE_RECOVERY_PHASES,
+    UPDATE_RECOVERY_SCHEMA_VERSION,
+)
 from marathon.refine import (
     EXIT_AUTO_PR_BRANCH_ABORT,
     EXIT_CONFIG_ERROR,
@@ -96,17 +108,29 @@ from marathon.refine import (
 )
 from marathon.review.config import ReviewConfig, load_config
 from marathon.review.state import (
+    RECOVERY_CONTINUE_PR,
+    RECOVERY_RETRY_BUILD,
+    RECOVERY_START_OVER,
+    RECOVERY_UPDATE_CONTINUE,
     clear_pending_pr_check,
     load_state,
     pending_rejections_needing_iteration,
     record_iteration,
+    record_stall,
 )
-from marathon.state import load_refine_state, now_iso
+from marathon.state import (
+    RefineState,
+    load_refine_state,
+    now_iso,
+    save_refine_state,
+)
 
 # Snapshot + lock locations (repo-relative).
 SNAPSHOT_SCHEMA_VERSION = 1
 JOBS_SNAPSHOT_RELPATH = Path(".marathon/conductor/jobs.json")
 CONDUCTOR_LOCK_FILENAME = "conductor.lock"
+START_OVER_RECOVERY_MARKER_FILENAME = "marathon-start-over-recovery.json"
+START_OVER_RECOVERY_SCHEMA_VERSION = 1
 
 # Concurrency: default 1 = parity with the single-flight daemon
 # (BINDING — see module docstring). The env var is a *fallback default*
@@ -258,6 +282,14 @@ class ConductorJob:
     # callbacks CAS this exact timestamp + rejected status; an old process can
     # never consume/attempt/stall a later re-reject or a verified issue.
     expected_verdict_ts: Optional[str] = None
+    # Operational recovery generation. Like ``expected_verdict_ts``, this is
+    # persisted into jobs.json/pid markers and must match at completion; an old
+    # worker cannot consume a newer click in the recovery dialog.
+    expected_recovery_id: Optional[str] = None
+    recovery_mode: Optional[str] = None
+    recovery_pr: Optional[int] = None
+    recovery_head_sha: Optional[str] = None
+    recovery_base: Optional[str] = None
     rejection_note: Optional[str] = None
     launch_nonce: Optional[str] = None         # binds the two-phase start ACK
     proc: Optional[object] = field(default=None, repr=False, compare=False)
@@ -451,6 +483,505 @@ def _paired_retry_workdir(
     return candidate if candidate.is_dir() else None
 
 
+def _publication_recovery_resume_checkout(
+    repo_dir: Path,
+    runs_parent: Path,
+    issue_num: int,
+    kept_worktrees: dict[int, str],
+    *,
+    expected_operation_id: str,
+    expected_repo: str,
+    expected_branch: Optional[str],
+    expected_base: str,
+    expected_remote_oid: str,
+    target_relpath: str,
+) -> Optional[tuple[Path, Path, str]]:
+    """Find an exact-operation write-ahead publication checkpoint.
+
+    The remote ref may already be at the new local commit, so recovery must
+    recognise this journal *before* enforcing the original-head fetch/archive
+    guards.  Every publication identity field plus the actual kept checkout is
+    checked; an issue-number-only leftover is never sufficient for adoption.
+    """
+    raw_candidates = [kept_worktrees.get(issue_num)]
+    snapshot_candidates: list[dict] = []
+    if expected_branch:
+        held = _registered_worktree_for_branch(repo_dir, expected_branch)
+        if held is not None:
+            raw_candidates.append(str(held))
+    for raw in reversed(list((load_jobs_snapshot(repo_dir) or {}).get("jobs", []))):
+        try:
+            snapshot_matches = (
+                int(raw.get("issue_num")) == issue_num
+                and raw.get("expected_recovery_id") == expected_operation_id
+            )
+        except (AttributeError, TypeError, ValueError):
+            snapshot_matches = False
+        if snapshot_matches:
+            snapshot_candidates.append(raw)
+            if raw.get("worktree"):
+                raw_candidates.append(str(raw["worktree"]))
+
+    def checkpoint_identity(
+        worktree: Path, workdir: Path,
+    ) -> Optional[tuple[str, str]]:
+        """Return the exact journal branch/commit, or fail closed."""
+        try:
+            checkpoint = load_refine_state(workdir / REFINE_STATE_FILENAME)
+            pending = checkpoint.pending_publication if checkpoint else None
+            branch = pending.get("branch") if isinstance(pending, dict) else None
+            commit_sha = (
+                pending.get("commit_sha") if isinstance(pending, dict) else None
+            )
+            identity_ok = (
+                checkpoint is not None
+                and isinstance(pending, dict)
+                and pending.get("schema_version")
+                == PUBLICATION_JOURNAL_SCHEMA_VERSION
+                and pending.get("operation_id") == expected_operation_id
+                and pending.get("kind") == "pr"
+                and pending.get("repo") == expected_repo
+                and pending.get("base") == expected_base
+                and pending.get("expected_remote_oid") == expected_remote_oid
+                and isinstance(branch, str)
+                and bool(branch)
+                and (expected_branch is None or branch == expected_branch)
+                and isinstance(commit_sha, str)
+                and re.fullmatch(r"[0-9a-fA-F]{40}", commit_sha) is not None
+                and Path(checkpoint.target_folder).resolve()
+                == (worktree / target_relpath).resolve()
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            identity_ok = False
+            branch = None
+            commit_sha = None
+        if identity_ok and isinstance(branch, str) and isinstance(commit_sha, str):
+            return branch, commit_sha
+        return None
+
+    seen: set[Path] = set()
+    for raw in raw_candidates:
+        if not raw:
+            continue
+        worktree = Path(raw)
+        try:
+            resolved = worktree.resolve()
+            if resolved in seen or not resolved.is_relative_to(
+                runs_parent.resolve()
+            ):
+                continue
+            seen.add(resolved)
+        except OSError:
+            continue
+        if not worktree.is_dir() or _worktree_live_pid(str(worktree)) is not None:
+            continue
+        workdir = _paired_retry_workdir(runs_parent, issue_num, worktree)
+        if workdir is None:
+            continue
+        identity = checkpoint_identity(worktree, workdir)
+        if identity is None:
+            continue
+        branch, commit_sha = identity
+        current_branch = _git(worktree, "branch", "--show-current")
+        current_head = _git(worktree, "rev-parse", "HEAD")
+        if (
+            current_branch.returncode == 0
+            and (current_branch.stdout or "").strip() == branch
+            and current_head.returncode == 0
+            and (current_head.stdout or "").strip() == commit_sha
+        ):
+            return worktree, workdir, branch
+
+    # The worker may have pushed and then lost its checkout (process cleanup,
+    # machine restart, or an operator removing only the worktree).  The old
+    # jobs snapshot still identifies the paired workdir WAL.  Reconstruct only
+    # when the remote is *exactly* the WAL's full commit; branch-name shape or
+    # issue number alone is never ownership proof.
+    from marathon.post_pipeline import observe_remote_branch
+
+    for raw in snapshot_candidates:
+        if not raw.get("worktree") or not raw.get("workdir"):
+            continue
+        worktree = Path(str(raw["worktree"]))
+        workdir = Path(str(raw["workdir"]))
+        try:
+            if worktree.exists() or not worktree.resolve().is_relative_to(
+                runs_parent.resolve()
+            ) or not workdir.resolve().is_relative_to(runs_parent.resolve()):
+                continue
+            paired = _paired_retry_workdir(runs_parent, issue_num, worktree)
+            if paired is None or paired.resolve() != workdir.resolve():
+                continue
+        except OSError:
+            continue
+        identity = checkpoint_identity(worktree, workdir)
+        if identity is None:
+            continue
+        branch, commit_sha = identity
+        if raw.get("branch") != branch:
+            continue
+        held = _registered_worktree_for_branch(repo_dir, branch)
+        if held is not None:
+            continue
+        local_head = _local_branch_head(repo_dir, branch)
+        if (
+            local_head is not None
+            and local_head != commit_sha
+            and not _preserve_local_branch_ref(
+                repo_dir,
+                issue_num,
+                branch,
+                commit_sha,
+                expected_operation_id,
+            )
+        ):
+            continue
+        known, remote_head, _message = observe_remote_branch(repo_dir, branch)
+        if not known or remote_head != commit_sha:
+            continue
+        fetched = _git(repo_dir, "fetch", "origin", branch)
+        remote = _git(repo_dir, "rev-parse", f"origin/{branch}")
+        if (
+            fetched.returncode != 0
+            or remote.returncode != 0
+            or (remote.stdout or "").strip() != commit_sha
+        ):
+            continue
+        add = _git(
+            repo_dir,
+            "worktree", "add", "-B", branch, str(worktree), commit_sha,
+        )
+        if add.returncode != 0:
+            continue
+        current_branch = _git(worktree, "branch", "--show-current")
+        current_head = _git(worktree, "rev-parse", "HEAD")
+        if (
+            current_branch.returncode == 0
+            and (current_branch.stdout or "").strip() == branch
+            and current_head.returncode == 0
+            and (current_head.stdout or "").strip() == commit_sha
+        ):
+            print(
+                f"--- reconstructed publication checkout for #{issue_num}: "
+                f"{worktree}@{commit_sha[:12]} ---",
+                flush=True,
+            )
+            return worktree, workdir, branch
+    return None
+
+
+def _update_recovery_resume_checkout(
+    repo_dir: Path,
+    runs_parent: Path,
+    issue_num: int,
+    branch: str,
+    kept_worktrees: dict[int, str],
+    *,
+    expected_operation_id: str,
+    expected_repo: str,
+    expected_pr: int,
+    expected_head: str,
+    expected_base: str,
+    target_relpath: str,
+) -> Optional[tuple[Path, Path, str]]:
+    """Find a journal-bound update worktree that can resume after a crash."""
+    raw_candidates = [kept_worktrees.get(issue_num)]
+    held = _registered_worktree_for_branch(repo_dir, branch)
+    if held is not None:
+        raw_candidates.append(str(held))
+    seen: set[Path] = set()
+    for raw in raw_candidates:
+        if not raw:
+            continue
+        worktree = Path(raw)
+        try:
+            resolved = worktree.resolve()
+            if resolved in seen or not resolved.is_relative_to(
+                runs_parent.resolve()
+            ):
+                continue
+            seen.add(resolved)
+        except OSError:
+            continue
+        if not worktree.is_dir() or _worktree_live_pid(str(worktree)) is not None:
+            continue
+        workdir = _paired_retry_workdir(runs_parent, issue_num, worktree)
+        if workdir is None:
+            continue
+        marker_path = workdir / UPDATE_RECOVERY_MARKER_FILENAME
+        try:
+            marker = json.loads(marker_path.read_text())
+            phase = marker.get("phase")
+            identity_ok = (
+                isinstance(marker, dict)
+                and marker.get("schema_version") == UPDATE_RECOVERY_SCHEMA_VERSION
+                and phase in UPDATE_RECOVERY_PHASES
+                and marker.get("operation_id") == expected_operation_id
+                and marker.get("github_repo") == expected_repo
+                and int(marker.get("pr")) == expected_pr
+                and marker.get("branch") == branch
+                and marker.get("original_expected_head") == expected_head
+                and marker.get("base_branch") == expected_base
+                and marker.get("target_path") == str(
+                    (worktree / target_relpath).resolve()
+                )
+                and isinstance(marker.get("base_sha"), str)
+                and isinstance(marker.get("current_local_head"), str)
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            identity_ok = False
+            phase = None
+        if identity_ok and isinstance(phase, str):
+            return worktree, workdir, phase
+    return None
+
+
+def _update_recovery_adoption_checkout(
+    repo_dir: Path,
+    runs_parent: Path,
+    issue_num: int,
+    branch: str,
+    kept_worktrees: dict[int, str],
+    *,
+    target_relpath: str,
+) -> Optional[tuple[Path, Path]]:
+    """Find a dead exact-branch checkpoint for a fresh update operation.
+
+    Unlike an update *resume*, this checkout has no operation journal yet. Its
+    ownership evidence is the selected PR's exact named branch plus the
+    conductor issue/worktree pairing. The recovery worker will checkpoint all
+    files and create the operation-bound journal before merging or publishing.
+    A journal or publication recipe from any other operation fails closed.
+    """
+    candidates: list[tuple[str, Optional[str]]] = [
+        (kept_worktrees.get(issue_num) or "", None)
+    ]
+    held = _registered_worktree_for_branch(repo_dir, branch)
+    if held is not None:
+        candidates.append((str(held), None))
+    for raw in reversed(list((load_jobs_snapshot(repo_dir) or {}).get("jobs", []))):
+        try:
+            matches = (
+                int(raw.get("issue_num")) == issue_num
+                and raw.get("branch") == branch
+            )
+        except (AttributeError, TypeError, ValueError):
+            matches = False
+        if matches and raw.get("worktree"):
+            candidates.append(
+                (str(raw["worktree"]), str(raw.get("workdir") or "") or None)
+            )
+
+    seen: set[Path] = set()
+    for raw_worktree, raw_workdir in candidates:
+        if not raw_worktree:
+            continue
+        worktree = Path(raw_worktree)
+        try:
+            resolved = worktree.resolve()
+            if resolved in seen or not resolved.is_relative_to(
+                runs_parent.resolve()
+            ):
+                continue
+            seen.add(resolved)
+        except OSError:
+            continue
+        if not worktree.is_dir() or _worktree_live_pid(str(worktree)) is not None:
+            continue
+        workdir = Path(raw_workdir) if raw_workdir else _paired_retry_workdir(
+            runs_parent, issue_num, worktree
+        )
+        if workdir is None:
+            prefix = f"wt-i{issue_num}-"
+            if not worktree.name.startswith(prefix):
+                continue
+            workdir = runs_parent / (
+                f"wd-i{issue_num}-{worktree.name[len(prefix):]}"
+            )
+        if workdir.exists() and not workdir.is_dir():
+            continue
+        try:
+            if not workdir.resolve().is_relative_to(runs_parent.resolve()):
+                continue
+        except OSError:
+            continue
+        # An existing operation journal must be handled only by its exact
+        # identity-aware resume path above; never relabel it as a new click.
+        if (workdir / UPDATE_RECOVERY_MARKER_FILENAME).exists():
+            continue
+        try:
+            checkpoint = load_refine_state(workdir / REFINE_STATE_FILENAME)
+        except Exception:  # noqa: BLE001 - malformed state remains untouched
+            continue
+        if checkpoint is not None:
+            try:
+                if Path(checkpoint.target_folder).resolve() != (
+                    worktree / target_relpath
+                ).resolve():
+                    continue
+            except OSError:
+                continue
+            if checkpoint.pending_publication is not None:
+                continue
+        current_branch = _git(worktree, "branch", "--show-current")
+        current_head = _git(worktree, "rev-parse", "HEAD")
+        merge_head = _git(
+            worktree, "rev-parse", "--verify", "--quiet", "MERGE_HEAD"
+        )
+        if (
+            current_branch.returncode == 0
+            and (current_branch.stdout or "").strip() == branch
+            and current_head.returncode == 0
+            and bool((current_head.stdout or "").strip())
+            and merge_head.returncode != 0
+            and (worktree / target_relpath).is_dir()
+        ):
+            return worktree, workdir
+    return None
+
+
+def _start_over_recovery_resume_checkout(
+    repo_dir: Path,
+    runs_parent: Path,
+    issue_num: int,
+    branch: str,
+    kept_worktrees: dict[int, str],
+    *,
+    expected_operation_id: str,
+    expected_repo: str,
+    target_relpath: str,
+    expected_pr: Optional[int],
+    expected_head: Optional[str],
+    expected_base: Optional[str],
+) -> Optional[tuple[Path, Path]]:
+    """Find a dead checkpoint owned by this exact start-over operation.
+
+    An issue-number-only kept-worktree entry is not enough: a later recovery
+    click must never adopt an older Aristotle project.  The workdir marker is
+    the durable identity, while an exact jobs-snapshot row supplies an
+    additional restart path to the worktree location.
+    """
+    raw_candidates = [kept_worktrees.get(issue_num)]
+    held = _registered_worktree_for_branch(repo_dir, branch)
+    if held is not None:
+        raw_candidates.append(str(held))
+    for raw in reversed(list((load_jobs_snapshot(repo_dir) or {}).get("jobs", []))):
+        try:
+            snapshot_matches = (
+                int(raw.get("issue_num")) == issue_num
+                and raw.get("expected_recovery_id") == expected_operation_id
+                and raw.get("recovery_mode") == RECOVERY_START_OVER
+                and raw.get("branch") == branch
+            )
+        except (AttributeError, TypeError, ValueError):
+            snapshot_matches = False
+        if snapshot_matches and raw.get("worktree"):
+            raw_candidates.append(str(raw["worktree"]))
+
+    seen: set[Path] = set()
+    for raw in raw_candidates:
+        if not raw:
+            continue
+        worktree = Path(raw)
+        try:
+            resolved = worktree.resolve()
+            if resolved in seen or not resolved.is_relative_to(
+                runs_parent.resolve()
+            ):
+                continue
+            seen.add(resolved)
+        except OSError:
+            continue
+        if not worktree.is_dir() or _worktree_live_pid(str(worktree)) is not None:
+            continue
+        workdir = _paired_retry_workdir(runs_parent, issue_num, worktree)
+        if workdir is None:
+            continue
+        try:
+            marker = json.loads(
+                (workdir / START_OVER_RECOVERY_MARKER_FILENAME).read_text()
+            )
+            identity_ok = (
+                isinstance(marker, dict)
+                and marker.get("schema_version")
+                == START_OVER_RECOVERY_SCHEMA_VERSION
+                and marker.get("operation_id") == expected_operation_id
+                and marker.get("github_repo") == expected_repo
+                and int(marker.get("issue")) == issue_num
+                and marker.get("branch") == branch
+                and marker.get("recovery_pr") == expected_pr
+                and marker.get("original_expected_head") == expected_head
+                and marker.get("base_branch") == expected_base
+                and marker.get("target_path")
+                == str((worktree / target_relpath).resolve())
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            identity_ok = False
+        current = _git(worktree, "branch", "--show-current")
+        if (
+            identity_ok
+            and current.returncode == 0
+            and (current.stdout or "").strip() == branch
+        ):
+            return worktree, workdir
+    return None
+
+
+def _write_start_over_recovery_marker(
+    workdir: Path,
+    *,
+    operation_id: str,
+    github_repo: str,
+    issue_num: int,
+    branch: str,
+    target_path: Path,
+    recovery_pr: Optional[int],
+    original_expected_head: Optional[str],
+    base_branch: Optional[str],
+) -> bool:
+    """Durably bind a start-over worktree/checkpoint before worker spawn."""
+    marker = workdir / START_OVER_RECOVERY_MARKER_FILENAME
+    payload = {
+        "schema_version": START_OVER_RECOVERY_SCHEMA_VERSION,
+        "operation_id": operation_id,
+        "github_repo": github_repo,
+        "issue": issue_num,
+        "branch": branch,
+        "recovery_pr": recovery_pr,
+        "original_expected_head": original_expected_head,
+        "base_branch": base_branch,
+        "target_path": str(target_path.resolve()),
+    }
+    if marker.exists():
+        try:
+            if json.loads(marker.read_text()) == payload:
+                return True
+        except (OSError, json.JSONDecodeError):
+            pass
+        print(
+            f"--- start-over deferred: {marker} belongs to a different or "
+            "corrupt recovery operation ---",
+            flush=True,
+        )
+        return False
+    try:
+        workdir.mkdir(parents=True, exist_ok=True)
+        tmp = marker.with_name(f"{marker.name}.tmp-{os.getpid()}")
+        with tmp.open("w") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _durable_replace_file(tmp, marker)
+        return True
+    except OSError as exc:
+        print(
+            f"--- start-over deferred: could not persist recovery identity "
+            f"in {marker} ({exc}) ---",
+            flush=True,
+        )
+        return False
+
+
 def _recover_retry_worktrees(
     cfg: ReviewConfig,
     runs_parent: Path,
@@ -466,16 +997,18 @@ def _recover_retry_worktrees(
     restart between retry attempts no longer reaps the worktree/checkpoint and
     starts the paid proof search from scratch.
     """
+    review_state = load_state(cfg)
     pending = {
         n for n, _st in pending_rejections_needing_iteration(cfg, None)
         if n not in busy_issues
+        and review_state.issues.get(n) is not None
     }
     # A stalled verdict is intentionally not dispatchable, but its kept
     # worktree/checkpoint must survive restart so a later human requeue can
     # continue the same Aristotle session instead of orphan-reaping it.
     stalled = {
         n
-        for n, st in load_state(cfg).issues.items()
+        for n, st in review_state.issues.items()
         if st.status == "stalled" and n not in busy_issues
     }
     recovered: dict[int, str] = {}
@@ -494,6 +1027,17 @@ def _recover_retry_worktrees(
             and issue not in pending
             and issue not in stalled
         ) or recovery_key in recovered:
+            continue
+        entry = review_state.issues.get(issue)
+        if (
+            not autonomous
+            and entry is not None
+            and entry.recovery_mode == RECOVERY_START_OVER
+            and (
+                raw.get("recovery_mode") != RECOVERY_START_OVER
+                or raw.get("expected_recovery_id") != entry.recovery_id
+            )
+        ):
             continue
         worktree_raw = raw.get("worktree")
         if not worktree_raw:
@@ -641,11 +1185,21 @@ def _reconcile_merged_rejections(cfg: ReviewConfig) -> list[int]:
     for issue_num, st in rejected.items():
         if issue_num not in merged:
             continue
+        # An explicit recovery operation owns this issue/branch until its own
+        # generation-aware completion path releases it.  A hand-merged old PR
+        # must not silently cancel retry/update/start-over intent.
+        if getattr(st, "recovery_id", None) is not None:
+            continue
         branch, merged_at = merged[issue_num]
         if not _ts_strictly_newer(merged_at, getattr(st, "verdict_ts", None)):
             continue  # merge predates this rejection — a fresh reject, not a stuck one
         n = _requeue_refined_issue(
-            cfg, branch, expected_verdict_ts=st.verdict_ts
+            cfg,
+            branch,
+            expected_verdict_ts=st.verdict_ts,
+            # Bind the observed absence too: a recovery queued after this scan
+            # wins the CAS and survives the old merge reconciliation.
+            expected_recovery_id=None,
         )
         if n is not None:
             reconciled.append(n)
@@ -697,6 +1251,7 @@ def _pick_dispatchable(
     slots: int,
     warned_unknown: Optional[set[int]] = None,
     queue_from_github: bool = False,
+    recovery_modes: Optional["frozenset[str]"] = None,
 ) -> list[tuple[int, int]]:
     """The deterministic scheduling decision: up to ``slots`` (issue,
     chapter) pairs to dispatch this tick.
@@ -715,11 +1270,20 @@ def _pick_dispatchable(
     running = [j for j in jobs if j.status == "running"]
     busy_issues = {j.issue_num for j in running}
     busy_targets = {j.target for j in running}
+    allowed_issues: Optional[set[int]] = None
+    if recovery_modes is not None:
+        allowed_issues = {
+            issue_num
+            for issue_num, entry in load_state(cfg).issues.items()
+            if entry.recovery_mode in recovery_modes
+        }
     picks: list[tuple[int, int]] = []
     for issue_num, chapter in _eligible_issues(cfg, warned_unknown, queue_from_github):
         if len(picks) >= slots:
             break
         if issue_num in busy_issues:
+            continue
+        if allowed_issues is not None and issue_num not in allowed_issues:
             continue
         if not_before.get(issue_num, 0.0) > now:
             continue
@@ -731,6 +1295,38 @@ def _pick_dispatchable(
     return picks
 
 
+def _park_deferred_recovery(cfg: ReviewConfig, issue_num: int) -> bool:
+    """Return a failed pre-dispatch recovery to the visible chooser.
+
+    Recovery intent makes a row dispatchable and therefore removes it from the
+    deck's parked list. If an exact-head/worktree safety guard then refuses to
+    launch, leaving the row rejected would hide it while the conductor retries
+    forever. CAS-stalling the same operation keeps all work intact and makes
+    the next decision visible again.
+    """
+    entry = load_state(cfg).issues.get(issue_num)
+    if (
+        entry is None
+        or entry.status != "rejected"
+        or not entry.recovery_id
+    ):
+        return False
+    parked = record_stall(
+        cfg,
+        issue_num,
+        expected_verdict_ts=entry.verdict_ts,
+        expected_recovery_id=entry.recovery_id,
+    )
+    if parked is None:
+        return False
+    print(
+        f"--- recovery #{issue_num} could not pass its safe pre-dispatch "
+        "guards; parked visibly for a refreshed recovery choice ---",
+        flush=True,
+    )
+    return True
+
+
 # --- Worktree management -----------------------------------------------------------
 
 
@@ -740,6 +1336,60 @@ def _git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
     )
+
+
+def _registered_worktree_for_branch(
+    repo_dir: Path, branch: str
+) -> Optional[Path]:
+    """Return the registered worktree currently holding ``branch``."""
+    cp = _git(repo_dir, "worktree", "list", "--porcelain")
+    if cp.returncode != 0:
+        return None
+    current: Optional[Path] = None
+    for line in (cp.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            current = Path(line[len("worktree "):].strip())
+        elif line.strip() == f"branch refs/heads/{branch}":
+            return current
+    return None
+
+
+def _unpublished_worktree_reason(
+    repo_dir: Path, worktree: Path, branch: Optional[str]
+) -> Optional[str]:
+    """Explain why force-removing a dead worktree could lose work.
+
+    Fail closed: unreadable status/HEAD/remote state is itself a reason to keep
+    the tree. Runtime marker files are ignored by git and therefore do not
+    create false positives here.
+    """
+    status = _git(worktree, "status", "--porcelain")
+    if status.returncode != 0:
+        return "git status could not be read"
+    if (status.stdout or "").strip():
+        return "it has uncommitted changes"
+    head = _git(worktree, "rev-parse", "HEAD")
+    if head.returncode != 0 or not (head.stdout or "").strip():
+        return "its HEAD could not be read"
+    if not branch:
+        return "it is detached and may be an unpublished recovery checkout"
+    remote = _git(
+        repo_dir, "ls-remote", "--heads", "origin", f"refs/heads/{branch}"
+    )
+    if remote.returncode != 0:
+        return "the remote branch could not be checked"
+    remote_sha = ""
+    for line in (remote.stdout or "").splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == f"refs/heads/{branch}":
+            remote_sha = fields[0]
+            break
+    local_sha = (head.stdout or "").strip()
+    if not remote_sha:
+        return "its branch has no remote publication"
+    if local_sha != remote_sha:
+        return "its HEAD is ahead of or diverged from the remote branch"
+    return None
 
 
 def _remove_worktree(repo_dir: Path, worktree: Path) -> None:
@@ -1273,12 +1923,27 @@ def _reap_orphan_worktree(repo_dir: Path, branch: str) -> bool:
     if path is None:
         _git(repo_dir, "worktree", "prune")  # only stale metadata held the branch
         return True
+    if not Path(path).name.startswith("wt-i"):
+        print(
+            f"  NOT reaping {path}: it is not a conductor-managed issue "
+            "worktree",
+            flush=True,
+        )
+        return False
     live_pid = _worktree_live_pid(path)
     if live_pid is not None:
         print(
             f"  NOT reaping {path}: a live job (pid {live_pid}) from a previous "
             "conductor is still using it — deferring this dispatch until it "
             "exits", flush=True,
+        )
+        return False
+    unpublished = _unpublished_worktree_reason(repo_dir, Path(path), branch)
+    if unpublished:
+        print(
+            f"  NOT reaping {path}: {unpublished}; preserving it as a "
+            "recovery candidate",
+            flush=True,
         )
         return False
     print(f"  reaping orphan worktree for {branch}: {path}", flush=True)
@@ -1307,6 +1972,20 @@ def prune_worktrees(repo_dir: Path, runs_parent: Path) -> None:
                 print(
                     f"  --prune SKIP {child}: a live job (pid {live_pid}) is "
                     "still using it",
+                    flush=True,
+                )
+                continue
+            branch_cp = _git(child, "branch", "--show-current")
+            branch = (
+                (branch_cp.stdout or "").strip()
+                if branch_cp.returncode == 0 else None
+            )
+            unpublished = _unpublished_worktree_reason(
+                repo_dir, child, branch or None
+            )
+            if unpublished:
+                print(
+                    f"  --prune SKIP {child}: {unpublished}",
                     flush=True,
                 )
                 continue
@@ -1496,6 +2175,50 @@ def _branch_pull_requests(
         return None
 
 
+def _open_refine_prs_for_issue(
+    cfg: ReviewConfig, issue_num: int
+) -> Optional[list[dict]]:
+    """All open refine PRs for an issue, or ``None`` when not provable.
+
+    A no-PR start-over confirmation is an expected-absence snapshot. Recheck
+    that absence at dispatch through paginated REST before choosing any branch;
+    otherwise a PR created after the dialog could be overwritten without ever
+    being shown or archived.
+    """
+    from marathon.review.automerge import _REFINE_BRANCH_RE
+    from marathon.review.github import gh
+
+    matches: list[dict] = []
+    for page in range(1, 11):
+        query = urlencode(
+            {"state": "open", "per_page": 100, "page": page}
+        )
+        try:
+            cp = gh(
+                "api",
+                f"repos/{cfg.github_repo}/pulls?{query}",
+                check=False,
+            )
+            if cp.returncode != 0:
+                return None
+            rows = json.loads(cp.stdout or "[]")
+        except Exception:  # noqa: BLE001 — absence must be affirmative
+            return None
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            head = row.get("head") if isinstance(row, dict) else None
+            branch = head.get("ref") if isinstance(head, dict) else None
+            match = _REFINE_BRANCH_RE.match(branch or "")
+            if match and int(match.group(1)) == issue_num:
+                matches.append(row)
+        if len(rows) < 100:
+            return matches
+    # Exactly 1000 rows may have a further page. Never infer absence from a
+    # bounded/truncated listing.
+    return None
+
+
 def _has_open_pr_for_issue(
     cfg: ReviewConfig, issue_num: int, chapter: int, *, kind: str = "refine"
 ) -> Optional[bool]:
@@ -1646,6 +2369,445 @@ def _refine_branch_for_dispatch(
     return branch
 
 
+def _fetch_exact_recovery_head(
+    repo_dir: Path, branch: str, expected_head: str
+) -> bool:
+    """Fetch and verify the exact PR head selected in the recovery dialog."""
+    from marathon.post_pipeline import observe_remote_branch
+
+    ok, remote_head, message = observe_remote_branch(repo_dir, branch)
+    if not ok or not remote_head or remote_head != expected_head:
+        found = remote_head[:12] if remote_head else "<absent>"
+        print(
+            f"--- recovery deferred: {branch} changed ({found} != expected "
+            f"{expected_head[:12]}); {message} ---",
+            flush=True,
+        )
+        return False
+    fetch = _git(repo_dir, "fetch", "origin", branch)
+    if fetch.returncode != 0:
+        print(
+            f"--- recovery deferred: fetch origin {branch} failed: "
+            f"{(fetch.stderr or fetch.stdout).strip()[:240]} ---",
+            flush=True,
+        )
+        return False
+    fetched = _git(repo_dir, "rev-parse", f"origin/{branch}")
+    if (
+        fetched.returncode != 0
+        or (fetched.stdout or "").strip() != expected_head
+    ):
+        print(
+            f"--- recovery deferred: fetched origin/{branch} did not resolve "
+            f"to {expected_head[:12]} ---",
+            flush=True,
+        )
+        return False
+    return True
+
+
+def _local_branch_head(repo_dir: Path, branch: str) -> Optional[str]:
+    cp = _git(repo_dir, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+    if cp.returncode != 0:
+        return None
+    value = (cp.stdout or "").strip()
+    return value or None
+
+
+def _local_branch_extends(
+    repo_dir: Path, branch: str, expected_remote_head: str
+) -> bool:
+    local_head = _local_branch_head(repo_dir, branch)
+    if local_head is None:
+        return False
+    return _git(
+        repo_dir,
+        "merge-base",
+        "--is-ancestor",
+        expected_remote_head,
+        local_head,
+    ).returncode == 0
+
+
+def _preserve_local_branch_ref(
+    repo_dir: Path,
+    issue_num: int,
+    branch: str,
+    expected_remote_head: str,
+    recovery_id: str,
+) -> bool:
+    """Archive an unpublished local branch tip before ``git -B`` can move it."""
+    local_head = _local_branch_head(repo_dir, branch)
+    if not local_head or local_head == expected_remote_head:
+        return True
+    archive = (
+        f"marathon/local-wip-i{issue_num}-{local_head[:12]}-"
+        f"{recovery_id[:8]}"
+    )
+    existing = _local_branch_head(repo_dir, archive)
+    if existing == local_head:
+        return True
+    if existing is not None:
+        print(
+            f"--- recovery deferred: local archive {archive} points at "
+            "different work ---",
+            flush=True,
+        )
+        return False
+    made = _git(repo_dir, "branch", archive, local_head)
+    if made.returncode != 0:
+        print(
+            f"--- recovery deferred: could not preserve local {branch}@"
+            f"{local_head[:12]}: "
+            f"{(made.stderr or made.stdout).strip()[:240]} ---",
+            flush=True,
+        )
+        return False
+    print(
+        f"--- recovery: preserved unpublished local ref as {archive}@"
+        f"{local_head[:12]} ---",
+        flush=True,
+    )
+    return True
+
+
+def _start_over_local_archive_branch(
+    issue_num: int, branch: str, recovery_id: str
+) -> str:
+    """Deterministic, ref-safe archive name for one recovery/branch pair."""
+    operation = hashlib.sha256(recovery_id.encode("utf-8")).hexdigest()[:12]
+    source = hashlib.sha256(branch.encode("utf-8")).hexdigest()[:12]
+    return f"marathon/local-archive-i{issue_num}-o{operation}-b{source}"
+
+
+def _preserve_no_pr_start_over_local_branch(
+    repo_dir: Path,
+    issue_num: int,
+    branch: str,
+    recovery_id: str,
+) -> bool:
+    """Preserve a local no-PR candidate before a fresh start-over branch.
+
+    A dead registered worktree is renamed onto an operation-scoped archive
+    branch.  ``git branch -m`` changes only the ref: tracked, staged, and
+    untracked files remain exactly where they are.  A branch not checked out in
+    a worktree is copied to the same archive instead, so a later ``-B`` can
+    never discard its unpublished commit tip.  A live owner always wins and
+    makes recovery defer.
+    """
+    archive = _start_over_local_archive_branch(
+        issue_num, branch, recovery_id
+    )
+    held = _registered_worktree_for_branch(repo_dir, branch)
+    if held is not None:
+        live_pid = _worktree_live_pid(str(held))
+        if live_pid is not None:
+            print(
+                f"--- start-over deferred: live pid {live_pid} still owns "
+                f"{held}; local work was left untouched ---",
+                flush=True,
+            )
+            return False
+        rename = _git(held, "branch", "-m", archive)
+        if rename.returncode != 0:
+            # Accept only the exact idempotent post-rename state.  In normal
+            # operation the old branch no longer has a registered holder after
+            # a successful rename, but this also makes restart/stale-metadata
+            # handling fail safe.
+            current = _git(held, "branch", "--show-current")
+            if (current.stdout or "").strip() != archive:
+                print(
+                    f"--- start-over deferred: could not preserve local "
+                    f"worktree {held} on {archive}: "
+                    f"{(rename.stderr or rename.stdout).strip()[:240]} ---",
+                    flush=True,
+                )
+                return False
+        print(
+            f"--- start-over: preserved local worktree {held} on "
+            f"{archive} ---",
+            flush=True,
+        )
+        return True
+
+    local_head = _local_branch_head(repo_dir, branch)
+    if local_head is None:
+        return True
+    archived_head = _local_branch_head(repo_dir, archive)
+    if archived_head == local_head:
+        return True
+    if archived_head is not None:
+        print(
+            f"--- start-over deferred: local archive {archive} points at "
+            "different work ---",
+            flush=True,
+        )
+        return False
+    made = _git(repo_dir, "branch", archive, local_head)
+    if made.returncode != 0:
+        print(
+            f"--- start-over deferred: could not preserve local {branch}@"
+            f"{local_head[:12]}: "
+            f"{(made.stderr or made.stdout).strip()[:240]} ---",
+            flush=True,
+        )
+        return False
+    print(
+        f"--- start-over: preserved local {branch}@{local_head[:12]} as "
+        f"{archive} ---",
+        flush=True,
+    )
+    return True
+
+
+def _select_no_pr_start_over_branch(
+    cfg: ReviewConfig,
+    issue_num: int,
+    chapter: int,
+    verdict_ts: Optional[str],
+    recovery_id: str,
+    runs_parent: Path,
+    kept_worktrees: dict[int, str],
+) -> Optional[tuple[str, Optional[tuple[Path, Path]]]]:
+    """Choose an affirmatively absent branch without overwriting old work.
+
+    The legacy branch and the verdict-generation branch may contain a push
+    whose PR creation failed.  They are deliberately left on the remote.  Any
+    local version (including a dirty dead worktree) is archived first.  The new
+    publication branch is derived from the recovery operation.  If that exact
+    operation branch is occupied, only its exact workdir publication WAL may
+    resume it; otherwise recovery defers instead of paying for a new session
+    on a slot suffix and abandoning the already-pushed commit.
+    """
+    from marathon.post_pipeline import observe_remote_branch
+
+    legacy = _branch_name_for_issue(
+        f"Chapter{chapter}", issue_num, kind="refine"
+    )
+    stale_candidates = [legacy]
+    if verdict_ts:
+        stale_candidates.append(
+            _branch_name_for_issue(
+                f"Chapter{chapter}",
+                issue_num,
+                kind="refine",
+                generation=verdict_ts,
+            )
+        )
+    for candidate in dict.fromkeys(stale_candidates):
+        known, remote_head, message = observe_remote_branch(
+            cfg.repo_dir, candidate
+        )
+        if not known:
+            print(f"--- start-over deferred: {message} ---", flush=True)
+            return None
+        if not _preserve_no_pr_start_over_local_branch(
+            cfg.repo_dir,
+            issue_num,
+            candidate,
+            recovery_id,
+        ):
+            return None
+        if remote_head is not None:
+            print(
+                f"--- start-over: preserving stale remote {candidate}@"
+                f"{remote_head[:12]} unchanged ---",
+                flush=True,
+            )
+
+    branch = _branch_name_for_issue(
+        f"Chapter{chapter}",
+        issue_num,
+        kind="refine",
+        generation=f"start-over:{recovery_id}:0",
+    )
+    resume = _start_over_recovery_resume_checkout(
+        cfg.repo_dir,
+        runs_parent,
+        issue_num,
+        branch,
+        kept_worktrees,
+        expected_operation_id=recovery_id,
+        expected_repo=cfg.github_repo,
+        target_relpath=_target_relpath(cfg, chapter),
+        expected_pr=None,
+        expected_head=None,
+        expected_base=None,
+    )
+    if resume is not None:
+        print(
+            f"--- start-over: resuming operation {recovery_id[:8]} for "
+            f"#{issue_num} in {resume[0]} ---",
+            flush=True,
+        )
+        return branch, resume
+    known, remote_head, message = observe_remote_branch(cfg.repo_dir, branch)
+    if not known:
+        print(f"--- start-over deferred: {message} ---", flush=True)
+        return None
+    if not _preserve_no_pr_start_over_local_branch(
+        cfg.repo_dir,
+        issue_num,
+        branch,
+        recovery_id,
+    ):
+        return None
+    if remote_head is None:
+        return branch, None
+    print(
+        f"--- start-over deferred: this operation's branch {branch}@"
+        f"{remote_head[:12]} is already occupied but no exact publication "
+        "checkpoint could be resumed; preserving it and refusing to start "
+        "another Aristotle session ---",
+        flush=True,
+    )
+    _park_deferred_recovery(cfg, issue_num)
+    return None
+
+
+def _archive_start_over_head(
+    cfg: ReviewConfig,
+    issue_num: int,
+    branch: str,
+    expected_head: str,
+    recovery_id: str,
+) -> bool:
+    """Durably archive the remote PR head and free any dead local checkout.
+
+    The archive is created before a fresh Aristotle session can start. A dirty
+    local worktree is *renamed* onto that archive branch without touching its
+    files, so unpublished progress remains recoverable on disk as well.
+    """
+    if not _fetch_exact_recovery_head(cfg.repo_dir, branch, expected_head):
+        return False
+    archive = (
+        f"marathon/archive-i{issue_num}-{expected_head[:12]}-"
+        f"{recovery_id[:8]}"
+    )
+    from marathon.post_pipeline import observe_remote_branch
+
+    known, archived_head, message = observe_remote_branch(cfg.repo_dir, archive)
+    if not known:
+        print(f"--- start-over deferred: {message} ---", flush=True)
+        return False
+    if archived_head not in (None, expected_head):
+        print(
+            f"--- start-over deferred: archive {archive} already points at "
+            "different work ---",
+            flush=True,
+        )
+        return False
+    if archived_head is None:
+        ref = f"refs/heads/{archive}"
+        push = _git(
+            cfg.repo_dir,
+            "push",
+            f"--force-with-lease={ref}:",
+            "origin",
+            f"{expected_head}:{ref}",
+        )
+        if push.returncode != 0:
+            print(
+                f"--- start-over deferred: could not archive {branch}@"
+                f"{expected_head[:12]}: "
+                f"{(push.stderr or push.stdout).strip()[:240]} ---",
+                flush=True,
+            )
+            return False
+    held = _registered_worktree_for_branch(cfg.repo_dir, branch)
+    if held is not None:
+        live_pid = _worktree_live_pid(str(held))
+        if live_pid is not None:
+            print(
+                f"--- start-over deferred: live pid {live_pid} still owns "
+                f"{held}; archived remote head but left the job untouched ---",
+                flush=True,
+            )
+            return False
+        rename = _git(held, "branch", "-m", archive)
+        if rename.returncode != 0:
+            # A restart may have already completed the rename. Only accept that
+            # exact safe state; otherwise keep both trees and defer.
+            current = _git(held, "branch", "--show-current")
+            if (current.stdout or "").strip() != archive:
+                print(
+                    f"--- start-over deferred: could not preserve local "
+                    f"worktree on {archive}: "
+                    f"{(rename.stderr or rename.stdout).strip()[:240]} ---",
+                    flush=True,
+                )
+                return False
+        print(
+            f"--- start-over: preserved local worktree {held} on {archive} ---",
+            flush=True,
+        )
+    elif not _preserve_local_branch_ref(
+        cfg.repo_dir,
+        issue_num,
+        branch,
+        expected_head,
+        recovery_id,
+    ):
+        return False
+    print(
+        f"--- start-over: archived prior PR head as {archive}@"
+        f"{expected_head[:12]} ---",
+        flush=True,
+    )
+    return True
+
+
+def _prepare_continue_checkpoint(
+    worktree: Path,
+    workdir: Path,
+    target: Path,
+    expected_branch: str,
+    expected_verdict_ts: Optional[str],
+) -> bool:
+    """Make a kept tree run one more round without checkout/reset.
+
+    Existing Aristotle IDs are retained and marked for ``project.ask``. If no
+    checkpoint exists, the exact PR/local diff is still preserved and refine
+    creates a fresh Aristotle project against that tree.
+    """
+    head = _git(worktree, "rev-parse", "HEAD")
+    branch = _git(worktree, "branch", "--show-current")
+    if head.returncode != 0 or branch.returncode != 0:
+        return False
+    head_sha = (head.stdout or "").strip()
+    actual_branch = (branch.stdout or "").strip()
+    if not head_sha or actual_branch != expected_branch:
+        print(
+            f"  continue: expected {expected_branch}, found "
+            f"{actual_branch or '<detached>'}; refusing to reuse it",
+            flush=True,
+        )
+        return False
+    state_path = workdir / REFINE_STATE_FILENAME
+    try:
+        state = load_refine_state(state_path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  continue: unreadable checkpoint ({exc}); preserving files")
+        state = None
+    same_target = False
+    if state is not None:
+        try:
+            same_target = Path(state.target_folder).resolve() == target.resolve()
+        except OSError:
+            same_target = False
+    if state is None or not same_target:
+        state = RefineState(target_folder=str(target))
+    if state.pending_publication is None:
+        state.iterations_completed = 0
+        state.current_iteration_idx = 0
+        state.force_continuation = bool(state.project_id)
+        state.preserve_local_branch = True
+        state.continuation_commit_sha = head_sha
+        state.review_verdict_ts = expected_verdict_ts
+    save_refine_state(state_path, state)
+    return True
+
+
 def _dispatch_job(
     cfg: ReviewConfig,
     issue_num: int,
@@ -1671,7 +2833,18 @@ def _dispatch_job(
     ``origin/<prover_branch>`` under a ``proof-`` name and its PR targets
     the prover branch, so proofs never touch ``main``."""
     expected_verdict_ts: Optional[str] = None
+    expected_recovery_id: Optional[str] = None
+    recovery_mode: Optional[str] = None
+    recovery_pr: Optional[int] = None
+    recovery_branch: Optional[str] = None
+    recovery_head_sha: Optional[str] = None
+    recovery_base: Optional[str] = None
     rejection_note: Optional[str] = None
+    auto_pr_expected_remote_oid: Optional[str] = None
+    update_resume: Optional[tuple[Path, Path, str]] = None
+    update_adoption: Optional[tuple[Path, Path]] = None
+    start_over_resume: Optional[tuple[Path, Path]] = None
+    publication_resume: Optional[tuple[Path, Path, str]] = None
     if not fill and not repair:
         current = load_state(cfg).issues.get(issue_num)
         # Missing is tolerated for low-level/manual callers and older tests;
@@ -1687,7 +2860,58 @@ def _dispatch_job(
             return None
         if current is not None:
             expected_verdict_ts = current.verdict_ts
+            expected_recovery_id = current.recovery_id
+            recovery_mode = current.recovery_mode
+            recovery_pr = current.recovery_pr
+            recovery_branch = current.recovery_branch
+            recovery_head_sha = current.recovery_head_sha
+            recovery_base = current.recovery_base
             rejection_note = current.notes
+            auto_pr_expected_remote_oid = recovery_head_sha
+            if recovery_mode in {
+                RECOVERY_RETRY_BUILD,
+                RECOVERY_CONTINUE_PR,
+                RECOVERY_UPDATE_CONTINUE,
+            } and not (
+                recovery_pr and recovery_branch and recovery_head_sha
+            ):
+                print(
+                    f"--- deferring #{issue_num}: {recovery_mode} lacks an "
+                    "exact PR/branch/head recovery snapshot ---",
+                    flush=True,
+                )
+                return None
+            if (
+                expected_recovery_id
+                and recovery_mode in {
+                    RECOVERY_CONTINUE_PR,
+                    RECOVERY_UPDATE_CONTINUE,
+                    RECOVERY_START_OVER,
+                }
+            ):
+                publication_resume = _publication_recovery_resume_checkout(
+                    cfg.repo_dir,
+                    runs_parent,
+                    issue_num,
+                    kept_worktrees,
+                    expected_operation_id=expected_recovery_id,
+                    expected_repo=cfg.github_repo,
+                    expected_branch=recovery_branch,
+                    expected_base=recovery_base or "main",
+                    expected_remote_oid=(
+                        ""
+                        if recovery_mode == RECOVERY_START_OVER
+                        and recovery_pr is None
+                        else recovery_head_sha or ""
+                    ),
+                    target_relpath=_target_relpath(cfg, chapter),
+                )
+                if (
+                    publication_resume is not None
+                    and recovery_mode == RECOVERY_START_OVER
+                    and recovery_pr is None
+                ):
+                    auto_pr_expected_remote_oid = ""
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     if repair:
         # Chapter-scoped repair branch (no review issue): marathon/repair-c<N>.
@@ -1711,20 +2935,263 @@ def _dispatch_job(
         branch = _branch_name_for_issue(f"Chapter{chapter}", issue_num, kind="proof")
         start_point = f"origin/{prover_branch}"
     else:
-        selected_branch = _refine_branch_for_dispatch(
-            cfg, issue_num, chapter, expected_verdict_ts
-        )
-        if selected_branch is None:
-            return None
-        branch = selected_branch
+        if (
+            publication_resume is None
+            and recovery_mode == RECOVERY_START_OVER
+            and recovery_pr is None
+        ):
+            open_refines = _open_refine_prs_for_issue(cfg, issue_num)
+            if open_refines is None:
+                print(
+                    f"--- deferring #{issue_num}: could not re-confirm that "
+                    "no refine PR appeared after start-over confirmation ---",
+                    flush=True,
+                )
+                return None
+            if open_refines:
+                print(
+                    f"--- deferring #{issue_num}: a refine PR appeared after "
+                    "the no-PR start-over confirmation; refusing to replace "
+                    "work the user never saw ---",
+                    flush=True,
+                )
+                _park_deferred_recovery(cfg, issue_num)
+                return None
+        if publication_resume is not None:
+            branch = publication_resume[2]
+            print(
+                f"--- resuming publication-only checkpoint for #{issue_num}: "
+                f"{publication_resume[1]} ---",
+                flush=True,
+            )
+        elif recovery_mode == RECOVERY_START_OVER and recovery_pr is None:
+            if not expected_recovery_id:
+                print(
+                    f"--- deferring #{issue_num}: no-PR start-over lacks an "
+                    "operation id ---",
+                    flush=True,
+                )
+                return None
+            selection = _select_no_pr_start_over_branch(
+                cfg,
+                issue_num,
+                chapter,
+                expected_verdict_ts,
+                expected_recovery_id,
+                runs_parent,
+                kept_worktrees,
+            )
+            if selection is None:
+                return None
+            branch, start_over_resume = selection
+            # Preserve the expected-absence lease all the way to publication.
+            # Refine must not re-observe a branch created after this guard and
+            # adopt its new OID as permission to overwrite it.
+            auto_pr_expected_remote_oid = ""
+        elif recovery_branch and recovery_mode:
+            branch = recovery_branch
+        else:
+            selected_branch = _refine_branch_for_dispatch(
+                cfg, issue_num, chapter, expected_verdict_ts
+            )
+            if selected_branch is None:
+                return None
+            branch = selected_branch
+        if (
+            publication_resume is None
+            and recovery_mode == RECOVERY_UPDATE_CONTINUE
+            and recovery_pr is not None
+            and recovery_head_sha is not None
+            and expected_recovery_id is not None
+        ):
+            update_resume = _update_recovery_resume_checkout(
+                cfg.repo_dir,
+                runs_parent,
+                issue_num,
+                branch,
+                kept_worktrees,
+                expected_operation_id=expected_recovery_id,
+                expected_repo=cfg.github_repo,
+                expected_pr=recovery_pr,
+                expected_head=recovery_head_sha,
+                expected_base=recovery_base or "main",
+                target_relpath=_target_relpath(cfg, chapter),
+            )
+            if update_resume is None:
+                update_adoption = _update_recovery_adoption_checkout(
+                    cfg.repo_dir,
+                    runs_parent,
+                    issue_num,
+                    branch,
+                    kept_worktrees,
+                    target_relpath=_target_relpath(cfg, chapter),
+                )
         start_point = WORKTREE_START_POINT
+        if publication_resume is not None:
+            # The write-ahead recipe proves that this exact operation may have
+            # advanced the remote from the originally selected head.  Reuse
+            # the kept checkout and let refine retry publication idempotently;
+            # never fetch/reset/archive it against the stale original head.
+            start_point = WORKTREE_START_POINT
+        elif recovery_mode in {
+            RECOVERY_RETRY_BUILD,
+            RECOVERY_CONTINUE_PR,
+            RECOVERY_UPDATE_CONTINUE,
+        }:
+            assert recovery_head_sha is not None
+            if not (
+                recovery_mode == RECOVERY_UPDATE_CONTINUE
+                and update_resume is not None
+            ):
+                if not _fetch_exact_recovery_head(
+                    cfg.repo_dir, branch, recovery_head_sha
+                ):
+                    return None
+            start_point = f"origin/{branch}"
+        elif (
+            recovery_mode == RECOVERY_START_OVER
+            and recovery_branch
+            and recovery_head_sha
+            and expected_recovery_id
+        ):
+            start_over_resume = _start_over_recovery_resume_checkout(
+                cfg.repo_dir,
+                runs_parent,
+                issue_num,
+                recovery_branch,
+                kept_worktrees,
+                expected_operation_id=expected_recovery_id,
+                expected_repo=cfg.github_repo,
+                target_relpath=_target_relpath(cfg, chapter),
+                expected_pr=recovery_pr,
+                expected_head=recovery_head_sha,
+                expected_base=recovery_base,
+            )
+            if start_over_resume is None and not _archive_start_over_head(
+                cfg,
+                issue_num,
+                recovery_branch,
+                recovery_head_sha,
+                expected_recovery_id,
+            ):
+                return None
+        if (
+            publication_resume is None
+            and recovery_mode == RECOVERY_UPDATE_CONTINUE
+            and recovery_head_sha
+            and expected_recovery_id
+            and update_resume is None
+            and not _preserve_local_branch_ref(
+                cfg.repo_dir,
+                issue_num,
+                branch,
+                recovery_head_sha,
+                expected_recovery_id,
+            )
+        ):
+            return None
+        if (
+            publication_resume is None
+            and recovery_mode == RECOVERY_CONTINUE_PR
+            and recovery_head_sha
+            and expected_recovery_id
+            and _local_branch_head(cfg.repo_dir, branch) is not None
+            and not _local_branch_extends(
+                cfg.repo_dir, branch, recovery_head_sha
+            )
+        ):
+            _preserve_local_branch_ref(
+                cfg.repo_dir,
+                issue_num,
+                branch,
+                recovery_head_sha,
+                expected_recovery_id,
+            )
+            print(
+                f"--- deferring #{issue_num}: local {branch} does not "
+                "contain the selected PR head; archived it but will not "
+                "publish divergent history ---",
+                flush=True,
+            )
+            return None
 
     kept_key = _kept_worktree_key(issue_num, fill=fill)
-    reuse = kept_worktrees.get(kept_key)
+    update_prepared = False
+    reuse = (
+        kept_worktrees.get(kept_key)
+        if recovery_mode not in {
+            RECOVERY_RETRY_BUILD,
+            RECOVERY_UPDATE_CONTINUE,
+            RECOVERY_START_OVER,
+        }
+        else None
+    )
+    selected_recovery_workdir: Optional[Path] = None
+    if publication_resume is not None:
+        resume_worktree, resume_workdir, _resume_branch = publication_resume
+        reuse = str(resume_worktree)
+        selected_recovery_workdir = resume_workdir
+        # In update fallback mode this bypasses the merge/build wrapper and
+        # invokes refine's publication-only fast path directly.
+        update_prepared = True
+    if recovery_mode == RECOVERY_UPDATE_CONTINUE and update_resume is not None:
+        resume_worktree, resume_workdir, resume_phase = update_resume
+        reuse = str(resume_worktree)
+        selected_recovery_workdir = resume_workdir
+        update_prepared = (
+            resume_phase == UPDATE_RECOVERY_PHASE_FALLBACK_PREPARED
+        )
+        print(
+            f"--- resuming base-update phase {resume_phase} for "
+            f"#{issue_num}: {resume_workdir} ---",
+            flush=True,
+        )
+    if recovery_mode == RECOVERY_UPDATE_CONTINUE and update_adoption is not None:
+        adoption_worktree, adoption_workdir = update_adoption
+        reuse = str(adoption_worktree)
+        selected_recovery_workdir = adoption_workdir
+        print(
+            f"--- adopting preserved PR checkpoint for #{issue_num}: "
+            f"{adoption_workdir} ---",
+            flush=True,
+        )
+    if recovery_mode == RECOVERY_START_OVER and start_over_resume is not None:
+        resume_worktree, resume_workdir = start_over_resume
+        reuse = str(resume_worktree)
+        selected_recovery_workdir = resume_workdir
+        print(
+            f"--- resuming start-over checkpoint for #{issue_num}: "
+            f"{resume_workdir} ---",
+            flush=True,
+        )
+    if (
+        not reuse
+        and publication_resume is None
+        and recovery_mode == RECOVERY_CONTINUE_PR
+    ):
+        held = _registered_worktree_for_branch(cfg.repo_dir, branch)
+        if (
+            held is not None
+            and held.is_dir()
+            and _worktree_live_pid(str(held)) is None
+            and held.resolve().is_relative_to(runs_parent.resolve())
+            and recovery_head_sha is not None
+            and _local_branch_extends(
+                cfg.repo_dir, branch, recovery_head_sha
+            )
+        ):
+            reuse = str(held)
+            print(
+                f"--- recovered preserved worktree for #{issue_num}: {held} ---",
+                flush=True,
+            )
     retry_workdir: Optional[Path] = None
+    start_over_marker_prepared = False
     if reuse and Path(reuse).is_dir():
         worktree = Path(reuse)
-        retry_workdir = _paired_retry_workdir(runs_parent, issue_num, worktree)
+        retry_workdir = selected_recovery_workdir or _paired_retry_workdir(
+            runs_parent, issue_num, worktree
+        )
         print(f"--- reusing kept worktree for #{issue_num}: {worktree} ---")
         if retry_workdir is not None:
             print(
@@ -1735,15 +3202,65 @@ def _dispatch_job(
         # A kept worktree from a FAILED attempt may already have Mathlib built
         # (the failure was mid-refine, not mid-build); only prime when it isn't,
         # so retries don't pay a redundant decompress.
-        if not _mathlib_already_built(worktree):
+        if (
+            publication_resume is None
+            and not _mathlib_already_built(worktree)
+        ):
             _prime_mathlib_cache(worktree)
     else:
         worktree = runs_parent / f"wt-i{issue_num}-{ts}"
         runs_parent.mkdir(parents=True, exist_ok=True)
-        proc = _git(
-            cfg.repo_dir,
-            "worktree", "add", "-B", branch, str(worktree), start_point,
-        )
+        if (
+            recovery_mode == RECOVERY_START_OVER
+            and expected_recovery_id is not None
+        ):
+            # Write-ahead ownership precedes even `worktree add -B`: that Git
+            # command creates the checkout and moves/claims the branch. A kill
+            # immediately after it must not leave an unidentifiable held tree.
+            # The paired paths are deterministic, so an orphan marker after a
+            # failed add is harmless and can be safely reused/cleaned later.
+            marker_workdir = runs_parent / f"wd-i{issue_num}-{ts}"
+            marker_target = worktree / _target_relpath(cfg, chapter)
+            if not _write_start_over_recovery_marker(
+                marker_workdir,
+                operation_id=expected_recovery_id,
+                github_repo=cfg.github_repo,
+                issue_num=issue_num,
+                branch=branch,
+                target_path=marker_target,
+                recovery_pr=recovery_pr,
+                original_expected_head=recovery_head_sha,
+                base_branch=recovery_base,
+            ):
+                return None
+            start_over_marker_prepared = True
+        if recovery_mode == RECOVERY_RETRY_BUILD:
+            # A build-only check never publishes code and need not own the PR's
+            # local branch. Detached checkout lets it coexist with a dirty
+            # continuation worktree that must remain untouched.
+            proc = _git(
+                cfg.repo_dir,
+                "worktree", "add", "--detach", str(worktree), start_point,
+            )
+        elif (
+            recovery_mode == RECOVERY_CONTINUE_PR
+            and recovery_head_sha is not None
+            and _local_branch_extends(
+                cfg.repo_dir, branch, recovery_head_sha
+            )
+        ):
+            # Prefer an unpublished local tip over the remote PR head. The
+            # final push remains leased against the exact remote SHA selected
+            # by the user, so this cannot overwrite a concurrent update.
+            proc = _git(
+                cfg.repo_dir,
+                "worktree", "add", str(worktree), branch,
+            )
+        else:
+            proc = _git(
+                cfg.repo_dir,
+                "worktree", "add", "-B", branch, str(worktree), start_point,
+            )
         if proc.returncode != 0:
             msg = ((proc.stderr or proc.stdout) or "").strip()
             lower = msg.lower()
@@ -1760,7 +3277,10 @@ def _dispatch_job(
                     f"--- #{issue_num}: branch {branch} held by a leftover "
                     "worktree; reaping it and retrying the add ---", flush=True,
                 )
-                if _reap_orphan_worktree(cfg.repo_dir, branch):
+                if (
+                    recovery_mode != RECOVERY_RETRY_BUILD
+                    and _reap_orphan_worktree(cfg.repo_dir, branch)
+                ):
                     proc = _git(
                         cfg.repo_dir, "worktree", "add", "-B", branch,
                         str(worktree), start_point,
@@ -1783,6 +3303,39 @@ def _dispatch_job(
     # session on every conductor-level retry.
     workdir = retry_workdir or (runs_parent / f"wd-i{issue_num}-{ts}")
     workdir.mkdir(parents=True, exist_ok=True)
+    target = worktree / _target_relpath(cfg, chapter)
+    if (
+        recovery_mode == RECOVERY_START_OVER
+        and expected_recovery_id is not None
+        and not start_over_marker_prepared
+        and not _write_start_over_recovery_marker(
+            workdir,
+            operation_id=expected_recovery_id,
+            github_repo=cfg.github_repo,
+            issue_num=issue_num,
+            branch=branch,
+            target_path=target,
+            recovery_pr=recovery_pr,
+            original_expected_head=recovery_head_sha,
+            base_branch=recovery_base,
+        )
+    ):
+        kept_worktrees[kept_key] = str(worktree)
+        return None
+    if recovery_mode == RECOVERY_CONTINUE_PR and not _prepare_continue_checkpoint(
+        worktree,
+        workdir,
+        target,
+        branch,
+        expected_verdict_ts,
+    ):
+        kept_worktrees[kept_key] = str(worktree)
+        print(
+            f"--- deferring #{issue_num}: could not prepare the preserved "
+            "PR/checkpoint for continuation ---",
+            flush=True,
+        )
+        return None
     if not fill and not repair:
         # A publication-only retry belongs to the OLD committed verdict even if
         # the human has since re-rejected.  Recover its persisted CAS token so
@@ -1803,7 +3356,6 @@ def _dispatch_job(
                 # the committed fix, even if today's remote-state selector
                 # would choose a different branch.
                 branch = pending_branch
-    target = worktree / _target_relpath(cfg, chapter)
     # The exact per-issue dispatch the daemon uses, flag-for-flag:
     # DEFAULT_REFINE_ARGS is imported, never forked. The conductor adds
     # exactly one flag of its own at this dispatch site:
@@ -1811,7 +3363,31 @@ def _dispatch_job(
     # formalization.yaml is the generalized form of the wall_time merge
     # race, so jobs never commit the yaml; the conductor regenerates it
     # centrally after each success (_regenerate_metadata_after_success).
-    if repair:
+    if recovery_mode == RECOVERY_RETRY_BUILD:
+        cmd = [
+            sys.executable,
+            "-m",
+            "marathon.recovery",
+            "retry-build",
+            "--repo-dir",
+            str(worktree),
+            "--repo",
+            cfg.github_repo,
+            "--pr",
+            str(recovery_pr),
+            "--expected-head",
+            str(recovery_head_sha),
+            "--expected-branch",
+            branch,
+            "--expected-base",
+            recovery_base or "main",
+            "--target",
+            _target_relpath(cfg, chapter),
+            "--build-timeout",
+            "2400",
+        ]
+        log_path = workdir / "conductor-recovery-build.log"
+    elif repair:
         # Repair the chapter's non-building modules against the CURRENT code.
         # The conductor passes the broken set explicitly (a fresh worktree has
         # no audit snapshot to discover from). `marathon repair` defaults
@@ -1903,11 +3479,56 @@ def _dispatch_job(
         ]
         if expected_verdict_ts is not None:
             cmd += ["--review-verdict-ts", expected_verdict_ts]
+        if auto_pr_expected_remote_oid is not None:
+            cmd += [
+                "--auto-pr-expected-remote-oid",
+                auto_pr_expected_remote_oid,
+            ]
+        if recovery_base is not None:
+            cmd += ["--auto-pr-base", recovery_base]
+        if expected_recovery_id is not None:
+            cmd += ["--recovery-operation-id", expected_recovery_id]
+        if recovery_mode == RECOVERY_CONTINUE_PR:
+            cmd += ["--auto-pr-continue-remote"]
         if rejection_note_file is not None:
             cmd += ["--review-rejection-note-file", str(rejection_note_file)]
         cmd += daemon.DEFAULT_REFINE_ARGS
         log_path = workdir / "conductor-refine.log"
         cmd += _tex_args(cfg, chapter)
+        if (
+            recovery_mode == RECOVERY_UPDATE_CONTINUE
+            and not update_prepared
+        ):
+            fallback_cmd = cmd
+            cmd = [
+                sys.executable,
+                "-m",
+                "marathon.recovery",
+                "update-continue",
+                "--repo-dir",
+                str(worktree),
+                "--repo",
+                cfg.github_repo,
+                "--pr",
+                str(recovery_pr),
+                "--expected-head",
+                str(recovery_head_sha),
+                "--expected-branch",
+                branch,
+                "--expected-base",
+                recovery_base or "main",
+                "--operation-id",
+                str(expected_recovery_id),
+                "--target",
+                _target_relpath(cfg, chapter),
+                "--workdir",
+                str(workdir),
+                "--build-timeout",
+                "2400",
+                "--",
+                *fallback_cmd,
+            ]
+            log_path = workdir / "conductor-recovery-update.log"
     job = ConductorJob(
         issue_num=issue_num,
         chapter=chapter,
@@ -1921,6 +3542,11 @@ def _dispatch_job(
         fill=fill,
         repair=repair,
         expected_verdict_ts=expected_verdict_ts,
+        expected_recovery_id=expected_recovery_id,
+        recovery_mode=recovery_mode,
+        recovery_pr=recovery_pr,
+        recovery_head_sha=recovery_head_sha,
+        recovery_base=recovery_base,
         rejection_note=rejection_note,
         launch_nonce=secrets.token_hex(16),
     )
@@ -2162,6 +3788,116 @@ def _branch_pr_exists(
     return False
 
 
+def _adopted_recovery_build_status(
+    cfg: ReviewConfig, sha: Optional[str]
+) -> Optional[str]:
+    """Return the trusted Marathon build status for one immutable commit.
+
+    An adopted recovery has no ``Popen`` handle, so its exit code is gone.
+    Existing PR presence is not completion evidence because recovery starts
+    from an already-open PR.  The exact-SHA commit status is the durable
+    evidence written by ``marathon.recovery``; unknown/malformed/API-failure
+    states fail closed as ``None``.
+    """
+    if not sha:
+        return None
+    from marathon.review.automerge import TRUSTED_BUILD_CONTEXT
+    from marathon.review.github import gh
+
+    try:
+        cp = gh(
+            "api",
+            f"repos/{cfg.github_repo}/commits/{sha}/statuses",
+            check=False,
+            timeout=20,
+        )
+    except Exception:  # noqa: BLE001 — restart recovery must fail closed
+        return None
+    if cp.returncode != 0:
+        return None
+    try:
+        rows = json.loads(cp.stdout or "[]")
+        if not isinstance(rows, list):
+            return None
+        matches = [
+            row for row in rows
+            if isinstance(row, dict)
+            and row.get("context") == TRUSTED_BUILD_CONTEXT
+        ]
+        if not matches:
+            return None
+        # GitHub returns newest-first today, but select explicitly so an API
+        # ordering change cannot resurrect an older green/red attestation.
+        latest = max(
+            matches,
+            key=lambda row: (
+                str(row.get("created_at") or ""),
+                int(row.get("id") or 0),
+            ),
+        )
+        state = str(latest.get("state") or "").lower()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if state == "success":
+        return "OK"
+    if state in {"failure", "error"}:
+        return "FAIL"
+    if state == "pending":
+        return "PENDING"
+    return None
+
+
+def _adopted_update_recovery_marker(
+    cfg: ReviewConfig, job: ConductorJob
+) -> Optional[dict]:
+    """Load the crash journal only when it belongs to this exact recovery.
+
+    A green status on the original PR head may predate an ``update_continue``
+    request.  Consequently, process death plus a green local HEAD is never
+    terminal evidence by itself: only this operation's schema-v2 journal can
+    identify a published fast path (or a prepared fallback refine).
+    """
+    marker_path = Path(job.workdir) / UPDATE_RECOVERY_MARKER_FILENAME
+    try:
+        marker = json.loads(marker_path.read_text())
+        if not isinstance(marker, dict):
+            return None
+        current_head = marker.get("current_local_head")
+        base_sha = marker.get("base_sha")
+        target_path = Path(marker.get("target_path"))
+        expected_target = (Path(job.worktree) / job.target).resolve()
+        marker_target = target_path.resolve()
+    except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    def _full_oid(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 40
+            and all(char in "0123456789abcdefABCDEF" for char in value)
+        )
+
+    expected_repo = getattr(cfg, "github_repo", None)
+    identity_ok = (
+        marker.get("schema_version") == UPDATE_RECOVERY_SCHEMA_VERSION
+        and marker.get("phase") in UPDATE_RECOVERY_PHASES
+        and marker.get("operation_id") == job.expected_recovery_id
+        and (
+            expected_repo is None
+            or marker.get("github_repo") == expected_repo
+        )
+        and not isinstance(marker.get("pr"), bool)
+        and marker.get("pr") == job.recovery_pr
+        and marker.get("branch") == job.branch
+        and marker.get("original_expected_head") == job.recovery_head_sha
+        and marker.get("base_branch") == (job.recovery_base or "main")
+        and _full_oid(current_head)
+        and _full_oid(base_sha)
+        and marker_target == expected_target
+    )
+    return marker if identity_ok else None
+
+
 def _reap_adopted_job(
     cfg: ReviewConfig, job: ConductorJob, kept_worktrees: dict[int, str],
     *, reconcile: bool,
@@ -2203,12 +3939,12 @@ def _reap_adopted_job(
             flush=True,
         )
         return
+    completed_cleanly = bool(
+        checkpoint is not None
+        and checkpoint.current_iteration_idx > 0
+        and checkpoint.iterations_completed >= checkpoint.current_iteration_idx
+    )
     if job.fill or job.repair:
-        completed_cleanly = bool(
-            checkpoint is not None
-            and checkpoint.current_iteration_idx > 0
-            and checkpoint.iterations_completed >= checkpoint.current_iteration_idx
-        )
         if completed_cleanly:
             job.status = "succeeded"
             _remove_worktree(cfg.repo_dir, Path(job.worktree))
@@ -2232,6 +3968,77 @@ def _reap_adopted_job(
                 flush=True,
             )
         return
+    if job.recovery_mode == RECOVERY_RETRY_BUILD:
+        build_status = _adopted_recovery_build_status(
+            cfg, job.recovery_head_sha
+        )
+        if build_status == "FAIL":
+            stalled = record_stall(
+                cfg,
+                job.issue_num,
+                expected_verdict_ts=job.expected_verdict_ts,
+                expected_recovery_id=job.expected_recovery_id,
+            )
+            job.status = "stalled" if stalled is not None else "failed"
+            _remove_worktree(cfg.repo_dir, Path(job.worktree))
+            print(
+                f"--- adopted build-only recovery #{job.issue_num} has a "
+                "trusted red status; parked for the next recovery choice ---",
+                flush=True,
+            )
+            return
+        if build_status != "OK":
+            job.status = "failed"
+            kept_worktrees[job.issue_num] = job.worktree
+            print(
+                f"--- adopted build-only recovery #{job.issue_num} exited "
+                "without a trusted terminal status; preserving its worktree "
+                "and refusing to infer success from the pre-existing PR ---",
+                flush=True,
+            )
+            return
+    elif job.recovery_mode == RECOVERY_UPDATE_CONTINUE:
+        # The exact crash journal, not an old green status on the original PR
+        # head, decides which update operation reached a terminal phase.
+        marker = _adopted_update_recovery_marker(cfg, job)
+        phase = marker.get("phase") if marker is not None else None
+        local_head = _job_head_sha(job)
+        published_head = (
+            marker.get("current_local_head") if marker is not None else None
+        )
+        fallback_complete = (
+            completed_cleanly
+            and phase == UPDATE_RECOVERY_PHASE_FALLBACK_PREPARED
+        )
+        fast_path_complete = (
+            not completed_cleanly
+            and phase == UPDATE_RECOVERY_PHASE_PUBLISHED
+            and local_head == published_head
+            and _adopted_recovery_build_status(cfg, published_head) == "OK"
+        )
+        if not (fallback_complete or fast_path_complete):
+            job.status = "failed"
+            kept_worktrees[job.issue_num] = job.worktree
+            print(
+                f"--- adopted update recovery #{job.issue_num} exited "
+                f"in journal phase {phase or '<unknown>'} without trusted "
+                "completion evidence; preserving its worktree and refusing "
+                "to infer success from the old PR ---",
+                flush=True,
+            )
+            return
+    elif job.recovery_mode in {RECOVERY_CONTINUE_PR, RECOVERY_START_OVER} and not (
+        completed_cleanly
+    ):
+        job.status = "failed"
+        kept_worktrees[job.issue_num] = job.worktree
+        print(
+            f"--- adopted {job.recovery_mode} recovery #{job.issue_num} "
+            "exited without a completed refine checkpoint; preserving its "
+            "worktree instead of trusting a pre-existing PR ---",
+            flush=True,
+        )
+        return
     job_head_sha = _job_head_sha(job)
     has_pr = (
         _branch_pr_exists(cfg, job.branch, job_head_sha)
@@ -2243,6 +4050,7 @@ def _reap_adopted_job(
             record_iteration(
                 cfg,
                 job.issue_num,
+                expected_recovery_id=job.expected_recovery_id,
                 iteration_branch=job.branch,
                 iteration_commit_sha=job_head_sha,
             )
@@ -2251,6 +4059,7 @@ def _reap_adopted_job(
                 cfg,
                 job.issue_num,
                 expected_verdict_ts=job.expected_verdict_ts,
+                expected_recovery_id=job.expected_recovery_id,
                 iteration_branch=job.branch,
                 iteration_commit_sha=job_head_sha,
             )
@@ -2266,11 +4075,6 @@ def _reap_adopted_job(
         # means failure/missing-note/etc. and must stay queued for retry.
         job.status = "failed"
         kept_worktrees[job.issue_num] = job.worktree
-        completed_cleanly = bool(
-            checkpoint is not None
-            and checkpoint.current_iteration_idx > 0
-            and checkpoint.iterations_completed >= checkpoint.current_iteration_idx
-        )
         if has_pr is None and completed_cleanly:
             kwargs = {
                 "pending_pr_branch": job.branch,
@@ -2278,6 +4082,8 @@ def _reap_adopted_job(
             }
             if job.expected_verdict_ts is not None:
                 kwargs["expected_verdict_ts"] = job.expected_verdict_ts
+            if job.expected_recovery_id is not None:
+                kwargs["expected_recovery_id"] = job.expected_recovery_id
             record_iteration(cfg, job.issue_num, **kwargs)
         if reconcile and has_pr is False and completed_cleanly:
             try:
@@ -2341,6 +4147,10 @@ def _requeue_if_no_pr_landed(cfg: ReviewConfig, job: ConductorJob) -> None:
         kwargs = {"landed": False}
         if expected_verdict_ts is not None:
             kwargs["expected_verdict_ts"] = expected_verdict_ts
+        # ``record_iteration`` clears operation A's recovery id before this
+        # network transition. Require it to remain clear: a recovery B queued
+        # while GitHub labels are being updated must win the local delete CAS.
+        kwargs["expected_recovery_id"] = None
         n = _requeue_refined_issue(cfg, branch, **kwargs)
         if n is not None:
             print(f"--- #{n} refine exited clean but landed no PR — requeued for "
@@ -2399,6 +4209,7 @@ def _retry_pending_pr_checks(cfg: ReviewConfig) -> int:
             branch,
             landed=False,
             expected_verdict_ts=entry.verdict_ts,
+            expected_recovery_id=entry.recovery_id,
         )
         if n is not None:
             resolved += 1
@@ -2607,10 +4418,35 @@ def _reap_finished(
                 flush=True,
             )
             continue
+        if (
+            job.recovery_mode == RECOVERY_RETRY_BUILD
+            and rc != 0
+            and not interrupted
+        ):
+            # A deterministic rebuild has already published red (or safely
+            # aborted on a changed SHA). Re-running it three times cannot
+            # improve code; return the issue to the recovery chooser so the
+            # next rung can preserve and continue the PR.
+            record_stall(
+                cfg,
+                job.issue_num,
+                expected_verdict_ts=job.expected_verdict_ts,
+                expected_recovery_id=job.expected_recovery_id,
+            )
+            job.status = "stalled"
+            _clear_worktree_pid_marker(job.worktree)
+            _remove_worktree(cfg.repo_dir, Path(job.worktree))
+            print(
+                f"    build-only recovery for #{job.issue_num} did not pass; "
+                "parked for the next explicit recovery choice",
+                flush=True,
+            )
+            continue
         backoff = daemon._handle_refine_exit(
             cfg, job.issue_num, rc, max_attempts=max_attempts,
             interrupted=interrupted, failure_detail=job.error,
             expected_verdict_ts=job.expected_verdict_ts,
+            expected_recovery_id=job.expected_recovery_id,
             pending_pr_branch=(job.branch if rc == 0 and reconcile else None),
             iteration_commit_sha=(_job_head_sha(job) if rc == 0 else None),
         )
@@ -2865,8 +4701,8 @@ def _dispatch_env_error() -> Optional[str]:
     if not os.environ.get("ARISTOTLE_API_KEY"):
         return (
             "ARISTOTLE_API_KEY is not set — refine/fill/repair dispatch is "
-            "DISABLED (automerge/reconcile still run). Export the key and "
-            "restart the conductor."
+            "DISABLED (exact-SHA build recovery, automerge, and reconcile "
+            "still run). Export the key and restart the conductor."
         )
     return None
 
@@ -3595,16 +5431,18 @@ def run_conductor(
             running = [j for j in jobs if j.status == "running"]
 
             picks: list[tuple[int, int]] = []
-            # DEGRADED mode: with a broken dispatch environment (no Aristotle
-            # key), dispatching would only burn doomed subprocesses — skip the
-            # whole dispatch phase but keep the keyless-safe passes (reap,
-            # automerge, reconcile, snapshot) running. The reason is published
-            # in the jobs snapshot so the deck can show it.
-            if not _STOP_REQUESTED and dispatch_env_error is None:
+            # DEGRADED mode still admits the exact-SHA retry-build recovery:
+            # it is deliberately independent of Aristotle. Every other paid
+            # dispatch remains blocked by the environment preflight.
+            if not _STOP_REQUESTED:
                 picks = _pick_dispatchable(
                     cfg, jobs, not_before, _now(), n - len(running),
                     warned_unknown,
                     queue_from_github,
+                    recovery_modes=(
+                        frozenset({RECOVERY_RETRY_BUILD})
+                        if dispatch_env_error is not None else None
+                    ),
                 )
                 for issue_num, chapter in picks:
                     job = _dispatch_job(
@@ -3613,6 +5451,7 @@ def run_conductor(
                     if job is None:
                         # Deferred (double-dispatch guard / spawn failure):
                         # stays queued; retried after a fixed defer window.
+                        _park_deferred_recovery(cfg, issue_num)
                         not_before[issue_num] = _now() + WORKTREE_DEFER_SECONDS
                         continue
                     jobs.append(job)
@@ -3634,7 +5473,8 @@ def run_conductor(
                 # repair at a time (foundational; edits main); build + the
                 # faithfulness jury gate what merges.
                 if (
-                    repair_chapters and not refine_running
+                    dispatch_env_error is None
+                    and repair_chapters and not refine_running
                     and not refine_pending and not repair_running
                     and (n - len(running)) > 0
                 ):
@@ -3677,7 +5517,8 @@ def run_conductor(
                 # the start of, a refine or repair. In-flight one-shot fills
                 # finish normally.
                 if (
-                    fill_chapters and prover_enabled_now and not refine_running
+                    dispatch_env_error is None
+                    and fill_chapters and prover_enabled_now and not refine_running
                     and not refine_pending and not repair_running
                 ):
                     slots = n - len(running)

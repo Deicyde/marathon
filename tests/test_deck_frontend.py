@@ -702,6 +702,9 @@ def test_every_definition_modal_close_path_cancels_pending_lookup(app_js: str):
     opened = _fn_body(code, "function openModal")
     assert "_marathonOnClose" in opened
     assert "if (e.target === backdrop) closeModal()" in opened
+    # Escape closes only the top modal; it must not bubble into the document
+    # handler and also close an underlying reject inspector/draft.
+    assert "e.stopPropagation()" in opened
     definition = _fn_body(code, "function openDefinitionSurface")
     assert "definitionRequestSeq += 1" in definition
     keys = _fn_body(code, "function attachKeys")

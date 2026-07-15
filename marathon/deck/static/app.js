@@ -7,7 +7,7 @@
  *   (verify / reject / defer) which records a LOCAL per-decl verdict only.
  *   When every declaration has been reviewed — OR the first rejection pauses
  *   the dependency-ordered review — a confirm-and-SHIP summary card appears;
- *   shipping composes the issue outcome and is the single irreversible action.
+ *   shipping composes the issue outcome and is the irreversible review action.
  *
  * Codes to the SHARED API CONTRACT:
  *   GET  /api/queue?chapter=N           -> {cards:[CardSummary], building, landed_today}
@@ -15,8 +15,10 @@
  *                                            progress:{reviewed,total}, complete, summary}
  *   POST /api/decl-verdict {issue,decl,verdict,note?}  (LOCAL ONLY — no GitHub/Aristotle/ledger)
  *                                       -> {ok, progress, complete, summary, next_decl}
- *   POST /api/ship {issue}              (THE ONLY IRREVERSIBLE side-effect)
+ *   POST /api/ship {issue}              (THE IRREVERSIBLE REVIEW side-effect)
  *                                       -> {ok, outcome, message, advanced_to_issue}
+ *   POST /api/recovery {issue,action,recovery_token,confirm_destructive}
+ *                                       -> {ok, accepted, queue_state, message}
  *   GET  /api/status (poll) or /api/events (SSE)  -> live job/build events
  *
  * BINDING SAFETY (load-bearing — see the task brief):
@@ -26,7 +28,7 @@
  *     declaration is LOCAL-ONLY (POST /api/decl-verdict records a sidecar
  *     verdict — it merges nothing, dispatches no Aristotle).
  *     (tests/test_deck_frontend.py statically enforces this single call site.)
- *   - Every POST (decl-verdict AND ship) carries the per-session token in the
+ *   - Every POST carries the per-session token in the
  *     X-Marathon-Session-Token header, read from the injected meta tag /
  *     bootstrap global. No token => the POST is refused client-side.
  *   - Reject notes are sent VERBATIM (no client-side rewriting) and are
@@ -34,6 +36,8 @@
  *     REQUIRED on a reject.
  *   - Ship asks for an explicit confirm (it merges a PR or dispatches
  *     Aristotle — irreversible).
+ *   - Recovery asks the human to choose a named, server-authorized mode;
+ *     archive-and-start-over requires its own destructive acknowledgement.
  *   - Read endpoints (queue/subdeck/status) are pure reads; they never mutate.
  */
 (function () {
@@ -159,8 +163,8 @@
   // --- network: the token-bearing POST primitive ---------------------------
   // postJSON attaches the per-session token (header + body fallback) and
   // unwraps the {ok:false,...} convention. It is the shared transport for
-  // BOTH the local decl-verdict and the irreversible ship — but note the
-  // two have very different consequences (see the two named callers below).
+  // local verdicts, operational recovery, and the irreversible ship — their
+  // consequences still live in separate named callers below.
   // Re-read the session token from a FRESH page load (the meta tag / global the
   // server injects). The token is minted per deck process, so after a deck
   // restart the in-memory SESSION_TOKEN goes stale; this refetches the live one
@@ -259,7 +263,7 @@
     return postJSON("/api/decl-lock", { issue: issue, decl: decl, locked: !!locked });
   }
 
-  // postShip — THE ONLY IRREVERSIBLE CALL. Composes the per-issue outcome
+  // postShip — THE IRREVERSIBLE REVIEW CALL. Composes the per-issue outcome
   // from the subdeck and either merges the PR (all verified) or dispatches
   // Aristotle with the composed note (any rejected). Reached ONLY from
   // shipIssue() (the explicit ship-button handler).
@@ -306,6 +310,20 @@
   // Aristotle with an ADD section). Safe to call freely.
   function postMissing(issue, note) {
     return postJSON("/api/missing", { issue: issue, note: note });
+  }
+
+  // postRecovery — queues ONE explicit recovery mode against the exact
+  // server-rendered stuck-row snapshot. Branches, PR numbers, and SHAs are
+  // deliberately absent from this body: the backend owns those refs and uses
+  // `recovery_token` as a compare-and-swap guard if they change while the
+  // dialog is open.
+  function postRecovery(issue, action, recoveryToken, confirmDestructive) {
+    return postJSON("/api/recovery", {
+      issue: issue,
+      action: action,
+      recovery_token: recoveryToken,
+      confirm_destructive: !!confirmDestructive,
+    });
   }
 
   // --- skip-API toggle (per-session, persistent) ---------------------------
@@ -1949,32 +1967,62 @@
   // === issue picker (the queue is ISSUE-level) =============================
 
   // The "⚠ N need attention" card shown on the swipe stage when the ready queue
-  // is drained but rejected issues are STRANDED (their fix never landed, or their
-  // tracking was reverted by a git reset — see dashboard.stuck_issues). Without
-  // this they only appear in the Issues tab, which the swipe reviewer never
-  // opens, so a rejection silently vanishes. Each row offers a one-click
-  // re-queue; the note is re-issued (recovered from GitHub for an orphan).
-  // One stuck row's status text + whether re-queue should confirm first. A
-  // stuck issue with an OPEN fix PR is not "the fix never landed" — the
-  // pipeline produced one and automerge is (correctly) holding it red; a
-  // re-queue spends a fresh billed Aristotle run, so ask before firing.
+  // is drained but rejected issues are parked. Without this they only appear in
+  // the Issues tab, which the swipe reviewer may never open, so a rejection can
+  // silently vanish. Each row opens the SAME recovery dialog as the Issues tab;
+  // recovery is never a one-click, ambiguous "re-queue".
   function stuckRowText(it) {
     if (it.fix_pr != null) {
-      var held = it.fix_pr_build === "OK" ? " [build:OK — merging shortly]"
-               : (it.fix_pr_build === "FAIL" || it.fix_pr_build === "TIMEOUT")
-                   ? " [build:" + it.fix_pr_build + " — held by automerge]" : "";
-      return "fix PR #" + it.fix_pr + " already open" + held;
+      var details = [];
+      if (it.fix_pr_build) details.push("build:" + it.fix_pr_build);
+      if (it.fix_pr_mergeable === "CONFLICTING" || it.fix_pr_merge_state === "DIRTY") {
+        details.push("conflicts with main");
+      } else if (it.fix_pr_merge_state === "BEHIND") {
+        details.push("behind main");
+      }
+      if (it.local_recovery_available) details.push("local checkpoint preserved");
+      return "fix PR #" + it.fix_pr + " already open" +
+        (details.length ? " [" + details.join(" · ") + "]" : "");
     }
-    return it.note_preview || "(rejected — no fix landed yet)";
+    return it.note_preview || "(rejected work is parked)";
   }
 
-  function confirmRequeue(it) {
-    if (it.fix_pr == null) return true;
-    return window.confirm(
-      "#" + it.num + " already has an open fix PR #" + it.fix_pr +
-      (it.fix_pr_build ? " [build:" + it.fix_pr_build + "]" : "") +
-      ".\nRe-queuing starts a NEW billed Aristotle run alongside it. Continue?"
-    );
+  function recoveryActions(it) {
+    // `recovery_*` are the public contract names. Accept the short names from
+    // the first recovery-enabled backend during a rolling deck restart.
+    return (it && (it.recovery_actions || it.actions)) || {};
+  }
+
+  function recommendedRecovery(it) {
+    var actions = recoveryActions(it);
+    var named = it && (it.recommended_recovery || it.recommended_action);
+    if (named && actions[named] && actions[named].enabled) return named;
+    var order = ["retry_build", "continue_pr", "update_continue", "start_over"];
+    for (var i = 0; i < order.length; i++) {
+      if (actions[order[i]] && actions[order[i]].enabled) return order[i];
+    }
+    return null;
+  }
+
+  function hasRecoveryAction(it) {
+    return !!recommendedRecovery(it);
+  }
+
+  function recoveryButton(row, repo, after) {
+    var available = hasRecoveryAction(row);
+    return el("button", {
+      class: "btn btn-tiny issue-recover",
+      type: "button",
+      disabled: available ? null : "disabled",
+      "aria-haspopup": "dialog",
+      "aria-label": "Recover issue #" + row.num,
+      title: available
+        ? "Choose how to recover this parked rejection without losing existing work"
+        : "No safe recovery action is currently available",
+      onclick: function (ev) {
+        openRecoveryDialog(row, repo, after, ev.currentTarget);
+      },
+    }, ["Recover…"]);
   }
 
   function showStuckAttentionCard(stuck, repo) {
@@ -1994,17 +2042,7 @@
       if (it.attempts) {
         kids.push(el("span", { class: "issue-tier", text: it.attempts + " tries" }));
       }
-      kids.push(el("button", {
-        class: "btn btn-tiny issue-requeue",
-        type: "button",
-        title: "Re-queue this rejection — the conductor retries it for Aristotle",
-        onclick: (function (row) {
-          return function (ev) {
-            if (!confirmRequeue(row)) return;
-            requeueIssue(row.num, ev.currentTarget, refreshQueue);
-          };
-        })(it),
-      }, ["Re-queue"]));
+      kids.push(recoveryButton(it, repo, refreshQueue));
       return el("div", { class: "issue-row stuck-row" }, kids);
     });
     var n = stuck.length;
@@ -2012,8 +2050,9 @@
       el("h2", { class: "msg-title",
                  text: "⚠ " + n + " issue" + (n > 1 ? "s" : "") + " need attention" }),
       el("p", { class: "msg-body",
-                text: "Rejected, but the fix never landed — the conductor can't "
-                    + "reach them. Re-queue to retry, or open Issues for detail." }),
+                text: "These rejected issues are parked. Choose a recovery path; "
+                    + "existing PR work is preserved unless you explicitly archive "
+                    + "it and start over." }),
       el("div", { class: "stuck-attention-list" }, rows),
       el("div", { class: "msg-actions" }, [
         el("button", { class: "btn", type: "button",
@@ -2050,7 +2089,7 @@
           var stuck = (d && d.issues) || [];
           // Only paint if we're STILL on the drained Review stage — the fetch
           // is async, so the user may have opened an issue or switched tabs
-          // (and re-queued from the Issues tab) meanwhile; don't render a stale
+          // (and recovered from the Issues tab) meanwhile; don't render a stale
           // card into a backgrounded stage.
           if (stuck.length && state.issue == null && state.activeTab === "review") {
             showStuckAttentionCard(stuck, d.repo);
@@ -2728,7 +2767,7 @@
     );
     card.appendChild(
       el("p", { class: "ship-warn", text:
-        "This is the ONLY irreversible action — " +
+        "This is the irreversible review action — " +
         (anyAristotle
           ? (partialReject
               ? "it dispatches the fix now; WAIT declarations stay untouched for the next round."
@@ -2931,8 +2970,8 @@
     openModal(el("div", { class: "modal-panel" }, kids));
   }
 
-  // shipIssue — THE SOLE CALLER OF postShip. This is the single irreversible
-  // action in the whole app. Reached ONLY from the confirm dialog opened by
+  // shipIssue — THE SOLE CALLER OF postShip. This is the irreversible review
+  // action. Reached ONLY from the confirm dialog opened by
   // the ship button on the completion summary — never on load, navigation,
   // a decl-verdict, or status polling.
   function shipIssue() {
@@ -2982,27 +3021,105 @@
   }
 
   // --- modals --------------------------------------------------------------
+  var modalDialogSeq = 0;
+
+  function modalFocusable(node) {
+    var selector = [
+      "a[href]", "button:not([disabled])", "input:not([disabled])",
+      "select:not([disabled])", "textarea:not([disabled])",
+      "[tabindex]:not([tabindex='-1'])",
+    ].join(",");
+    var all = node.querySelectorAll(selector);
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      var hiddenAncestor = typeof all[i].closest === "function"
+        ? all[i].closest("[hidden]") : null;
+      if (!hiddenAncestor && !all[i].hasAttribute("hidden") &&
+          all[i].getAttribute("aria-hidden") !== "true") {
+        out.push(all[i]);
+      }
+    }
+    return out;
+  }
+
   function isModalOpen() {
     return !modalRoot().hasAttribute("hidden");
   }
   function closeModal() {
     var root = modalRoot();
     var onClose = root._marathonOnClose;
+    var returnFocus = root._marathonReturnFocus;
+    if (root._marathonKeyHandler) {
+      root.removeEventListener("keydown", root._marathonKeyHandler);
+    }
     root._marathonOnClose = null;
+    root._marathonReturnFocus = null;
+    root._marathonKeyHandler = null;
     root.setAttribute("hidden", "hidden");
     root.innerHTML = "";
     if (typeof onClose === "function") onClose();
+    // Restore focus after any onClose re-render. If the trigger disappeared in
+    // that render, leave focus alone rather than jumping somewhere surprising.
+    setTimeout(function () {
+      if (returnFocus && document.contains(returnFocus) &&
+          typeof returnFocus.focus === "function") returnFocus.focus();
+    }, 0);
   }
-  function openModal(node, onClose) {
+  function openModal(node, onClose, returnFocus) {
     var root = modalRoot();
     root.innerHTML = "";
     root._marathonOnClose = onClose || null;
+    root._marathonReturnFocus = returnFocus || document.activeElement || null;
+    if (!node.hasAttribute("role")) node.setAttribute("role", "dialog");
+    if (!node.hasAttribute("aria-modal")) node.setAttribute("aria-modal", "true");
+    if (!node.hasAttribute("tabindex")) node.setAttribute("tabindex", "-1");
+    if (!node.hasAttribute("aria-labelledby")) {
+      var modalTitle = node.querySelector(".modal-title");
+      if (modalTitle) {
+        if (!modalTitle.id) modalTitle.id = "modal-title-" + (++modalDialogSeq);
+        node.setAttribute("aria-labelledby", modalTitle.id);
+      } else {
+        node.setAttribute("aria-label", "Dialog");
+      }
+    }
     var backdrop = el("div", { class: "modal-backdrop" }, [node]);
     backdrop.addEventListener("click", function (e) {
       if (e.target === backdrop) closeModal();
     });
     root.appendChild(backdrop);
     root.removeAttribute("hidden");
+    root._marathonKeyHandler = function (e) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        closeModal();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      var focusable = modalFocusable(node);
+      if (!focusable.length) {
+        e.preventDefault();
+        node.focus();
+        return;
+      }
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (e.shiftKey && (document.activeElement === first ||
+          !node.contains(document.activeElement))) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    root.addEventListener("keydown", root._marathonKeyHandler);
+    setTimeout(function () {
+      if (root.hasAttribute("hidden") || !root.contains(node)) return;
+      var autofocus = node.querySelector("[autofocus]:not([disabled])");
+      var focusable = modalFocusable(node);
+      (autofocus || focusable[0] || node).focus();
+    }, 0);
   }
 
   function openRejectNote() {
@@ -4747,35 +4864,311 @@
   }
 
   // --- Issues tab: every registered issue grouped by chapter ---
-  function postRequeue(issue) {
-    return postJSON("/api/requeue", { issue: issue });
-  }
 
-  // Re-issue a parked issue's stored rejection note (one-click) — mirrors the
-  // dropCitation token-POST pattern: disable + spinner, POST, toast + re-render
-  // on success, toast + re-enable on failure. `after` runs on success (default:
-  // re-render the Issues tab); the swipe attention card passes refreshQueue.
-  function requeueIssue(issue, btn, after) {
-    if (btn) { btn.disabled = true; btn.textContent = "re-queuing…"; }
-    postRequeue(issue)
-      .then(function (res) {
-        if (res && res.requeued) {
-          flashToast("Re-queued #" + issue + " — the conductor will retry it");
-          (after || renderIssuesTab)();
-        } else {
-          flashToast((res && res.message) || "Not re-queued");
-          if (btn) { btn.disabled = false; btn.textContent = "Re-queue"; }
-        }
-      })
-      .catch(function (err) {
-        flashToast(err && err.message ? err.message : "Re-queue failed");
-        if (btn) { btn.disabled = false; btn.textContent = "Re-queue"; }
+  var RECOVERY_ACTION_ORDER = [
+    "retry_build", "continue_pr", "update_continue", "start_over",
+  ];
+  var RECOVERY_ACTION_COPY = {
+    retry_build: {
+      title: "Retry build",
+      preservation: "Keeps the exact PR head. Does not call Aristotle.",
+    },
+    continue_pr: {
+      title: "Continue existing PR",
+      preservation: "Keeps the current diff and resumes its checkpoint when available.",
+    },
+    update_continue: {
+      title: "Update from main & continue",
+      preservation: "Keeps the PR diff while bringing it onto current main.",
+    },
+    start_over: {
+      title: "Archive & start over",
+      preservation: "Archives the old head, then starts a new Aristotle run from main.",
+    },
+  };
+  var recoveryDialogSeq = 0;
+
+  // One shared recovery dialog serves both the drained Review stage and the
+  // Issues tab. It presents only server-derived capabilities and sends only an
+  // action name + snapshot token; no client-controlled git refs cross the API.
+  function openRecoveryDialog(row, repo, after, trigger) {
+    var actions = recoveryActions(row);
+    var selected = recommendedRecovery(row);
+    if (!selected) {
+      flashToast("No safe recovery action is currently available for #" + row.num);
+      return;
+    }
+
+    var seq = ++recoveryDialogSeq;
+    var titleId = "recovery-title-" + seq;
+    var statusId = "recovery-status-" + seq;
+    var completed = false;
+    var busy = false;
+    var radios = [];
+
+    var title = el("h2", {
+      class: "modal-title recovery-title",
+      id: titleId,
+      text: "Recover issue #" + row.num,
+    });
+    var contextKids = [];
+    if (row.fix_pr != null) {
+      contextKids.push("Continue from ");
+      contextKids.push(ghLink(repo, "pull", row.fix_pr, "PR #" + row.fix_pr, "mono"));
+      if (row.fix_pr_branch) contextKids.push(" on " + row.fix_pr_branch);
+      if (row.fix_pr_head_sha) {
+        contextKids.push(" at ");
+        contextKids.push(el("span", {
+          class: "mono recovery-sha",
+          title: row.fix_pr_head_sha,
+          text: row.fix_pr_head_sha.slice(0, 8),
+        }));
+      }
+      if (row.fix_pr_build) contextKids.push(" · build " + row.fix_pr_build);
+      if (row.local_recovery_available) {
+        contextKids.push(" · unpublished local checkpoint available");
+      }
+      contextKids.push(".");
+    } else {
+      contextKids.push("No open Marathon PR was found. Only actions that can safely "
+        + "recover from the stored rejection are available.");
+    }
+    var context = el("p", { class: "modal-sub recovery-context" }, contextKids);
+
+    var conductorNote = null;
+    if (row.conductor_online === false) {
+      conductorNote = el("div", {
+        class: "recovery-conductor-note",
+        role: "note",
+        text: row.host_conductor_disabled
+          ? "This deck cannot launch a conductor on its host. The request will be saved and wait for an external conductor."
+          : "The conductor appears offline. You can save the request now; it will wait until a conductor is running.",
       });
+    }
+
+    var optionList = el("div", {
+      class: "recovery-options",
+      role: "radiogroup",
+      "aria-label": "Recovery method",
+    });
+    RECOVERY_ACTION_ORDER.forEach(function (name) {
+      var spec = actions[name];
+      if (!spec) return;
+      var copy = RECOVERY_ACTION_COPY[name] || { title: name, preservation: "" };
+      if (name === "start_over" && row.fix_pr == null) {
+        copy = {
+          title: "Start over",
+          preservation: "Starts a new Aristotle run from current main.",
+        };
+      }
+      var inputId = "recovery-" + seq + "-" + name;
+      var recommended = name === recommendedRecovery(row);
+      var radio = el("input", {
+        class: "recovery-radio",
+        id: inputId,
+        type: "radio",
+        name: "recovery-action-" + seq,
+        value: name,
+        checked: name === selected ? "checked" : null,
+        disabled: spec.enabled ? null : "disabled",
+        autofocus: name === selected ? "autofocus" : null,
+      });
+      radios.push(radio);
+      var badges = [];
+      if (recommended) badges.push(el("span", {
+        class: "recovery-badge recovery-badge-recommended",
+        text: "Recommended",
+      }));
+      if (spec.cost) badges.push(el("span", {
+        class: "recovery-badge",
+        text: spec.cost,
+      }));
+      if (spec.destructive || name === "start_over") badges.push(el("span", {
+        class: "recovery-badge recovery-badge-danger",
+        text: "Destructive",
+      }));
+      var body = el("span", { class: "recovery-choice-body" }, [
+        el("span", { class: "recovery-choice-head" }, [
+          el("strong", { text: copy.title }),
+          el("span", { class: "recovery-badges" }, badges),
+        ]),
+        el("span", {
+          class: "recovery-choice-reason",
+          text: spec.reason || copy.preservation,
+        }),
+        el("span", {
+          class: "recovery-choice-preservation",
+          text: copy.preservation,
+        }),
+      ]);
+      optionList.appendChild(el("label", {
+        class: "recovery-option" + (spec.enabled ? "" : " is-disabled"),
+        for: inputId,
+      }, [radio, body]));
+    });
+
+    var destructiveCheck = el("input", {
+      id: "recovery-destructive-" + seq,
+      type: "checkbox",
+    });
+    var destructiveWrap = el("div", {
+      class: "recovery-destructive-confirm",
+    }, [
+      el("label", { for: "recovery-destructive-" + seq }, [
+        destructiveCheck,
+        el("span", { text:
+          (row.fix_pr != null
+            ? "I understand that this archives the existing PR head and starts a new Aristotle run from current main."
+            : "I understand that this abandons the parked recovery state and starts a new Aristotle run from current main.")
+        }),
+      ]),
+    ]);
+    var status = el("div", {
+      class: "recovery-status",
+      id: statusId,
+      role: "status",
+      tabindex: "-1",
+      "aria-live": "polite",
+      "aria-atomic": "true",
+    });
+    var cancel = el("button", {
+      class: "btn",
+      type: "button",
+      onclick: function () { closeModal(); },
+    }, ["Cancel"]);
+    var submit = el("button", {
+      class: "btn btn-primary",
+      type: "submit",
+    }, ["Queue recovery"]);
+    var actionsBar = el("div", { class: "modal-actions" }, [cancel, submit]);
+    var form = el("form", {
+      class: "recovery-form",
+      "aria-describedby": statusId,
+    }, [
+      title,
+      context,
+      conductorNote,
+      optionList,
+      destructiveWrap,
+      status,
+      actionsBar,
+    ]);
+    var panel = el("div", {
+      class: "modal-panel recovery-modal",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-labelledby": titleId,
+    }, [form]);
+
+    function chosenName() {
+      for (var i = 0; i < radios.length; i++) {
+        if (radios[i].checked) return radios[i].value;
+      }
+      return null;
+    }
+
+    function selectedIsDestructive() {
+      var name = chosenName();
+      return name === "start_over" ||
+        !!(name && actions[name] && actions[name].destructive);
+    }
+
+    function updateConfirmation(resetCheck) {
+      var destructive = selectedIsDestructive();
+      if (resetCheck) destructiveCheck.checked = false;
+      if (destructive) destructiveWrap.removeAttribute("hidden");
+      else destructiveWrap.setAttribute("hidden", "hidden");
+      submit.disabled = busy || !chosenName() ||
+        (destructive && !destructiveCheck.checked);
+      submit.className = "btn " + (destructive ? "btn-danger" : "btn-primary");
+    }
+
+    radios.forEach(function (radio) {
+      radio.addEventListener("change", function () {
+        status.textContent = "";
+        status.className = "recovery-status";
+        updateConfirmation(true);
+      });
+    });
+    destructiveCheck.addEventListener("change", function () {
+      updateConfirmation(false);
+    });
+    updateConfirmation(false);
+
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      if (busy) return;
+      var action = chosenName();
+      var destructive = selectedIsDestructive();
+      if (!action) return;
+      if (destructive && !destructiveCheck.checked) {
+        status.textContent = "Confirm the archive-and-start-over warning first.";
+        status.className = "recovery-status is-error";
+        destructiveCheck.focus();
+        return;
+      }
+      busy = true;
+      status.textContent = "Saving recovery request…";
+      status.className = "recovery-status";
+      submit.disabled = true;
+      submit.textContent = "Queueing…";
+      cancel.disabled = true;
+      destructiveCheck.disabled = true;
+      radios.forEach(function (radio) { radio.disabled = true; });
+
+      postRecovery(row.num, action, row.recovery_token, destructive)
+        .then(function (res) {
+          completed = true;
+          busy = false;
+          var waiting = res && (res.conductor_online === false ||
+            res.queue_state === "waiting_for_conductor");
+          status.textContent = (res && res.message ? res.message :
+            "Recovery queued for #" + row.num + ".") +
+            (waiting
+              ? " The request is saved and will start when a conductor is online."
+              : " You can close this dialog; progress will appear in Status.");
+          status.className = "recovery-status is-success";
+          cancel.setAttribute("hidden", "hidden");
+          submit.disabled = false;
+          submit.textContent = "Close";
+          submit.setAttribute("type", "button");
+          submit.onclick = function () { closeModal(); };
+          submit.focus();
+          // Escape/backdrop remains available during a slow request. If the
+          // user already closed the dialog, still refresh the originating
+          // surface when the durable request is accepted.
+          if (!document.contains(panel)) {
+            flashToast(status.textContent);
+            if (typeof after === "function") after();
+          }
+        })
+        .catch(function (err) {
+          busy = false;
+          status.textContent = err && err.message
+            ? err.message
+            : "Could not queue recovery.";
+          status.className = "recovery-status is-error";
+          cancel.disabled = false;
+          destructiveCheck.disabled = false;
+          radios.forEach(function (radio) {
+            var spec = actions[radio.value];
+            radio.disabled = !(spec && spec.enabled);
+          });
+          submit.textContent = "Queue recovery";
+          updateConfirmation(false);
+          if (document.contains(panel)) status.focus();
+          else flashToast(status.textContent);
+        });
+    });
+
+    openModal(panel, function () {
+      if (completed && typeof after === "function") after();
+    }, trigger);
   }
 
-  // The "Stalled — needs re-reject" surface: issues the conductor parked (status
-  // 'stalled', or 'rejected' with no pending iteration) — NOT in the swipe queue,
-  // so otherwise unreachable without the CLI. Each gets a one-click Re-queue.
+  // Parked rejections are not in the swipe queue, so this best-effort section
+  // keeps them reachable without the CLI. Every row opens the shared recovery
+  // chooser; no recovery action fires from the row itself.
   // Best-effort: a fetch failure never breaks the Issues tab.
   function renderStuckSection(host, repo) {
     getJSON("/api/stuck").then(function (d) {
@@ -4794,24 +5187,12 @@
           kids.push(ghLink(repo, "pull", it.fix_pr, "PR #" + it.fix_pr, "issue-tier"));
         if (it.attempts) kids.push(el("span", { class: "issue-tier",
                                                 text: it.attempts + " tries" }));
-        kids.push(el("button", {
-          class: "btn btn-tiny issue-requeue",
-          type: "button",
-          title: it.has_note
-            ? "Re-issue this rejection's stored note — re-queues it for Aristotle"
-            : "No stored note to re-queue — use the CLI",
-          onclick: (function (row) {
-            return function (ev) {
-              if (!confirmRequeue(row)) return;
-              requeueIssue(row.num, ev.currentTarget);
-            };
-          })(it),
-        }, ["Re-queue"]));
+        kids.push(recoveryButton(it, repo, renderIssuesTab));
         return el("div", { class: "issue-row stuck-row" }, kids);
       });
       var section = el("section", { class: "chap-block stuck-block" }, [
         el("div", { class: "chap-title" }, [
-          "Stalled — needs re-reject",
+          "Parked — choose recovery",
           el("span", { class: "chap-count", text: stuck.length + " parked" }),
         ]),
       ].concat(rows));

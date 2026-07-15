@@ -868,17 +868,21 @@ def test_worktree_parent_inside_repo_refused(cfg, monkeypatch):
     assert "inside the repo" in str(exc.value)
 
 
-def test_prune_removes_leftover_worktrees(cfg, subprocess_calls, tmp_path):
+def test_prune_fails_closed_when_leftover_publication_state_is_unreadable(
+    cfg, subprocess_calls, tmp_path
+):
     runs_parent = tmp_path / "runs"
     (runs_parent / "wt-i22-20260610-120000").mkdir(parents=True)
     (runs_parent / "wd-i22-20260610-120000").mkdir()  # workdir: untouched
 
     conductor.prune_worktrees(cfg.repo_dir, runs_parent)
 
-    assert subprocess_calls == [
-        ["git", "-C", str(cfg.repo_dir), "worktree", "remove", "--force",
-         str(runs_parent / "wt-i22-20260610-120000")],
-        ["git", "-C", str(cfg.repo_dir), "worktree", "prune"],
+    # The generic subprocess double returns no branch/HEAD.  Cleanup must now
+    # treat that uncertainty as potentially unpublished work and preserve the
+    # directory; only stale worktree metadata may be pruned.
+    assert not any(call[3:5] == ["worktree", "remove"] for call in subprocess_calls)
+    assert subprocess_calls[-1] == [
+        "git", "-C", str(cfg.repo_dir), "worktree", "prune"
     ]
 
 
