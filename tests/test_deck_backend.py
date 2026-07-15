@@ -1074,7 +1074,7 @@ def test_definition_lookup_and_term_index_routes(running_server):
 def test_reconciliation_preview_and_guarded_decision_routes(
     running_server, monkeypatch
 ):
-    _server, base, token = running_server
+    server, base, token = running_server
     from marathon.deck import refresh as refresh_mod
 
     proposal = {"old": "A.old", "new": "A.new"}
@@ -1089,6 +1089,8 @@ def test_reconciliation_preview_and_guarded_decision_routes(
     status, raw = _get(base + "/api/reconciliation/22")
     assert status == 200
     assert json.loads(raw)["proposed_renames"] == [proposal]
+
+    server.queue_payload(14, lambda: {"version": 1})
 
     seen = {}
     monkeypatch.setattr(
@@ -1114,6 +1116,9 @@ def test_reconciliation_preview_and_guarded_decision_routes(
     assert status == 200 and json.loads(raw)["updated"] is True
     assert seen["issue"] == 22
     assert seen["confirmation"]["renames"] == [proposal]
+    assert server.queue_payload(
+        14, lambda: {"version": 2}
+    ) == {"version": 2}
 
     status, _raw = _post(
         base + "/api/reconcile-proposal",

@@ -148,6 +148,7 @@ QUEUE_CACHE_TTL_SECONDS = 5.0
 _QUEUE_MUTATING_POST_ROUTES = frozenset({
     "/api/verdict",
     "/api/ship",
+    "/api/reconcile-proposal",
     "/api/refresh-issue",
     "/api/drop-citation",
     "/api/requeue",
@@ -384,6 +385,7 @@ class DeckHandler(BaseHTTPRequestHandler):
             and not getattr(self, "_queue_cache_invalidated", False)
             and HTTPStatus.OK <= int(status) < HTTPStatus.MULTIPLE_CHOICES
             and payload.get("ok") is not False
+            and payload.get("updated") is not False
         ):
             self.server.invalidate_queue_cache()  # type: ignore[attr-defined]
             self._queue_cache_invalidated = True
