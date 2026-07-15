@@ -1582,6 +1582,11 @@
     // Wrapper diagnostics/tactic states take precedence over their nested
     // keyword token so one pointer position can never open two interpretations.
     var target = node.closest(".tactic, .has-info") || node.closest(VERSO_HOVER_SELECTOR);
+    // Definition links are the keyboard focus target, while their semantic
+    // hover metadata lives on the wrapped token span.
+    if (!target && node.matches("a[href]")) {
+      target = node.querySelector(VERSO_HOVER_SELECTOR);
+    }
     if (!target) return null;
     var container = target.closest(".verso-semantic-source");
     return container && container._marathonVersoHoverContext

@@ -467,6 +467,9 @@ def test_verso_artifacts_are_data_only_and_hovers_use_committed_code(app_js: str
     hover = _fn_body(code, "function ensureVersoHoverController")
     assert "mouseover" in hover and "focusin" in hover and "Escape" in hover
     assert "MutationObserver" in hover
+    target = _fn_body(code, "function versoHoverTarget")
+    assert 'node.matches("a[href]")' in target
+    assert "node.querySelector(VERSO_HOVER_SELECTOR)" in target
     # Generated artifacts are parsed/fetched only. No generated CSS or JS is
     # installed into Marathon's privileged document.
     for forbidden in (
