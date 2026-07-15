@@ -326,6 +326,30 @@ Runner = Callable[..., subprocess.CompletedProcess[str]]
 SourceTokenFn = Callable[[Path], str]
 
 
+def _lake_environment(
+    environ: Optional[dict[str, str]] = None, *, home: Optional[Path] = None
+) -> dict[str, str]:
+    """Return an environment that can find elan shims in GUI services.
+
+    macOS LaunchAgents commonly receive a minimal PATH even though Lean is
+    correctly installed for the user.  Add the conventional elan bin directory
+    without replacing any configured PATH entries; CLI and test environments
+    therefore keep their normal executable resolution.
+    """
+
+    env = dict(os.environ if environ is None else environ)
+    elan_bin = (home or Path.home()) / ".elan" / "bin"
+    try:
+        has_lake = (elan_bin / "lake").is_file()
+    except OSError:
+        has_lake = False
+    if has_lake:
+        entries = [entry for entry in env.get("PATH", "").split(os.pathsep) if entry]
+        if str(elan_bin) not in entries:
+            env["PATH"] = os.pathsep.join([str(elan_bin), *entries])
+    return env
+
+
 class VersoArtifactManager:
     """Asynchronous, single-flight Verso artifact builder for one repository."""
 
@@ -343,6 +367,7 @@ class VersoArtifactManager:
         )
         self._check_lake = runner is None
         self._runner: Runner = runner or subprocess.run
+        self._process_env = _lake_environment()
         self._source_token_fn = source_token_fn or definition_source_token
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -443,7 +468,9 @@ class VersoArtifactManager:
 
         if self._locking_unavailable:
             return None
-        if self._check_lake and shutil.which("lake") is None:
+        if self._check_lake and shutil.which(
+            "lake", path=self._process_env.get("PATH")
+        ) is None:
             with self._lock:
                 self._project = None
                 self._project_signature = None
@@ -925,7 +952,7 @@ class VersoArtifactManager:
             "timeout": timeout,
             # Lake 5 no longer exposes the old `-j` option.  Its jobs run on
             # Lean's task pool, so bound it to keep the live deck responsive.
-            "env": {**os.environ, "LEAN_NUM_THREADS": _LEAN_BUILD_THREADS},
+            "env": {**self._process_env, "LEAN_NUM_THREADS": _LEAN_BUILD_THREADS},
             # The inherited POSIX descriptor keeps the flock alive if the
             # deck is killed while Lake continues during a relaunch.
             "pass_fds": (lock_fd,),

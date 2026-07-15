@@ -97,6 +97,21 @@ def test_discovers_matching_stable_verso_tag(tmp_path):
     assert "stable lean-toolchain" in status["error"]
 
 
+def test_lake_environment_adds_elan_for_minimal_gui_service_path(tmp_path):
+    home = tmp_path / "home"
+    lake = home / ".elan" / "bin" / "lake"
+    lake.parent.mkdir(parents=True)
+    lake.write_text("#!/bin/sh\n")
+    lake.chmod(0o755)
+
+    env = verso._lake_environment({"PATH": "/usr/bin"}, home=home)
+    assert env["PATH"].split(verso.os.pathsep) == [
+        str(lake.parent), "/usr/bin"
+    ]
+    assert verso.shutil.which("lake", path=env["PATH"]) == str(lake)
+    assert verso._lake_environment(env, home=home)["PATH"] == env["PATH"]
+
+
 def test_missing_platform_lock_reports_precise_unavailable(tmp_path, monkeypatch):
     repo = _project(tmp_path)
     runner = FakeVersoRunner()
