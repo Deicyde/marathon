@@ -141,6 +141,20 @@ MAX_REVIEW_SOURCE_BYTES = 2 * 1024 * 1024
 # external GitHub changes.
 QUEUE_CACHE_TTL_SECONDS = 5.0
 
+# These successful POSTs change fields consumed by ``build_queue`` (issue
+# verdict/state/body, active recovery jobs, or the chapter registry).  Other
+# POST routes update declaration-review/intake/prover state that is not part of
+# the queue payload and therefore must not detach an in-flight queue build.
+_QUEUE_MUTATING_POST_ROUTES = frozenset({
+    "/api/verdict",
+    "/api/ship",
+    "/api/refresh-issue",
+    "/api/drop-citation",
+    "/api/requeue",
+    "/api/recovery",
+    "/api/approve-chapter",
+})
+
 
 class _QueueFlight:
     """One queue build shared by concurrent readers of the same chapter."""
@@ -359,6 +373,20 @@ class DeckHandler(BaseHTTPRequestHandler):
         return self.server.cfg  # type: ignore[attr-defined]
 
     def _send_json(self, payload: dict, status: int = HTTPStatus.OK) -> None:
+        # A successful queue-affecting POST invalidates immediately after its
+        # durable work and *before* the response is visible.  The browser may
+        # refresh the queue as soon as it receives this response; invalidating
+        # in do_POST's finally block would leave a race where that refresh sees
+        # the old five-second cache entry.  Errors and read-only POSTs do not
+        # disturb an in-flight queue build.
+        if (
+            getattr(self, "_queue_invalidation_pending", False)
+            and not getattr(self, "_queue_cache_invalidated", False)
+            and HTTPStatus.OK <= int(status) < HTTPStatus.MULTIPLE_CHOICES
+            and payload.get("ok") is not False
+        ):
+            self.server.invalidate_queue_cache()  # type: ignore[attr-defined]
+            self._queue_cache_invalidated = True
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -388,6 +416,10 @@ class DeckHandler(BaseHTTPRequestHandler):
     # --- GET (pure reads only) --------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802 (stdlib handler name)
+        # A BaseHTTPRequestHandler instance can serve multiple keep-alive
+        # requests; never carry a prior POST's invalidation marker into a GET.
+        self._queue_invalidation_pending = False
+        self._queue_cache_invalidated = False
         parsed = urlsplit(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -766,11 +798,16 @@ class DeckHandler(BaseHTTPRequestHandler):
     )
 
     def do_POST(self) -> None:  # noqa: N802 (stdlib handler name)
+        self._queue_invalidation_pending = False
+        self._queue_cache_invalidated = False
         parsed = urlsplit(self.path)
         if parsed.path not in self._POST_ROUTES:
             return self._send_error_json(
                 HTTPStatus.NOT_FOUND, f"no POST route {parsed.path!r}"
             )
+        self._queue_invalidation_pending = (
+            parsed.path in _QUEUE_MUTATING_POST_ROUTES
+        )
         # Bind the collaborator's forwarded GitHub OAuth token (if a proxy
         # supplied one) for the whole dispatch, so every GitHub write the handler
         # makes is attributed to them. No header (local use) => ambient gh auth.
@@ -811,12 +848,6 @@ class DeckHandler(BaseHTTPRequestHandler):
                     self._api_ship()
         except BrokenPipeError:
             return
-        finally:
-            # Conservatively invalidate after every recognized POST, including
-            # validation failures.  This keeps successful mutations exact and
-            # avoids a response-status bookkeeping seam; an unnecessary miss
-            # costs at most one new, coalesced build.
-            self.server.invalidate_queue_cache()  # type: ignore[attr-defined]
 
     def _read_guarded_body(self) -> Optional[dict]:
         """Shared POST preamble for every side-effecting route: the

@@ -205,11 +205,43 @@ def test_load_context_large_metadata_gap_caps_rest_fallback(
         ),
     )
 
-    ctx = cards._load_context(cfg, issue_nums)
+    ctx = cards._load_context(
+        cfg,
+        issue_nums,
+        rest_metadata_limit=cards._DECK_REST_METADATA_FALLBACK_LIMIT,
+    )
 
     expected = issue_nums[:cards._DECK_REST_METADATA_FALLBACK_LIMIT]
     assert rest_calls == [expected]
     assert set(ctx.issue_meta) == set(expected)
+
+
+def test_load_context_default_preserves_complete_sibling_metadata(
+    tmp_path, monkeypatch,
+):
+    """Reconciliation reads remain complete when the GraphQL bulk call fails."""
+    cfg = make_cfg(tmp_path)
+    import marathon.review.github as gh_mod
+
+    issue_nums = list(
+        range(100, 100 + cards._DECK_REST_METADATA_FALLBACK_LIMIT + 4)
+    )
+    recovered = _bodies_for({n: f"Decl{n}" for n in issue_nums})
+    rest_calls = []
+    monkeypatch.setattr(gh_mod, "fetch_issues_bulk", lambda nums, repo: None)
+    monkeypatch.setattr(
+        gh_mod,
+        "fetch_issues_rest_bulk",
+        lambda nums, repo: (
+            rest_calls.append(list(nums))
+            or {n: recovered[n] for n in nums}
+        ),
+    )
+
+    ctx = cards._load_context(cfg, issue_nums)
+
+    assert rest_calls == [issue_nums]
+    assert ctx.issue_meta == recovered
 
 
 def test_large_queue_graphql_failure_keeps_unfetched_placeholders(
@@ -927,17 +959,21 @@ def test_get_queue_is_pure_no_verdict(running_server, monkeypatch):
     assert "jobs" in json.loads(sbody)
 
 
-def test_successful_post_invalidates_queue_cache(running_server, monkeypatch):
+def test_successful_queue_mutation_invalidates_cache(running_server, monkeypatch):
     """A mutation cannot leave the server-side queue snapshot cached."""
     server, base, token = running_server
     server.queue_payload(14, lambda: {"version": 1})
 
-    from marathon import conductor
+    from marathon.deck import refresh as refresh_mod
 
-    monkeypatch.setattr(conductor, "set_prover_enabled", lambda repo, enabled: None)
+    monkeypatch.setattr(
+        refresh_mod,
+        "refresh_issue_signatures",
+        lambda cfg, issue: {"ok": True, "updated": True, "issue": issue},
+    )
     status, raw = _post(
-        base + "/api/prover-toggle",
-        {"enabled": True},
+        base + "/api/refresh-issue",
+        {"issue": 22},
         headers={deck_server.TOKEN_HEADER: token},
     )
     assert status == 200
@@ -948,6 +984,64 @@ def test_successful_post_invalidates_queue_cache(running_server, monkeypatch):
         14, lambda: builds.append(1) or {"version": 2}
     ) == {"version": 2}
     assert builds == [1]
+
+
+def test_queue_cache_invalidates_before_mutation_response(
+    running_server, monkeypatch,
+):
+    """An immediate browser refresh cannot beat post-action invalidation."""
+    server, base, token = running_server
+    server.queue_payload(14, lambda: {"version": 1})
+
+    from marathon.deck import refresh as refresh_mod
+
+    monkeypatch.setattr(
+        refresh_mod,
+        "refresh_issue_signatures",
+        lambda cfg, issue: {"ok": True, "updated": True, "issue": issue},
+    )
+    original_invalidate = server.invalidate_queue_cache
+    invalidated = Event()
+    release_response = Event()
+
+    def block_after_invalidation():
+        original_invalidate()
+        invalidated.set()
+        assert release_response.wait(timeout=5)
+
+    monkeypatch.setattr(server, "invalidate_queue_cache", block_after_invalidation)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            response = pool.submit(
+                _post,
+                base + "/api/refresh-issue",
+                {"issue": 22},
+                {deck_server.TOKEN_HEADER: token},
+            )
+            assert invalidated.wait(timeout=2)
+            assert server.queue_payload(
+                14, lambda: {"version": 2}
+            ) == {"version": 2}
+            release_response.set()
+            status, raw = response.result(timeout=2)
+    finally:
+        release_response.set()
+
+    assert status == 200
+    assert json.loads(raw)["ok"] is True
+
+
+def test_rejected_post_does_not_invalidate_queue_cache(running_server):
+    """Bad clients cannot detach a live flight or evict a completed queue."""
+    server, base, _token = running_server
+    server.queue_payload(14, lambda: {"version": 1})
+
+    status, _raw = _post(base + "/api/refresh-issue", {"issue": 22})
+
+    assert status == 403
+    assert server.queue_payload(
+        14, lambda: pytest.fail("rejected POST evicted the queue cache")
+    ) == {"version": 1}
 
 
 def test_definition_lookup_and_term_index_routes(running_server):

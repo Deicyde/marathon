@@ -393,10 +393,19 @@ _DECK_REST_METADATA_FALLBACK_LIMIT = 8
 
 
 def _load_context(
-    cfg: "ReviewConfig", issue_nums: list[int]
+    cfg: "ReviewConfig",
+    issue_nums: list[int],
+    *,
+    rest_metadata_limit: Optional[int] = None,
 ) -> _DeckContext:
     """Read the snapshot, tiers, issue metadata, and verdict statuses for
-    ``issue_nums`` — all read-only, all degrading."""
+    ``issue_nums`` — all read-only, all degrading.
+
+    ``rest_metadata_limit`` bounds only the REST recovery after a bulk GraphQL
+    gap.  Correctness-sensitive reconciliation callers leave it unset so they
+    still see every sibling issue body; the broad queue read supplies one
+    worker-pool wave so its HTTP latency remains bounded.
+    """
     # Local imports: keep this module importable on a checkout whose audit
     # / ledger deps are lazy (mirrors the review CLI's audit↔review
     # boundary discipline).
@@ -411,18 +420,14 @@ def _load_context(
     except Exception:  # noqa: BLE001 - read-side GitHub outage degrades honestly
         issue_meta = {}
     # Preserve the one-call GraphQL fast path. REST is live, uncached, and only
-    # fills numbers GraphQL did not return (including whole-call failure). Bound
-    # the degraded path: a 76-card queue must not wait through ten waves of REST
-    # timeouts after the GraphQL request already consumed its own timeout.
+    # fills numbers GraphQL did not return (including whole-call failure). Broad
+    # queue callers apply a limit; completeness-sensitive callers do not.
     missing = [n for n in requested if n not in issue_meta]
+    if rest_metadata_limit is not None:
+        missing = missing[:max(0, rest_metadata_limit)]
     if missing:
         try:
-            issue_meta.update(
-                fetch_issues_rest_bulk(
-                    missing[:_DECK_REST_METADATA_FALLBACK_LIMIT],
-                    cfg.github_repo,
-                )
-            )
+            issue_meta.update(fetch_issues_rest_bulk(missing, cfg.github_repo))
         except Exception:  # noqa: BLE001 - metadata is optional deck context
             pass
     verdict_status = _verdict_status(cfg, issue_meta)
@@ -941,7 +946,11 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
     Degrades honestly with no snapshot (tier '-', every card non-ready
     with the reason, bodies/titles still present)."""
     issue_nums = _chapter_issue_nums(cfg, chapter)
-    ctx = _load_context(cfg, issue_nums)
+    ctx = _load_context(
+        cfg,
+        issue_nums,
+        rest_metadata_limit=_DECK_REST_METADATA_FALLBACK_LIMIT,
+    )
     # Rename/split recovery needs current audit declarations to establish a
     # trustworthy tier.  When snapshot validation withheld every declaration
     # (for example, main moved since the last audit), scanning all stale cards
