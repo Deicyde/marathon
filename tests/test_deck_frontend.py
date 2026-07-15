@@ -354,6 +354,237 @@ def test_source_highlighting_is_wired(app_js: str):
     assert "leanHighlight(" in card
 
 
+# --- Verso semantic source (safe progressive enhancement) ------------------
+
+def test_verso_semantic_endpoints_are_pure_reads(app_js: str):
+    code = _strip_block_comments(app_js)
+    status = _fn_body(code, "function fetchVersoStatus")
+    manifest = _fn_body(code, "function fetchVersoManifest")
+    assert 'getJSON("/api/verso-status")' in status
+    assert 'getJSON("/api/verso-manifest")' in manifest
+    assert "postJSON(" not in status + manifest
+
+
+def test_failed_verso_build_exposes_an_explicit_guarded_retry(app_js: str):
+    code = _strip_block_comments(app_js)
+    transport = _fn_body(code, "function retryVersoBuild")
+    assert 'postJSON("/api/verso-retry", {})' in transport
+    button = _fn_body(code, "function versoRetryButton")
+    assert 'stateName !== "error"' in button
+    assert "retryVersoBuildFrom(this)" in button
+    retry = _fn_body(code, "function retryVersoBuildFrom")
+    assert "versoRetryBusy" in retry
+    assert "versoMetadataEpoch += 1" in retry
+    assert "ensureVersoMetadata(true)" in retry
+    assert "scheduleVersoStatusPoll(metadata.status)" in retry
+
+
+def test_verso_is_a_progressive_layer_over_immediate_raw_source(app_js: str):
+    code = _strip_block_comments(app_js)
+    card = _fn_body(code, "function renderDeclCard")
+    assert "leanHighlight(card.source_block, card.kernel)" in card
+    assert "makeVersoShell(rawCode" in card
+    assert "enhanceVersoDeclaration(semanticSource" in card
+
+    reader = _fn_body(code, "function renderReaderTarget")
+    assert "leanHighlight(target.source_block" in reader
+    assert "makeVersoShell(rawSource" in reader
+    assert "enhanceVersoDeclaration(semanticSource" in reader
+
+    full_file = _fn_body(code, "function readerFullFile")
+    assert "fetchReviewSource(path)" in full_file
+    assert "makeVersoShell(rawSource" in full_file
+    assert "enhanceVersoModule(semanticFile, path)" in full_file
+
+
+def test_verso_generated_html_passes_through_strict_sanitizer(app_js: str):
+    code = _strip_block_comments(app_js)
+    sanitizer = _fn_body(code, "function sanitizeVersoNode")
+    html = _fn_body(code, "function sanitizeVersoHTML")
+    decl = _fn_body(code, "function declarationCodeFromPage")
+    module = _fn_body(code, "function moduleCodeFromPage")
+    hover = _fn_body(code, "function makeVersoHover")
+
+    assert "VERSO_ALLOWED_TAGS" in sanitizer
+    assert "VERSO_DROP_TAGS" in sanitizer
+    assert "safeVersoURL" in sanitizer
+    assert "createElement" in sanitizer and "createTextNode" in sanitizer
+    assert "DOMParser" in html and "sanitizeVersoNode" in html
+    assert "sanitizeVersoNode" in decl and "sanitizeVersoNode" in module
+    assert 'querySelector("section.code-content")' in module
+    assert "content.childNodes" in module
+    for prose_tag in ("H1", "H2", "H3", "BLOCKQUOTE"):
+        assert prose_tag in app_js
+    assert "sanitizeVersoHTML(" in hover and "docs[hoverId]" in hover
+    assert "idPrefix" in sanitizer and "idPrefix" in hover
+    for body in (sanitizer, html, decl, module, hover):
+        assert "innerHTML" not in body, "generated or hover HTML must never be injected raw"
+    for dangerous in ("SCRIPT", "STYLE", "IFRAME", "OBJECT", "SVG", "FORM"):
+        assert dangerous in app_js
+
+
+def test_verso_urls_are_same_origin_and_mount_confined(app_js: str):
+    code = _strip_block_comments(app_js)
+    safe_url = _fn_body(code, "function safeVersoURL")
+    assert "window.location.origin" in safe_url
+    assert "parsed.origin" in safe_url
+    assert "parsed.pathname.indexOf(root)" in safe_url
+    assert "pageRelative" in safe_url and "new URL(raw, resolutionBase)" in safe_url
+    assert "artifactBase" in safe_url and "resolutionBase" in safe_url
+    assert "return null" in safe_url
+    assert "safeVersoURL(relative)" in _fn_body(code, "function fetchVersoPage")
+
+
+def test_verso_page_relative_and_extra_definition_links_are_rewritten_safely(app_js: str):
+    code = _strip_block_comments(app_js)
+    sanitizer = _fn_body(code, "function sanitizeVersoNode")
+    assert 'safeVersoURL(source.getAttribute("href"), pageRelative, artifactBase)' in sanitizer
+    decl = _fn_body(code, "function declarationCodeFromPage")
+    module = _fn_body(code, "function moduleCodeFromPage")
+    assert "sanitizeVersoNode(code, pageRelative, artifactBase, idPrefix)" in decl
+    assert "sanitizeVersoNode(source, pageRelative, artifactBase, idPrefix)" in module
+    doc_base = _fn_body(code, "function versoDocumentBase")
+    assert 'querySelector("base[href]")' in doc_base
+    assert "virtualOrigin" in doc_base
+    assert "virtualBase" in doc_base and "versoRootPath" in doc_base
+    assert "return safeVersoURL(mounted)" in doc_base
+    extras = _fn_body(code, "function appendVersoExtraLinks")
+    assert 'closest("[data-verso-links]")' in extras
+    assert "JSON.parse(raw)" in extras
+    assert "safeVersoURL(item.href, pageRelative, artifactBase)" in extras
+    assert "innerHTML" not in extras
+
+
+def test_verso_artifacts_are_data_only_and_hovers_use_committed_code(app_js: str):
+    code = _strip_block_comments(app_js)
+    enhance = _fn_body(code, "function enhanceVersoDeclaration")
+    assert "ensureVersoMetadata" in enhance
+    assert "fetchVersoPage" in enhance
+    assert "fetchVersoDocs" in enhance
+    hovers = _fn_body(code, "function activateVersoHovers")
+    assert "data-binding" in hovers and "binding-hl" in hovers
+    assert "ensureVersoHoverController" in hovers
+    hover = _fn_body(code, "function ensureVersoHoverController")
+    assert "mouseover" in hover and "focusin" in hover and "Escape" in hover
+    assert "MutationObserver" in hover
+    # Generated artifacts are parsed/fetched only. No generated CSS or JS is
+    # installed into Marathon's privileged document.
+    for forbidden in (
+        "function loadVersoScript", "function appendVersoStylesheet",
+        "function loadVersoAssets", 'el("script"', 'el("link"',
+        "popper.js", "tippy.js", "tippy-border.css",
+    ):
+        assert forbidden not in app_js
+
+
+def test_verso_artifact_requests_are_token_pinned_and_retryable(app_js: str):
+    code = _strip_block_comments(app_js)
+    root = _fn_body(code, "function versoRootPath")
+    assert "manifest.root_url" in root
+    assert root.index("manifest.root_url") < root.index("status.root_url")
+
+    page = _fn_body(code, "function fetchVersoPage")
+    assert "delete state.versoPages[key]" in page
+    docs = _fn_body(code, "function fetchVersoDocs")
+    assert "versoDocsRequestToken" in docs and "versoDocsToken" in docs
+
+
+def test_verso_fragment_ids_are_unique_and_hover_init_waits_for_docs(app_js: str):
+    code = _strip_block_comments(app_js)
+    sanitizer = _fn_body(code, "function sanitizeVersoNode")
+    assert '(idPrefix || "") + sourceId' in sanitizer
+    assert '(idPrefix || "") + labelFor' in sanitizer
+    shell = _fn_body(code, "function makeVersoShell")
+    assert "versoFragmentSeq" in shell and "_marathonVersoIdPrefix" in shell
+    decl = _fn_body(code, "function enhanceVersoDeclaration")
+    module = _fn_body(code, "function enhanceVersoModule")
+    assert "shell._marathonVersoIdPrefix" in decl
+    assert "shell._marathonVersoIdPrefix" in module
+    assert "state.versoManifest.artifact_token !== artifactToken" in decl
+    assert "state.versoManifest.artifact_token !== artifactToken" in module
+
+    hovers = _fn_body(code, "function activateVersoHovers")
+    assert "fetchVersoDocs()" in hovers
+    assert "ensureVersoHoverController" in hovers
+    assert hovers.rindex('setAttribute("data-verso-hovers", "1")') > hovers.index(
+        "ensureVersoHoverController"
+    )
+
+    reset = _fn_body(code, "function resetVersoInteractions")
+    assert 'removeAttribute("data-verso-bindings")' in reset
+    assert 'removeAttribute("data-verso-hovers")' in reset
+    assert 'removeAttribute("data-verso-hover-retries")' in reset
+    assert "state.versoHoverController.closeFor(container)" in reset
+    paint = _fn_body(code, "function paintVersoResult")
+    assert paint.index("resetVersoInteractions(semantic)") < paint.index(
+        "semantic.removeChild"
+    )
+
+
+def test_verso_building_status_polls_then_upgrades_mounted_surfaces(app_js: str):
+    code = _strip_block_comments(app_js)
+    ensure = _fn_body(code, "function ensureVersoMetadata")
+    poll = _fn_body(code, "function scheduleVersoStatusPoll")
+    # A transient building response must not satisfy the terminal cache path.
+    assert "isBuilding" in ensure
+    assert "!isBuilding" in ensure
+    assert "selectedArtifactMatches" in ensure
+    assert "requestEpoch !== state.versoMetadataEpoch" in ensure
+    assert "versoMetadataSuperseded" in ensure
+    assert "scheduleVersoStatusPoll(result.status)" in ensure
+    assert "wasBuilding" in ensure and "transport_error" in ensure
+    for state_name in ('"building"', '"queued"', '"idle"'):
+        assert state_name in poll
+    assert "setTimeout" in poll and "2000" in poll and "10000" in poll
+    assert "versoPollAttempts >= 390" in poll
+    assert "ensureVersoMetadata(true)" in poll
+    assert "refreshMountedVersoSurfaces()" in poll
+    refresh = _fn_body(code, "function refreshMountedVersoSurfaces")
+    assert 'getAttribute("data-verso-artifact") === artifactToken' in refresh
+    assert "updateVersoFreshness" in refresh
+
+
+def test_stale_verso_never_hides_current_raw_source(app_js: str):
+    code = _strip_block_comments(app_js)
+    shell = _fn_body(code, "function makeVersoShell")
+    assert shell.index("raw,") < shell.index("semantic,")
+    freshness = _fn_body(code, "function updateVersoFreshness")
+    assert 'if (stale) raw.setAttribute("open", "open")' in freshness
+    assert "Current raw source (stale Verso view follows)" in freshness
+    paint = _fn_body(code, "function paintVersoResult")
+    assert "updateVersoFreshness(shell, status)" in paint
+
+
+def test_verso_surfaces_report_building_stale_and_error(app_js: str, style_css: str):
+    code = _strip_block_comments(app_js)
+    badge = _fn_body(code, "function versoBadge")
+    for label in ("Verso building", "Verso stale", "Verso error", "Verso semantic"):
+        assert label in badge
+    shell = _fn_body(code, "function makeVersoShell")
+    assert "Current raw source" in shell
+    assert "verso-raw-fallback" in shell
+    for cls in (
+        ".verso-source-shell", ".verso-semantic-source", ".verso-raw-fallback",
+        ".verso-status-building", ".verso-status-stale", ".verso-status-error",
+        ".binding-hl", ".verso-safe-hover",
+        ".verso-semantic-module > .md-text",
+    ):
+        assert cls in style_css
+
+
+def test_marathon_trust_and_owner_inspector_remains_review_details(app_js: str):
+    code = _strip_block_comments(app_js)
+    card = _fn_body(code, "function renderDeclCard")
+    reader = _fn_body(code, "function renderReaderTarget")
+    assert "Review details" in card and "showDefinitionLookup" in card
+    assert "Review details" in reader and "showDefinitionLookup" in reader
+    rendered = _fn_body(code, "function renderDefinitionMatch")
+    assert "Trust evidence" in rendered
+    assert "Owning review card" in rendered
+    # Reconciliation/integrity reads are intentionally not replaced by Verso.
+    assert "/api/reconciliation/" in app_js
+
+
 # --- reject requires a verbatim note ----------------------------------------
 
 def test_reject_requires_a_note(app_js: str):

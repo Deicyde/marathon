@@ -19,6 +19,10 @@ API surface (shared contract — the gate reconciles any drift):
 * ``GET  /api/project-graph`` → project issue/declaration dependency DAG (read)
 * ``GET  /api/definition``    → current-source identifier lookup (read)
 * ``GET  /api/definition-terms`` → compact project identifier index (read)
+* ``GET  /api/verso-status``  → nonblocking semantic-doc build status
+* ``GET  /api/verso-manifest`` → last-good Verso navigation manifest
+* ``GET  /verso/<path>``      → last-good generated Verso artifact
+* ``POST /api/verso-retry``   → explicitly retry a failed semantic-doc build
 * ``GET  /api/reconciliation/{id}`` → pending identity proposals (read)
 * ``GET  /api/status``        → live conductor/landing events (poll)
 * ``GET  /api/events``        → the same, as Server-Sent Events
@@ -52,15 +56,16 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import re
 import secrets
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import Event, Lock
 from time import monotonic
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 if TYPE_CHECKING:  # pragma: no cover — type-only
     from marathon.review.config import ReviewConfig
@@ -97,6 +102,17 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # app.js: new index.html, cached old JS — e.g. a new tab that did nothing.)
 ASSET_VERSION_PLACEHOLDER = "__ASSET_VERSION__"
 
+# ``None`` is a useful explicit value for tests/demo mode (no manager), so a
+# private sentinel distinguishes it from the normal "construct one" path.
+_DEFAULT_VERSO_MANAGER = object()
+_VERSO_ARTIFACT_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+_VERSO_HTML_CSP = (
+    "sandbox; default-src 'none'; script-src 'none'; connect-src 'none'; "
+    "frame-src 'none'; form-action 'none'; base-uri 'self'; "
+    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'"
+)
+_VERSO_ACTIVE_DOCUMENT_SUFFIXES = frozenset({".html", ".htm", ".xhtml", ".svg", ".xml"})
+
 
 def _asset_version() -> str:
     newest = 0.0
@@ -114,10 +130,15 @@ _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
     ".js": "application/javascript; charset=utf-8",
+    ".mjs": "application/javascript; charset=utf-8",
     ".json": "application/json; charset=utf-8",
     ".svg": "image/svg+xml",
     ".png": "image/png",
     ".ico": "image/x-icon",
+    ".txt": "text/plain; charset=utf-8",
+    ".xml": "application/xml; charset=utf-8",
+    ".wasm": "application/wasm",
+    ".webmanifest": "application/manifest+json",
     ".woff": "font/woff",
     ".woff2": "font/woff2",
     ".map": "application/json; charset=utf-8",
@@ -264,6 +285,7 @@ class DeckServer(ThreadingHTTPServer):
         token: str,
         default_chapter: Optional[int] = None,
         demo: bool = False,
+        verso_manager=_DEFAULT_VERSO_MANAGER,
     ):
         self.cfg = cfg
         self.token = token
@@ -285,7 +307,55 @@ class DeckServer(ThreadingHTTPServer):
         self._queue_cache: dict[Optional[int], tuple[float, dict]] = {}
         self._queue_flights: dict[Optional[int], _QueueFlight] = {}
         self._queue_generation = 0
+
+        # Verso elaboration is deliberately isolated behind its artifact
+        # manager.  Constructing the manager does no build work; only
+        # GET /api/verso-status asks it to start its background single-flight
+        # builder.  Queue/card routes never consult it.  Explicit ``None`` is
+        # used by demo mode and focused server tests.
+        self._verso_close_lock = Lock()
+        self._verso_closed = False
+        self._verso_unavailable_reason: Optional[str] = None
+        if verso_manager is _DEFAULT_VERSO_MANAGER and not demo:
+            try:
+                from marathon.deck.verso import VersoArtifactManager
+
+                verso_manager = VersoArtifactManager(cfg.repo_dir)
+            except Exception:  # noqa: BLE001 — the deck must still start
+                verso_manager = None
+                self._verso_unavailable_reason = (
+                    "Verso semantic documentation is not configured"
+                )
+        elif verso_manager is _DEFAULT_VERSO_MANAGER:
+            verso_manager = None
+            self._verso_unavailable_reason = (
+                "Verso semantic documentation is unavailable in demo mode"
+            )
+        elif verso_manager is None:
+            self._verso_unavailable_reason = (
+                "Verso semantic documentation is not configured"
+            )
+        self.verso_manager = verso_manager
         super().__init__(server_address, DeckHandler)
+
+    def server_close(self) -> None:
+        """Close the HTTP socket and the server-owned artifact manager.
+
+        ``server_close`` is commonly called from both fixture cleanup and a
+        surrounding ``finally`` block.  Keep manager shutdown idempotent and
+        nonblocking: stopping the review UI must not wait for a Lake/Verso
+        subprocess that was already in flight.
+        """
+        with self._verso_close_lock:
+            if not self._verso_closed:
+                self._verso_closed = True
+                manager = self.verso_manager
+                if manager is not None:
+                    try:
+                        manager.shutdown(wait=False)
+                    except Exception:  # noqa: BLE001 — closing stays best-effort
+                        pass
+        super().server_close()
 
     def queue_payload(
         self, chapter: Optional[int], build: Callable[[], dict]
@@ -405,6 +475,7 @@ class DeckHandler(BaseHTTPRequestHandler):
     def _send_bytes(
         self, body: bytes, content_type: str, status: int = HTTPStatus.OK,
         cache_control: Optional[str] = None,
+        extra_headers: Optional[dict[str, str]] = None,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -412,6 +483,8 @@ class DeckHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         if cache_control is not None:
             self.send_header("Cache-Control", cache_control)
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -430,6 +503,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                 return self._serve_index()
             if path.startswith("/static/"):
                 return self._serve_static(path)
+            if path.startswith("/verso/"):
+                return self._serve_verso(path)
             if path == "/api/queue":
                 return self._api_queue(query)
             if path.startswith("/api/card/"):
@@ -460,6 +535,10 @@ class DeckHandler(BaseHTTPRequestHandler):
                 return self._api_definition(query)
             if path == "/api/definition-terms":
                 return self._api_definition_terms()
+            if path == "/api/verso-status":
+                return self._api_verso_status()
+            if path == "/api/verso-manifest":
+                return self._api_verso_manifest()
             if path.startswith("/api/reconciliation/"):
                 return self._api_reconciliation(
                     path[len("/api/reconciliation/"):]
@@ -528,6 +607,207 @@ class DeckHandler(BaseHTTPRequestHandler):
             candidate.suffix, "application/octet-stream"
         )
         self._send_bytes(candidate.read_bytes(), content_type)
+
+    def _serve_verso(self, path: str) -> None:
+        """Serve one file explicitly authorized by the artifact manager.
+
+        Decode exactly once, reject every absolute/traversing spelling before
+        consulting the manager, and never infer a filesystem path here.  The
+        manager resolves only against the current/last-good artifact, so stale
+        build directories and arbitrary repo files cannot become HTTP-visible.
+        Generated pages are served ``no-store`` because the stable URL names
+        follow the moving last-good artifact rather than containing a content
+        digest.
+        """
+        manager = getattr(self.server, "verso_manager", None)
+        if manager is None:
+            return self._send_error_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                getattr(
+                    self.server,
+                    "_verso_unavailable_reason",
+                    "Verso semantic documentation is unavailable",
+                ),
+            )
+
+        try:
+            raw = unquote(path[len("/verso/"):], errors="strict")
+        except (UnicodeDecodeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.FORBIDDEN, "invalid Verso artifact path"
+            )
+        rel = PurePosixPath(raw)
+        if (
+            not raw
+            or "\\" in raw
+            or rel.is_absolute()
+            or any(part in ("", ".", "..") for part in rel.parts)
+        ):
+            return self._send_error_json(
+                HTTPStatus.FORBIDDEN, "path outside the Verso artifact"
+            )
+        # New clients pin every page, asset, and hover-table request to the
+        # manifest's immutable artifact token. Keep accepting the legacy
+        # moving mount for old tabs, but never silently fall back when an
+        # explicit token was supplied.
+        parts = rel.parts
+        artifact_token = (
+            parts[0]
+            if parts and _VERSO_ARTIFACT_TOKEN_RE.fullmatch(parts[0])
+            else None
+        )
+        artifact_path = raw
+        if artifact_token is not None:
+            artifact_path = "/".join(parts[1:])
+            if raw.endswith("/") and artifact_path:
+                artifact_path += "/"
+        try:
+            # Preserve a trailing slash: Verso's manifest uses directory URLs
+            # and the manager deliberately resolves those to ``index.html``.
+            candidate = manager.resolve_artifact(
+                artifact_path, artifact_token=artifact_token
+            )
+        except (OSError, ValueError):
+            candidate = None
+        if candidate is None:
+            return self._send_error_json(
+                HTTPStatus.NOT_FOUND, f"no Verso artifact {rel.as_posix()!r}"
+            )
+        candidate = Path(candidate)
+        if not candidate.is_file():
+            return self._send_error_json(
+                HTTPStatus.NOT_FOUND, f"no Verso artifact {rel.as_posix()!r}"
+            )
+        try:
+            body = candidate.read_bytes()
+        except OSError:
+            return self._send_error_json(
+                HTTPStatus.NOT_FOUND, f"no Verso artifact {rel.as_posix()!r}"
+            )
+        content_type = _CONTENT_TYPES.get(
+            candidate.suffix.lower(), "application/octet-stream"
+        )
+        extra_headers = None
+        if candidate.suffix.lower() in _VERSO_ACTIVE_DOCUMENT_SUFFIXES:
+            # Generated pages may be opened for whole-file reading, but they
+            # are never trusted application code.  A sandboxed, scriptless
+            # document cannot read Marathon's injected session token or call
+            # its privileged POST endpoints, even if an artifact is tampered.
+            extra_headers = {
+                "Content-Security-Policy": _VERSO_HTML_CSP,
+                "Cross-Origin-Opener-Policy": "same-origin",
+                "Referrer-Policy": "no-referrer",
+                "X-Frame-Options": "DENY",
+            }
+        self._send_bytes(
+            body,
+            content_type,
+            cache_control="no-store",
+            extra_headers=extra_headers,
+        )
+
+    def _verso_status_payload(self, *, trigger: bool) -> dict:
+        """Return the stable frontend status contract without blocking."""
+        manager = getattr(self.server, "verso_manager", None)
+        if manager is None:
+            return {
+                "state": "unavailable",
+                "available": False,
+                "stale": False,
+                "source_token": None,
+                "artifact_token": None,
+                "error": getattr(
+                    self.server,
+                    "_verso_unavailable_reason",
+                    "Verso semantic documentation is unavailable",
+                ),
+                "root_url": "/verso/",
+            }
+
+        raw = manager.status(trigger=trigger)
+        state = str(raw.get("state") or "unavailable")
+        error = raw.get("error")
+        if error is None and state in {"error", "failed", "unavailable"}:
+            error = raw.get("message")
+        artifact_token = raw.get("artifact_token")
+        root_url = (
+            f"/verso/{artifact_token}/"
+            if isinstance(artifact_token, str)
+            and _VERSO_ARTIFACT_TOKEN_RE.fullmatch(artifact_token)
+            else "/verso/"
+        )
+        return {
+            "state": state,
+            "available": bool(raw.get("available", False)),
+            "stale": bool(raw.get("stale", False)),
+            "source_token": raw.get("source_token"),
+            "artifact_token": artifact_token,
+            "error": error,
+            "root_url": root_url,
+        }
+
+    def _api_verso_status(self) -> None:
+        # ``status(trigger=True)`` may only enqueue the manager's background
+        # work.  It never executes Lake/Verso in this request thread.
+        self._send_json(self._verso_status_payload(trigger=True))
+
+    def _api_verso_manifest(self) -> None:
+        manager = getattr(self.server, "verso_manager", None)
+        if manager is None:
+            status = self._verso_status_payload(trigger=False)
+            return self._send_json(
+                {"ok": False, **status}, status=HTTPStatus.SERVICE_UNAVAILABLE
+            )
+        manifest = manager.manifest(trigger=False)
+        if manifest is None:
+            status = self._verso_status_payload(trigger=False)
+            # A build/error is retryable; a genuinely absent artifact is a
+            # normal 404.  Both responses stay machine-readable and truthful.
+            code = (
+                HTTPStatus.SERVICE_UNAVAILABLE
+                if status["state"] in {
+                    "building", "error", "failed", "unavailable"
+                }
+                else HTTPStatus.NOT_FOUND
+            )
+            return self._send_json({"ok": False, **status}, status=code)
+        payload = dict(manifest)
+        payload.setdefault("constants", {})
+        payload.setdefault("modules", {})
+        token = payload.get("artifact_token")
+        payload.setdefault(
+            "root_url",
+            f"/verso/{token}/"
+            if isinstance(token, str)
+            and _VERSO_ARTIFACT_TOKEN_RE.fullmatch(token)
+            else "/verso/",
+        )
+        self._send_json(payload)
+
+    def _api_verso_retry(self) -> None:
+        """Explicitly clear the sticky failed-token guard and retry once.
+
+        Ordinary status polling intentionally leaves a failed build parked so
+        one persistent Lean error cannot consume the machine forever.  This
+        token-guarded local action is the deliberate recovery path for a
+        transient timeout, dependency fetch, or tool failure.
+        """
+
+        data = self._read_guarded_body()
+        if data is None:
+            return
+        manager = getattr(self.server, "verso_manager", None)
+        if manager is None:
+            return self._send_error_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                getattr(
+                    self.server,
+                    "_verso_unavailable_reason",
+                    "Verso semantic documentation is unavailable",
+                ),
+            )
+        manager.trigger(force=True)
+        self._send_json({"ok": True, **self._verso_status_payload(trigger=False)})
 
     @property
     def _demo(self) -> bool:
@@ -796,7 +1076,7 @@ class DeckHandler(BaseHTTPRequestHandler):
         "/api/refresh-issue", "/api/drop-citation", "/api/requeue",
         "/api/recovery",
         "/api/add-chapter", "/api/chapter-intake-status", "/api/approve-chapter",
-        "/api/prover-toggle",
+        "/api/prover-toggle", "/api/verso-retry",
     )
 
     def do_POST(self) -> None:  # noqa: N802 (stdlib handler name)
@@ -846,6 +1126,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                     self._api_approve_chapter()
                 elif parsed.path == "/api/prover-toggle":
                     self._api_prover_toggle()
+                elif parsed.path == "/api/verso-retry":
+                    self._api_verso_retry()
                 else:  # /api/ship
                     self._api_ship()
         except BrokenPipeError:
@@ -2125,6 +2407,7 @@ def make_server(
     default_chapter: Optional[int] = None,
     demo: bool = False,
     trusted_origins: "Sequence[str]" = (),
+    verso_manager=_DEFAULT_VERSO_MANAGER,
 ) -> DeckServer:
     """Construct (do not start) a :class:`DeckServer` bound to 127.0.0.1
     on ``port`` (0 = an ephemeral OS-assigned port, used by tests). A fresh
@@ -2135,7 +2418,10 @@ def make_server(
     proxy on a public host)."""
     if token is None:
         token = secrets.token_urlsafe(32)
-    server = DeckServer((BIND_HOST, port), cfg, token, default_chapter, demo=demo)
+    server = DeckServer(
+        (BIND_HOST, port), cfg, token, default_chapter, demo=demo,
+        verso_manager=verso_manager,
+    )
     server.trusted_origins = tuple(trusted_origins or ())
     return server
 

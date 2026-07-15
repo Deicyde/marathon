@@ -19,6 +19,7 @@
  *                                       -> {ok, outcome, message, advanced_to_issue}
  *   POST /api/recovery {issue,action,recovery_token,confirm_destructive}
  *                                       -> {ok, accepted, queue_state, message}
+ *   POST /api/verso-retry {}            -> retry one failed semantic-doc build
  *   GET  /api/status (poll) or /api/events (SSE)  -> live job/build events
  *
  * BINDING SAFETY (load-bearing — see the task brief):
@@ -155,6 +156,15 @@
     var url = "/api/definition?name=" + encodeURIComponent(name);
     if (state.issue != null) url += "&issue=" + encodeURIComponent(state.issue);
     return getJSON(url);
+  }
+  function fetchVersoStatus() {
+    return getJSON("/api/verso-status");
+  }
+  function fetchVersoManifest() {
+    return getJSON("/api/verso-manifest");
+  }
+  function retryVersoBuild() {
+    return postJSON("/api/verso-retry", {});
   }
   function fetchReconciliation(issue) {
     return getJSON("/api/reconciliation/" + encodeURIComponent(issue));
@@ -389,6 +399,24 @@
     definitionTermsRequestToken: null,
     definitionTermsQueued: null,
     definitionRequestSeq: 0,
+    // Verso is an optional, asynchronously-built semantic view of the same
+    // source. Raw current source is always painted first; these fields only
+    // control a progressive enhancement and can never block review.
+    versoStatus: null,
+    versoManifest: null,
+    versoMetadataRequest: null,
+    versoMetadataEpoch: 0,
+    versoDocsRequest: null,
+    versoDocsRequestToken: null,
+    versoDocs: null,
+    versoDocsToken: null,
+    versoPages: Object.create(null),
+    versoObservedSourceToken: null,
+    versoPollTimer: null,
+    versoPollAttempts: 0,
+    versoRetryBusy: false,
+    versoFragmentSeq: 0,
+    versoHoverController: null,
     reconciliation: null,
     reconciliationBusy: false,
   };
@@ -906,6 +934,994 @@
     return nodes;
   }
 
+  // --- Verso semantic source (progressive enhancement) --------------------
+  // Verso's generated HTML is elaboration-aware: it knows bindings, resolved
+  // constants, types, docstrings, and tactic states. The current raw source is
+  // still rendered immediately and remains available behind a disclosure.
+  //
+  // SECURITY: generated pages and -verso-docs.json are build artifacts, not
+  // trusted application markup. They are parsed in an inert document and
+  // copied node-by-node through the allowlist below. No generated string is
+  // ever assigned to innerHTML, and no script or stylesheet from the artifact
+  // is installed into Marathon's privileged document.
+  var VERSO_ALLOWED_TAGS = {
+    A: true, BLOCKQUOTE: true, BR: true, CODE: true, DD: true, DIV: true,
+    DL: true, DT: true, EM: true, H1: true, H2: true, H3: true, H4: true,
+    H5: true, H6: true, HR: true, INPUT: true, KBD: true, LABEL: true,
+    LI: true, OL: true, P: true, PRE: true, SPAN: true, STRONG: true,
+    SUB: true, SUP: true, TABLE: true, TBODY: true, TD: true, TH: true,
+    THEAD: true, TR: true, UL: true,
+  };
+  var VERSO_DROP_TAGS = {
+    BASE: true, EMBED: true, FORM: true, FRAME: true, IFRAME: true,
+    LINK: true, MATH: true, META: true, OBJECT: true, SCRIPT: true,
+    STYLE: true, SVG: true, TEMPLATE: true,
+  };
+  var VERSO_DATA_ATTRS = {
+    "data-binding": true,
+    "data-lean-context": true,
+    "data-verso-links": true,
+    "data-verso-hover": true,
+  };
+
+  function versoRootPath() {
+    var status = state.versoStatus || {};
+    var manifest = state.versoManifest || {};
+    // Once a manifest has been selected its immutable, token-scoped mount is
+    // authoritative. This prevents a publication between the page and hover
+    // requests from pairing code with another artifact's numeric hover IDs.
+    var raw = typeof manifest.root_url === "string" ? manifest.root_url :
+      (typeof status.root_url === "string" ? status.root_url : "/verso/");
+    try {
+      var parsed = new URL(raw, window.location.origin);
+      if (parsed.origin !== window.location.origin) return "/verso/";
+      var path = parsed.pathname || "/verso/";
+      return path.slice(-1) === "/" ? path : path + "/";
+    } catch (e) {
+      return "/verso/";
+    }
+  }
+
+  // Resolve a generated link underneath the same-origin Verso mount. Absolute
+  // external URLs, protocol-relative URLs, javascript:, data:, and links that
+  // escape the mount are discarded.
+  function safeVersoURL(raw, pageRelative, artifactBase) {
+    if (typeof raw !== "string" || !raw || raw.indexOf("//") === 0) return null;
+    var root = versoRootPath();
+    try {
+      var rootURL = new URL(root, window.location.origin);
+      var pageURL = rootURL;
+      if (pageRelative) {
+        if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(pageRelative)) {
+          pageURL = new URL(pageRelative);
+        } else if (String(pageRelative).indexOf(root) === 0) {
+          pageURL = new URL(pageRelative, window.location.origin);
+        } else if (String(pageRelative).charAt(0) === "/") {
+          pageURL = new URL(root + String(pageRelative).replace(/^\/+/, ""), window.location.origin);
+        } else {
+          pageURL = new URL(pageRelative, rootURL);
+        }
+        if (pageURL.origin !== window.location.origin || pageURL.pathname.indexOf(root) !== 0) {
+          return null;
+        }
+      }
+
+      var parsed;
+      if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(raw)) {
+        parsed = new URL(raw);
+      } else if (raw.indexOf(root) === 0) {
+        parsed = new URL(raw, window.location.origin);
+      } else if (raw.charAt(0) === "/") {
+        parsed = new URL(root + raw.replace(/^\/+/, ""), window.location.origin);
+      } else {
+        // Verso's Link.relativeLink values are site-root-relative strings such
+        // as `GeometricAnalysis/Other/#id`; the generated page's <base> tells
+        // us where that site root lives. Explicit #, ./, ../, and ? references
+        // retain ordinary page-relative URL semantics.
+        var isExplicitRelative = raw.charAt(0) === "#" || raw.charAt(0) === "?" ||
+          raw.indexOf("./") === 0 || raw.indexOf("../") === 0;
+        var resolutionBase = pageURL;
+        if (artifactBase && !isExplicitRelative) {
+          var candidateBase = new URL(artifactBase, window.location.origin);
+          if (candidateBase.origin === window.location.origin &&
+              candidateBase.pathname.indexOf(root) === 0) {
+            resolutionBase = candidateBase;
+          }
+        }
+        parsed = new URL(raw, resolutionBase);
+      }
+      if (parsed.origin !== window.location.origin || parsed.pathname.indexOf(root) !== 0) {
+        return null;
+      }
+      return parsed.pathname + parsed.search + parsed.hash;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function versoDocumentBase(page, pageRelative) {
+    var base = page && page.querySelector && page.querySelector("base[href]");
+    if (!base) return null;
+    var raw = base.getAttribute("href");
+    if (!raw || raw.indexOf("//") === 0) return null;
+    // Resolve in the artifact's *virtual* site root before remounting. Verso
+    // emits bases such as ../../.. for pages that originally lived at `/`;
+    // resolving that directly in the browser would climb above `/verso/`.
+    // The dummy origin preserves the generated site's URL semantics while the
+    // final safeVersoURL call confines the result to our same-origin mount.
+    try {
+      var root = versoRootPath();
+      var safePage = safeVersoURL(pageRelative);
+      if (!safePage) return null;
+      var parsedPage = new URL(safePage, window.location.origin);
+      var artifactPath = parsedPage.pathname.slice(root.length);
+      var virtualOrigin = "https://marathon-verso.invalid/";
+      var virtualPage = new URL(artifactPath + parsedPage.search + parsedPage.hash, virtualOrigin);
+      var virtualBase = new URL(raw, virtualPage);
+      if (virtualBase.origin !== new URL(virtualOrigin).origin) return null;
+      var mounted = root + virtualBase.pathname.replace(/^\/+/, "") +
+        virtualBase.search + virtualBase.hash;
+      return safeVersoURL(mounted);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function safeVersoClass(value) {
+    value = String(value || "");
+    return value.length <= 300 && /^[A-Za-z0-9 _:-]*$/.test(value) ? value : "";
+  }
+
+  function safeVersoScalar(value) {
+    value = String(value || "");
+    return value.length <= 1000 && !/[\u0000-\u001f]/.test(value) ? value : null;
+  }
+
+  function sanitizeVersoNode(source, pageRelative, artifactBase, idPrefix) {
+    if (!source) return null;
+    if (source.nodeType === 3) return document.createTextNode(source.nodeValue || "");
+    if (source.nodeType !== 1) return null;
+    var tag = String(source.tagName || "").toUpperCase();
+    if (VERSO_DROP_TAGS[tag]) return null;
+
+    var target = VERSO_ALLOWED_TAGS[tag]
+      ? document.createElement(tag.toLowerCase())
+      : document.createDocumentFragment();
+    if (VERSO_ALLOWED_TAGS[tag]) {
+      var cls = safeVersoClass(source.getAttribute("class"));
+      if (cls) target.setAttribute("class", cls);
+      ["title", "role", "aria-label", "aria-hidden", "aria-expanded"].forEach(function (attr) {
+        if (!source.hasAttribute(attr)) return;
+        var value = safeVersoScalar(source.getAttribute(attr));
+        if (value != null) target.setAttribute(attr, value);
+      });
+      if (source.hasAttribute("id")) {
+        var sourceId = safeVersoScalar(source.getAttribute("id"));
+        if (sourceId != null) target.setAttribute("id", (idPrefix || "") + sourceId);
+      }
+      Object.keys(VERSO_DATA_ATTRS).forEach(function (attr) {
+        if (!source.hasAttribute(attr)) return;
+        var value = safeVersoScalar(source.getAttribute(attr));
+        if (value != null) target.setAttribute(attr, value);
+      });
+      if (tag === "A" && source.hasAttribute("href")) {
+        var href = safeVersoURL(source.getAttribute("href"), pageRelative, artifactBase);
+        if (href) {
+          target.setAttribute("href", href);
+          target.setAttribute("target", "_blank");
+          target.setAttribute("rel", "noopener noreferrer");
+        }
+      }
+      if (tag === "INPUT") {
+        if (String(source.getAttribute("type") || "").toLowerCase() === "checkbox") {
+          target.setAttribute("type", "checkbox");
+          if (source.hasAttribute("checked")) target.checked = true;
+        } else {
+          // Verso uses only checkbox inputs for tactic-state toggles.
+          return null;
+        }
+      }
+      if (tag === "LABEL" && source.hasAttribute("for")) {
+        var labelFor = safeVersoScalar(source.getAttribute("for"));
+        if (labelFor != null) target.setAttribute("for", (idPrefix || "") + labelFor);
+      }
+    }
+    for (var i = 0; i < source.childNodes.length; i++) {
+      var child = sanitizeVersoNode(source.childNodes[i], pageRelative, artifactBase, idPrefix);
+      if (child) target.appendChild(child);
+    }
+    return target;
+  }
+
+  function sanitizeVersoHTML(markup, pageRelative, artifactBase, idPrefix) {
+    var fragment = document.createDocumentFragment();
+    if (typeof markup !== "string") return fragment;
+    var parsed = new DOMParser().parseFromString(markup, "text/html");
+    for (var i = 0; i < parsed.body.childNodes.length; i++) {
+      var child = sanitizeVersoNode(
+        parsed.body.childNodes[i], pageRelative, artifactBase, idPrefix
+      );
+      if (child) fragment.appendChild(child);
+    }
+    return fragment;
+  }
+
+  function fetchVersoDocs() {
+    var token = state.versoManifest && state.versoManifest.artifact_token;
+    if (token && state.versoDocsToken === token && state.versoDocs) {
+      return Promise.resolve(state.versoDocs);
+    }
+    if (state.versoDocsRequest && state.versoDocsRequestToken === token) {
+      return state.versoDocsRequest;
+    }
+    var url = safeVersoURL("-verso-docs.json");
+    if (!url) return Promise.resolve(null);
+    state.versoDocsRequestToken = token || null;
+    state.versoDocsRequest = getJSON(url)
+      .then(function (docs) {
+        var parsed = docs && typeof docs === "object" ? docs : null;
+        if (token && state.versoManifest &&
+            state.versoManifest.artifact_token === token) {
+          state.versoDocs = parsed;
+          state.versoDocsToken = token;
+        }
+        return parsed;
+      })
+      .catch(function () {
+        if (state.versoDocsRequestToken === token) {
+          state.versoDocsRequest = null;
+          state.versoDocsRequestToken = null;
+        }
+        return null;
+      });
+    return state.versoDocsRequest;
+  }
+
+  function fetchVersoPage(relative) {
+    var url = safeVersoURL(relative);
+    if (!url) return Promise.reject(new Error("Unsafe Verso page URL"));
+    var token = (state.versoManifest && state.versoManifest.artifact_token) || "unknown";
+    var key = token + "\n" + url;
+    if (state.versoPages[key]) return state.versoPages[key];
+    state.versoPages[key] = fetch(url, {
+      method: "GET",
+      headers: { Accept: "text/html" },
+      credentials: "same-origin",
+    }).then(function (response) {
+      if (!response.ok) {
+        var error = new Error("HTTP " + response.status + " for " + url);
+        error.httpStatus = response.status;
+        throw error;
+      }
+      return response.text();
+    }).then(function (markup) {
+      return new DOMParser().parseFromString(markup, "text/html");
+    }).catch(function (error) {
+      delete state.versoPages[key];
+      throw error;
+    });
+    return state.versoPages[key];
+  }
+
+  function ensureVersoMetadata(force) {
+    var currentState = String((state.versoStatus && state.versoStatus.state) || "").toLowerCase();
+    var isBuilding = currentState === "building" || currentState === "queued" || currentState === "idle";
+    var selectedArtifactMatches = !!(
+      state.versoManifest && state.versoStatus &&
+      state.versoManifest.artifact_token &&
+      state.versoManifest.artifact_token === state.versoStatus.artifact_token
+    );
+    if (!force && state.versoStatus && !isBuilding &&
+        (!state.versoStatus.available || selectedArtifactMatches)) {
+      return Promise.resolve({ status: state.versoStatus, manifest: state.versoManifest });
+    }
+    if (state.versoMetadataRequest) return state.versoMetadataRequest;
+    var requestEpoch = state.versoMetadataEpoch;
+    var previousStatus = state.versoStatus;
+    var previousManifest = state.versoManifest;
+    state.versoMetadataRequest = fetchVersoStatus()
+      .then(function (status) {
+        if (requestEpoch !== state.versoMetadataEpoch) {
+          var superseded = new Error("Verso metadata request was superseded");
+          superseded.versoMetadataSuperseded = true;
+          throw superseded;
+        }
+        state.versoStatus = status || { state: "unavailable", available: false };
+        if (!state.versoStatus.available) {
+          if (!previousManifest) state.versoManifest = null;
+          return null;
+        }
+        return fetchVersoManifest().then(function (manifest) {
+          if (requestEpoch !== state.versoMetadataEpoch) {
+            var superseded = new Error("Verso metadata request was superseded");
+            superseded.versoMetadataSuperseded = true;
+            throw superseded;
+          }
+          if (!manifest || typeof manifest !== "object") {
+            throw new Error("Verso manifest is not an object");
+          }
+          if (!manifest.artifact_token || typeof manifest.artifact_token !== "string") {
+            throw new Error("Verso manifest has no artifact token");
+          }
+          state.versoManifest = manifest;
+          // The manifest is an atomic selection of one retained artifact. If
+          // publication advanced after the preceding status read, keep the
+          // badge honest and use this token for every page/docs/asset request.
+          state.versoStatus.available = true;
+          state.versoStatus.artifact_token = manifest.artifact_token;
+          if (!previousManifest || previousManifest.artifact_token !== manifest.artifact_token) {
+            state.versoPages = Object.create(null);
+            state.versoDocs = null;
+            state.versoDocsToken = null;
+            state.versoDocsRequest = null;
+            state.versoDocsRequestToken = null;
+          }
+          return manifest;
+        });
+      })
+      .then(function () {
+        return { status: state.versoStatus, manifest: state.versoManifest };
+      })
+      .catch(function (error) {
+        if (error && error.versoMetadataSuperseded) {
+          return { status: state.versoStatus, manifest: state.versoManifest };
+        }
+        var previousState = String((previousStatus && previousStatus.state) || "").toLowerCase();
+        var wasBuilding = previousState === "building" || previousState === "queued" ||
+          previousState === "idle";
+        if (wasBuilding) {
+          // A temporary status/manifest transport failure is not a backend
+          // build failure. Preserve the transitional state so a long healthy
+          // build continues polling instead of becoming permanently parked.
+          state.versoStatus = Object.assign({}, previousStatus, {
+            transport_error: (error && error.message) || "Could not poll Verso metadata",
+          });
+        } else {
+          state.versoStatus = {
+            state: "error",
+            available: !!previousManifest,
+            stale: !!previousManifest,
+            root_url: "/verso/",
+            error: (error && error.message) || "Could not load Verso metadata",
+          };
+        }
+        state.versoManifest = previousManifest || null;
+        return { status: state.versoStatus, manifest: state.versoManifest };
+      });
+    state.versoMetadataRequest = state.versoMetadataRequest.then(function (result) {
+      if (requestEpoch === state.versoMetadataEpoch) {
+        state.versoMetadataRequest = null;
+        scheduleVersoStatusPoll(result.status);
+      }
+      return result;
+    });
+    return state.versoMetadataRequest;
+  }
+
+  // A first visit normally starts a background doc build and gets a truthful
+  // `building` response. Retry without blocking the raw-source UI, then upgrade
+  // every still-mounted surface when the last-good artifact becomes ready.
+  // Poll quickly for the usual incremental build, then back off. The cap is
+  // about 61 minutes, matching the build+render hard timeouts without letting a
+  // forgotten tab poll forever.
+  function scheduleVersoStatusPoll(status) {
+    var statusState = String((status && status.state) || "").toLowerCase();
+    var transitional = statusState === "building" || statusState === "queued" || statusState === "idle";
+    var retryError = statusState === "error" && state.versoPollAttempts < 3;
+    if (!transitional && !retryError) {
+      if (state.versoPollTimer) clearTimeout(state.versoPollTimer);
+      state.versoPollTimer = null;
+      state.versoPollAttempts = 0;
+      return;
+    }
+    if (state.versoPollTimer || state.versoPollAttempts >= 390) return;
+    var delay = state.versoPollAttempts < 30 ? 2000 : 10000;
+    state.versoPollTimer = setTimeout(function () {
+      state.versoPollTimer = null;
+      state.versoPollAttempts += 1;
+      ensureVersoMetadata(true).then(function (metadata) {
+        refreshMountedVersoSurfaces();
+        scheduleVersoStatusPoll(metadata.status);
+      });
+    }, delay);
+  }
+
+  function versoConstantEntry(name) {
+    var constants = state.versoManifest && state.versoManifest.constants;
+    // The canonical manifest is keyed directly by qualified declaration name.
+    // Also accept an explicitly nested `qualified` map for older prototypes.
+    var qualified = constants && constants.qualified && !constants.qualified.url
+      ? constants.qualified : constants;
+    if (!qualified || typeof qualified !== "object") return null;
+    if (qualified[name]) return qualified[name];
+    var suffix = "." + name;
+    var matches = Object.keys(qualified).filter(function (candidate) {
+      return candidate === name || candidate.slice(-suffix.length) === suffix;
+    });
+    return matches.length === 1 ? qualified[matches[0]] : null;
+  }
+
+  function sourcePathToModule(path) {
+    return String(path || "")
+      .replace(/^\.\//, "")
+      .replace(/\.lean$/, "")
+      .replace(/^\/+|\/+$/g, "")
+      .replace(/\//g, ".");
+  }
+
+  function versoModuleEntry(path) {
+    var modules = state.versoManifest && state.versoManifest.modules;
+    if (!modules || typeof modules !== "object") return null;
+    var moduleName = sourcePathToModule(path);
+    if (modules[moduleName]) return modules[moduleName];
+    var normalizedPath = String(path || "").replace(/\\/g, "/").replace(/^\.\//, "");
+    var matches = Object.keys(modules).filter(function (candidate) {
+      var entry = modules[candidate] || {};
+      return candidate.slice(-(moduleName.length + 1)) === "." + moduleName ||
+        normalizedPath.slice(-(candidate.replace(/\./g, "/").length + 5)) ===
+          candidate.replace(/\./g, "/") + ".lean" ||
+        entry.path === path || entry.source_file === path;
+    });
+    return matches.length === 1 ? modules[matches[0]] : null;
+  }
+
+  function versoBadge(status, mode) {
+    status = status || { state: "loading", available: false };
+    var stateName = String(status.state || "loading").toLowerCase();
+    var rebuilding = stateName === "building" || stateName === "queued";
+    var label = "Verso loading";
+    var cls = "verso-status-loading";
+    if (status.stale && status.available && (stateName === "error" || status.error)) {
+      label = "Verso stale · rebuild error";
+      cls = "verso-status-error";
+    } else if (status.stale && status.available && rebuilding) {
+      label = "Verso stale · rebuilding";
+      cls = "verso-status-stale";
+    } else if (status.stale && status.available) {
+      label = "Verso stale";
+      cls = "verso-status-stale";
+    } else if (stateName === "building" || stateName === "queued") {
+      label = "Verso building · raw source shown";
+      cls = "verso-status-building";
+    } else if (stateName === "error" || status.error) {
+      label = "Verso error · raw source shown";
+      cls = "verso-status-error";
+    } else if (status.available) {
+      label = mode === "module" ? "Verso semantic file" : "Verso semantic";
+      cls = "verso-status-ready";
+    } else if (stateName === "unavailable" || stateName === "missing") {
+      label = "Verso unavailable · raw source shown";
+      cls = "verso-status-error";
+    }
+    var badge = el("span", { class: "verso-status " + cls, text: label });
+    badge.setAttribute("role", "status");
+    if (status.error) badge.setAttribute("title", String(status.error));
+    return badge;
+  }
+
+  function retryVersoBuildFrom(button) {
+    if (state.versoRetryBusy) return;
+    state.versoRetryBusy = true;
+    button.disabled = true;
+    button.textContent = "Retrying…";
+    retryVersoBuild()
+      .then(function (status) {
+        state.versoMetadataEpoch += 1;
+        state.versoMetadataRequest = null;
+        state.versoStatus = status;
+        state.versoPollAttempts = 0;
+        // A fast retry can publish between dispatch and response. Re-select
+        // its manifest before repainting so ready status is never paired with
+        // the previous artifact.
+        return ensureVersoMetadata(true);
+      })
+      .then(function (metadata) {
+        state.versoRetryBusy = false;
+        refreshMountedVersoSurfaces();
+        scheduleVersoStatusPoll(metadata.status);
+      })
+      .catch(function (error) {
+        state.versoRetryBusy = false;
+        button.disabled = false;
+        button.textContent = "Retry Verso build";
+        button.setAttribute(
+          "title", (error && error.message) || "Could not retry the Verso build"
+        );
+      });
+  }
+
+  function versoRetryButton(status) {
+    var stateName = String((status && status.state) || "").toLowerCase();
+    if (stateName !== "error" && stateName !== "failed") return null;
+    return el("button", {
+      type: "button",
+      class: "verso-retry",
+      text: state.versoRetryBusy ? "Retrying…" : "Retry Verso build",
+      disabled: state.versoRetryBusy ? "disabled" : null,
+      onclick: function () { retryVersoBuildFrom(this); },
+    });
+  }
+
+  function updateVersoBadge(shell, status, mode) {
+    var old = shell.querySelector(".verso-status");
+    var fresh = versoBadge(status, mode);
+    if (!old || !old.parentNode) return;
+    var meta = old.parentNode;
+    meta.replaceChild(fresh, old);
+    var oldRetry = meta.querySelector(".verso-retry");
+    if (oldRetry) oldRetry.remove();
+    var retry = versoRetryButton(status);
+    if (retry) meta.insertBefore(retry, fresh.nextSibling);
+  }
+
+  function makeVersoShell(rawSource, mode, identity) {
+    var raw = el("details", { class: "verso-raw-fallback", open: "open" }, [
+      el("summary", { text: "Current raw source" }),
+      rawSource,
+    ]);
+    var semantic = el("div", {
+      class: "verso-semantic-source " + (mode === "module" ? "verso-semantic-module" : "verso-semantic-decl"),
+      hidden: "hidden",
+    });
+    var shell = el("div", {
+      class: "verso-source-shell",
+      "data-verso-kind": mode,
+      "data-verso-identity": identity || "",
+    }, [
+      el("div", { class: "verso-source-meta" }, [
+        versoBadge(state.versoStatus, mode),
+        versoRetryButton(state.versoStatus),
+        el("span", { class: "verso-source-help", text:
+          "Hover for elaborated types; select a resolved name to open its Verso definition." }),
+      ]),
+      raw,
+      semantic,
+    ]);
+    shell._marathonVersoGeneration = 0;
+    shell._marathonVersoIdPrefix = "marathon-verso-" + (++state.versoFragmentSeq) + "-";
+    return shell;
+  }
+
+  function declarationCodeFromPage(page, entry, pageRelative, artifactBase, idPrefix) {
+    var anchorName = entry && entry.anchor;
+    if (!anchorName && entry && typeof entry.url === "string" && entry.url.indexOf("#") >= 0) {
+      try { anchorName = decodeURIComponent(entry.url.split("#").slice(1).join("#")); }
+      catch (e) { anchorName = entry.url.split("#").slice(1).join("#"); }
+    }
+    if (!anchorName) return null;
+    var anchor = page.getElementById(anchorName);
+    if (!anchor) return null;
+    var code = anchor;
+    while (code && !(code.tagName === "CODE" && code.classList.contains("hl"))) {
+      code = code.parentElement;
+    }
+    return code ? sanitizeVersoNode(code, pageRelative, artifactBase, idPrefix) : null;
+  }
+
+  function moduleCodeFromPage(page, pageRelative, artifactBase, idPrefix) {
+    var fragment = document.createDocumentFragment();
+    var content = page.querySelector("section.code-content");
+    var sourceNodes = content ? content.childNodes :
+      page.querySelectorAll("code.hl.lean.block, pre code.hl.lean");
+    for (var i = 0; i < sourceNodes.length; i++) {
+      var source = sourceNodes[i];
+      if (source.nodeType === 3 && !String(source.nodeValue || "").trim()) continue;
+      var clean = sanitizeVersoNode(source, pageRelative, artifactBase, idPrefix);
+      if (!clean) continue;
+      if (source.nodeType === 1 && source.tagName === "CODE" &&
+          source.classList.contains("hl")) {
+        fragment.appendChild(el("pre", { class: "verso-module-block" }, [clean]));
+      } else {
+        fragment.appendChild(clean);
+      }
+    }
+    return fragment.childNodes.length ? fragment : null;
+  }
+
+  function appendVersoExtraLinks(popup, target, pageRelative, artifactBase) {
+    var owner = target.closest && target.closest("[data-verso-links]");
+    if (!owner) return;
+    var raw = owner.getAttribute("data-verso-links");
+    if (!raw || raw.length > 20000) return;
+    try {
+      var extras = JSON.parse(raw);
+      if (!Array.isArray(extras)) return;
+      var list = el("ul", { class: "extra-doc-links" });
+      extras.slice(0, 25).forEach(function (item) {
+        if (!item || typeof item !== "object") return;
+        var href = safeVersoURL(item.href, pageRelative, artifactBase);
+        var label = safeVersoScalar(item.short || item.long || "Open definition");
+        if (!href || label == null) return;
+        var anchor = el("a", {
+          href: href,
+          target: "_blank",
+          rel: "noopener noreferrer",
+          text: label,
+        });
+        var title = safeVersoScalar(item.long || "");
+        if (title) anchor.setAttribute("title", title);
+        list.appendChild(el("li", {}, [anchor]));
+      });
+      if (list.childNodes.length) popup.appendChild(list);
+    } catch (e) {
+      // Malformed metadata is ignored; semantic source and raw fallback remain.
+    }
+  }
+
+  function makeVersoHover(target, docs, pageRelative, artifactBase, idPrefix) {
+    var popup = el("div", {
+      class: "hl lean verso-safe-hover verso-hover-popover",
+      role: "tooltip",
+    });
+    var hoverId = target.getAttribute("data-verso-hover");
+    if (hoverId && docs && typeof docs[hoverId] === "string") {
+      popup.appendChild(sanitizeVersoHTML(
+        docs[hoverId], pageRelative, artifactBase,
+        (idPrefix || "") + "hover-" + hoverId + "-"
+      ));
+    } else {
+      var embedded = target.querySelector(".hover-info, .tactic-state");
+      if (embedded) {
+        var clean = sanitizeVersoNode(
+          embedded, pageRelative, artifactBase, (idPrefix || "") + "embedded-"
+        );
+        if (clean) popup.appendChild(clean);
+      }
+    }
+    appendVersoExtraLinks(popup, target, pageRelative, artifactBase);
+    return popup.childNodes.length ? popup : null;
+  }
+
+  var VERSO_HOVER_SELECTOR =
+    ".const.token, .keyword.token, .literal.token, .option.token, " +
+    ".var.token, .typed.token, .has-info, .tactic, .level-var, " +
+    ".level-const, .level-op, .sort";
+
+  function versoHoverTarget(node) {
+    if (!node || !node.closest) return null;
+    // Wrapper diagnostics/tactic states take precedence over their nested
+    // keyword token so one pointer position can never open two interpretations.
+    var target = node.closest(".tactic, .has-info") || node.closest(VERSO_HOVER_SELECTOR);
+    if (!target) return null;
+    var container = target.closest(".verso-semantic-source");
+    return container && container._marathonVersoHoverContext
+      ? { target: target, container: container } : null;
+  }
+
+  function versoTargetHasHover(target, docs) {
+    var hoverId = target.getAttribute("data-verso-hover");
+    return !!(
+      (hoverId && docs && typeof docs[hoverId] === "string") ||
+      target.querySelector(".hover-info, .tactic-state") ||
+      (target.closest && target.closest("[data-verso-links]"))
+    );
+  }
+
+  function ensureVersoHoverController() {
+    if (state.versoHoverController) return state.versoHoverController;
+    var popup = null;
+    var activeTarget = null;
+    var activeContainer = null;
+    var closeTimer = null;
+
+    function closeNow() {
+      if (closeTimer) clearTimeout(closeTimer);
+      closeTimer = null;
+      if (popup && popup.parentNode) popup.parentNode.removeChild(popup);
+      if (activeTarget) activeTarget.setAttribute("aria-expanded", "false");
+      popup = null;
+      activeTarget = null;
+      activeContainer = null;
+    }
+    function scheduleClose() {
+      if (closeTimer) clearTimeout(closeTimer);
+      closeTimer = setTimeout(closeNow, 140);
+    }
+    function openTarget(found) {
+      var target = found.target;
+      var container = found.container;
+      var context = container._marathonVersoHoverContext;
+      if (!context || !versoTargetHasHover(target, context.docs)) return;
+      if (activeTarget === target && popup) {
+        if (closeTimer) clearTimeout(closeTimer);
+        return;
+      }
+      closeNow();
+      popup = makeVersoHover(
+        target, context.docs, context.pageRelative, context.artifactBase, context.idPrefix
+      );
+      if (!popup) return;
+      activeTarget = target;
+      activeContainer = container;
+      popup.addEventListener("mouseenter", function () {
+        if (closeTimer) clearTimeout(closeTimer);
+      });
+      popup.addEventListener("mouseleave", scheduleClose);
+      document.body.appendChild(popup);
+      var rect = target.getBoundingClientRect();
+      var left = Math.max(8, Math.min(rect.left, window.innerWidth - popup.offsetWidth - 8));
+      var top = rect.bottom + 6;
+      if (top + popup.offsetHeight > window.innerHeight - 8) {
+        top = Math.max(8, rect.top - popup.offsetHeight - 6);
+      }
+      popup.style.left = Math.round(left) + "px";
+      popup.style.top = Math.round(top) + "px";
+      target.setAttribute("aria-expanded", "true");
+    }
+    function openFromEvent(event) {
+      var found = versoHoverTarget(event.target);
+      if (found) openTarget(found);
+    }
+    function leaveFromEvent(event) {
+      var found = versoHoverTarget(event.target);
+      if (!found || found.target !== activeTarget) return;
+      if (event.relatedTarget && found.target.contains(event.relatedTarget)) return;
+      scheduleClose();
+    }
+    function onKeydown(event) {
+      if (event.key === "Escape") closeNow();
+      else if ((event.key === "Enter" || event.key === " ") && versoHoverTarget(event.target)) {
+        event.preventDefault();
+        openFromEvent(event);
+      }
+    }
+    function onClick(event) {
+      if (event.target.closest && event.target.closest("a[href]")) return;
+      var found = versoHoverTarget(event.target);
+      if (found) openTarget(found);
+    }
+    document.addEventListener("mouseover", openFromEvent);
+    document.addEventListener("mouseout", leaveFromEvent);
+    document.addEventListener("focusin", openFromEvent);
+    document.addEventListener("focusout", leaveFromEvent);
+    document.addEventListener("keydown", onKeydown);
+    document.addEventListener("click", onClick);
+    document.addEventListener("scroll", closeNow, true);
+    window.addEventListener("resize", closeNow);
+    new MutationObserver(function () {
+      if (activeTarget && !activeTarget.isConnected) closeNow();
+    }).observe(document.body, { childList: true, subtree: true });
+
+    state.versoHoverController = {
+      closeFor: function (container) {
+        if (container === activeContainer) closeNow();
+      },
+    };
+    return state.versoHoverController;
+  }
+
+  function activateVersoHovers(
+    container, docs, pageRelative, artifactBase, idPrefix, artifactToken
+  ) {
+    if (!container) return;
+    if (container.getAttribute("data-verso-bindings") !== "1") {
+      container.setAttribute("data-verso-bindings", "1");
+      var tokens = container.querySelectorAll(".hl.lean .token[data-binding]");
+      for (var i = 0; i < tokens.length; i++) {
+        tokens[i].addEventListener("mouseover", function () {
+          var binding = this.getAttribute("data-binding");
+          var context = this.closest(".hl.lean");
+          context = context && context.getAttribute("data-lean-context");
+          if (!binding) return;
+          var peers = container.querySelectorAll('.hl.lean .token[data-binding="' +
+            (window.CSS && CSS.escape ? CSS.escape(binding) : binding.replace(/[^A-Za-z0-9_-]/g, "")) + '"]');
+          for (var j = 0; j < peers.length; j++) {
+            var peerContext = peers[j].closest(".hl.lean");
+            if (!context || !peerContext || peerContext.getAttribute("data-lean-context") === context) {
+              peers[j].classList.add("binding-hl");
+            }
+          }
+        });
+        tokens[i].addEventListener("mouseout", function () {
+          var highlighted = container.querySelectorAll(".binding-hl");
+          for (var j = 0; j < highlighted.length; j++) highlighted[j].classList.remove("binding-hl");
+        });
+      }
+    }
+    if (container.getAttribute("data-verso-hovers") === "1") return;
+    if (!docs) {
+      var retries = Number(container.getAttribute("data-verso-hover-retries") || "0");
+      if (retries >= 3) return;
+      container.setAttribute("data-verso-hover-retries", String(retries + 1));
+      setTimeout(function () {
+        var currentToken = state.versoManifest && state.versoManifest.artifact_token;
+        if (artifactToken && currentToken !== artifactToken) return;
+        fetchVersoDocs()
+          .then(function (freshDocs) {
+            activateVersoHovers(
+              container, freshDocs, pageRelative, artifactBase, idPrefix, artifactToken
+            );
+          });
+      }, 2000);
+      return;
+    }
+    container._marathonVersoHoverContext = {
+      docs: docs,
+      pageRelative: pageRelative,
+      artifactBase: artifactBase,
+      idPrefix: idPrefix,
+    };
+    ensureVersoHoverController();
+    var seenBindings = Object.create(null);
+    var hoverTargets = container.querySelectorAll(VERSO_HOVER_SELECTOR);
+    hoverTargets.forEach(function (target) {
+      var owningWrapper = target.closest(".tactic, .has-info");
+      if (owningWrapper && owningWrapper !== target) return;
+      if (!versoTargetHasHover(target, docs) || target.closest("a[href]")) return;
+      var binding = target.getAttribute("data-binding");
+      var wrapper = target.matches(".tactic, .has-info");
+      if (binding && !wrapper) {
+        if (seenBindings[binding]) return;
+        seenBindings[binding] = true;
+      }
+      target._marathonVersoOldTabIndex = target.getAttribute("tabindex");
+      target.setAttribute("tabindex", "0");
+      target.setAttribute("aria-expanded", "false");
+      target.setAttribute("data-marathon-verso-focus", "1");
+    });
+    container.setAttribute("data-verso-hovers", "1");
+  }
+
+  function resetVersoInteractions(container) {
+    if (!container) return;
+    container.removeAttribute("data-verso-bindings");
+    container.removeAttribute("data-verso-hovers");
+    container.removeAttribute("data-verso-hover-retries");
+    container.querySelectorAll(".binding-hl").forEach(function (node) {
+      node.classList.remove("binding-hl");
+    });
+    if (state.versoHoverController) state.versoHoverController.closeFor(container);
+    container.querySelectorAll("[data-marathon-verso-focus]").forEach(function (node) {
+      if (node._marathonVersoOldTabIndex == null) node.removeAttribute("tabindex");
+      else node.setAttribute("tabindex", node._marathonVersoOldTabIndex);
+      node.removeAttribute("aria-expanded");
+      node.removeAttribute("data-marathon-verso-focus");
+      delete node._marathonVersoOldTabIndex;
+    });
+    delete container._marathonVersoHoverContext;
+  }
+
+  function updateVersoFreshness(shell, status) {
+    var semantic = shell.querySelector(".verso-semantic-source");
+    var raw = shell.querySelector(".verso-raw-fallback");
+    var stale = !!(status && status.stale);
+    if (semantic) semantic.setAttribute("data-verso-stale", stale ? "1" : "0");
+    if (!raw) return;
+    if (stale) raw.setAttribute("open", "open");
+    else raw.removeAttribute("open");
+    var summary = raw.querySelector("summary");
+    if (summary) summary.textContent = stale
+      ? "Current raw source (stale Verso view follows)"
+      : "Show current raw source";
+  }
+
+  function paintVersoResult(
+    shell, clean, status, docs, pageRelative, artifactBase, artifactToken
+  ) {
+    var semantic = shell.querySelector(".verso-semantic-source");
+    resetVersoInteractions(semantic);
+    while (semantic.firstChild) semantic.removeChild(semantic.firstChild);
+    semantic.appendChild(clean);
+    semantic.removeAttribute("hidden");
+    updateVersoFreshness(shell, status);
+    semantic.setAttribute("data-verso-artifact", artifactToken || "");
+    activateVersoHovers(
+      semantic, docs, pageRelative, artifactBase,
+      shell._marathonVersoIdPrefix, artifactToken
+    );
+  }
+
+  function enhanceVersoDeclaration(shell, name) {
+    var generation = ++shell._marathonVersoGeneration;
+    ensureVersoMetadata(false).then(function (metadata) {
+      if (generation !== shell._marathonVersoGeneration) return;
+      var status = metadata.status || {};
+      updateVersoBadge(shell, status, "declaration");
+      if (!status.available || !metadata.manifest) return;
+      var entry = versoConstantEntry(name);
+      if (!entry || !entry.url) {
+        updateVersoBadge(shell, {
+          state: "error", available: false,
+          error: "No Verso declaration anchor for " + name,
+        }, "declaration");
+        return;
+      }
+      var pageURL = String(entry.url).split("#")[0];
+      var artifactToken = metadata.manifest.artifact_token;
+      return Promise.all([
+        fetchVersoPage(pageURL), fetchVersoDocs(),
+      ]).then(function (parts) {
+        if (generation !== shell._marathonVersoGeneration) return;
+        if (!state.versoManifest ||
+            state.versoManifest.artifact_token !== artifactToken) return;
+        var artifactBase = versoDocumentBase(parts[0], pageURL);
+        var clean = declarationCodeFromPage(
+          parts[0], entry, pageURL, artifactBase, shell._marathonVersoIdPrefix
+        );
+        if (!clean) throw new Error("Verso declaration anchor was not found");
+        paintVersoResult(
+          shell, clean, status, parts[1], pageURL, artifactBase, artifactToken
+        );
+      });
+    }).catch(function (error) {
+      if (generation !== shell._marathonVersoGeneration) return;
+      updateVersoBadge(shell, {
+        state: "error", available: false,
+        error: (error && error.message) || "Could not render Verso source",
+      }, "declaration");
+    });
+  }
+
+  function enhanceVersoModule(shell, path) {
+    var generation = ++shell._marathonVersoGeneration;
+    ensureVersoMetadata(false).then(function (metadata) {
+      if (generation !== shell._marathonVersoGeneration) return;
+      var status = metadata.status || {};
+      updateVersoBadge(shell, status, "module");
+      if (!status.available || !metadata.manifest) return;
+      var entry = versoModuleEntry(path);
+      if (!entry || !entry.url) {
+        updateVersoBadge(shell, {
+          state: "error", available: false,
+          error: "No Verso module page for " + path,
+        }, "module");
+        return;
+      }
+      var artifactToken = metadata.manifest.artifact_token;
+      return Promise.all([
+        fetchVersoPage(entry.url), fetchVersoDocs(),
+      ]).then(function (parts) {
+        if (generation !== shell._marathonVersoGeneration) return;
+        if (!state.versoManifest ||
+            state.versoManifest.artifact_token !== artifactToken) return;
+        var artifactBase = versoDocumentBase(parts[0], entry.url);
+        var clean = moduleCodeFromPage(
+          parts[0], entry.url, artifactBase, shell._marathonVersoIdPrefix
+        );
+        if (!clean) throw new Error("Verso module page has no Lean code blocks");
+        paintVersoResult(
+          shell, clean, status, parts[1], entry.url, artifactBase, artifactToken
+        );
+      });
+    }).catch(function (error) {
+      if (generation !== shell._marathonVersoGeneration) return;
+      updateVersoBadge(shell, {
+        state: "error", available: false,
+        error: (error && error.message) || "Could not render Verso module",
+      }, "module");
+    });
+  }
+
+  function refreshMountedVersoSurfaces() {
+    var shells = document.querySelectorAll(".verso-source-shell[data-verso-kind]");
+    var artifactToken = state.versoManifest && state.versoManifest.artifact_token;
+    for (var i = 0; i < shells.length; i++) {
+      var kind = shells[i].getAttribute("data-verso-kind");
+      var identity = shells[i].getAttribute("data-verso-identity");
+      var semantic = shells[i].querySelector(".verso-semantic-source");
+      if (artifactToken && semantic && semantic.childNodes.length &&
+          semantic.getAttribute("data-verso-artifact") === artifactToken) {
+        updateVersoBadge(shells[i], state.versoStatus || {}, kind);
+        updateVersoFreshness(shells[i], state.versoStatus || {});
+        continue;
+      }
+      if (kind === "module") enhanceVersoModule(shells[i], identity);
+      else enhanceVersoDeclaration(shells[i], identity);
+    }
+  }
+
+  function observeVersoSourceToken(token) {
+    if (!token || token === state.versoObservedSourceToken) return;
+    var hadToken = !!state.versoObservedSourceToken;
+    state.versoObservedSourceToken = token;
+    if (!hadToken) return;
+    state.versoStatus = null;
+    state.versoMetadataEpoch += 1;
+    state.versoMetadataRequest = null;
+    state.versoPollAttempts = 0;
+    ensureVersoMetadata(true).then(refreshMountedVersoSurfaces);
+  }
+
   // === subdeck header (parent issue + progress) ============================
 
   function subdeckHeader() {
@@ -1392,7 +2408,7 @@
       member.kind ? el("span", { class: "decl-panel-kind", text: member.kind }) : null,
       el("span", { class: "mono", text: member.name }),
     ]);
-    openDefinitionSurface("Definition", [
+    openDefinitionSurface("Review details", [
       meta,
       inspectorCode("Elaborated type", member.type_pp),
       inspectorCode("Definition body", member.value_pp),
@@ -1456,7 +2472,7 @@
         }, ["Open #" + owner.issue + " · " + (owner.title || "review card")]));
       });
     }
-    openDefinitionSurface("Definition", [
+    openDefinitionSurface("Review details", [
       el("p", { class: "inspector-meta" }, [
         match.kind ? el("span", { class: "decl-panel-kind", text: match.kind }) : null,
         tierBadge(match.tier || "-", match.qualifiers || []),
@@ -1715,14 +2731,29 @@
       var titleKids = [document.createTextNode("Source")];
       if (card.source_file)
         titleKids.push(el("span", { class: "src-file mono", text: card.source_file }));
+      var rawCode = el("pre", { class: "source-block" }, [
+        el("code", { class: "lean" }, leanHighlight(card.source_block, card.kernel)),
+      ]);
+      var semanticSource = makeVersoShell(rawCode, "declaration", card.name || "");
+      var detailsButton = el("button", {
+        class: "btn btn-tiny source-review-details",
+        type: "button",
+        "data-no-swipe": "true",
+        onclick: function (event) {
+          event.stopPropagation();
+          showDefinitionLookup(card.name, kernelTermLookup(card.kernel)[card.name] || null);
+        },
+      }, ["Review details"]);
       panel.appendChild(
         el("section", { class: "sec-source" }, [
-          el("h3", { class: "sec-title" }, titleKids),
-          el("pre", { class: "source-block" }, [
-            el("code", { class: "lean" }, leanHighlight(card.source_block, card.kernel)),
+          el("div", { class: "source-title-row" }, [
+            el("h3", { class: "sec-title" }, titleKids),
+            detailsButton,
           ]),
+          semanticSource,
         ])
       );
+      enhanceVersoDeclaration(semanticSource, card.name || "");
     } else if (card.in_code === false) {
       // request 1: the decl is cited by the issue but was NOT found anywhere
       // in the current code (renamed/deleted) — a STALE CITATION. Replace the
@@ -3199,7 +4230,10 @@
     if (b) b.textContent = state.building + " building";
     if (l) l.textContent = state.landedToday + " landed today";
     if (s.jobs && s.jobs.length) renderJobProgress(s.jobs);
-    if (s.source_token) refreshDefinitionTerms(s.source_token, false);
+    if (s.source_token) {
+      refreshDefinitionTerms(s.source_token, false);
+      observeVersoSourceToken(s.source_token);
+    }
   }
   function renderJobProgress(jobs) {
     var conn = document.getElementById("status-conn");
@@ -3602,7 +4636,10 @@
           }
           var code = el("code", { class: "lean" });
           leanHighlight(payload.source || "", []).forEach(function (node) { code.appendChild(node); });
-          body.appendChild(el("pre", { class: "source-block reader-full-source" }, [code]));
+          var rawSource = el("pre", { class: "source-block reader-full-source" }, [code]);
+          var semanticFile = makeVersoShell(rawSource, "module", path);
+          body.appendChild(semanticFile);
+          enhanceVersoModule(semanticFile, path);
         })
         .catch(function (err) {
           body.innerHTML = "";
@@ -3665,7 +4702,10 @@
     if (target.source_block) {
       var code = el("code", { class: "lean" });
       leanHighlight(target.source_block, []).forEach(function (node) { code.appendChild(node); });
-      article.appendChild(el("pre", { class: "source-block reader-source" }, [code]));
+      var rawSource = el("pre", { class: "source-block reader-source" }, [code]);
+      var semanticSource = makeVersoShell(rawSource, "declaration", target.name || "");
+      article.appendChild(semanticSource);
+      enhanceVersoDeclaration(semanticSource, target.name || "");
     } else {
       article.appendChild(el("div", { class: "decl-nosource", text:
         "Source unavailable for this current review target." }));
@@ -3695,6 +4735,10 @@
       target.verdict === "deferred" ? "↺ Deferred" : "Defer",
     ]);
     var focused = el("button", { class: "btn btn-tiny", type: "button" }, ["Focused review"]);
+    var reviewDetails = el("button", {
+      class: "btn btn-tiny source-review-details",
+      type: "button",
+    }, ["Review details"]);
     keep.addEventListener("click", function () { readerVerdict(target, "verify", null, keep); });
     reject.addEventListener("click", function () {
       if (editor.panel.hasAttribute("hidden")) editor.panel.removeAttribute("hidden");
@@ -3702,13 +4746,18 @@
       if (!editor.panel.hasAttribute("hidden")) editor.note.focus();
     });
     defer.addEventListener("click", function () { readerVerdict(target, "defer", null, defer); });
+    reviewDetails.addEventListener("click", function () {
+      showDefinitionLookup(target.name, null);
+    });
     focused.addEventListener("click", function () {
       state.filesResumeScroll = window.scrollY || window.pageYOffset || 0;
       state.filesResumeName = target.name;
       switchTab("review");
       openIssue(target.issue);
     });
-    article.appendChild(el("div", { class: "reader-actions" }, [keep, reject, defer, focused]));
+    article.appendChild(el("div", { class: "reader-actions" }, [
+      keep, reject, defer, reviewDetails, focused,
+    ]));
     article.appendChild(editor.panel);
     return article;
   }
@@ -5311,6 +6360,7 @@
     // remain available as the honest fallback.
     refreshQueue();   // pure read — opens the first ready issue's subdeck immediately
     refreshDefinitionTerms(null, true);
+    ensureVersoMetadata(false); // optional semantic source; raw source never waits on it
     startStatus();    // pure read (SSE/poll)
   }
 
@@ -5341,6 +6391,11 @@
     kernelTermLookup: kernelTermLookup,
     projectTermCandidates: projectTermCandidates,
     showDefinitionLookup: showDefinitionLookup,
+    // Security and progressive-enhancement hooks are exposed for deterministic
+    // browser smoke tests. They perform reads/renders only and never POST.
+    sanitizeVersoHTML: sanitizeVersoHTML,
+    safeVersoURL: safeVersoURL,
+    ensureVersoMetadata: ensureVersoMetadata,
     reconciliationProposalPanel: reconciliationProposalPanel,
     readerTargetMatches: readerTargetMatches,
     graphLayout: graphLayout,
