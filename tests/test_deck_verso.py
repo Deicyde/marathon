@@ -1,6 +1,10 @@
+import json
+import re
 import subprocess
 import threading
 from pathlib import Path
+
+import pytest
 
 import marathon.deck.verso as verso
 from marathon.deck.verso import (
@@ -79,6 +83,7 @@ class FakeVersoRunner:
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text("{}")
         elif command[1:3] == ["exe", "verso-html"]:
+            assert Path(command[3]).is_dir()
             _write_site(Path(command[-1]))
         return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
 
@@ -110,6 +115,209 @@ def test_lake_environment_adds_elan_for_minimal_gui_service_path(tmp_path):
     ]
     assert verso.shutil.which("lake", path=env["PATH"]) == str(lake)
     assert verso._lake_environment(env, home=home)["PATH"] == env["PATH"]
+
+
+def test_staged_literate_math_is_scoped_restored_and_escaped(tmp_path):
+    source = tmp_path / "persistent-literate"
+    source.mkdir()
+    payload = {
+        "items": {
+            "items": [
+                {
+                    "code": [
+                        {
+                            "markdown": [
+                                0,
+                                "Demo.answer",
+                                {
+                                    "blocks": [
+                                        {
+                                            "p": [
+                                                {"normal": "For "},
+                                                {
+                                                    "latexMath": [
+                                                        "x < y & ",
+                                                        "</code><script>bad()</script>",
+                                                    ]
+                                                },
+                                                {
+                                                    "latexMathDisplay": [
+                                                        r"\int_0^1 x\,dx"
+                                                    ]
+                                                },
+                                            ]
+                                        }
+                                    ]
+                                },
+                            ]
+                        },
+                        {
+                            "markdownModDoc": {
+                                "blocks": [
+                                    {"p": [{"latexMath": ["z", "^2"]}]}
+                                ]
+                            }
+                        },
+                        {"goals": {"latexMath": ["not Markdown"]}},
+                    ]
+                }
+            ]
+        },
+        "outsideMarkdown": {"latexMathDisplay": ["also untouched"]},
+    }
+    original = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    persistent_json = source / "Demo.json"
+    persistent_json.write_text(original, encoding="utf-8")
+    (source / "asset.txt").write_text("copied", encoding="utf-8")
+
+    staged = tmp_path / "work" / "literate"
+    nonce = "1234567890abcdef1234567890abcdef"
+    markers = verso._stage_literate_for_html(source, staged, nonce)
+
+    assert persistent_json.read_text(encoding="utf-8") == original
+    assert (staged / "asset.txt").read_text(encoding="utf-8") == "copied"
+    assert list(markers.values()) == [
+        ("inline", "x < y & </code><script>bad()</script>"),
+        ("display", r"\int_0^1 x\,dx"),
+        ("inline", "z^2"),
+    ]
+    assert all(
+        re.fullmatch(
+            rf"__MARATHON_VERSO_MATH_{nonce}_[ID]_[0-9]+__", marker
+        )
+        for marker in markers
+    )
+
+    rewritten = json.loads((staged / "Demo.json").read_text(encoding="utf-8"))
+    code = rewritten["items"]["items"][0]["code"]
+    paragraph = code[0]["markdown"][2]["blocks"][0]["p"]
+    inline_marker, display_marker, module_marker = markers
+    assert paragraph[1] == {"code": [inline_marker]}
+    assert paragraph[2] == {"code": [display_marker]}
+    assert code[1]["markdownModDoc"]["blocks"][0]["p"][0] == {
+        "code": [module_marker]
+    }
+    assert code[2]["goals"] == {"latexMath": ["not Markdown"]}
+    assert rewritten["outsideMarkdown"] == {
+        "latexMathDisplay": ["also untouched"]
+    }
+
+    site = tmp_path / "site"
+    page = site / "Demo" / "index.html"
+    page.parent.mkdir(parents=True)
+    page.write_text(
+        "<p>"
+        f"<code>{inline_marker}</code>"
+        f"<code>{display_marker}</code>"
+        f"<code>{module_marker}</code>"
+        "<code>ordinary</code>"
+        "</p>",
+        encoding="utf-8",
+    )
+
+    assert verso._restore_rendered_math(site, markers) == 3
+    html = page.read_text(encoding="utf-8")
+    assert (
+        '<code class="math inline">'
+        "x &lt; y &amp; &lt;/code&gt;&lt;script&gt;bad()&lt;/script&gt;"
+        "</code>"
+    ) in html
+    assert (
+        '<code class="math display">\\int_0^1 x\\,dx</code>' in html
+    )
+    assert '<code class="math inline">z^2</code>' in html
+    assert "<script>" not in html
+    assert "<code>ordinary</code>" in html
+
+
+def test_image_alt_math_is_normalized_without_creating_a_marker(tmp_path):
+    source = tmp_path / "persistent-literate"
+    source.mkdir()
+    payload = {
+        "items": {
+            "items": [
+                {
+                    "code": [
+                        {
+                            "markdown": {
+                                "blocks": [
+                                    {
+                                        "p": [
+                                            {
+                                                "img": [
+                                                    [{"normal": "plot.svg"}],
+                                                    [],
+                                                    [
+                                                        {"normal": "Plot of "},
+                                                        {"latexMath": ["f", "(x)"]},
+                                                    ],
+                                                ]
+                                            },
+                                            {"normal": " where "},
+                                            {"latexMath": ["x", "^2"]},
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+    (source / "Demo.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    staged = tmp_path / "work" / "literate"
+    nonce = "1234567890abcdef1234567890abcdef"
+    markers = verso._stage_literate_for_html(source, staged, nonce)
+
+    assert len(markers) == 1
+    assert list(markers.values()) == [("inline", "x^2")]
+    rewritten = json.loads((staged / "Demo.json").read_text(encoding="utf-8"))
+    paragraph = rewritten["items"]["items"][0]["code"][0]["markdown"][
+        "blocks"
+    ][0]["p"]
+    assert paragraph[0]["img"][2] == [
+        {"normal": "Plot of "},
+        {"normal": "f(x)"},
+    ]
+    assert paragraph[2] == {"code": [next(iter(markers))]}
+
+
+def test_rendered_math_marker_mismatch_fails_closed(tmp_path):
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "index.html").write_text("<p>formula disappeared</p>")
+    marker = (
+        "__MARATHON_VERSO_MATH_"
+        "1234567890abcdef1234567890abcdef_I_0__"
+    )
+
+    with pytest.raises(
+        verso.VersoBuildError,
+        match=r"expected 1 exact markers; missing 1, duplicated 0",
+    ):
+        verso._restore_rendered_math(site, {marker: ("inline", "x")})
+
+
+def test_rendered_math_marker_mismatch_reports_missing_and_duplicates(tmp_path):
+    site = tmp_path / "site"
+    site.mkdir()
+    nonce = "1234567890abcdef1234567890abcdef"
+    first = f"__MARATHON_VERSO_MATH_{nonce}_I_0__"
+    second = f"__MARATHON_VERSO_MATH_{nonce}_D_1__"
+    (site / "index.html").write_text(
+        f"<code>{first}</code><code>{first}</code>", encoding="utf-8"
+    )
+
+    with pytest.raises(
+        verso.VersoBuildError,
+        match=r"expected 2 exact markers; missing 1, duplicated 1",
+    ):
+        verso._restore_rendered_math(
+            site,
+            {first: ("inline", "x"), second: ("display", "y")},
+        )
 
 
 def test_missing_platform_lock_reports_precise_unavailable(tmp_path, monkeypatch):
@@ -163,10 +371,10 @@ def test_builds_nested_overlay_and_semantic_manifest(tmp_path):
         "@DemoPackage/+Demo:literate",
         "@DemoPackage/+Demo.Chapter15.Hidden:literate",
     ]
-    assert runner.commands[2][:-1] == [
-        "lake", "exe", "verso-html", ".lake/build/literate"
-    ]
+    assert runner.commands[2][:3] == ["lake", "exe", "verso-html"]
+    assert Path(runner.commands[2][3]).name == "literate"
     assert Path(runner.commands[2][-1]).name == "site"
+    assert Path(runner.commands[2][3]).parent == Path(runner.commands[2][-1]).parent
     assert Path(runner.commands[2][-1]).parent.name.startswith(artifact_token + "-")
     assert all(env["LEAN_NUM_THREADS"] == "2" for env in runner.environments)
     assert manager.root == repo / ".lake" / "marathon-verso"
@@ -190,6 +398,90 @@ def test_builds_nested_overlay_and_semantic_manifest(tmp_path):
     }
     assert manager.resolve_artifact("Demo/Main/").name == "index.html"
     assert manager.resolve_artifact("code.css").read_text().startswith(".const")
+    assert not (manager.root / "artifacts" / artifact_token / "literate").exists()
+
+
+def test_artifact_build_restores_math_without_mutating_incremental_cache(tmp_path):
+    repo = _project(tmp_path)
+    payload = {
+        "items": {
+            "items": [
+                {
+                    "code": [
+                        {
+                            "markdown": [
+                                0,
+                                "Demo.answer",
+                                {
+                                    "blocks": [
+                                        {
+                                            "p": [
+                                                {"latexMath": ["x", " < y"]},
+                                                {
+                                                    "latexMathDisplay": [
+                                                        "z & </code>"
+                                                    ]
+                                                },
+                                            ]
+                                        }
+                                    ]
+                                },
+                            ]
+                        }
+                    ]
+                }
+            ]
+        },
+        "module": "Demo",
+    }
+    persistent_text = json.dumps(payload, ensure_ascii=False) + "\n"
+
+    class MathRunner(FakeVersoRunner):
+        def __call__(self, command, **kwargs):
+            result = super().__call__(command, **kwargs)
+            root = Path(kwargs["cwd"])
+            if command[1] == "build":
+                persistent = root / ".lake" / "build" / "literate" / "Demo.json"
+                persistent.write_text(persistent_text, encoding="utf-8")
+            elif command[1:3] == ["exe", "verso-html"]:
+                staged_text = Path(command[3]).joinpath("Demo.json").read_text(
+                    encoding="utf-8"
+                )
+                markers = re.findall(
+                    r"__MARATHON_VERSO_MATH_[0-9a-f]{32}_[ID]_[0-9]+__",
+                    staged_text,
+                )
+                assert len(markers) == 2
+                persistent = root / ".lake" / "build" / "literate" / "Demo.json"
+                assert persistent.read_text(encoding="utf-8") == persistent_text
+                page = Path(command[-1]) / "Demo" / "Main" / "index.html"
+                html = page.read_text(encoding="utf-8")
+                html = html.replace(
+                    "</body>",
+                    "".join(f"<code>{marker}</code>" for marker in markers)
+                    + "</body>",
+                )
+                page.write_text(html, encoding="utf-8")
+            return result
+
+    manager = VersoArtifactManager(
+        repo, runner=MathRunner(), source_token_fn=lambda _repo: TOKEN_A
+    )
+    manager.trigger()
+    assert manager.wait(2)
+    assert manager.status(trigger=False)["state"] == "ready"
+
+    persistent = manager.root / ".lake" / "build" / "literate" / "Demo.json"
+    assert persistent.read_text(encoding="utf-8") == persistent_text
+    page = manager.resolve_artifact("Demo/Main/").read_text(encoding="utf-8")
+    assert '<code class="math inline">x &lt; y</code>' in page
+    assert (
+        '<code class="math display">z &amp; &lt;/code&gt;</code>' in page
+    )
+    artifact = manager.root / "artifacts" / manager.manifest(trigger=False)[
+        "artifact_token"
+    ]
+    assert not (artifact / "literate").exists()
 
 
 def test_cache_is_keyed_by_source_and_failure_keeps_last_success(tmp_path):

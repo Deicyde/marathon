@@ -946,7 +946,7 @@
   // is installed into Marathon's privileged document.
   var VERSO_ALLOWED_TAGS = {
     A: true, BLOCKQUOTE: true, BR: true, CODE: true, DD: true, DIV: true,
-    DL: true, DT: true, EM: true, H1: true, H2: true, H3: true, H4: true,
+    DEL: true, DL: true, DT: true, EM: true, H1: true, H2: true, H3: true, H4: true,
     H5: true, H6: true, HR: true, INPUT: true, KBD: true, LABEL: true,
     LI: true, OL: true, P: true, PRE: true, SPAN: true, STRONG: true,
     SUB: true, SUP: true, TABLE: true, TBODY: true, TD: true, TH: true,
@@ -1081,8 +1081,12 @@
     if (!source) return null;
     if (source.nodeType === 3) return document.createTextNode(source.nodeValue || "");
     if (source.nodeType !== 1) return null;
-    var tag = String(source.tagName || "").toUpperCase();
-    if (VERSO_DROP_TAGS[tag]) return null;
+    var sourceTag = String(source.tagName || "").toUpperCase();
+    if (VERSO_DROP_TAGS[sourceTag]) return null;
+    // verso-html currently emits <emph> for Markdown emphasis. It is not a
+    // standard HTML element, so normalize it to semantic <em> while copying
+    // through the allowlist instead of flattening away the emphasis.
+    var tag = sourceTag === "EMPH" ? "EM" : sourceTag;
 
     var target = VERSO_ALLOWED_TAGS[tag]
       ? document.createElement(tag.toLowerCase())
@@ -1387,16 +1391,38 @@
       label = "Verso error · raw source shown";
       cls = "verso-status-error";
     } else if (status.available) {
-      label = mode === "module" ? "Verso semantic file" : "Verso semantic";
+      // A healthy semantic view should look like the native source viewer,
+      // not an embedded product. Keep the status node for atomic refreshes,
+      // but remove it (and the whole metadata row) from the ready-state UI.
+      label = "";
       cls = "verso-status-ready";
     } else if (stateName === "unavailable" || stateName === "missing") {
       label = "Verso unavailable · raw source shown";
       cls = "verso-status-error";
     }
-    var badge = el("span", { class: "verso-status " + cls, text: label });
+    var badge = el("span", {
+      class: "verso-status " + cls,
+      text: label,
+      hidden: label ? null : "hidden",
+    });
     badge.setAttribute("role", "status");
     if (status.error) badge.setAttribute("title", String(status.error));
     return badge;
+  }
+
+  function versoNeedsStatusChrome(status) {
+    status = status || { state: "loading", available: false };
+    var stateName = String(status.state || "loading").toLowerCase();
+    return !status.available || !!status.stale || !!status.error ||
+      stateName === "building" || stateName === "queued" ||
+      stateName === "error" || stateName === "failed";
+  }
+
+  function updateVersoStatusChrome(shell, status) {
+    var meta = shell && shell.querySelector(".verso-source-meta");
+    if (!meta) return;
+    if (versoNeedsStatusChrome(status)) meta.removeAttribute("hidden");
+    else meta.setAttribute("hidden", "hidden");
   }
 
   function retryVersoBuildFrom(button) {
@@ -1452,31 +1478,38 @@
     if (oldRetry) oldRetry.remove();
     var retry = versoRetryButton(status);
     if (retry) meta.insertBefore(retry, fresh.nextSibling);
+    // A shell may already have hidden its raw source after a successful
+    // semantic render. If a later rebuild becomes stale or fails, restore the
+    // current source immediately along with the actionable status chrome.
+    updateVersoFreshness(shell, status);
   }
 
   function makeVersoShell(rawSource, mode, identity) {
-    var raw = el("details", { class: "verso-raw-fallback", open: "open" }, [
-      el("summary", { text: "Current raw source" }),
-      rawSource,
-    ]);
+    // Raw source paints synchronously and remains the automatic fallback for
+    // building, failed, unavailable, or stale semantic artifacts. Once a
+    // fresh semantic view is mounted it disappears without adding a second
+    // source-view toggle to every declaration.
+    var raw = el("div", { class: "verso-raw-fallback" }, [rawSource]);
     var semantic = el("div", {
       class: "verso-semantic-source " + (mode === "module" ? "verso-semantic-module" : "verso-semantic-decl"),
       hidden: "hidden",
     });
+    var meta = el("div", { class: "verso-source-meta" }, [
+      versoBadge(state.versoStatus, mode),
+      versoRetryButton(state.versoStatus),
+      el("span", { class: "verso-source-help", text:
+        "Hover for elaborated types; select a resolved name to open its definition." }),
+    ]);
     var shell = el("div", {
       class: "verso-source-shell",
       "data-verso-kind": mode,
       "data-verso-identity": identity || "",
     }, [
-      el("div", { class: "verso-source-meta" }, [
-        versoBadge(state.versoStatus, mode),
-        versoRetryButton(state.versoStatus),
-        el("span", { class: "verso-source-help", text:
-          "Hover for elaborated types; select a resolved name to open its Verso definition." }),
-      ]),
+      meta,
       raw,
       semantic,
     ]);
+    updateVersoStatusChrome(shell, state.versoStatus);
     shell._marathonVersoGeneration = 0;
     shell._marathonVersoIdPrefix = "marathon-verso-" + (++state.versoFragmentSeq) + "-";
     return shell;
@@ -1495,7 +1528,37 @@
     while (code && !(code.tagName === "CODE" && code.classList.contains("hl"))) {
       code = code.parentElement;
     }
-    return code ? sanitizeVersoNode(code, pageRelative, artifactBase, idPrefix) : null;
+    if (!code) return null;
+
+    var fragment = document.createDocumentFragment();
+    // A Verso declaration doc-comment is rendered as the element immediately
+    // before its elaborated code block. Keep this association deliberately
+    // strict: scanning farther can attach a module doc or the previous field's
+    // prose to the declaration currently under review.
+    var prose = code.previousElementSibling;
+    var isDeclarationProse = !!(
+      prose && prose.classList && !prose.classList.contains("mod-doc") &&
+      (prose.classList.contains("md-text") || prose.classList.contains("verso-text"))
+    );
+    if (isDeclarationProse) {
+      var cleanProse = sanitizeVersoNode(
+        prose, pageRelative, artifactBase, (idPrefix || "") + "doc-"
+      );
+      if (cleanProse) {
+        var proseContainer = cleanProse;
+        if (cleanProse.nodeType === 1 && cleanProse.classList) {
+          cleanProse.classList.add("verso-declaration-doc");
+        } else {
+          // A future Verso renderer may use a non-allowlisted wrapper element.
+          // Retain its sanitized children inside Marathon-owned prose chrome.
+          proseContainer = el("div", { class: "verso-declaration-doc" }, [cleanProse]);
+        }
+        fragment.appendChild(proseContainer);
+      }
+    }
+    var cleanCode = sanitizeVersoNode(code, pageRelative, artifactBase, idPrefix);
+    if (cleanCode) fragment.appendChild(cleanCode);
+    return fragment.childNodes.length ? fragment : null;
   }
 
   function moduleCodeFromPage(page, pageRelative, artifactBase, idPrefix) {
@@ -1792,12 +1855,27 @@
     var stale = !!(status && status.stale);
     if (semantic) semantic.setAttribute("data-verso-stale", stale ? "1" : "0");
     if (!raw) return;
-    if (stale) raw.setAttribute("open", "open");
-    else raw.removeAttribute("open");
-    var summary = raw.querySelector("summary");
-    if (summary) summary.textContent = stale
-      ? "Current raw source (stale Verso view follows)"
-      : "Show current raw source";
+    var selectedArtifact = state.versoManifest && state.versoManifest.artifact_token;
+    var semanticArtifact = semantic && semantic.getAttribute("data-verso-artifact");
+    var artifactMatches = !!(
+      selectedArtifact && semanticArtifact === selectedArtifact
+    );
+    var hasSemantic = !!(semantic && semantic.childNodes.length);
+    // A ready status can arrive before its page fragment. Never let a fragment
+    // from the previous generation replace the current raw source during that
+    // fetch (or remain visible if the fetch ultimately fails).
+    if (hasSemantic && artifactMatches && status && status.available) {
+      semantic.removeAttribute("hidden");
+    } else if (hasSemantic) {
+      semantic.setAttribute("hidden", "hidden");
+    }
+    var semanticReady = !!(
+      hasSemantic && artifactMatches && status && status.available &&
+      !semantic.hasAttribute("hidden")
+    );
+    if (versoNeedsStatusChrome(status) || !semanticReady) raw.removeAttribute("hidden");
+    else raw.setAttribute("hidden", "hidden");
+    updateVersoStatusChrome(shell, status);
   }
 
   function paintVersoResult(
@@ -1805,11 +1883,22 @@
   ) {
     var semantic = shell.querySelector(".verso-semantic-source");
     resetVersoInteractions(semantic);
+    // renderVersoMath marks a mount after processing so repeat calls cannot
+    // re-enter KaTeX's generated DOM. Fresh semantic content gets a fresh
+    // budget by clearing that marker before the old children are removed.
+    semantic.removeAttribute("data-marathon-verso-math-rendered");
     while (semantic.firstChild) semantic.removeChild(semantic.firstChild);
     semantic.appendChild(clean);
+    // The sanitized fragment retains Verso's prose structure. Typeset only
+    // its explicit or delimiter-based math nodes in place so paragraphs,
+    // emphasis, links, and declaration/code boundaries remain intact.
+    if (window.MarathonLatex && window.MarathonLatex.renderVersoMath) {
+      try { window.MarathonLatex.renderVersoMath(semantic); }
+      catch (e) { /* raw TeX remains visible as the fail-safe */ }
+    }
+    semantic.setAttribute("data-verso-artifact", artifactToken || "");
     semantic.removeAttribute("hidden");
     updateVersoFreshness(shell, status);
-    semantic.setAttribute("data-verso-artifact", artifactToken || "");
     activateVersoHovers(
       semantic, docs, pageRelative, artifactBase,
       shell._marathonVersoIdPrefix, artifactToken

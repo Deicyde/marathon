@@ -13,6 +13,15 @@
 (function () {
   "use strict";
 
+  // Keep generated/formalization prose from handing an unbounded expression
+  // to KaTeX. KaTeX renders synchronously, so both one expression and the sum
+  // of all expressions on a Verso mount need independent limits.
+  var MAX_LATEX_SOURCE = 4096;
+  var MAX_VERSO_MATH_NODES = 300;
+  var MAX_VERSO_PROSE_CHARS = 250000;
+  var MAX_VERSO_TEX_CHARS = 24000;
+  var VERSO_MATH_RENDERED_ATTR = "data-marathon-verso-math-rendered";
+
   function katexAvailable() {
     // KaTeX is "available" only if the script actually loaded AND its onerror
     // flag was never tripped. window.katex is the real signal; the *_FAILED
@@ -21,15 +30,42 @@
       typeof window.katex !== "undefined" &&
       window.katex &&
       typeof window.katex.render === "function" &&
-      !window.__KATEX_JS_FAILED
+      !window.__KATEX_JS_FAILED &&
+      !window.__KATEX_CSS_FAILED
     );
+  }
+
+  function dollarIsEscaped(src, index) {
+    var slashes = 0;
+    for (var i = index - 1; i >= 0 && src[i] === "\\"; i--) slashes++;
+    return slashes % 2 === 1;
+  }
+
+  function nextUnescapedDollar(src, start) {
+    for (var i = start; i < src.length; i++) {
+      if (src[i] === "$" && !dollarIsEscaped(src, i)) return i;
+    }
+    return -1;
+  }
+
+  function nextDisplayClose(src, start) {
+    var i = nextUnescapedDollar(src, start);
+    while (i !== -1) {
+      if (src[i + 1] === "$" && !dollarIsEscaped(src, i + 1)) return i;
+      i = nextUnescapedDollar(src, i + 1);
+    }
+    return -1;
   }
 
   // Split a string into alternating [text, math, text, math, ...] segments by
   // $$...$$ (display) and $...$ (inline). Returns a list of {kind, value}
-  // where kind is "text" | "inline" | "display". A trailing unmatched $ is
-  // treated as literal text (we never drop characters).
+  // where kind is "text" | "inline" | "display". Escaped dollars and
+  // malformed/unmatched delimiters remain literal text (we never drop
+  // characters). Requiring non-whitespace immediately inside inline delimiters
+  // also prevents ordinary prose such as "cost $5 and tax $10" from being
+  // paired across its two currency markers.
   function tokenize(src) {
+    src = String(src == null ? "" : src);
     var out = [];
     var i = 0;
     var n = src.length;
@@ -41,24 +77,33 @@
       }
     }
     while (i < n) {
-      if (src[i] === "$" && src[i + 1] === "$") {
-        var end = src.indexOf("$$", i + 2);
-        if (end === -1) {
-          buf += src.slice(i);
-          break;
+      if (src[i] === "$" && !dollarIsEscaped(src, i) && src[i + 1] === "$") {
+        var end = nextDisplayClose(src, i + 2);
+        if (end !== -1 && src.slice(i + 2, end).trim()) {
+          flushText();
+          out.push({ kind: "display", value: src.slice(i + 2, end) });
+          i = end + 2;
+        } else {
+          buf += "$$";
+          i += 2;
         }
-        flushText();
-        out.push({ kind: "display", value: src.slice(i + 2, end) });
-        i = end + 2;
-      } else if (src[i] === "$") {
-        var endI = src.indexOf("$", i + 1);
-        if (endI === -1) {
-          buf += src.slice(i);
-          break;
+      } else if (src[i] === "$" && !dollarIsEscaped(src, i)) {
+        var first = src[i + 1] || "";
+        var endI = nextUnescapedDollar(src, i + 1);
+        var inlineSource = endI === -1 ? "" : src.slice(i + 1, endI);
+        var validEnd = endI !== -1 && src[endI + 1] !== "$" &&
+          inlineSource.indexOf("\n") === -1 && inlineSource.indexOf("\r") === -1 &&
+          !/\s/.test(first) && !/\s/.test(src[endI - 1] || "");
+        if (validEnd) {
+          flushText();
+          out.push({ kind: "inline", value: inlineSource });
+          i = endI + 1;
+        } else {
+          // Consume only this marker. A later marker may still begin a valid
+          // expression (for example, "cost $5; variable $x$").
+          buf += "$";
+          i += 1;
         }
-        flushText();
-        out.push({ kind: "inline", value: src.slice(i + 1, endI) });
-        i = endI + 1;
       } else {
         buf += src[i];
         i += 1;
@@ -71,18 +116,32 @@
   // Render one math segment into `parent`. Uses KaTeX when available; on ANY
   // failure (unavailable, or a KaTeX parse error) falls back to a styled raw
   // code span carrying the original LaTeX. Never throws to the caller.
-  function renderMath(parent, latex, display) {
-    if (katexAvailable()) {
+  function reserveTypesetBudget(budget, chars) {
+    if (!budget) return true;
+    var used = Number(budget.texChars) || 0;
+    if (chars > MAX_VERSO_TEX_CHARS - used) return false;
+    budget.texChars = used + chars;
+    return true;
+  }
+
+  function renderMath(parent, latex, display, typesetBudget) {
+    latex = String(latex == null ? "" : latex);
+    var withinLimits = latex.length <= MAX_LATEX_SOURCE &&
+      reserveTypesetBudget(typesetBudget, latex.length);
+    if (withinLimits && katexAvailable()) {
       try {
         var span = document.createElement("span");
         span.className = display ? "katex-display-wrap" : "katex-inline-wrap";
         window.katex.render(latex, span, {
           displayMode: !!display,
           throwOnError: false,
+          trust: false,
+          maxExpand: 1000,
+          maxSize: 20,
           errorColor: "#b54",
         });
         parent.appendChild(span);
-        return;
+        return span;
       } catch (e) {
         // fall through to raw fallback
       }
@@ -94,6 +153,132 @@
     code.textContent = (display ? "$$" : "$") + latex + (display ? "$$" : "$");
     code.title = "raw LaTeX (math renderer unavailable — offline-safe fallback)";
     parent.appendChild(code);
+    return code;
+  }
+
+  function markVersoMath(node, display) {
+    if (!node || !node.classList) return;
+    node.classList.add("verso-math");
+    node.classList.add(display ? "verso-math-display" : "verso-math-inline");
+    node.setAttribute(VERSO_MATH_RENDERED_ATTR, "1");
+  }
+
+  function generatedVersoMathElement(node) {
+    if (!node || node.nodeType !== 1 || !node.classList) return false;
+    return node.getAttribute(VERSO_MATH_RENDERED_ATTR) === "1" ||
+      node.classList.contains("katex") ||
+      node.classList.contains("verso-math") ||
+      node.classList.contains("latex-fallback");
+  }
+
+  function insideGeneratedVersoMath(node, container) {
+    for (var current = node; current && current !== container; current = current.parentElement) {
+      if (generatedVersoMathElement(current)) return true;
+    }
+    return false;
+  }
+
+  function replaceVersoMathCode(node, typesetBudget) {
+    if (!node || !node.parentNode) return false;
+    var latex = node.textContent || "";
+    var display = node.classList.contains("display");
+    var fragment = document.createDocumentFragment();
+    var rendered = renderMath(fragment, latex, display, typesetBudget);
+    markVersoMath(rendered, display);
+    node.parentNode.replaceChild(fragment, node);
+    return true;
+  }
+
+  // Collect text nodes without crossing elements whose contents must remain
+  // literal or whose click target should not be rewritten. This preserves the
+  // Markdown DOM emitted by Verso instead of flattening a whole prose block.
+  function collectVersoMathText(node, out, budget) {
+    if (!node || out.length >= MAX_VERSO_MATH_NODES || budget.chars >= MAX_VERSO_PROSE_CHARS) {
+      return;
+    }
+    if (node.nodeType === 3) {
+      var value = node.nodeValue || "";
+      if (value.length > MAX_VERSO_PROSE_CHARS - budget.chars) {
+        budget.chars = MAX_VERSO_PROSE_CHARS;
+        return;
+      }
+      budget.chars += value.length;
+      if (value.indexOf("$") >= 0) out.push(node);
+      return;
+    }
+    if (node.nodeType !== 1) return;
+    if (generatedVersoMathElement(node)) return;
+    var tag = String(node.tagName || "").toUpperCase();
+    if (tag === "CODE" || tag === "PRE" || tag === "A" || tag === "KBD") return;
+    for (var i = 0; i < node.childNodes.length; i++) {
+      collectVersoMathText(node.childNodes[i], out, budget);
+      if (out.length >= MAX_VERSO_MATH_NODES || budget.chars >= MAX_VERSO_PROSE_CHARS) break;
+    }
+  }
+
+  function replaceVersoDelimitedMath(node, remaining, typesetBudget) {
+    if (!node || !node.parentNode || remaining <= 0) return 0;
+    var parts = tokenize(node.nodeValue || "");
+    var mathCount = 0;
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].kind !== "text") mathCount++;
+    }
+    if (!mathCount) return 0;
+
+    var fragment = document.createDocumentFragment();
+    var renderedCount = 0;
+    for (var j = 0; j < parts.length; j++) {
+      var part = parts[j];
+      if (part.kind === "text") {
+        fragment.appendChild(document.createTextNode(part.value));
+      } else if (renderedCount < remaining) {
+        var display = part.kind === "display";
+        var rendered = renderMath(fragment, part.value, display, typesetBudget);
+        markVersoMath(rendered, display);
+        renderedCount++;
+      } else {
+        // Preserve delimiters verbatim once the per-mount budget is reached.
+        var delimiter = part.kind === "display" ? "$$" : "$";
+        fragment.appendChild(document.createTextNode(delimiter + part.value + delimiter));
+      }
+    }
+    node.parentNode.replaceChild(fragment, node);
+    return renderedCount;
+  }
+
+  // Render both Verso's explicit math nodes and ordinary $...$/$$...$$ text
+  // found in prose. Explicit nodes arrive as inert <code class="math ...">
+  // from the sanitizer. Raw delimiters are handled text-node by text-node and
+  // never inside CODE/PRE/A/KBD, so existing markup and source are untouched.
+  function renderVersoMath(container) {
+    if (!container || !container.querySelectorAll || !container.getAttribute ||
+        !container.setAttribute) return 0;
+    // A repeat call must not walk KaTeX's generated MathML/HTML or spend the
+    // limits a second time. Callers that replace the mount's contents clear
+    // this marker before installing the new sanitized fragment.
+    if (container.getAttribute(VERSO_MATH_RENDERED_ATTR) === "1") return 0;
+    container.setAttribute(VERSO_MATH_RENDERED_ATTR, "1");
+    var renderedCount = 0;
+    var typesetBudget = { texChars: 0 };
+    var explicit = container.querySelectorAll("code.math.inline, code.math.display");
+    for (var i = 0; i < explicit.length && renderedCount < MAX_VERSO_MATH_NODES; i++) {
+      if (insideGeneratedVersoMath(explicit[i], container)) continue;
+      if (replaceVersoMathCode(explicit[i], typesetBudget)) renderedCount++;
+    }
+
+    var prose = container.querySelectorAll(".md-text, .verso-text");
+    var candidates = [];
+    var budget = { chars: 0 };
+    for (var j = 0; j < prose.length && candidates.length < MAX_VERSO_MATH_NODES; j++) {
+      collectVersoMathText(prose[j], candidates, budget);
+      if (budget.chars >= MAX_VERSO_PROSE_CHARS) break;
+    }
+    for (var k = 0; k < candidates.length && renderedCount < MAX_VERSO_MATH_NODES; k++) {
+      renderedCount += replaceVersoDelimitedMath(
+        candidates[k], MAX_VERSO_MATH_NODES - renderedCount, typesetBudget
+      );
+    }
+    return renderedCount;
   }
 
   // UNIFIED inline renderer: math ($$…$$, $…$) AND markdown (**bold**, `code`,
@@ -235,6 +420,6 @@
 
   window.MarathonLatex = {
     render: render, katexAvailable: katexAvailable, tokenize: tokenize,
-    renderMarkdown: renderMarkdown,
+    renderMarkdown: renderMarkdown, renderVersoMath: renderVersoMath,
   };
 })();

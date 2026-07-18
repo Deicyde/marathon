@@ -25,6 +25,7 @@ import tomllib
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from html import escape as _html_escape
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator, Optional
@@ -53,6 +54,11 @@ _RENDER_TIMEOUT_SECONDS = 60 * 15
 _LEAN_BUILD_THREADS = "2"
 _MODULE_TARGET_BATCH_SIZE = 100
 _ARTIFACT_RETENTION = 5  # current site plus four recent pinned-tab generations
+_ARTIFACT_PIPELINE_VERSION = "marathon-verso-v2"
+_MATH_SENTINEL_PREFIX = "__MARATHON_VERSO_MATH_"
+_MATH_SENTINEL_RE = re.compile(
+    rf"<code>({_MATH_SENTINEL_PREFIX}[0-9a-f]{{32}}_[ID]_[0-9]+__)</code>"
+)
 
 
 class VersoUnavailable(RuntimeError):
@@ -84,8 +90,214 @@ class VersoProject:
 def effective_artifact_token(source_token: str, dependency_signature: str) -> str:
     """Bind a source fingerprint to the Lake/toolchain configuration used."""
 
-    payload = f"marathon-verso-v1\0{source_token}\0{dependency_signature}"
+    payload = (
+        f"{_ARTIFACT_PIPELINE_VERSION}\0{source_token}\0{dependency_signature}"
+    )
     return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
+def _markdown_math_source(kind: str, pieces: Any) -> str:
+    """Join the ``Array String`` encoded by MD4Lean's JSON exporter."""
+
+    if not isinstance(pieces, list) or not all(
+        isinstance(piece, str) for piece in pieces
+    ):
+        raise VersoBuildError(
+            f"the literate JSON contained a malformed {kind} node"
+        )
+    return "".join(pieces)
+
+
+def _normalize_image_alt_math(value: Any) -> Any:
+    """Keep image-alt formulas as plain text that ``verso-html`` emits.
+
+    The standalone renderer deliberately filters image alt text down to
+    ``normal`` nodes.  A code marker in this context would therefore disappear
+    before the restoration pass.  Preserve the TeX as accessible text instead.
+    Other alt nodes remain untouched so this shim does not reinterpret
+    MD4Lean's image representation.
+    """
+
+    if not isinstance(value, list):
+        return value
+    normalized = []
+    for item in value:
+        replacement = item
+        if isinstance(item, dict) and len(item) == 1:
+            for ast_kind in ("latexMath", "latexMathDisplay"):
+                if ast_kind in item:
+                    replacement = {
+                        "normal": _markdown_math_source(ast_kind, item[ast_kind])
+                    }
+                    break
+        normalized.append(replacement)
+    return normalized
+
+
+def _rewrite_markdown_math(
+    value: Any,
+    *,
+    nonce: str,
+    markers: dict[str, tuple[str, str]],
+) -> Any:
+    """Replace math nodes in one Markdown AST with renderer-safe code nodes."""
+
+    if isinstance(value, list):
+        return [
+            _rewrite_markdown_math(item, nonce=nonce, markers=markers)
+            for item in value
+        ]
+    if not isinstance(value, dict):
+        return value
+
+    if len(value) == 1 and "img" in value:
+        image = value["img"]
+        if not isinstance(image, list) or len(image) != 3:
+            return value
+        return {
+            "img": [image[0], image[1], _normalize_image_alt_math(image[2])]
+        }
+
+    if len(value) == 1:
+        for ast_kind, css_kind, marker_kind in (
+            ("latexMath", "inline", "I"),
+            ("latexMathDisplay", "display", "D"),
+        ):
+            if ast_kind in value:
+                source = _markdown_math_source(ast_kind, value[ast_kind])
+                marker = (
+                    f"{_MATH_SENTINEL_PREFIX}{nonce}_{marker_kind}_"
+                    f"{len(markers)}__"
+                )
+                markers[marker] = (css_kind, source)
+                return {"code": [marker]}
+
+    return {
+        key: _rewrite_markdown_math(item, nonce=nonce, markers=markers)
+        for key, item in value.items()
+    }
+
+
+def _rewrite_literate_document_math(
+    value: Any,
+    *,
+    nonce: str,
+    markers: dict[str, tuple[str, str]],
+) -> Any:
+    """Find Markdown payloads without touching other literate JSON fields."""
+
+    if isinstance(value, list):
+        return [
+            _rewrite_literate_document_math(item, nonce=nonce, markers=markers)
+            for item in value
+        ]
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: (
+            _rewrite_markdown_math(item, nonce=nonce, markers=markers)
+            if key in {"markdown", "markdownModDoc"}
+            else _rewrite_literate_document_math(
+                item, nonce=nonce, markers=markers
+            )
+        )
+        for key, item in value.items()
+    }
+
+
+def _stage_literate_for_html(
+    source_dir: Path, target_dir: Path, nonce: str
+) -> dict[str, tuple[str, str]]:
+    """Copy literate facets and preserve Markdown math for ``verso-html``.
+
+    Standalone ``verso-html`` currently discards MD4Lean's math constructors.
+    Its inline-code constructor is lossless, so the disposable copy replaces
+    each formula with a unique marker that can be restored after rendering.
+    The persistent incremental facets are never rewritten.
+    """
+
+    if re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
+        raise ValueError("the Verso math marker nonce must be 32 lowercase hex digits")
+
+    source_dir = Path(source_dir)
+    target_dir = Path(target_dir)
+    markers: dict[str, tuple[str, str]] = {}
+    collision_prefix = f"{_MATH_SENTINEL_PREFIX}{nonce}_"
+    try:
+        shutil.copytree(source_dir, target_dir)
+        for path in sorted(target_dir.rglob("*.json")):
+            raw = path.read_text(encoding="utf-8")
+            if collision_prefix in raw:
+                raise VersoBuildError(
+                    "the literate JSON collided with the generated math marker"
+                )
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise VersoBuildError(
+                    f"could not parse staged literate JSON {path.name}: {exc}"
+                ) from exc
+            rewritten = _rewrite_literate_document_math(
+                data, nonce=nonce, markers=markers
+            )
+            if rewritten != data:
+                path.write_text(
+                    json.dumps(rewritten, ensure_ascii=False, separators=(",", ":"))
+                    + "\n",
+                    encoding="utf-8",
+                )
+    except (OSError, shutil.Error) as exc:
+        shutil.rmtree(target_dir, ignore_errors=True)
+        raise VersoBuildError(f"could not stage the literate facets: {exc}") from exc
+    except Exception:
+        shutil.rmtree(target_dir, ignore_errors=True)
+        raise
+    return markers
+
+
+def _restore_rendered_math(
+    site_dir: Path, markers: dict[str, tuple[str, str]]
+) -> int:
+    """Restore exact code markers to escaped, inert math elements."""
+
+    if not markers:
+        return 0
+    counts = dict.fromkeys(markers, 0)
+
+    def replace(match: re.Match[str]) -> str:
+        marker = match.group(1)
+        value = markers.get(marker)
+        if value is None:
+            return match.group(0)
+        counts[marker] += 1
+        css_kind, source = value
+        return (
+            f'<code class="math {css_kind}">'
+            f"{_html_escape(source)}"
+            "</code>"
+        )
+
+    try:
+        for path in sorted(Path(site_dir).rglob("*.html")):
+            raw = path.read_text(encoding="utf-8")
+            rewritten = _MATH_SENTINEL_RE.sub(replace, raw)
+            if rewritten != raw:
+                path.write_text(rewritten, encoding="utf-8")
+    except OSError as exc:
+        raise VersoBuildError(
+            f"could not restore math in the rendered Verso site: {exc}"
+        ) from exc
+
+    mismatched = [marker for marker, count in counts.items() if count != 1]
+    if mismatched:
+        missing = sum(1 for count in counts.values() if count == 0)
+        duplicated = sum(max(0, count - 1) for count in counts.values())
+        raise VersoBuildError(
+            "verso-html did not preserve every Markdown math node: "
+            f"expected {len(markers)} exact markers; "
+            f"missing {missing}, duplicated {duplicated}"
+        )
+    return sum(counts.values())
 
 
 def verso_tag_from_toolchain(repo_dir: Path) -> str:
@@ -1092,19 +1304,31 @@ class VersoArtifactManager:
 
             work = self.root / "work" / f"{token}-{uuid.uuid4().hex}"
             site = work / "site"
+            staged_literate = work / "literate"
             work.mkdir(parents=True, exist_ok=False)
             try:
-                self._run_command(
-                    [
-                        "lake",
-                        "exe",
-                        "verso-html",
-                        ".lake/build/literate",
-                        str(site),
-                    ],
-                    _RENDER_TIMEOUT_SECONDS,
-                    lock_fd=lock_fd,
+                math_markers = _stage_literate_for_html(
+                    literate, staged_literate, uuid.uuid4().hex
                 )
+                try:
+                    self._run_command(
+                        [
+                            "lake",
+                            "exe",
+                            "verso-html",
+                            str(staged_literate),
+                            str(site),
+                        ],
+                        _RENDER_TIMEOUT_SECONDS,
+                        lock_fd=lock_fd,
+                    )
+                    _restore_rendered_math(site, math_markers)
+                finally:
+                    shutil.rmtree(staged_literate, ignore_errors=True)
+                if staged_literate.exists():
+                    raise VersoBuildError(
+                        "could not remove the staged literate facets"
+                    )
                 manifest = build_verso_manifest(site, token)
                 if not manifest["modules"]:
                     raise VersoBuildError("verso-html produced no module pages")

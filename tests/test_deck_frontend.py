@@ -423,6 +423,110 @@ def test_verso_generated_html_passes_through_strict_sanitizer(app_js: str):
         assert dangerous in app_js
 
 
+def test_verso_declaration_mounts_only_its_immediately_preceding_prose(app_js: str):
+    code = _strip_block_comments(app_js)
+    decl = _fn_body(code, "function declarationCodeFromPage")
+    sanitizer = _fn_body(code, "function sanitizeVersoNode")
+
+    # Declaration doc-comments are an exact sibling association. In
+    # particular, never scan backwards and accidentally borrow a module doc or
+    # the previous declaration/field's prose.
+    assert "code.previousElementSibling" in decl
+    assert "previousSibling" not in decl
+    assert 'classList.contains("md-text")' in decl
+    assert 'classList.contains("verso-text")' in decl
+    assert '!prose.classList.contains("mod-doc")' in decl
+    assert decl.index("fragment.appendChild(proseContainer)") < decl.index(
+        "fragment.appendChild(cleanCode)"
+    )
+    assert 'classList.add("verso-declaration-doc")' in decl
+
+    # verso-html's nonstandard emphasis element is normalized while it is
+    # still inside the sanitizer; it is never admitted as an arbitrary tag.
+    assert 'sourceTag === "EMPH" ? "EM" : sourceTag' in sanitizer
+    assert "VERSO_ALLOWED_TAGS[tag]" in sanitizer
+
+
+def test_verso_prose_math_is_dom_preserving_bounded_and_offline_safe(
+    app_js: str, katex_js: str,
+):
+    code = _strip_block_comments(app_js)
+    paint = _fn_body(code, "function paintVersoResult")
+    assert "semantic.appendChild(clean)" in paint
+    assert "MarathonLatex.renderVersoMath(semantic)" in paint
+    assert paint.index("semantic.appendChild(clean)") < paint.index(
+        "MarathonLatex.renderVersoMath(semantic)"
+    ) < paint.index('semantic.removeAttribute("hidden")')
+    assert paint.index(
+        'semantic.removeAttribute("data-marathon-verso-math-rendered")'
+    ) < paint.index("semantic.removeChild")
+
+    katex_code = _strip_block_comments(katex_js)
+    render = _fn_body(katex_code, "function renderVersoMath")
+    collect = _fn_body(katex_code, "function collectVersoMathText")
+    replace = _fn_body(katex_code, "function replaceVersoDelimitedMath")
+    math = _fn_body(katex_code, "function renderMath")
+    assert 'querySelectorAll("code.math.inline, code.math.display")' in render
+    assert 'querySelectorAll(".md-text, .verso-text")' in render
+    for literal_parent in ('tag === "CODE"', 'tag === "PRE"', 'tag === "A"'):
+        assert literal_parent in collect
+    assert "MAX_VERSO_PROSE_CHARS - budget.chars" in collect
+    assert "MAX_VERSO_MATH_NODES" in render
+    assert "MAX_VERSO_TEX_CHARS" in katex_code
+    per_expression = re.search(r"MAX_LATEX_SOURCE\s*=\s*(\d+)", katex_code)
+    total_mount = re.search(r"MAX_VERSO_TEX_CHARS\s*=\s*(\d+)", katex_code)
+    assert per_expression and int(per_expression.group(1)) <= 4096
+    assert total_mount and int(total_mount.group(1)) <= 24000
+    assert "var typesetBudget = { texChars: 0 }" in render
+    assert "replaceVersoMathCode(explicit[i], typesetBudget)" in render
+    assert "MAX_VERSO_MATH_NODES - renderedCount, typesetBudget" in render
+    assert "reserveTypesetBudget(typesetBudget, latex.length)" in math
+    assert "tokenize(node.nodeValue" in replace  # raw $...$ and $$...$$ prose
+    assert "createDocumentFragment" in replace and "replaceChild" in replace
+    assert "textContent" not in render  # never flatten the mounted prose tree
+    for option in ("trust: false", "maxExpand: 1000", "maxSize: 20"):
+        assert option in math
+    assert "latex-fallback" in math and "textContent" in math
+    assert "renderVersoMath: renderVersoMath" in katex_js
+
+
+def test_verso_raw_math_parser_is_escape_aware_and_conservative(katex_js: str):
+    code = _strip_block_comments(katex_js)
+    tokenize = _fn_body(code, "function tokenize")
+    escaped = _fn_body(code, "function dollarIsEscaped")
+
+    # Odd backslash parity protects surviving Markdown/TeX escapes. Inline
+    # delimiters follow TeX/Markdown whitespace conventions, and an invalid
+    # opening marker is consumed alone so a later ordinary $x$ can still win.
+    assert 'src[i] === "$" && !dollarIsEscaped(src, i)' in tokenize
+    assert 'src[i + 1] === "$"' in tokenize
+    assert "nextDisplayClose(src, i + 2)" in tokenize
+    assert "nextUnescapedDollar(src, i + 1)" in tokenize
+    assert 'inlineSource.indexOf("\\n") === -1' in tokenize
+    assert 'inlineSource.indexOf("\\r") === -1' in tokenize
+    assert "!/\\s/.test(first)" in tokenize
+    assert "!/\\s/.test(src[endI - 1]" in tokenize
+    assert 'buf += "$"' in tokenize and "i += 1" in tokenize
+    assert 'src[i] === "\\\\"' in escaped and "slashes % 2 === 1" in escaped
+
+
+def test_verso_math_renderer_is_css_aware_and_idempotent(katex_js: str):
+    code = _strip_block_comments(katex_js)
+    available = _fn_body(code, "function katexAvailable")
+    render = _fn_body(code, "function renderVersoMath")
+    collect = _fn_body(code, "function collectVersoMathText")
+    generated = _fn_body(code, "function generatedVersoMathElement")
+
+    assert "!window.__KATEX_JS_FAILED" in available
+    assert "!window.__KATEX_CSS_FAILED" in available
+    assert 'container.getAttribute(VERSO_MATH_RENDERED_ATTR) === "1"' in render
+    assert 'container.setAttribute(VERSO_MATH_RENDERED_ATTR, "1")' in render
+    assert "insideGeneratedVersoMath(explicit[i], container)" in render
+    assert "generatedVersoMathElement(node)" in collect
+    for generated_class in ('"katex"', '"verso-math"', '"latex-fallback"'):
+        assert generated_class in generated
+
+
 def test_verso_urls_are_same_origin_and_mount_confined(app_js: str):
     code = _strip_block_comments(app_js)
     safe_url = _fn_body(code, "function safeVersoURL")
@@ -522,6 +626,9 @@ def test_verso_fragment_ids_are_unique_and_hover_init_waits_for_docs(app_js: str
     assert paint.index("resetVersoInteractions(semantic)") < paint.index(
         "semantic.removeChild"
     )
+    assert paint.index('setAttribute("data-verso-artifact"') < paint.index(
+        'removeAttribute("hidden")'
+    ) < paint.index("updateVersoFreshness(shell, status)")
 
 
 def test_verso_building_status_polls_then_upgrades_mounted_surfaces(app_js: str):
@@ -551,21 +658,38 @@ def test_stale_verso_never_hides_current_raw_source(app_js: str):
     code = _strip_block_comments(app_js)
     shell = _fn_body(code, "function makeVersoShell")
     assert shell.index("raw,") < shell.index("semantic,")
+    assert 'el("div", { class: "verso-raw-fallback" }' in shell
+    assert 'el("details"' not in shell and 'el("summary"' not in shell
+    assert "Current raw source" not in shell and "Show current raw source" not in shell
     freshness = _fn_body(code, "function updateVersoFreshness")
-    assert 'if (stale) raw.setAttribute("open", "open")' in freshness
-    assert "Current raw source (stale Verso view follows)" in freshness
+    assert "state.versoManifest.artifact_token" in freshness
+    assert 'semantic.getAttribute("data-verso-artifact")' in freshness
+    assert "semanticArtifact === selectedArtifact" in freshness
+    assert "hasSemantic && artifactMatches && status && status.available" in freshness
+    assert 'semantic.removeAttribute("hidden")' in freshness
+    assert 'semantic.setAttribute("hidden", "hidden")' in freshness
+    assert freshness.index('semantic.removeAttribute("hidden")') < freshness.index(
+        'semantic.setAttribute("hidden", "hidden")'
+    )
+    assert "versoNeedsStatusChrome(status) || !semanticReady" in freshness
+    assert 'raw.removeAttribute("hidden")' in freshness
+    assert 'raw.setAttribute("hidden", "hidden")' in freshness
     paint = _fn_body(code, "function paintVersoResult")
     assert "updateVersoFreshness(shell, status)" in paint
 
 
-def test_verso_surfaces_report_building_stale_and_error(app_js: str, style_css: str):
+def test_verso_surfaces_report_only_actionable_statuses_and_keep_raw_fallback(
+    app_js: str, style_css: str,
+):
     code = _strip_block_comments(app_js)
     badge = _fn_body(code, "function versoBadge")
-    for label in ("Verso building", "Verso stale", "Verso error", "Verso semantic"):
+    for label in ("Verso building", "Verso stale", "Verso error"):
         assert label in badge
+    assert "Verso semantic" not in badge
+    assert 'hidden: label ? null : "hidden"' in badge
     shell = _fn_body(code, "function makeVersoShell")
-    assert "Current raw source" in shell
     assert "verso-raw-fallback" in shell
+    assert "Current raw source" not in shell and "Show current raw source" not in shell
     for cls in (
         ".verso-source-shell", ".verso-semantic-source", ".verso-raw-fallback",
         ".verso-status-building", ".verso-status-stale", ".verso-status-error",
@@ -573,6 +697,48 @@ def test_verso_surfaces_report_building_stale_and_error(app_js: str, style_css: 
         ".verso-semantic-module > .md-text",
     ):
         assert cls in style_css
+
+
+def test_verso_semantic_styles_match_the_dark_marathon_theme(style_css: str):
+    start = style_css.index(".verso-source-shell")
+    end = style_css.index("/* Elaborated type demoted", start)
+    verso = style_css[start:end]
+
+    for themed_value in (
+        "background: #0b0e14",
+        "background: var(--panel)",
+        "background: var(--panel-2)",
+        "color: var(--ink)",
+        "color: var(--muted)",
+        "border-bottom: 1px solid var(--line)",
+        "color: #ff7b72",
+        "color: #79c0ff",
+        "color: #ffa657",
+        "color: #a5d6ff",
+        "color: #d2a8ff",
+    ):
+        assert themed_value in verso
+
+    for light_background in ("#fff", "#f8fafc", "#eef2f6", "#f6f8fa", "#eaeef2"):
+        assert light_background not in verso
+
+
+def test_verso_prose_and_math_have_scoped_readable_styles(style_css: str):
+    start = style_css.index(".verso-source-shell")
+    end = style_css.index("/* Elaborated type demoted", start)
+    verso = style_css[start:end]
+    for selector in (
+        ".verso-declaration-doc",
+        ".verso-semantic-module > .md-text",
+        ".verso-semantic-module > .verso-text",
+        ".verso-semantic-source code.math",
+        ".verso-semantic-source .verso-math-inline",
+        ".verso-semantic-source .verso-math-display",
+        ".verso-semantic-source .verso-math.latex-fallback",
+    ):
+        assert selector in verso
+    assert ":where(.md-text, .verso-text)" in verso
+    assert "overflow-x: auto" in verso
 
 
 def test_marathon_trust_and_owner_inspector_remains_review_details(app_js: str):
