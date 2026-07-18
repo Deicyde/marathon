@@ -127,7 +127,11 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
     """The global orchestrator's live status: is a conductor alive (lock pid),
     its concurrency + last snapshot time, the per-job table (running/finished),
     and the recent landings. Pure read; everything degrades to empty."""
-    from marathon.conductor import conductor_lock_path, load_jobs_snapshot
+    from marathon.conductor import (
+        conductor_lock_path,
+        load_jobs_snapshot,
+        snapshot_job_is_live,
+    )
     from marathon.review import daemon
 
     # Liveness: the conductor lock holds the live pid (same check the conductor
@@ -155,12 +159,8 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
         jpid = raw.get("pid")
         # Mirror `conductor status`: a "running" job whose pid is dead is shown
         # as such (the state machine recorded nothing; next run re-dispatches).
-        if status == "running" and jpid is not None:
-            try:
-                if not daemon.process_alive(int(jpid)):
-                    status = "running (pid dead)"
-            except (ValueError, TypeError):
-                pass
+        if status == "running" and not snapshot_job_is_live(raw):
+            status = "running (pid dead)"
         workdir = raw.get("workdir")
         job = {
             "issue_num": raw.get("issue_num"),

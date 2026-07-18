@@ -1268,10 +1268,24 @@ def test_tier_badges_cover_the_ladder(app_js: str, style_css: str):
 
 def test_empty_and_error_states_exist(app_js: str):
     code = _strip_block_comments(app_js)
-    # all-caught-up + building count + error retry, never a blank screen.
+    # A truly resolved project says all caught up. An unresolved-but-blocked
+    # project explains its refinement/audit/dependency blockers and links to
+    # Status; a stale serialized job must never promise it is still building.
     assert "All caught up" in app_js
+    assert "No issues ready for review" in app_js
+    assert "awaiting_refinement" in app_js
+    assert "needs_attention" in app_js
+    assert "awaiting_audit" in app_js
+    assert "dependency_blocked" in app_js
+    assert "other_unresolved" in app_js
+    assert "actively building" in app_js
+    assert "check back shortly" not in app_js
+    assert "Open status" in app_js
     assert "showErrorCard" in code
     assert "Retry" in app_js
+    summary = _fn_body(code, "function queueBlockerSummary")
+    assert "state.viewBuilding" in summary
+    assert "state.building" not in summary
 
 
 def test_subdeck_card_tier_is_the_gate(app_js: str):

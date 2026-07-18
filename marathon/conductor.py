@@ -1611,6 +1611,10 @@ def _command_is_marathon_worker(command: str) -> bool:
             f" -m marathon {kind} " in padded
             for kind in ("refine", "fill", "repair")
         )
+        or any(
+            f" -m marathon.recovery {action} " in padded
+            for action in ("retry-build", "update-continue")
+        )
     )
 
 
@@ -1684,6 +1688,36 @@ def _job_process_group_live(
         return True
     if group_match is None and not strict_identity:
         return _process_group_alive(pgid)
+    return False
+
+
+def snapshot_job_is_live(raw: dict) -> bool:
+    """Whether a serialized ``running`` job definitely owns a live worker.
+
+    ``jobs.json`` deliberately survives conductor and machine restarts.  Its
+    status field is therefore launch history, not proof of current liveness.
+    Read-only surfaces must use the same PID/PGID + worktree identity checks as
+    conductor recovery; otherwise an interrupted job remains "building"
+    forever even though the Status tab correctly reports a dead process.
+
+    This is intentionally stricter than the cleanup guard: an ambiguous
+    process-group lookup should protect a worktree from deletion, but it is not
+    evidence that the deck may tell a reviewer an issue is actively building.
+    Legacy rows without a worktree cannot be identity-checked and therefore do
+    not count as live on read-only status surfaces.
+    """
+    if raw.get("status") != "running":
+        return False
+    try:
+        pid = int(raw["pid"]) if raw.get("pid") else None
+        pgid = int(raw["pgid"]) if raw.get("pgid") else None
+    except (TypeError, ValueError):
+        return False
+    worktree = str(raw.get("worktree") or "")
+    if worktree:
+        return _job_process_group_live(
+            pid, pgid, worktree, strict_identity=True
+        )
     return False
 
 

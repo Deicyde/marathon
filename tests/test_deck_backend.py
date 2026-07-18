@@ -355,6 +355,13 @@ def test_queue_ready_and_dep_ordering(tmp_path, monkeypatch):
     assert by_id[23].ready is False
     assert by_id[23].blocked_reason is not None
     assert "#22" in by_id[23].blocked_reason
+    assert queue.unresolved == 3
+    assert queue.view_building == 0
+    assert queue.awaiting_refinement == 0
+    assert queue.needs_attention == 0
+    assert queue.awaiting_audit == 0
+    assert queue.dependency_blocked == 1
+    assert queue.other_unresolved == 2
 
 
 def test_blocked_card_carries_blocked_reason_below_floor(tmp_path, monkeypatch):
@@ -584,6 +591,64 @@ def test_queue_degrades_without_snapshot(tmp_path, monkeypatch):
         # The card still names its decl + title (from the issue body).
         assert c.decl == {22: "Foo", 23: "Bar", 24: "Baz"}[c.id]
         assert c.title
+    assert queue.unresolved == 3
+    assert queue.awaiting_audit == 3
+    assert queue.dependency_blocked == 0
+    assert queue.other_unresolved == 0
+
+
+def test_queue_blocker_counts_are_view_scoped_and_mutually_exclusive(
+    tmp_path, monkeypatch,
+):
+    cfg = make_cfg(tmp_path)
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="def", value_pp="fun x => x"),
+        _decl("Demo.Chapter14.Bar", cone=["Demo.Chapter14.Foo"]),
+        _decl("Demo.Chapter14.Baz", kind="def", value_pp="0"),
+    ]))
+    patch_bulk(monkeypatch, _bodies_for({22: "Foo", 23: "Bar", 24: "Baz"}))
+
+    from marathon.conductor import ConductorJob, write_jobs_snapshot
+    from marathon.review.state import record_rejection, record_stall
+
+    rejected = record_rejection(cfg, 22, "Please refine Foo")
+    job = ConductorJob(
+        issue_num=22, chapter=14, target="Demo/Chapter14",
+        worktree="/wt", workdir="/wd", branch="marathon/refine-c14-i22",
+        pid=4242, status="running",
+    )
+    write_jobs_snapshot(cfg.repo_dir, [job], concurrency=1)
+    monkeypatch.setattr(
+        "marathon.conductor.snapshot_job_is_live", lambda raw: True
+    )
+
+    queue = cards.build_queue(cfg, chapter=14)
+    assert queue.building == 1
+    assert queue.view_building == 1
+    assert queue.awaiting_refinement == 0  # active #22 is counted only once
+    assert queue.dependency_blocked == 1
+
+    # A live job in another chapter remains in the global status count, but it
+    # must not explain why Chapter 14 has no review-ready card.
+    job.issue_num = 31
+    job.chapter = 15
+    write_jobs_snapshot(cfg.repo_dir, [job], concurrency=1)
+    queue = cards.build_queue(cfg, chapter=14)
+    assert queue.building == 1
+    assert queue.view_building == 0
+    assert queue.awaiting_refinement == 1
+
+    # Parked work is a separate recovery category, not still "awaiting" an
+    # automatic refinement that the conductor will never dispatch.
+    record_stall(cfg, 22, expected_verdict_ts=rejected.verdict_ts)
+    queue = cards.build_queue(cfg, chapter=14)
+    assert queue.awaiting_refinement == 0
+    assert queue.needs_attention == 1
+    assert (
+        queue.view_building + queue.awaiting_refinement
+        + queue.needs_attention + queue.awaiting_audit
+        + queue.dependency_blocked + queue.other_unresolved
+    ) == queue.unresolved
 
 
 def test_queue_skips_surfacing_when_validated_snapshot_is_empty(
@@ -949,6 +1014,12 @@ def test_get_queue_is_pure_no_verdict(running_server, monkeypatch):
     payload = json.loads(body)
     assert "cards" in payload and "building" in payload
     assert "landed_today" in payload
+    for key in (
+        "view_building", "unresolved", "awaiting_refinement",
+        "needs_attention", "awaiting_audit", "dependency_blocked",
+        "other_unresolved",
+    ):
+        assert key in payload
     ids = {c["id"] for c in payload["cards"]}
     assert ids == {22, 23, 24}
     # Also a card detail + status — all pure reads.
@@ -1207,6 +1278,9 @@ def test_status_emits_from_runtime_files(tmp_path, monkeypatch):
         aristotle_status="RUNNING",
     )
     write_jobs_snapshot(cfg.repo_dir, [job], concurrency=2)
+    monkeypatch.setattr(
+        "marathon.conductor.snapshot_job_is_live", lambda raw: True
+    )
 
     status = deck_server.collect_status(cfg)
     assert status["building"] == 1
@@ -1222,6 +1296,17 @@ def test_status_emits_from_runtime_files(tmp_path, monkeypatch):
     queue = cards.build_queue(cfg, chapter=14)
     assert queue.landed_today == 0
     assert queue.building == 1
+
+    # A serialized running row is only history once its worker dies. Queue and
+    # lightweight status must agree with the richer Status dashboard instead
+    # of advertising a phantom build forever after a reboot.
+    monkeypatch.setattr(
+        "marathon.conductor.snapshot_job_is_live", lambda raw: False
+    )
+    status = deck_server.collect_status(cfg)
+    assert status["building"] == 0
+    assert status["jobs"][0]["status"] == "running (pid dead)"
+    assert cards.build_queue(cfg, chapter=14).building == 0
 
 
 def test_sse_events_endpoint_emits_status(running_server):

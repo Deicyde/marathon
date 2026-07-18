@@ -2334,11 +2334,12 @@ def collect_status(cfg: "ReviewConfig") -> dict:
     (recent landings), and the latest bounce reports. Every source
     degrades to empty rather than raising, so the status pane never breaks
     the page."""
+    jobs = _status_jobs(cfg)
     return {
-        "jobs": _status_jobs(cfg),
+        "jobs": jobs,
         "landings": _status_landings(cfg),
         "bounces": _status_bounces(cfg),
-        "building": _count_running(cfg),
+        "building": sum(1 for job in jobs if job.get("status") == "running"),
         "source_token": _status_source_token(cfg),
     }
 
@@ -2354,7 +2355,7 @@ def _status_source_token(cfg: "ReviewConfig") -> Optional[str]:
 
 
 def _status_jobs(cfg: "ReviewConfig") -> list[dict]:
-    from marathon.conductor import load_jobs_snapshot
+    from marathon.conductor import load_jobs_snapshot, snapshot_job_is_live
 
     try:
         snap = load_jobs_snapshot(cfg.repo_dir)
@@ -2364,19 +2365,18 @@ def _status_jobs(cfg: "ReviewConfig") -> list[dict]:
         return []
     out: list[dict] = []
     for job in snap.get("jobs", []):
+        status = job.get("status")
+        if status == "running" and not snapshot_job_is_live(job):
+            status = "running (pid dead)"
         out.append({
             "issue_num": job.get("issue_num"),
             "chapter": job.get("chapter"),
-            "status": job.get("status"),
+            "status": status,
             "project_id": job.get("project_id"),
             "aristotle_status": job.get("aristotle_status"),
             "started_ts": job.get("started_ts"),
         })
     return out
-
-
-def _count_running(cfg: "ReviewConfig") -> int:
-    return sum(1 for j in _status_jobs(cfg) if j.get("status") == "running")
 
 
 def _status_landings(cfg: "ReviewConfig", limit: int = 10) -> list[dict]:

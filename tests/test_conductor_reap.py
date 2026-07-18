@@ -1351,6 +1351,41 @@ def test_ambiguous_reused_group_protects_but_is_not_adoptable(monkeypatch):
     assert conductor._job_process_group_live(
         71, 71, "/wt/job", strict_identity=True
     ) is False
+    assert conductor.snapshot_job_is_live({
+        "status": "running", "pid": 71, "pgid": 71, "worktree": "/wt/job",
+    }) is False
+
+
+def test_snapshot_liveness_requires_worktree_identity(monkeypatch):
+    monkeypatch.setattr(conductor.daemon, "process_alive", lambda _pid: True)
+
+    # An old pid-only row cannot prove that a reused PID is Marathon's worker.
+    assert conductor.snapshot_job_is_live({
+        "status": "running", "pid": 71,
+    }) is False
+
+
+@pytest.mark.parametrize("action", ["retry-build", "update-continue"])
+def test_snapshot_liveness_recognizes_recovery_workers(
+    monkeypatch, action,
+):
+    monkeypatch.setattr(conductor.daemon, "process_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        conductor.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "python -m marathon.recovery " + action
+                + " --repo-dir /wt/job --target Demo/Chapter14"
+            ),
+        ),
+    )
+
+    assert conductor.snapshot_job_is_live({
+        "status": "running", "pid": 71, "pgid": 71,
+        "worktree": "/wt/job",
+    }) is True
 
 
 def test_clear_marker_removes_file_and_inherited_entry(tmp_path):

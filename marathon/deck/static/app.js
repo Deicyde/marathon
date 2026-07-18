@@ -360,7 +360,14 @@
   var state = {
     queue: [],          // [CardSummary] — ready ISSUES (the picker)
     building: 0,
+    viewBuilding: 0,
     landedToday: 0,
+    unresolved: 0,
+    awaitingRefinement: 0,
+    needsAttention: 0,
+    awaitingAudit: 0,
+    dependencyBlocked: 0,
+    otherUnresolved: 0,
     issue: null,        // the open subdeck's issue number (or null)
     subdeck: null,      // the GET /api/subdeck payload for `issue`
     currentDecl: null,  // the DeclCard currently on the stage (or null)
@@ -3190,20 +3197,57 @@
     setActionsEnabled(false);
   }
 
-  // Open the subdeck for the first ready issue, or show "all caught up".
+  function queueBlockerSummary() {
+    if (!state.unresolved) return "Every issue in this view has been reviewed.";
+    var parts = [];
+    if (state.viewBuilding > 0) {
+      parts.push(
+        state.viewBuilding + " issue" + (state.viewBuilding === 1 ? " is" : "s are") +
+        " actively building"
+      );
+    }
+    if (state.awaitingRefinement > 0) {
+      parts.push(
+        state.awaitingRefinement + " awaiting refinement"
+      );
+    }
+    if (state.needsAttention > 0) {
+      parts.push(state.needsAttention + " need recovery attention");
+    }
+    if (state.awaitingAudit > 0) {
+      parts.push(state.awaitingAudit + " awaiting audit evidence");
+    }
+    if (state.dependencyBlocked > 0) {
+      parts.push(state.dependencyBlocked + " blocked by dependencies");
+    }
+    if (state.otherUnresolved > 0) {
+      parts.push(state.otherUnresolved + " other unresolved");
+    }
+    return (parts.length ? parts.join("; ") :
+      state.unresolved + " unresolved issue(s) are currently blocked") + ".";
+  }
+
+  // Open the subdeck for the first ready issue, or explain why none are ready.
   function openFirstReadyIssue() {
     var ready = readyIssues();
     if (!ready.length) {
       state.issue = null;
       state.subdeck = null;
       state.currentDecl = null;
+      var unresolved = state.unresolved > 0;
+      var actions = [
+        { label: "Refresh", kind: "btn-primary", onClick: refreshQueue },
+      ];
+      if (unresolved) {
+        actions.unshift({
+          label: "Open status",
+          onClick: function () { switchTab("status"); },
+        });
+      }
       showMessageCard({
-        title: "All caught up",
-        body:
-          state.building > 0
-            ? state.building + " issue(s) building — check back shortly."
-            : "No ready issues in this view.",
-        actions: [{ label: "Refresh", kind: "btn-primary", onClick: refreshQueue }],
+        title: unresolved ? "No issues ready for review" : "All caught up",
+        body: queueBlockerSummary(),
+        actions: actions,
       });
       // Upgrade to the attention card if rejected issues are stranded — else a
       // reviewer with an empty queue never learns they exist. Best-effort: a
@@ -4388,7 +4432,14 @@
       .then(function (data) {
         state.queue = (data.cards || []).slice();
         state.building = data.building || 0;
+        state.viewBuilding = data.view_building || 0;
         state.landedToday = data.landed_today || 0;
+        state.unresolved = data.unresolved || 0;
+        state.awaitingRefinement = data.awaiting_refinement || 0;
+        state.needsAttention = data.needs_attention || 0;
+        state.awaitingAudit = data.awaiting_audit || 0;
+        state.dependencyBlocked = data.dependency_blocked || 0;
+        state.otherUnresolved = data.other_unresolved || 0;
         applyStatus({ building: state.building, landed_today: state.landedToday });
         // The queue is the issue PICKER: drop straight into the first ready
         // issue's subdeck (auto-pick). No verdict/ship here — pure reads only.

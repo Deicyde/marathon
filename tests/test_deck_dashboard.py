@@ -52,6 +52,9 @@ def test_conductor_status_alive_with_jobs(tmp_path, monkeypatch):
         },
     )
     monkeypatch.setattr("marathon.review.daemon.process_alive", lambda pid: True)
+    monkeypatch.setattr(
+        "marathon.conductor.snapshot_job_is_live", lambda raw: True
+    )
 
     d = dash.conductor_status(_cfg(tmp_path))
 

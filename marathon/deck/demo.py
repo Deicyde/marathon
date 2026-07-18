@@ -362,7 +362,19 @@ def demo_queue() -> dict:
             "blocked_reason": "shipped/reviewed (demo)" if done else None,
             "title": iss["title"],
         })
-    return {"cards": cards, "building": 0, "landed_today": 0}
+    unresolved = sum(1 for card in cards if card["ready"])
+    return {
+        "cards": cards,
+        "building": 0,
+        "landed_today": 0,
+        "view_building": 0,
+        "unresolved": unresolved,
+        "awaiting_refinement": 0,
+        "needs_attention": 0,
+        "awaiting_audit": 0,
+        "dependency_blocked": 0,
+        "other_unresolved": unresolved,
+    }
 
 
 def _reconcile(decls):

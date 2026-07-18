@@ -347,12 +347,26 @@ class Queue:
     cards: list[CardSummary]
     building: int
     landed_today: int
+    view_building: int = 0
+    unresolved: int = 0
+    awaiting_refinement: int = 0
+    needs_attention: int = 0
+    awaiting_audit: int = 0
+    dependency_blocked: int = 0
+    other_unresolved: int = 0
 
     def to_json(self) -> dict:
         return {
             "cards": [c.to_json() for c in self.cards],
             "building": self.building,
             "landed_today": self.landed_today,
+            "view_building": self.view_building,
+            "unresolved": self.unresolved,
+            "awaiting_refinement": self.awaiting_refinement,
+            "needs_attention": self.needs_attention,
+            "awaiting_audit": self.awaiting_audit,
+            "dependency_blocked": self.dependency_blocked,
+            "other_unresolved": self.other_unresolved,
         }
 
 
@@ -847,21 +861,25 @@ def _readiness(
 # ---------------------------------------------------------------------------
 
 
-def _building_count(cfg: "ReviewConfig") -> int:
-    """How many conductor jobs are currently running (the "building"
-    counter). Read purely from the conductor's jobs.json snapshot — no
-    process inspection, no API. 0 when there is no conductor snapshot."""
-    from marathon.conductor import load_jobs_snapshot
+def _live_building_jobs(cfg: "ReviewConfig") -> list[dict]:
+    """Serialized conductor jobs that definitely own a live worker.
+
+    A raw ``status == 'running'`` row can outlive its worker across a reboot.
+    Use conductor recovery's liveness predicate so Queue, Status, and Issues
+    cannot disagree about a phantom build.
+    """
+    from marathon.conductor import load_jobs_snapshot, snapshot_job_is_live
 
     try:
         snap = load_jobs_snapshot(cfg.repo_dir)
     except Exception:  # noqa: BLE001 — droppable runtime state
-        return 0
+        return []
     if not snap:
-        return 0
-    return sum(
-        1 for j in snap.get("jobs", []) if j.get("status") == "running"
-    )
+        return []
+    return [
+        job for job in snap.get("jobs", [])
+        if isinstance(job, dict) and snapshot_job_is_live(job)
+    ]
 
 
 def _landed_today_count(cfg: "ReviewConfig") -> int:
@@ -996,10 +1014,57 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
             blocked_reason=blocked_reason,
             title=meta.get("title") or f"#{num}",
         ))
+    live_jobs = _live_building_jobs(cfg)
+    live_issue_ids: set[int] = set()
+    for job in live_jobs:
+        try:
+            live_issue_ids.add(int(job.get("issue_num")))
+        except (TypeError, ValueError):
+            pass
+
+    unresolved_cards = [
+        card for card in cards
+        if ctx.verdict_status.get(card.id) not in RESOLVED_DEP_STATUSES
+    ]
+    unresolved_ids = {card.id for card in unresolved_cards}
+    active_ids = unresolved_ids & live_issue_ids
+    refinement_ids = {
+        card.id for card in unresolved_cards
+        if ctx.verdict_status.get(card.id) == "rejected"
+    } - active_ids
+    attention_ids = {
+        card.id for card in unresolved_cards
+        if ctx.verdict_status.get(card.id) == "stalled"
+    } - active_ids
+    audit_ids = {
+        card.id for card in unresolved_cards
+        if not card.ready and card.blocked_reason
+        and (
+            "audit evidence" in card.blocked_reason
+            or "audit snapshot" in card.blocked_reason
+            or "fails to build" in card.blocked_reason
+        )
+    } - active_ids - refinement_ids - attention_ids
+    dependency_ids = {
+        card.id for card in unresolved_cards
+        if not card.ready and card.blocked_reason
+        and card.blocked_reason.startswith("waiting on dependency")
+    } - active_ids - refinement_ids - attention_ids - audit_ids
+    categorized_ids = (
+        active_ids | refinement_ids | attention_ids | audit_ids | dependency_ids
+    )
+
     return Queue(
         cards=cards,
-        building=_building_count(cfg),
+        building=len(live_jobs),
         landed_today=_landed_today_count(cfg),
+        view_building=len(active_ids),
+        unresolved=len(unresolved_ids),
+        awaiting_refinement=len(refinement_ids),
+        needs_attention=len(attention_ids),
+        awaiting_audit=len(audit_ids),
+        dependency_blocked=len(dependency_ids),
+        other_unresolved=len(unresolved_ids - categorized_ids),
     )
 
 
