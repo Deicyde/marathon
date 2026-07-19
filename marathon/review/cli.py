@@ -597,6 +597,7 @@ def _run_automerge_subcommand(args) -> None:
         dry_run=getattr(args, "dry_run", False),
     )
     merged = [r for r in results if r.action in ("merged", "would-merge")]
+    recovering = [r for r in results if r.action == "recovery-queued"]
     skipped = [r for r in results if r.action == "skipped"]
     failed = [r for r in results if r.action == "failed"]
     if not results:
@@ -604,8 +605,11 @@ def _run_automerge_subcommand(args) -> None:
         return
     print(
         f"automerge: {len(merged)} merged/would-merge, "
+        f"{len(recovering)} base refresh(es) queued, "
         f"{len(skipped)} skipped, {len(failed)} failed."
     )
+    for r in recovering:
+        print(r.line())
     for r in skipped:
         print(r.line())
     if failed:

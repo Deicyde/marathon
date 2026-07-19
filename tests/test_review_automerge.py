@@ -554,6 +554,109 @@ def test_recovery_queued_inside_merge_cannot_be_consumed_by_old_completion(
     assert current.recovery_mode == review_state.RECOVERY_START_OVER
 
 
+@pytest.mark.parametrize(
+    "mergeable, merge_state, reason",
+    [
+        ("CONFLICTING", "DIRTY", "merge conflicts"),
+        (
+            "MERGEABLE",
+            "BEHIND",
+            "base moved after build",
+        ),
+    ],
+)
+def test_automerge_queues_non_destructive_update_for_stale_owned_refine(
+    monkeypatch, tmp_path, mergeable, merge_state, reason
+):
+    from tests.test_conductor import make_cfg
+
+    cfg = make_cfg(tmp_path)
+    head = "marathon/refine-c16-i240"
+    pr = _pr(
+        279,
+        head=head,
+        build="OK",
+        mergeable=mergeable,
+        state=merge_state,
+    )
+    rejected = review_state.record_rejection(
+        cfg, 240, "keep the existing PR and repair its integration"
+    )
+    review_state.record_iteration(
+        cfg,
+        240,
+        expected_verdict_ts=rejected.verdict_ts,
+        iteration_branch=head,
+        iteration_commit_sha=pr["headRefOid"],
+    )
+    calls = _install_gh(monkeypatch, [pr])
+
+    [result] = am.automerge(cfg)
+
+    assert calls["merged"] == []
+    assert result.action == "recovery-queued"
+    assert reason in result.reason
+    current = review_state.load_state(cfg).issues[240]
+    assert current.recovery_mode == review_state.RECOVERY_UPDATE_CONTINUE
+    assert current.recovery_id
+    assert current.recovery_pr == 279
+    assert current.recovery_branch == head
+    assert current.recovery_head_sha == pr["headRefOid"]
+    assert current.recovery_base == "main"
+    assert current.needs_iteration() is True
+
+    # A second merge pass must not replace the operation token or enqueue a
+    # duplicate worker while the first recovery owns the branch.
+    operation_id = current.recovery_id
+    [second] = am.automerge(cfg)
+    assert second.action == "skipped"
+    assert review_state.load_state(cfg).issues[240].recovery_id == operation_id
+
+
+def test_automerge_does_not_auto_recover_unowned_or_scope_excluded_refine(
+    monkeypatch, tmp_path
+):
+    from tests.test_conductor import make_cfg
+
+    cfg = make_cfg(tmp_path)
+    head = "marathon/refine-c16-i240"
+    pr = _pr(
+        279,
+        head=head,
+        build="OK",
+        mergeable="CONFLICTING",
+        state="DIRTY",
+    )
+    rejected = review_state.record_rejection(cfg, 240, "repair it")
+    review_state.record_iteration(
+        cfg,
+        240,
+        expected_verdict_ts=rejected.verdict_ts,
+        iteration_branch=head,
+        iteration_commit_sha="a-different-head",
+    )
+    _install_gh(monkeypatch, [pr])
+
+    [unowned] = am.automerge(cfg)
+    assert unowned.action == "skipped"
+    assert review_state.load_state(cfg).issues[240].recovery_id is None
+
+    review_state.record_iteration(
+        cfg,
+        240,
+        expected_verdict_ts=rejected.verdict_ts,
+        iteration_branch=head,
+        iteration_commit_sha=pr["headRefOid"],
+    )
+    [excluded] = am.automerge(cfg, scope="infra")
+    assert excluded.action == "skipped"
+    assert review_state.load_state(cfg).issues[240].recovery_id is None
+
+    [dry_run] = am.automerge(cfg, dry_run=True)
+    assert dry_run.action == "skipped"
+    assert review_state.load_state(cfg).issues[240].recovery_id is None
+
+
 def test_pr_fields_include_commits():
     # The build-verdict signal must ride in the single `gh pr list` call.
     assert "commits" in am._PR_FIELDS

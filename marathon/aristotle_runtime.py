@@ -48,6 +48,7 @@ from aristotlelib import (
 RETRYABLE_STATUSES: frozenset[TaskStatus] = frozenset({
     TaskStatus.COMPLETE_WITH_ERRORS,
     TaskStatus.FAILED,
+    TaskStatus.OUT_OF_BUDGET,
 })
 
 NON_RETRYABLE_FAILURE_STATUSES: frozenset[TaskStatus] = frozenset({
@@ -67,8 +68,10 @@ NON_RETRYABLE_FAILURE_STATUSES: frozenset[TaskStatus] = frozenset({
 # ``RETRYABLE_STATUSES``; when both flags fire, the continuation path
 # is preferred. ``OUT_OF_BUDGET`` used to live in
 # ``NON_RETRYABLE_FAILURE_STATUSES`` (treated as a hard terminal); it
-# was promoted to continuable in line with the SDK's "Resume by telling
-# Aristotle to continue" docstring.
+# was promoted to both continuable and retryable in line with the SDK's
+# "Resume by telling Aristotle to continue" docstring. Keeping it out of the
+# retryable set made refine classify it as an unexpected status and waste a
+# whole conductor attempt before the next process finally called ``ask()``.
 CONTINUABLE_STATUSES: frozenset[TaskStatus] = frozenset({
     TaskStatus.COMPLETE_WITH_ERRORS,
     TaskStatus.OUT_OF_BUDGET,

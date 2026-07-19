@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -86,8 +87,11 @@ SAFE_INFRA_PREFIX = ".marathon/"
 
 @dataclass(frozen=True)
 class AutoMergeResult:
-    """One PR's outcome this cycle. ``action`` ∈ {merged, would-merge, skipped,
-    failed}; ``reason`` is the human-readable why."""
+    """One PR's outcome this cycle.
+
+    ``action`` is one of ``merged``, ``would-merge``, ``recovery-queued``,
+    ``skipped``, or ``failed``; ``reason`` is the human-readable why.
+    """
 
     pr: int
     head: str
@@ -99,6 +103,7 @@ class AutoMergeResult:
         verb = {
             "merged": "merged",
             "would-merge": "WOULD merge",
+            "recovery-queued": "queued base-refresh recovery for",
             "skipped": "skip",
             "failed": "FAILED to merge",
         }.get(self.action, self.action)
@@ -617,6 +622,76 @@ def _pr_head_sha(pr: dict) -> Optional[str]:
     return oid if isinstance(oid, str) and oid else None
 
 
+def _queue_base_update_recovery(
+    cfg: "ReviewConfig",
+    pr: dict,
+) -> Optional[int]:
+    """Queue ``update-continue`` for one stale, owned refine PR.
+
+    A green refine PR can become BEHIND or CONFLICTING after another Marathon
+    PR lands on the same base.  The merge gate has always refused that untested
+    integration, but merely returning ``"merge conflicts"`` left the rejection
+    parked until a human pressed Re-queue.  Convert that deterministic merge
+    outcome into the existing non-destructive recovery operation instead:
+    update the *same* branch from the current base, build it, and call Aristotle
+    only if the integration itself needs repair.
+
+    Every identity used below is immutable and compare-and-swapped through
+    review state.  A new human verdict, a moved PR head, or an already-running
+    recovery therefore wins without being overwritten.  Non-state-backed
+    callers retain the old read-only skip behaviour.
+    """
+    if not hasattr(cfg, "repo_dir"):
+        return None
+    head = pr.get("headRefName")
+    match = _REFINE_BRANCH_RE.match(head or "")
+    pr_num = pr.get("number")
+    head_sha = _pr_head_sha(pr)
+    base = pr.get("baseRefName")
+    if (
+        match is None
+        or not isinstance(pr_num, int)
+        or not isinstance(head_sha, str)
+        or not isinstance(base, str)
+        or not base
+    ):
+        return None
+
+    from marathon.review.state import (
+        RECOVERY_UPDATE_CONTINUE,
+        load_state,
+        request_recovery_if_current,
+    )
+
+    issue = int(match.group(1))
+    current = load_state(cfg).issues.get(issue)
+    if (
+        current is None
+        or current.status != "rejected"
+        or current.recovery_id is not None
+        or current.iteration_branch != head
+        or current.iteration_commit_sha != head_sha
+        or not (current.notes or "").strip()
+        or current.needs_iteration()
+    ):
+        return None
+
+    queued = request_recovery_if_current(
+        cfg,
+        issue,
+        expected_status="rejected",
+        expected_verdict_ts=current.verdict_ts,
+        expected_recovery_id=None,
+        recovery_id=secrets.token_hex(16),
+        recovery_mode=RECOVERY_UPDATE_CONTINUE,
+        recovery_pr=pr_num,
+        recovery_branch=head,
+        recovery_head_sha=head_sha,
+        recovery_base=base,
+    )
+    return issue if queued is not None else None
+
+
 def automerge(
     cfg: "ReviewConfig",
     *,
@@ -691,7 +766,23 @@ def automerge(
             if not ok:
                 reason = ownership_reason
         if not ok:
-            results.append(AutoMergeResult(num, head, title, "skipped", reason))
+            recovery_issue = None
+            if not dry_run and scope == "any" and reason in {
+                "merge conflicts",
+                "base moved after build; update the refine PR and rebuild",
+            }:
+                recovery_issue = _queue_base_update_recovery(cfg, pr)
+            if recovery_issue is not None:
+                results.append(AutoMergeResult(
+                    num,
+                    head,
+                    title,
+                    "recovery-queued",
+                    f"{reason}; preserving PR and updating #{recovery_issue} "
+                    "from the current base",
+                ))
+            else:
+                results.append(AutoMergeResult(num, head, title, "skipped", reason))
             continue
         if dry_run:
             results.append(AutoMergeResult(num, head, title, "would-merge", reason))
@@ -742,11 +833,17 @@ def automerge(
 
     merged_n = sum(1 for r in results if r.action == "merged")
     would_n = sum(1 for r in results if r.action == "would-merge")
-    if results and (merged_n or would_n or any(r.action == "failed" for r in results)):
+    recovery_n = sum(1 for r in results if r.action == "recovery-queued")
+    if results and (
+        merged_n
+        or would_n
+        or recovery_n
+        or any(r.action == "failed" for r in results)
+    ):
         verb = "would merge" if dry_run else "merged"
         print(
             f"  automerge: {len(prs)} open PR(s) onto {base}; "
-            f"{verb} {would_n or merged_n}",
+            f"{verb} {would_n or merged_n}; queued {recovery_n} base refresh(es)",
             flush=True,
         )
         for r in results:
