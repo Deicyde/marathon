@@ -371,6 +371,7 @@ def demo_queue() -> dict:
         "unresolved": unresolved,
         "awaiting_refinement": 0,
         "needs_attention": 0,
+        "needs_citation_mapping": 0,
         "awaiting_audit": 0,
         "dependency_blocked": 0,
         "other_unresolved": unresolved,

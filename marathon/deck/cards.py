@@ -351,6 +351,7 @@ class Queue:
     unresolved: int = 0
     awaiting_refinement: int = 0
     needs_attention: int = 0
+    needs_citation_mapping: int = 0
     awaiting_audit: int = 0
     dependency_blocked: int = 0
     other_unresolved: int = 0
@@ -364,6 +365,7 @@ class Queue:
             "unresolved": self.unresolved,
             "awaiting_refinement": self.awaiting_refinement,
             "needs_attention": self.needs_attention,
+            "needs_citation_mapping": self.needs_citation_mapping,
             "awaiting_audit": self.awaiting_audit,
             "dependency_blocked": self.dependency_blocked,
             "other_unresolved": self.other_unresolved,
@@ -634,6 +636,23 @@ def _decls_for_issue(ctx: _DeckContext, num: int) -> list[str]:
     return sorted(extract_declarations_from_issue_body(body))
 
 
+def _issue_needs_citation_mapping(ctx: _DeckContext, num: int) -> bool:
+    """Whether a fetched issue body contains no Lean declaration citations.
+
+    This is deliberately distinct from missing GitHub metadata: a failed or
+    capped metadata fetch must not make a healthy card look as if a human
+    deleted its mapping.  Once the body is present, however, an empty
+    ``### Lean declarations`` / ``### Lean signatures`` section is actionable
+    issue drift, not something another machine-audit run can repair.
+    """
+    meta = ctx.issue_meta.get(num)
+    return (
+        meta is not None
+        and meta.get("body") is not None
+        and not _decls_for_issue(ctx, num)
+    )
+
+
 def _resolve_to_snapshot(ctx: _DeckContext, raw: str) -> Optional[str]:
     """Resolve a body-cited name (often unqualified) to a snapshot decl:
     exact, else a UNIQUE dotted-suffix match — the same deterministic rule
@@ -827,6 +846,11 @@ def _readiness(
     if status == "deferred":
         return False, "deferred"
 
+    if _issue_needs_citation_mapping(ctx, num):
+        return False, (
+            "no Lean declarations cited — map this issue to its current "
+            "declaration(s) before review"
+        )
     if ctx.snapshot is None:
         return False, "no audit snapshot — run `marathon audit run` to gate it"
     broken_decl = _issue_build_broken(ctx, num)
@@ -1036,6 +1060,10 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
         card.id for card in unresolved_cards
         if ctx.verdict_status.get(card.id) == "stalled"
     } - active_ids
+    mapping_ids = {
+        card.id for card in unresolved_cards
+        if _issue_needs_citation_mapping(ctx, card.id)
+    } - active_ids - refinement_ids - attention_ids
     audit_ids = {
         card.id for card in unresolved_cards
         if not card.ready and card.blocked_reason
@@ -1044,14 +1072,15 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
             or "audit snapshot" in card.blocked_reason
             or "fails to build" in card.blocked_reason
         )
-    } - active_ids - refinement_ids - attention_ids
+    } - active_ids - refinement_ids - attention_ids - mapping_ids
     dependency_ids = {
         card.id for card in unresolved_cards
         if not card.ready and card.blocked_reason
         and card.blocked_reason.startswith("waiting on dependency")
-    } - active_ids - refinement_ids - attention_ids - audit_ids
+    } - active_ids - refinement_ids - attention_ids - mapping_ids - audit_ids
     categorized_ids = (
-        active_ids | refinement_ids | attention_ids | audit_ids | dependency_ids
+        active_ids | refinement_ids | attention_ids | mapping_ids | audit_ids
+        | dependency_ids
     )
 
     return Queue(
@@ -1062,6 +1091,7 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
         unresolved=len(unresolved_ids),
         awaiting_refinement=len(refinement_ids),
         needs_attention=len(attention_ids),
+        needs_citation_mapping=len(mapping_ids),
         awaiting_audit=len(audit_ids),
         dependency_blocked=len(dependency_ids),
         other_unresolved=len(unresolved_ids - categorized_ids),

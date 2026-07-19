@@ -864,6 +864,7 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .issue-row { display: flex; align-items: center; gap: 0.55rem; padding: 0.5rem 0.7rem; border: 1px solid var(--line); border-radius: 9px; margin-bottom: 0.35rem; background: var(--panel); }
 .issue-id { font-family: var(--mono); color: var(--muted); min-width: 2.8rem; font-size: 0.82rem; }
 .issue-title { flex: 1; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.issue-blocker { max-width: 38%; color: var(--warn); font-size: 0.74rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .issue-tier { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 0.3rem; }
 .issue-row.is-ready { cursor: pointer; }
 .issue-row.is-ready:hover { border-color: var(--accent); }

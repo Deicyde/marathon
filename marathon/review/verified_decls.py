@@ -126,21 +126,49 @@ _DECL_SECTION_RE = re.compile(
 # (`def DifferentialForm.IsNonvanishing`) — the intake emits both shapes.
 _BACKTICK_TOKEN_RE = re.compile(r"`([^`\n]+)`")
 _BARE_NAME_RE = re.compile(r"[A-Za-z_][\w'.]*\Z")
+_DECL_BULLET_RE = re.compile(r"^[ \t]*[-*+][ \t]+")
+
+
+def _declaration_bullet_citation(
+    line: str,
+) -> "Optional[tuple[str, re.Match[str]]]":
+    """Return the primary ``(name, token_match)`` cited by one Markdown bullet.
+
+    Intake bullets contain exactly one declaration anchor, followed by free-form
+    explanatory prose that may itself contain Lean identifiers in backticks::
+
+        - [`Prop_16_5`](...) — `manifoldIntegral` is well-defined for ...
+
+    Only the *first valid declaration token* is the citation.  Treating every
+    later backtick as another citation made the stale-citation control delete
+    the whole bullet when a descriptive term disappeared, silently erasing the
+    real declaration anchor.  All declaration-section readers and rewriters
+    share this helper so extraction and mutation cannot disagree again.
+    """
+    if _DECL_BULLET_RE.match(line) is None:
+        return None
+    for match in _BACKTICK_TOKEN_RE.finditer(line):
+        content = match.group(1).strip()
+        decl_match = _DECL_RE.match(content)
+        if decl_match:
+            return decl_match.group("name"), match
+        if _BARE_NAME_RE.fullmatch(content):
+            return content, match
+    return None
 
 
 def extract_declarations_from_declaration_sections(body: str) -> set[str]:
     """Declaration names cited in a ``### Lean declarations`` section (the
     chapter-intake issue format: backtick'd names + source links). Handles a
-    bare name (`Foo.bar`) AND a name carrying its keyword (`def Foo.bar`)."""
+    bare name (`Foo.bar`) AND a name carrying its keyword (`def Foo.bar`).
+    Descriptive backticks after a bullet's primary anchor are prose, not extra
+    citations."""
     out: set[str] = set()
     for sec in _DECL_SECTION_RE.finditer(body):
-        for m in _BACKTICK_TOKEN_RE.finditer(sec.group(1)):
-            content = m.group(1).strip()
-            dm = _DECL_RE.match(content)
-            if dm:
-                out.add(dm.group("name"))         # `def Foo.bar` → Foo.bar
-            elif _BARE_NAME_RE.match(content):
-                out.add(content)                  # `Foo.bar` → Foo.bar
+        for line in sec.group(1).splitlines():
+            citation = _declaration_bullet_citation(line)
+            if citation is not None:
+                out.add(citation[0])
     return out
 
 

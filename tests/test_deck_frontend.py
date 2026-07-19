@@ -1323,12 +1323,16 @@ def test_empty_and_error_states_exist(app_js: str):
     assert "No issues ready for review" in app_js
     assert "awaiting_refinement" in app_js
     assert "needs_attention" in app_js
+    assert "needs_citation_mapping" in app_js
+    assert "need declaration mapping" in app_js
     assert "awaiting_audit" in app_js
+    assert "need current machine-audit evidence" in app_js
     assert "dependency_blocked" in app_js
     assert "other_unresolved" in app_js
     assert "actively building" in app_js
     assert "check back shortly" not in app_js
     assert "Open status" in app_js
+    assert "Open issues" in app_js
     assert "showErrorCard" in code
     assert "Retry" in app_js
     summary = _fn_body(code, "function queueBlockerSummary")
@@ -2122,6 +2126,7 @@ def test_dashboard_numbers_link_to_github(app_js: str):
     assert "target" in fn and "stopPropagation" in fn  # new tab; don't open review
     iss = _fn_body(code, "function renderIssuesTab")
     assert 'ghLink(d.repo, "issues"' in iss
+    assert "it.blocked_reason" in iss and "issue-blocker" in iss
     hist = _fn_body(code, "function renderHistoryTab")
     assert 'ghLink(d.repo, "issues"' in hist   # verdict events -> issue
     assert 'ghLink(d.repo, "pull"' in hist     # merged PRs -> PR

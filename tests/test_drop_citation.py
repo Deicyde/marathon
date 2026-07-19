@@ -23,6 +23,8 @@ Coverage here:
 * REFUSES a live (in-code) decl;
 * REFUSES a decl with a leaf-match rename ("reconcile, don't drop");
 * REFUSES a decl the issue does not cite.
+* REFUSES removal of the final real declaration citation;
+* never mistakes a descriptive backtick on a declaration bullet for a citation.
 
 Fully offline: head_sha / issue_body / _gh_edit_body / the snapshot are
 monkeypatched or written under a tmp repo; no network / git / lake. Reuses the
@@ -31,6 +33,8 @@ signature-body fixtures.
 """
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 from marathon.deck import refresh as refresh_mod
 from marathon.deck.refresh import (
@@ -239,6 +243,72 @@ def test_refuses_uncited_decl(tmp_path, monkeypatch):
     r = drop_stale_citation(cfg, 98, "Demo.Chapter15.Tf.NeverCited.absent")
     assert r["ok"] is False and r["dropped"] is False
     assert "does not cite" in r["message"]
+    assert edits == []
+
+
+def test_refuses_descriptive_backtick_without_deleting_real_anchor(
+    tmp_path, monkeypatch,
+):
+    """A prose identifier later on a declaration bullet is not its citation.
+    The old all-backticks parser treated it as one and deleted the entire line,
+    taking the genuine first anchor with it."""
+    kept = "Demo.Chapter15.Tf.KeptResult.holds"
+    body = (
+        "### Lean declarations\n\n"
+        f"- [`{kept}`](Tf.lean) — the old `{_DEAD}` helper is unnecessary.\n\n"
+        "### Informal Statement\n\nThe statement.\n"
+    )
+    cfg, edits = _setup(tmp_path, monkeypatch, body=body)
+
+    r = drop_stale_citation(cfg, 98, _DEAD)
+
+    assert r["ok"] is False and r["dropped"] is False
+    assert "does not cite" in r["message"]
+    assert edits == []
+    assert extract_declarations_from_issue_body(body) == {kept}
+
+
+def test_refuses_to_drop_final_declaration_citation(tmp_path, monkeypatch):
+    """Even a confirmed-dead citation cannot be removed when it is the issue's
+    final anchor; the replacement must be mapped first so the card never becomes
+    an empty, permanently unreviewable ghost."""
+    body = _decl_body(_DEAD)
+    cfg, edits = _setup(tmp_path, monkeypatch, body=body)
+
+    r = drop_stale_citation(cfg, 98, _DEAD)
+
+    assert r["ok"] is False and r["dropped"] is False
+    assert "final Lean declaration citation" in r["message"]
+    assert "map its replacement first" in r["message"]
+    assert edits == []
+
+
+def test_refuses_drop_when_result_split_replacements_are_available(
+    tmp_path, monkeypatch,
+):
+    """A differently suffixed 1→N split has no same-leaf rename target, but the
+    result-key surfacing model can still recover it.  Drop must defer to that
+    reconciliation instead of destroying the old identity anchor."""
+    kept = "Demo.Chapter15.Tf.KeptResult.holds"
+    body = _decl_body(kept, _DEAD)
+    cfg, edits = _setup(tmp_path, monkeypatch, body=body)
+    import marathon.deck.cards as card_mod
+
+    monkeypatch.setattr(
+        card_mod,
+        "surfaced_decls_for_issue",
+        lambda cfg, issue, cited: [
+            SimpleNamespace(name="Demo.Prop_preserving", in_code=True),
+            SimpleNamespace(name="Demo.Prop_reversing", in_code=True),
+        ],
+    )
+
+    r = drop_stale_citation(cfg, 98, _DEAD)
+
+    assert r["ok"] is False and r["dropped"] is False
+    assert "replacement declaration(s) are available" in r["message"]
+    assert "Demo.Prop_preserving" in r["message"]
+    assert "reconcile before dropping" in r["message"]
     assert edits == []
 
 

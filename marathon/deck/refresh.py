@@ -605,6 +605,7 @@ from marathon.review.verified_decls import (  # noqa: E402
     _ATTR as _DECL_ATTR,
     _BACKTICK_TOKEN_RE,
     _BARE_NAME_RE,
+    _declaration_bullet_citation,
     _DECL_RE,
     _DECL_SECTION_RE,
     _MOD as _DECL_MOD,
@@ -1217,18 +1218,16 @@ def _citation_identity_fingerprint(body: str, old: str) -> Optional[str]:
 
     for section_match in _DECL_SECTION_RE.finditer(body):
         for line in section_match.group(1).splitlines():
-            for token_match in _BACKTICK_TOKEN_RE.finditer(line):
-                content = token_match.group(1).strip()
-                decl_match = _DECL_RE.match(content)
-                token = decl_match.group("name") if decl_match else (
-                    content if _BARE_NAME_RE.match(content) else None
-                )
-                if token is not None and _cites_same_decl(token, old):
-                    anchors.append({
-                        "format": "declaration",
-                        "token": token,
-                        "shape": content,
-                    })
+            citation = _declaration_bullet_citation(line)
+            if citation is None:
+                continue
+            token, token_match = citation
+            if _cites_same_decl(token, old):
+                anchors.append({
+                    "format": "declaration",
+                    "token": token,
+                    "shape": token_match.group(1).strip(),
+                })
     if not anchors:
         return None
     anchors.sort(key=lambda item: (
@@ -2058,16 +2057,11 @@ def _drop_declaration_bullet(body: str, decl_name: str) -> tuple[str, bool]:
         section = m.group(1)
         out_lines: list[str] = []
         for line in section.splitlines(keepends=True):
-            citing = False
-            for tok in _BACKTICK_TOKEN_RE.finditer(line):
-                content = tok.group(1).strip()
-                dm = _DECL_RE.match(content)
-                name = dm.group("name") if dm else (
-                    content if _BARE_NAME_RE.match(content) else None
-                )
-                if name is not None and _cites_same_decl(name, decl_name):
-                    citing = True
-                    break
+            citation = _declaration_bullet_citation(line)
+            citing = (
+                citation is not None
+                and _cites_same_decl(citation[0], decl_name)
+            )
             if citing:
                 dropped = True
                 continue  # drop this bullet line entirely
@@ -2178,7 +2172,8 @@ def _drop_stale_citation_unlocked(
     but ONLY a human may invoke it (dropping can erase a real missing-work
     signal), via the token-gated ``POST /api/drop-citation``.
 
-    SAFETY GATE — ``decl_name`` is droppable ONLY when ALL three hold (else this
+    SAFETY GATE — ``decl_name`` is droppable ONLY when every condition holds
+    (else this
     returns ``{ok:False, dropped:False, message:…}`` and writes NOTHING):
 
     * (a) it is CITED by the issue body (in ``extract_declarations_from_issue_body``,
@@ -2189,8 +2184,11 @@ def _drop_stale_citation_unlocked(
       the auto-reconciler uses (:func:`_leaf_match_rename` over
       :func:`orphaned_chapter_decls` for the issue's chapter). A rename target
       means RECONCILE, not drop, so we REFUSE and name the target.
+    * (d) at least one other real declaration citation remains. An issue with no
+      declaration anchor is not reviewable, so removing its last anchor requires
+      first mapping a replacement (or explicitly closing/deferring the issue).
 
-    Only a confirmed dead-end (cited + gone-from-code + no rename) is dropped.
+    Only a confirmed dead-end with another real anchor still present is dropped.
 
     The body edit removes the citation from BOTH formats — the matching
     ``### Lean declarations`` bullet line AND the matching ``### Lean
@@ -2206,6 +2204,7 @@ def _drop_stale_citation_unlocked(
     (``verified_staleness`` sees "removed/renamed") — no special handling here."""
     from marathon.deck.cards import (
         _build_decl_view, _load_context, _decls_for_issue, _ledger,
+        surfaced_decls_for_issue,
     )
     from marathon.review.github import issue_body as _issue_body
     from marathon.review.verified_decls import (
@@ -2231,9 +2230,10 @@ def _drop_stale_citation_unlocked(
     # cited raw name to a card view (the same machinery the deck/footnote use)
     # and find the one whose resolved name is ``decl_name``. A name not cited at
     # all is refused here.
+    cited_body_names = extract_declarations_from_issue_body(body)
     if not any(
         _cites_same_decl(c, decl_name)
-        for c in extract_declarations_from_issue_body(body)
+        for c in cited_body_names
     ):
         return {"ok": False, "dropped": False,
                 "message": (
@@ -2280,6 +2280,44 @@ def _drop_stale_citation_unlocked(
                         f"a rename is available (`{rename}`) — "
                         "reconcile, don't drop")}
 
+    # A stale parent may have split into differently suffixed declarations, so
+    # the same-leaf rename gate above cannot see it (``Prop_16_3`` →
+    # ``Prop_16_3_preserving`` / ``_reversing``).  Reuse the deck's tightly
+    # result-key/docstring-gated surfacing model before allowing destruction.
+    # Explicit citation drops are rare; the extra read is preferable to losing
+    # a recoverable old→new identity transition.
+    surfaced = surfaced_decls_for_issue(cfg, issue_num, cited_raw)
+    replacements = sorted({view.name for view in surfaced if view.in_code})
+    if replacements:
+        joined = ", ".join(f"`{name}`" for name in replacements)
+        return {
+            "ok": False,
+            "dropped": False,
+            "message": (
+                f"replacement declaration(s) are available ({joined}) — "
+                "reconcile before dropping the stale citation"
+            ),
+        }
+
+    # (d) NEVER STRAND THE ISSUE — a citation section with no real anchors is
+    # not machine-auditable or reviewable.  Map the replacement first so the
+    # old→new transition is atomic from the deck's perspective.  This also
+    # catches the common one-bullet case before any body rewrite is attempted.
+    remaining = {
+        cited for cited in cited_body_names
+        if not _cites_same_decl(cited, decl_name)
+    }
+    if not remaining:
+        return {
+            "ok": False,
+            "dropped": False,
+            "message": (
+                f"refusing to drop #{issue_num}'s final Lean declaration "
+                "citation — map its replacement first (or close/defer the "
+                "issue if the tracked work was intentionally removed)"
+            ),
+        }
+
     # Gate passed: a confirmed dead-end. Remove the citation from BOTH formats.
     new_body, dropped_bullet = _drop_declaration_bullet(body, decl_name)
     new_body, dropped_block = _drop_signature_block(new_body, decl_name)
@@ -2290,6 +2328,20 @@ def _drop_stale_citation_unlocked(
                     "block/bullet was found in the body")}
 
     new_body, _noted = _append_informal_drop_note(new_body, decl_name)
+
+    # Belt-and-braces postcondition: even with a malformed multi-declaration
+    # block, the rewrite must remove exactly the requested citation(s), never an
+    # unrelated anchor merely because it shared a Markdown line or fence.
+    after_citations = extract_declarations_from_issue_body(new_body)
+    if after_citations != remaining:
+        return {
+            "ok": False,
+            "dropped": False,
+            "message": (
+                f"dropping `{decl_name}` would change unrelated declaration "
+                f"citations on #{issue_num}; no edit was made"
+            ),
+        }
 
     result = {
         "ok": True, "dropped": True,
@@ -2372,21 +2424,22 @@ def _swap_decl_token(section: str, old_name: str, new_name: str) -> tuple[str, b
     replaced)``."""
     replaced = False
 
-    def _sub(m: "re.Match[str]") -> str:
-        nonlocal replaced
-        content = m.group(1).strip()
+    lines: list[str] = []
+    for line in section.splitlines(keepends=True):
+        citation = _declaration_bullet_citation(line)
+        if citation is None or not _cites_same_decl(citation[0], old_name):
+            lines.append(line)
+            continue
+        _anchor, match = citation
+        content = match.group(1).strip()
         # Keyword shape: `def Foo.bar` — swap only the trailing name.
         dm = _DECL_KW_PREFIX_RE.match(content)
-        if dm and dm.group("name") == old_name:
-            replaced = True
-            return f"`{dm.group('kw')}{new_name}`"
-        # Bare-name shape: `Foo.bar`.
-        if content == old_name:
-            replaced = True
-            return f"`{new_name}`"
-        return m.group(0)
-
-    return _BACKTICK_TOKEN_RE.sub(_sub, section), replaced
+        replacement = (
+            f"`{dm.group('kw')}{new_name}`" if dm else f"`{new_name}`"
+        )
+        lines.append(line[:match.start()] + replacement + line[match.end():])
+        replaced = True
+    return "".join(lines), replaced
 
 
 def _remove_decl_bullet_lines(
@@ -2403,18 +2456,18 @@ def _remove_decl_bullet_lines(
     removed: "set[str]" = set()
     kept: "list[str]" = []
     for line in section.split("\n"):
-        if line.lstrip().startswith("-"):
-            hit = None
-            for mm in _BACKTICK_TOKEN_RE.finditer(line):
-                content = mm.group(1).strip()
-                dm = _DECL_KW_PREFIX_RE.match(content)
-                cand = dm.group("name") if dm else content
-                if cand in want:
-                    hit = cand
-                    break
-            if hit is not None:
-                removed.add(hit)
-                continue
+        citation = _declaration_bullet_citation(line)
+        hit = next(
+            (
+                name for name in want
+                if citation is not None
+                and _cites_same_decl(citation[0], name)
+            ),
+            None,
+        )
+        if hit is not None:
+            removed.add(hit)
+            continue
         kept.append(line)
     return "\n".join(kept), removed
 

@@ -287,11 +287,10 @@
   }
 
   // postDropCitation — A GitHub WRITE (token-gated, HUMAN-TRIGGERED). Drops a
-  // confirmed-dead stale citation (cited + gone-from-code + no rename) from the
-  // issue body so the issue reviews cleanly. The backend re-validates the
-  // safety gate before any write — a live decl / a rename target / an uncited
-  // name is REFUSED ({ok:false}). Reached ONLY from the footnote's per-citation
-  // "Drop citation" button.
+  // confirmed-dead stale citation from the issue body so the issue reviews
+  // cleanly. The backend re-validates that it is cited, gone from code, has no
+  // replacement, and is not the issue's final anchor. Any failed condition is
+  // REFUSED ({ok:false}). Reached ONLY from the footnote's per-citation button.
   function postDropCitation(issue, decl) {
     return postJSON("/api/drop-citation", { issue: issue, decl: decl });
   }
@@ -365,6 +364,7 @@
     unresolved: 0,
     awaitingRefinement: 0,
     needsAttention: 0,
+    needsCitationMapping: 0,
     awaitingAudit: 0,
     dependencyBlocked: 0,
     otherUnresolved: 0,
@@ -2255,9 +2255,9 @@
   // nothing). The push-refresh button is the explicit way to fix the drift.
   // HUMAN-TRIGGERED drop of one confirmed-dead stale citation. POSTs to the
   // token-gated /api/drop-citation; the BACKEND re-validates the safety gate
-  // (cited + gone-from-code + no rename) before any write, so a refusal
-  // (rename available / live decl / uncited) surfaces here as a toast and
-  // writes nothing. On success the issue body lost the dead citation, so we
+  // (cited + gone-from-code + no replacement + another anchor remains) before
+  // any write, so a refusal surfaces here as a toast and writes nothing. On
+  // success the issue body lost the dead citation, so we
   // reload the subdeck to re-read it. NOT automatic — dropping can erase a real
   // missing-work signal, which is why it's a deliberate per-citation click.
   function dropCitation(name, btn) {
@@ -2385,8 +2385,8 @@
           class: "btn btn-tiny stale-drop",
           type: "button",
           title: "Drop this citation from the issue body — only if the decl was "
-               + "removed from the code (not renamed). The backend re-checks "
-               + "before writing.",
+               + "removed from the code, has no replacement, and is not the "
+               + "issue's final declaration. The backend re-checks before writing.",
           onclick: (function (nm) {
             return function (ev) { dropCitation(nm, ev.currentTarget); };
           })(name),
@@ -2407,9 +2407,10 @@
         reconciliationProposalPanel(),
         el("span", { class: "stale-foot-tail", text:
           "These are NOT review cards. The conductor reconciles renames " +
-          "automatically; a citation with no proven rename is kept (it may " +
+          "automatically; a citation with no proven replacement is kept (it may " +
           "signal genuinely-missing work). If the decl was deliberately " +
-          "REMOVED from the code, drop its citation above." }),
+          "REMOVED from the code, drop its citation above after mapping any " +
+          "replacement; the final declaration anchor cannot be dropped." }),
       ]),
     ]);
     return foot;
@@ -3249,8 +3250,11 @@
     if (state.needsAttention > 0) {
       parts.push(state.needsAttention + " need recovery attention");
     }
+    if (state.needsCitationMapping > 0) {
+      parts.push(state.needsCitationMapping + " need declaration mapping");
+    }
     if (state.awaitingAudit > 0) {
-      parts.push(state.awaitingAudit + " awaiting audit evidence");
+      parts.push(state.awaitingAudit + " need current machine-audit evidence");
     }
     if (state.dependencyBlocked > 0) {
       parts.push(state.dependencyBlocked + " blocked by dependencies");
@@ -3277,6 +3281,12 @@
         actions.unshift({
           label: "Open status",
           onClick: function () { switchTab("status"); },
+        });
+      }
+      if (state.needsCitationMapping > 0) {
+        actions.unshift({
+          label: "Open issues",
+          onClick: function () { switchTab("issues"); },
         });
       }
       showMessageCard({
@@ -4472,6 +4482,7 @@
         state.unresolved = data.unresolved || 0;
         state.awaitingRefinement = data.awaiting_refinement || 0;
         state.needsAttention = data.needs_attention || 0;
+        state.needsCitationMapping = data.needs_citation_mapping || 0;
         state.awaitingAudit = data.awaiting_audit || 0;
         state.dependencyBlocked = data.dependency_blocked || 0;
         state.otherUnresolved = data.other_unresolved || 0;
@@ -6820,6 +6831,11 @@
             statusBadge(it.status),
             el("span", { class: "issue-title", title: it.title || "", text: it.title || "(untitled)" }),
           ];
+          if (it.blocked_reason) kids.push(el("span", {
+            class: "issue-blocker",
+            title: it.blocked_reason,
+            text: it.blocked_reason,
+          }));
           if (it.tier) kids.push(el("span", { class: "issue-tier", text: it.tier }));
           var row = el("div", { class: "issue-row" + (it.ready ? " is-ready" : "") }, kids);
           if (it.ready) row.addEventListener("click", function () {

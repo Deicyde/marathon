@@ -2053,9 +2053,10 @@ class DeckHandler(BaseHTTPRequestHandler):
         it routes through the MECHANICAL
         :func:`marathon.deck.refresh.drop_stale_citation` (NO Claude), which
         validates the citation is a confirmed dead-end (cited + gone-from-code +
-        no rename) BEFORE removing it from both body formats and writing the new
-        body via a SINGLE ``gh issue edit``. A citation with a rename target / a
-        live decl / an uncited name is REFUSED (``ok:False``) and NOT written."""
+        no replacement + another real anchor remains) BEFORE removing it from
+        both body formats and writing the new body via a SINGLE ``gh issue
+        edit``. A citation with a replacement, a live/uncited name, or no other
+        anchor is REFUSED (``ok:False``) and NOT written."""
         data = self._read_guarded_body()
         if data is None:
             return  # the guard already sent the 4xx (origin / body / token)

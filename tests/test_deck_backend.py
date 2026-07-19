@@ -360,6 +360,7 @@ def test_queue_ready_and_dep_ordering(tmp_path, monkeypatch):
     assert queue.view_building == 0
     assert queue.awaiting_refinement == 0
     assert queue.needs_attention == 0
+    assert queue.needs_citation_mapping == 0
     assert queue.awaiting_audit == 0
     assert queue.dependency_blocked == 1
     assert queue.other_unresolved == 2
@@ -593,9 +594,43 @@ def test_queue_degrades_without_snapshot(tmp_path, monkeypatch):
         assert c.decl == {22: "Foo", 23: "Bar", 24: "Baz"}[c.id]
         assert c.title
     assert queue.unresolved == 3
+    assert queue.needs_citation_mapping == 0
     assert queue.awaiting_audit == 3
     assert queue.dependency_blocked == 0
     assert queue.other_unresolved == 0
+
+
+def test_empty_declaration_section_needs_mapping_not_audit(
+    tmp_path, monkeypatch,
+):
+    """A fetched issue whose citation section is empty is actionable body
+    drift.  A fresh audit cannot fix it, so it gets its own mutually-exclusive
+    queue category instead of the misleading ``awaiting_audit`` label."""
+    cfg = make_cfg(tmp_path)
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="def", value_pp="fun x => x"),
+        _decl("Demo.Chapter14.Bar"),
+        _decl("Demo.Chapter14.Baz", kind="def", value_pp="0"),
+    ]))
+    meta = _bodies_for({22: "Foo", 23: "Bar", 24: "Baz"})
+    meta[23]["body"] = "### Lean declarations\n\n\n### Informal Statement\n\nLemma Bar."
+    patch_bulk(monkeypatch, meta)
+
+    queue = cards.build_queue(cfg, chapter=14)
+    card = next(card for card in queue.cards if card.id == 23)
+
+    assert card.ready is False
+    assert card.decl == ""
+    assert card.blocked_reason is not None
+    assert "no Lean declarations cited" in card.blocked_reason
+    assert queue.needs_citation_mapping == 1
+    assert queue.awaiting_audit == 0
+    assert (
+        queue.view_building + queue.awaiting_refinement
+        + queue.needs_attention + queue.needs_citation_mapping
+        + queue.awaiting_audit + queue.dependency_blocked
+        + queue.other_unresolved
+    ) == queue.unresolved
 
 
 def test_queue_blocker_counts_are_view_scoped_and_mutually_exclusive(
@@ -647,7 +682,8 @@ def test_queue_blocker_counts_are_view_scoped_and_mutually_exclusive(
     assert queue.needs_attention == 1
     assert (
         queue.view_building + queue.awaiting_refinement
-        + queue.needs_attention + queue.awaiting_audit
+        + queue.needs_attention + queue.needs_citation_mapping
+        + queue.awaiting_audit
         + queue.dependency_blocked + queue.other_unresolved
     ) == queue.unresolved
 
@@ -1083,7 +1119,8 @@ def test_get_queue_is_pure_no_verdict(running_server, monkeypatch):
     assert "landed_today" in payload
     for key in (
         "view_building", "unresolved", "awaiting_refinement",
-        "needs_attention", "awaiting_audit", "dependency_blocked",
+        "needs_attention", "needs_citation_mapping", "awaiting_audit",
+        "dependency_blocked",
         "other_unresolved",
     ):
         assert key in payload

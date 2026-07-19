@@ -44,6 +44,25 @@ def test_declaration_sections_scoped_to_lean_declarations_only():
     assert extract_declarations_from_declaration_sections(INTAKE_BODY) == {"PointwiseOrientation"}
 
 
+def test_declaration_bullet_uses_only_primary_anchor_not_description():
+    """Backticked Lean terms in a bullet's explanation are prose.  Treating
+    them as citations made dropping one erase the bullet's real anchor."""
+    body = """### Lean declarations
+- [`Prop_16_3`](GeometricAnalysis/LeeSM/Chapter16/IntegrationRn.lean) — extension of 16.1 to compactly supported forms on open subsets: `∫_V ω = σ · ∫_U G*ω`.
+- [`Lemma_16_2`](GeometricAnalysis/LeeSM/Chapter16/IntegrationRn.lean) — every compact `K ⊆` open `U` lies in an open domain of integration `D` with `K ⊆ D ⊆ D̄ ⊆ U` (supporting lemma; no separate roadmap line — grouped here).
+"""
+    assert extract_declarations_from_declaration_sections(body) == {
+        "Prop_16_3", "Lemma_16_2",
+    }
+
+
+def test_prop_16_5_description_terms_are_not_citations():
+    body = """### Lean declarations
+- [`Prop_16_5`](GeometricAnalysis/LeeSM/Chapter16/IntegrationManifold.lean) — `manifoldIntegral` equals the signed chart sum for any valid `IsSmoothChartCover`; independence of cover/partition/chart choice follows by transitivity.
+"""
+    assert extract_declarations_from_declaration_sections(body) == {"Prop_16_5"}
+
+
 # the roadmap-granularity intake emits the keyword INSIDE the backticks
 INTAKE_BODY_KEYWORD = """### Lean declarations
 - `def DifferentialForm.IsNonvanishing` — [OrientationForms.lean](GeometricAnalysis/LeeSM/Chapter15/OrientationForms.lean#L67-L72)
