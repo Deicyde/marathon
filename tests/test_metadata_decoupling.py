@@ -640,20 +640,24 @@ def reject_args(num=22):
 @pytest.fixture
 def reject_env(tmp_path, monkeypatch):
     """cmd_reject with its config/GitHub boundaries faked: real
-    record_rejection into tmp state.json, recorded gh calls."""
+    record_rejection into tmp state.json, recorded REST projection calls."""
     cfg = make_cfg(tmp_path)
     monkeypatch.setattr(review, "load_config", lambda repo_dir=None: cfg)
     gh_calls: list = []
-    def fake_gh(*a, **kw):
-        gh_calls.append(a)
-        stdout = (
-            '{"labels":[{"name":"review:rejected"}]}'
-            if a[:2] == ("issue", "view")
-            else ""
-        )
-        return subprocess.CompletedProcess(a, 0, stdout=stdout, stderr="")
-
-    monkeypatch.setattr(review, "gh", fake_gh)
+    monkeypatch.setattr(
+        review,
+        "post_issue_comment_rest",
+        lambda issue_num, repo, body: gh_calls.append(
+            ("comment", issue_num, repo, body)
+        ),
+    )
+    monkeypatch.setattr(
+        review,
+        "converge_issue_labels_rest",
+        lambda issue_num, repo, **kwargs: gh_calls.append(
+            ("labels", issue_num, repo, kwargs)
+        ) or True,
+    )
     return SimpleNamespace(cfg=cfg, gh=gh_calls)
 
 

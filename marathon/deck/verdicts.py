@@ -141,15 +141,22 @@ def clear_defer(cfg: "ReviewConfig", issue_num: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _verify_args(issue_num: int) -> Namespace:
+def _verify_args(issue_num: int, operation_id: Optional[str] = None) -> Namespace:
     """The argparse namespace ``cmd_verify`` reads (``issue_num`` /
     ``close`` / ``comment``). The deck verifies statements-accepted but
     keeps the issue OPEN (``close=False``) — sorrys may remain on a
     skeleton; closing belongs to the CLI's explicit ``--close``."""
-    return Namespace(issue_num=issue_num, close=False, comment=None)
+    return Namespace(
+        issue_num=issue_num,
+        close=False,
+        comment=None,
+        operation_id=operation_id,
+    )
 
 
-def _reject_args(issue_num: int, note: str) -> Namespace:
+def _reject_args(
+    issue_num: int, note: str, operation_id: Optional[str] = None
+) -> Namespace:
     """The argparse namespace ``cmd_reject`` reads. ``notes`` carries the
     human's note as INLINE TEXT: ``cmd_reject`` treats a non-file value as
     the verbatim note and records it through ``record_rejection`` →
@@ -157,7 +164,11 @@ def _reject_args(issue_num: int, note: str) -> Namespace:
     path's Claude-bypass, preserved). ``no_refine=False`` so the rejection
     dispatches exactly as a CLI reject would."""
     return Namespace(
-        issue_num=issue_num, notes=note, comment=None, no_refine=False,
+        issue_num=issue_num,
+        notes=note,
+        comment=None,
+        no_refine=False,
+        operation_id=operation_id,
     )
 
 
@@ -166,6 +177,8 @@ def apply_verdict(
     issue_num: int,
     verdict: str,
     note: Optional[str] = None,
+    *,
+    operation_id: Optional[str] = None,
 ) -> VerdictResult:
     """Route one deck verdict and return the next ready card.
 
@@ -195,7 +208,7 @@ def apply_verdict(
 
     if verdict == "verify":
         clear_defer(cfg, issue_num)
-        review_mod.cmd_verify(_verify_args(issue_num))
+        review_mod.cmd_verify(_verify_args(issue_num, operation_id))
         message = f"#{issue_num} verified"
     elif verdict == "reject":
         if note is None or not str(note).strip():
@@ -204,7 +217,9 @@ def apply_verdict(
                 "Aristotle); refusing to route an empty rejection"
             )
         clear_defer(cfg, issue_num)
-        review_mod.cmd_reject(_reject_args(issue_num, str(note)))
+        review_mod.cmd_reject(
+            _reject_args(issue_num, str(note), operation_id)
+        )
         message = f"#{issue_num} rejected; note dispatched verbatim"
     else:  # defer
         _record_defer(cfg, issue_num)

@@ -44,6 +44,7 @@ and leaving later declarations untouched for the next review round.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from contextlib import ExitStack, contextmanager
@@ -1170,6 +1171,31 @@ def compose_ship_note(
     return "\n".join(lines)
 
 
+def _ship_operation_id(
+    cfg: "ReviewConfig",
+    issue_num: int,
+    verdict: str,
+    note: Optional[str],
+) -> str:
+    """Stable ID for one saved human-review generation.
+
+    Per-declaration records include mutation timestamps, so a genuine later
+    review receives a different ID even when its prose happens to be identical.
+    A retry after a partial external failure sees the same records and therefore
+    reuses the original GitHub comment instead of duplicating it.
+    """
+    payload = {
+        "issue": issue_num,
+        "verdict": verdict,
+        "note": note,
+        "records": issue_verdicts(cfg, issue_num),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _next_ready_issue(cfg: "ReviewConfig", just_shipped: int) -> Optional[int]:
     """The next ready issue to enter (its subdeck) after shipping
     ``just_shipped``, scoped to that issue's chapter. Rebuilds the ISSUE
@@ -1287,6 +1313,7 @@ def _ship_issue_once(
 
     if summary["rejected"] or missing:
         note = compose_ship_note(issue_num, composed_summary, missing)
+        operation_id = _ship_operation_id(cfg, issue_num, "reject", note)
         # HARD-FREEZE only the LOCKED decls (opt-in) — a sibling-decl refine
         # cannot change their signature. Soft-kept (verified, unlocked) decls
         # stay REWRITABLE: Aristotle may re-type them when a fix legitimately
@@ -1309,7 +1336,13 @@ def _ship_issue_once(
                 )
         except Exception as exc:  # noqa: BLE001 — freeze is a hardening, never a blocker
             print(f"  freeze: skipped ({exc})", flush=True)
-        apply_verdict(cfg, issue_num, "reject", note=note)
+        apply_verdict(
+            cfg,
+            issue_num,
+            "reject",
+            note=note,
+            operation_id=operation_id,
+        )
         outcome = "shipped"
         n_fix = len(summary["rejected"])
         bits = []
@@ -1328,7 +1361,12 @@ def _ship_issue_once(
                 "left untouched for the next review round"
             )
     else:
-        apply_verdict(cfg, issue_num, "verify")
+        apply_verdict(
+            cfg,
+            issue_num,
+            "verify",
+            operation_id=_ship_operation_id(cfg, issue_num, "verify", None),
+        )
         outcome = "verified"
         message = (
             f"#{issue_num} verified: all {len(kept)} declaration(s) "

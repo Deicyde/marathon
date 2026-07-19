@@ -5,10 +5,12 @@ from __future__ import annotations
 import contextlib
 import contextvars
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import os
 import subprocess
 from typing import Iterator, Optional, Sequence
+from urllib.parse import quote
 
 
 # Per-request GitHub identity. When the deck is shared behind an authenticating
@@ -48,6 +50,7 @@ def gh(
     check: bool = True,
     capture: bool = True,
     timeout: Optional[float] = None,
+    input_text: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
     """Invoke ``gh`` with the given arguments.
 
@@ -58,6 +61,10 @@ def gh(
     ``timeout`` (seconds) bounds the subprocess; on expiry ``subprocess.run``
     raises ``subprocess.TimeoutExpired`` — callers on a request-handler path
     should catch it. ``None`` (default) preserves the original unbounded call.
+
+    ``input_text`` is passed on stdin.  This is the safe path for large issue
+    comments: their mathematical/review content never appears in argv or in a
+    command-shaped exception.
 
     If a per-request actor token is bound (see :func:`actor_github_token`),
     it is injected as ``GH_TOKEN`` so the call authenticates as that
@@ -72,10 +79,175 @@ def gh(
         check=False,
         env=env,
         timeout=timeout,
+        input=input_text,
     )
     if check and cp.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args)} failed: {cp.stderr.strip()}")
     return cp
+
+
+def post_issue_comment_rest(
+    issue_num: int,
+    repo: str,
+    body: str,
+    *,
+    operation_id: Optional[str] = None,
+    timeout: float = 15.0,
+) -> bool:
+    """Post one issue comment through REST, keeping ``body`` off argv.
+
+    ``gh issue comment`` uses GitHub's GraphQL quota even though issue comments
+    have a first-class REST endpoint.  Review ships must not fail merely because
+    GraphQL is exhausted while the REST core quota is healthy.
+
+    When ``operation_id`` is supplied, a deterministic hidden marker makes the
+    write retry-safe across a later label/local-state failure (and even an
+    ambiguous POST timeout).  ``False`` means that marker already existed and
+    the prior comment was reused; ``True`` means this call published it.
+    """
+    if operation_id:
+        marker_digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+        marker = f"<!-- marathon-verdict-operation:{marker_digest} -->"
+        exists = _issue_comment_marker_exists_rest(
+            issue_num, repo, marker, timeout=min(timeout, 10.0)
+        )
+        if exists is None:
+            raise RuntimeError(
+                f"GitHub REST comment state for #{issue_num} could not be "
+                "confirmed; no duplicate comment was attempted"
+            )
+        if exists:
+            return False
+        body = f"{body}\n\n{marker}"
+
+    endpoint = f"repos/{repo}/issues/{issue_num}/comments"
+    try:
+        cp = gh(
+            "api", "--method", "POST", endpoint, "--input", "-",
+            check=False,
+            timeout=timeout,
+            input_text=json.dumps({"body": body}, ensure_ascii=False),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"GitHub REST comment for #{issue_num} could not be published: {exc}"
+        ) from exc
+    if cp.returncode != 0:
+        detail = ((cp.stderr or cp.stdout) or "unknown GitHub error").strip()
+        raise RuntimeError(
+            f"GitHub REST comment for #{issue_num} could not be published: "
+            f"{detail[:500]}"
+        )
+    return True
+
+
+def _issue_comment_marker_exists_rest(
+    issue_num: int,
+    repo: str,
+    marker: str,
+    *,
+    timeout: float = 10.0,
+) -> Optional[bool]:
+    """Whether any issue comment contains ``marker``; ``None`` if unknown."""
+    endpoint = f"repos/{repo}/issues/{issue_num}/comments?per_page=100"
+    try:
+        cp = gh(
+            "api", "--paginate", "--slurp", endpoint,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if cp.returncode != 0:
+        return None
+    try:
+        pages = json.loads(cp.stdout or "[]")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(pages, list):
+        return None
+    for page in pages:
+        if not isinstance(page, list):
+            return None
+        for comment in page:
+            if not isinstance(comment, dict):
+                continue
+            comment_body = comment.get("body")
+            if isinstance(comment_body, str) and marker in comment_body:
+                return True
+    return False
+
+
+def issue_labels_rest(
+    issue_num: int,
+    repo: str,
+    *,
+    timeout: float = 20.0,
+) -> Optional[set[str]]:
+    """Read an issue's labels from the REST core quota; ``None`` on failure."""
+    try:
+        cp = gh(
+            "api", f"repos/{repo}/issues/{issue_num}",
+            check=False, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if cp.returncode != 0:
+        return None
+    try:
+        data = json.loads(cp.stdout or "{}")
+        if not isinstance(data, dict) or not isinstance(data.get("labels"), list):
+            return None
+        return {
+            str(label["name"])
+            for label in data["labels"]
+            if isinstance(label, dict) and label.get("name") is not None
+        }
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def converge_issue_labels_rest(
+    issue_num: int,
+    repo: str,
+    *,
+    required: Sequence[str] = (),
+    forbidden: Sequence[str] = (),
+    attempts: int = 2,
+    timeout: float = 8.0,
+) -> bool:
+    """Converge additive/removal label constraints and confirm by REST readback.
+
+    The additive and single-label removal endpoints preserve unrelated labels,
+    unlike replacing the issue's complete label array after a racy read.
+    """
+    required_set = {str(label) for label in required if str(label)}
+    forbidden_set = {str(label) for label in forbidden if str(label)}
+    for _ in range(max(1, attempts)):
+        try:
+            for label in sorted(forbidden_set):
+                encoded = quote(label, safe="")
+                gh(
+                    "api", "--method", "DELETE",
+                    f"repos/{repo}/issues/{issue_num}/labels/{encoded}",
+                    check=False, timeout=timeout,
+                )
+            if required_set:
+                gh(
+                    "api", "--method", "POST",
+                    f"repos/{repo}/issues/{issue_num}/labels", "--input", "-",
+                    check=False,
+                    timeout=timeout,
+                    input_text=json.dumps({"labels": sorted(required_set)}),
+                )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        labels = issue_labels_rest(issue_num, repo, timeout=timeout)
+        if labels is not None and required_set <= labels and not (
+            forbidden_set & labels
+        ):
+            return True
+    return False
 
 
 def issue_view_json(
@@ -102,6 +274,9 @@ def issue_view_json(
 
 
 def issue_labels(issue_num: int, repo: str) -> Optional[set[str]]:
+    labels = issue_labels_rest(issue_num, repo)
+    if labels is not None:
+        return labels
     data = issue_view_json(issue_num, repo, "labels", check=False)
     if data is None:
         return None

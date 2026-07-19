@@ -52,7 +52,7 @@ def _install_common_patches(monkeypatch, refresh_calls):
 
     monkeypatch.setattr(
         verdicts_mod, "apply_verdict",
-        lambda cfg, issue, verdict, note=None: None,
+        lambda cfg, issue, verdict, note=None, **kwargs: None,
     )
     monkeypatch.setattr(subdeck, "clear_issue", lambda cfg, issue: None)
     monkeypatch.setattr(subdeck, "_next_ready_issue", lambda cfg, issue: None)

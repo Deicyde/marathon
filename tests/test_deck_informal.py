@@ -342,7 +342,7 @@ def _patch_ship_common(monkeypatch):
 
     monkeypatch.setattr(
         verdicts_mod, "apply_verdict",
-        lambda cfg, issue, verdict, note=None: None,
+        lambda cfg, issue, verdict, note=None, **kwargs: None,
     )
     monkeypatch.setattr(subdeck, "build_subdeck", lambda c, i, **k: _complete_subdeck())
     monkeypatch.setattr(subdeck, "clear_issue", lambda cfg, issue: None)

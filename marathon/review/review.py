@@ -23,10 +23,12 @@ from typing import Optional
 from marathon.review.automerge import _head_build_verdict
 from marathon.review.config import ReviewConfig, load_config
 from marathon.review.github import (
+    converge_issue_labels_rest,
     fetch_issues_bulk,
     gh,
     issue_labels,
     issue_title,
+    post_issue_comment_rest,
 )
 from marathon.review.state import record_rejection, record_verification
 from marathon.review.tracker import update_tracker_emoji
@@ -426,28 +428,17 @@ def _ensure_verified_label(cfg: "ReviewConfig", num: int) -> bool:
     state is not success: queue status gives rejection precedence, so recording
     a local verification while ``review:rejected`` remains would strand the
     issue in a split brain."""
-    for _ in (1, 2):
-        # Removal may transiently fail independently of the add, so converge
-        # both sides on every attempt and confirm both by read-back.
-        gh("issue", "edit", str(num), "--repo", cfg.github_repo,
-           "--remove-label", cfg.labels.rejected, check=False)
-        gh("issue", "edit", str(num), "--repo", cfg.github_repo,
-           "--add-label", cfg.labels.verified, check=False)
-        try:
-            cp = gh("issue", "view", str(num), "--repo", cfg.github_repo,
-                    "--json", "labels", check=True)
-            names = [lbl.get("name") for lbl in json.loads(cp.stdout).get("labels", [])]
-            if (cfg.labels.verified in names
-                    and cfg.labels.rejected not in names):
-                return True
-        except (RuntimeError, ValueError, KeyError, OSError):
-            pass
+    if converge_issue_labels_rest(
+        num,
+        cfg.github_repo,
+        required=(cfg.labels.verified,),
+        forbidden=(cfg.labels.rejected,),
+    ):
+        return True
     print(
         f"  ⚠ label: could NOT confirm the final verified-only label state on "
         f"#{num} after 2 attempts — no local verification was recorded. "
-        "Repair it manually: "
-        f"gh issue edit {num} --add-label '{cfg.labels.verified}' "
-        f"--remove-label '{cfg.labels.rejected}'"
+        "Retry Ship after GitHub connectivity recovers."
     )
     return False
 
@@ -470,7 +461,13 @@ def cmd_verify(args) -> None:
     comment = args.comment or default_comment
 
     print(f"Marking #{num} as VERIFIED...")
-    gh("issue", "comment", str(num), "--repo", cfg.github_repo, "--body", comment)
+    operation_id = getattr(args, "operation_id", None)
+    if operation_id:
+        post_issue_comment_rest(
+            num, cfg.github_repo, comment, operation_id=operation_id
+        )
+    else:
+        post_issue_comment_rest(num, cfg.github_repo, comment)
     # Add the verified label + drop any rejected one, CONFIRMING it landed. The
     # deck's "already verified" status keys off this label, so a SILENT failure
     # here (the old `check=False` that swallowed a transient gh error) leaves the
@@ -761,29 +758,13 @@ def _maybe_merge_marathon_pr(cfg: ReviewConfig, issue_num: int) -> None:
 
 def _ensure_rejected_label(cfg: "ReviewConfig", num: int) -> bool:
     """Converge GitHub to rejected-present/verified-absent and confirm it."""
-    for _ in (1, 2):
-        gh(
-            "issue", "edit", str(num), "--repo", cfg.github_repo,
-            "--remove-label", cfg.labels.verified, check=False,
-        )
-        gh(
-            "issue", "edit", str(num), "--repo", cfg.github_repo,
-            "--add-label", cfg.labels.rejected, check=False,
-        )
-        try:
-            cp = gh(
-                "issue", "view", str(num), "--repo", cfg.github_repo,
-                "--json", "labels", check=True,
-            )
-            names = {
-                item.get("name")
-                for item in json.loads(cp.stdout or "{}").get("labels", [])
-                if isinstance(item, dict)
-            }
-            if cfg.labels.rejected in names and cfg.labels.verified not in names:
-                return True
-        except (RuntimeError, ValueError, KeyError, OSError):
-            pass
+    if converge_issue_labels_rest(
+        num,
+        cfg.github_repo,
+        required=(cfg.labels.rejected,),
+        forbidden=(cfg.labels.verified,),
+    ):
+        return True
     print(
         f"  ⚠ label: could NOT confirm the final rejected-only label state "
         f"on #{num}; no local rejection was recorded or dispatched. Retry "
@@ -800,27 +781,12 @@ def _ensure_unreviewed_labels(cfg: "ReviewConfig", num: int) -> bool:
     entry. Without compensation the issue would look rejected on GitHub while
     being unreviewed locally.
     """
-    for _ in (1, 2):
-        for label in (cfg.labels.rejected, cfg.labels.verified):
-            gh(
-                "issue", "edit", str(num), "--repo", cfg.github_repo,
-                "--remove-label", label, check=False,
-            )
-        try:
-            cp = gh(
-                "issue", "view", str(num), "--repo", cfg.github_repo,
-                "--json", "labels", check=True,
-            )
-            names = {
-                item.get("name")
-                for item in json.loads(cp.stdout or "{}").get("labels", [])
-                if isinstance(item, dict)
-            }
-            if (cfg.labels.rejected not in names
-                    and cfg.labels.verified not in names):
-                return True
-        except (RuntimeError, ValueError, KeyError, OSError):
-            pass
+    if converge_issue_labels_rest(
+        num,
+        cfg.github_repo,
+        forbidden=(cfg.labels.rejected, cfg.labels.verified),
+    ):
+        return True
     print(
         f"  ⚠ label: could NOT confirm unreviewed labels on #{num}; "
         "repair the GitHub labels before reviewing it again"
@@ -842,8 +808,7 @@ def cmd_reject(args) -> None:
 
     print(f"Marking #{num} as REJECTED...")
     comment = args.comment or (
-        "❌ REJECTED — see body for findings; fix queued in "
-        "`.marathon/review/state.json` (`marathon review reject` queue)."
+        "❌ REJECTED — see body for findings."
     )
     # Mirror the verbatim note into the comment inside an HTML-comment marker
     # (invisible in render) so a collaborator's conductor that discovers its
@@ -852,7 +817,20 @@ def cmd_reject(args) -> None:
     from marathon.review.reject_note import embed_reject_note
 
     comment = f"{comment}\n\n{embed_reject_note(notes_text)}"
-    gh("issue", "comment", str(num), "--repo", cfg.github_repo, "--body", comment)
+    try:
+        operation_id = getattr(args, "operation_id", None)
+        if operation_id:
+            post_issue_comment_rest(
+                num, cfg.github_repo, comment, operation_id=operation_id
+            )
+        else:
+            post_issue_comment_rest(num, cfg.github_repo, comment)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"GitHub projection failed for rejection #{num}; no rejection "
+            "was queued. The deck's saved declaration decisions remain safe "
+            f"to retry: {exc}"
+        ) from exc
     if not _ensure_rejected_label(cfg, num):
         raise RuntimeError(
             f"rejection of #{num} was not recorded because GitHub labels did "

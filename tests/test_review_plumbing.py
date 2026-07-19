@@ -243,6 +243,7 @@ def test_cmd_verify_updates_tracker_even_without_pr(tmp_path, monkeypatch, capsy
     cfg = make_cfg(tmp_path)
     monkeypatch.setattr(review_mod, "load_config", lambda: cfg)
     monkeypatch.setattr(review_mod, "gh", FakeGh(lambda args: completed(stdout="")))
+    monkeypatch.setattr(review_mod, "post_issue_comment_rest", lambda *a, **kw: None)
     monkeypatch.setattr(review_mod, "_ensure_verified_label", lambda cfg_, num: True)
 
     recorded_verifications: list[int] = []
@@ -272,6 +273,7 @@ def test_cmd_verify_survives_tracker_failure(tmp_path, monkeypatch, capsys):
     cfg = make_cfg(tmp_path)
     monkeypatch.setattr(review_mod, "load_config", lambda: cfg)
     monkeypatch.setattr(review_mod, "gh", FakeGh(lambda args: completed(stdout="")))
+    monkeypatch.setattr(review_mod, "post_issue_comment_rest", lambda *a, **kw: None)
     monkeypatch.setattr(review_mod, "_ensure_verified_label", lambda cfg_, num: True)
     monkeypatch.setattr(review_mod, "record_verification", lambda cfg_, num: None)
 

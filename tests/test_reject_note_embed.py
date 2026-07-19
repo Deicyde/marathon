@@ -38,19 +38,16 @@ def test_cmd_reject_embeds_note_in_github_comment(monkeypatch):
 
     import marathon.review.review as review
 
-    calls = []
+    comments = []
 
-    def fake_gh(*a, **k):
-        calls.append(a)
-        stdout = (
-            '{"labels":[{"name":"review:rejected"}]}'
-            if a[:2] == ("issue", "view")
-            else ""
-        )
-        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+    def fake_post(issue, repo, body, **kwargs):
+        comments.append((issue, repo, body, kwargs))
 
     recorded = {}
-    monkeypatch.setattr(review, "gh", fake_gh)
+    monkeypatch.setattr(review, "post_issue_comment_rest", fake_post)
+    monkeypatch.setattr(
+        review, "converge_issue_labels_rest", lambda *a, **k: True
+    )
     monkeypatch.setattr(review, "record_rejection",
                         lambda cfg, n, notes: recorded.update(note=notes))
     monkeypatch.setattr(review, "_ensure_conductor", lambda cfg: None)
@@ -63,13 +60,19 @@ def test_cmd_reject_embeds_note_in_github_comment(monkeypatch):
 
     note = "FIX these declarations (rejected):\n- A: do X"
     review.cmd_reject(SimpleNamespace(
-        issue_num=7, notes=note, comment=None, no_refine=True))
+        issue_num=7,
+        notes=note,
+        comment=None,
+        no_refine=True,
+        operation_id="saved-review-7",
+    ))
 
-    bodies = [a[a.index("--body") + 1] for a in calls
-              if "comment" in a and "--body" in a]
-    assert bodies, "no issue comment posted"
-    assert "marathon-reject-note" in bodies[0]          # embedded marker
-    assert "- A: do X" in bodies[0]                      # verbatim note
+    assert comments, "no issue comment posted"
+    issue, repo, body, kwargs = comments[0]
+    assert (issue, repo) == (7, "o/r")
+    assert kwargs == {"operation_id": "saved-review-7"}
+    assert "marathon-reject-note" in body                # embedded marker
+    assert "- A: do X" in body                            # verbatim note
     assert recorded["note"] == note                      # still recorded locally
 
 
@@ -79,16 +82,10 @@ def test_cmd_reject_does_not_record_mixed_verified_rejected_labels(monkeypatch):
     import pytest
     import marathon.review.review as review
 
-    def fake_gh(*a, **k):
-        stdout = (
-            '{"labels":[{"name":"review:rejected"},'
-            '{"name":"review:verified"}]}'
-            if a[:2] == ("issue", "view")
-            else ""
-        )
-        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
-
-    monkeypatch.setattr(review, "gh", fake_gh)
+    monkeypatch.setattr(review, "post_issue_comment_rest", lambda *a, **k: None)
+    monkeypatch.setattr(
+        review, "converge_issue_labels_rest", lambda *a, **k: False
+    )
     monkeypatch.setattr(
         review,
         "record_rejection",
@@ -118,6 +115,70 @@ def test_cmd_reject_does_not_record_mixed_verified_rejected_labels(monkeypatch):
                 no_refine=False,
             )
         )
+
+
+def test_cmd_reject_rest_comment_failure_is_concise_and_records_nothing(
+    monkeypatch,
+):
+    """A failed GitHub projection keeps the saved deck review retryable.
+
+    In particular, the very long mathematical note must not be copied into the
+    command-shaped error and no issue-level rejection may be queued locally.
+    """
+    from types import SimpleNamespace
+
+    import pytest
+    import marathon.review.review as review
+
+    note = "SENSITIVE_REJECT_NOTE " + ("canonical boundary model; " * 80)
+    recorded = []
+    converged = []
+
+    def fail_comment(*_args, **_kwargs):
+        raise RuntimeError(
+            "GitHub REST comment for #171 could not be published: rate limited"
+        )
+
+    monkeypatch.setattr(review, "post_issue_comment_rest", fail_comment)
+    monkeypatch.setattr(
+        review,
+        "converge_issue_labels_rest",
+        lambda *a, **k: converged.append((a, k)) or True,
+    )
+    monkeypatch.setattr(
+        review,
+        "record_rejection",
+        lambda *args, **kwargs: recorded.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        review,
+        "load_config",
+        lambda: SimpleNamespace(
+            github_repo="o/r",
+            labels=SimpleNamespace(
+                rejected="review:rejected", verified="review:verified"
+            ),
+            state_path="/tmp/state.json",
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        review.cmd_reject(
+            SimpleNamespace(
+                issue_num=171,
+                notes=note,
+                comment=None,
+                no_refine=False,
+            )
+        )
+
+    message = str(caught.value)
+    assert "GitHub projection failed for rejection #171" in message
+    assert "saved declaration decisions remain safe to retry" in message
+    assert "SENSITIVE_REJECT_NOTE" not in message
+    assert len(message) < 300
+    assert recorded == []
+    assert converged == []  # never publish a rejected label without its note
 
 
 def test_embed_extract_roundtrip_with_arrow_in_note():

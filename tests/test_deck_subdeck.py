@@ -388,6 +388,23 @@ def test_receipt_invalidation_failure_cannot_commit_new_verdict(
     assert subdeck.issue_verdicts(cfg, 30) == {}
 
 
+def test_ship_operation_id_is_stable_for_retry_and_changes_with_review(
+    tmp_path,
+):
+    cfg = make_cfg(tmp_path)
+    subdeck.record_decl_verdict(cfg, 30, "N.A", "reject", note="fix it")
+
+    first = subdeck._ship_operation_id(cfg, 30, "reject", "composite note")
+    assert first == subdeck._ship_operation_id(
+        cfg, 30, "reject", "composite note"
+    )
+
+    subdeck.record_decl_verdict(cfg, 30, "N.A", "reject", note="fix it again")
+    assert first != subdeck._ship_operation_id(
+        cfg, 30, "reject", "composite note"
+    )
+
+
 # ---------------------------------------------------------------------------
 # build_subdeck — overlay, ordering, progress / complete / summary
 # ---------------------------------------------------------------------------
@@ -557,6 +574,7 @@ def test_ship_partial_reject_stops_before_later_declarations(tmp_path, monkeypat
     assert out["partial"] is True
     assert "stopped at first rejection" in out["message"]
     assert "reject" in calls and "verify" not in calls
+    assert len(calls["reject"].operation_id) == 64
     note = calls["reject"].notes
     assert "- Demo.Chapter14.Foo" in note
     assert "- Demo.Chapter14.Bar: wrong upstream definition" in note
@@ -622,6 +640,7 @@ def test_ship_all_verified_routes_cmd_verify(tmp_path, monkeypatch):
     assert "verify" in calls and "reject" not in calls
     assert calls["verify"].issue_num == 22
     assert calls["verify"].close is False  # deck keeps the issue OPEN
+    assert len(calls["verify"].operation_id) == 64
     # The store is cleared on a successful ship.
     assert subdeck.issue_verdicts(cfg, 22) == {}
 
