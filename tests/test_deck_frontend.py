@@ -559,6 +559,26 @@ def test_verso_page_relative_and_extra_definition_links_are_rewritten_safely(app
     assert "innerHTML" not in extras
 
 
+def test_verso_copy_exports_plain_lean_without_markdown_links(app_js: str):
+    code = _strip_block_comments(app_js)
+    copy = _fn_body(code, "function copyVersoSelectionAsPlainText")
+    sanitizer = _fn_body(code, "function sanitizeVersoNode")
+
+    # Keep semantic names as accessible, clickable anchors in the rendered
+    # source, but suppress the rich-HTML clipboard flavor that Markdown-aware
+    # destinations rewrite as `[declaration](URL)`.
+    assert 'target.setAttribute("href", href)' in sanitizer
+    assert 'document.addEventListener("copy", copyVersoSelectionAsPlainText)' in copy
+    assert "window.getSelection" in copy
+    assert "selection.isCollapsed" in copy
+    assert 'anchorElement.closest(".verso-semantic-source")' in copy
+    assert "container.contains(selection.focusNode)" in copy
+    assert "clipboard.clearData()" in copy
+    assert 'clipboard.setData("text/plain", plain)' in copy
+    assert "event.preventDefault()" in copy
+    assert "text/html" not in copy
+
+
 def test_verso_artifacts_are_data_only_and_hovers_use_committed_code(app_js: str):
     code = _strip_block_comments(app_js)
     enhance = _fn_body(code, "function enhanceVersoDeclaration")

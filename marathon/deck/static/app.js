@@ -1491,6 +1491,38 @@
     updateVersoFreshness(shell, status);
   }
 
+  function copyVersoSelectionAsPlainText(event) {
+    // Semantic references are real anchors so they remain mouse/keyboard
+    // navigable. Browsers consequently put a text/html flavor on the
+    // clipboard, which Markdown-aware destinations turn into `[name](URL)`.
+    // Override only selections wholly inside this semantic source and publish
+    // the rendered Lean text alone. Selections spanning other UI retain the
+    // browser's normal copy behavior.
+    var clipboard = event && event.clipboardData;
+    var selection = window.getSelection && window.getSelection();
+    if (!clipboard || !selection || selection.isCollapsed ||
+        !selection.anchorNode || !selection.focusNode) return;
+    var anchorElement = selection.anchorNode.nodeType === 1
+      ? selection.anchorNode : selection.anchorNode.parentElement;
+    var container = anchorElement && anchorElement.closest
+      ? anchorElement.closest(".verso-semantic-source") : null;
+    if (!container ||
+        !container.contains(selection.focusNode)) return;
+    var plain = selection.toString();
+    if (!plain) return;
+    try {
+      clipboard.clearData();
+      clipboard.setData("text/plain", plain);
+      event.preventDefault();
+    } catch (e) {
+      // Leave the browser default intact if clipboard mutation is unavailable.
+    }
+  }
+  // In non-editable content the Clipboard API targets the focused element
+  // (often <body>), not necessarily the element containing the selection.
+  // Delegate once from document and identify the semantic source above.
+  document.addEventListener("copy", copyVersoSelectionAsPlainText);
+
   function makeVersoShell(rawSource, mode, identity) {
     // Raw source paints synchronously and remains the automatic fallback for
     // building, failed, unavailable, or stale semantic artifacts. Once a

@@ -371,7 +371,7 @@ def _swr(key: str, ttl: float, fetch):
         with _SWR_LOCK:
             _SWR[key] = {"ts": time.time(), "data": val, "busy": False}
         return val
-    if now - ent["ts"] > ttl and not ent["busy"]:
+    if now - ent["ts"] >= ttl and not ent["busy"]:
         with _SWR_LOCK:
             ent["busy"] = True
 
