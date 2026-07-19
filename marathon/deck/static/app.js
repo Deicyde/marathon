@@ -146,8 +146,8 @@
         return payload;
       });
   }
-  function fetchProjectGraph() {
-    return getJSON("/api/project-graph");
+  function fetchProjectGraph(force) {
+    return getJSON("/api/project-graph" + (force ? "?refresh=1" : ""));
   }
   function fetchDefinitionTerms() {
     return getJSON("/api/definition-terms");
@@ -397,8 +397,11 @@
     filesResumeName: null,
     filesBusy: false,
     graphData: null,
-    graphFilter: { chapter: "all", status: "all", type: "all", query: "" },
-    graphView: { zoom: 1 },
+    graphFilter: { chapter: "all", status: "all", query: "" },
+    // The useful default is the project-level issue dependency graph.  The
+    // mixed issue→declaration ownership picture remains available as an
+    // explicitly-labelled map, but it is not dependency topology.
+    graphView: { zoom: 1, mode: "issues" },
     definitionTerms: { names: [], short: {} },
     definitionNameSet: {},
     definitionSourceToken: null,
@@ -5159,15 +5162,45 @@
       .catch(function (err) { dashError("dash-files", err); });
   }
 
-  // --- Graph tab: project-wide issue/declaration dependency DAG -----------
+  // --- Graph tab: project-wide issue/declaration dependency graph ---------
 
-  function graphNodeMatches(node, filter) {
+  var GRAPH_NODE_LIMIT = 500;
+
+  function graphModeSpec(mode) {
+    if (mode === "declarations") {
+      return {
+        mode: mode,
+        title: "Declaration dependency graph",
+        nodeType: "declaration",
+        edgeKind: "declaration-dependency",
+        help: "Direct declaration dependencies point from prerequisite to dependent.",
+      };
+    }
+    if (mode === "ownership") {
+      return {
+        mode: mode,
+        title: "Issues + declarations map",
+        nodeType: null,
+        edgeKind: "contains",
+        help: "Dashed lines show which declarations each issue reviews. This is an ownership map, not a dependency graph.",
+      };
+    }
+    return {
+      mode: "issues",
+      title: "Issue dependency graph",
+      nodeType: "issue",
+      edgeKind: "issue-dependency",
+      help: "Issue prerequisites point toward the later issues that depend on them.",
+    };
+  }
+
+  function graphNodeMatches(node, filter, ignoreQuery) {
     if (filter.chapter !== "all") {
       var chapters = node.chapters || (node.chapter != null ? [node.chapter] : []);
       if (chapters.map(String).indexOf(String(filter.chapter)) < 0) return false;
     }
     if (filter.status !== "all" && node.status !== filter.status) return false;
-    if (filter.type !== "all" && node.type !== filter.type) return false;
+    if (ignoreQuery) return true;
     var query = String(filter.query || "").trim().toLowerCase();
     if (query) {
       var haystack = [node.label, node.title, node.source_file, node.issue,
@@ -5177,55 +5210,174 @@
     return true;
   }
 
+  function graphModeView(data, filter, mode) {
+    var spec = graphModeSpec(mode);
+    var candidates = (data.nodes || []).filter(function (node) {
+      return (!spec.nodeType || node.type === spec.nodeType) &&
+        graphNodeMatches(node, filter, true);
+    });
+    var candidateIds = Object.create(null);
+    candidates.forEach(function (node) { candidateIds[node.id] = true; });
+    var modeEdges = (data.edges || []).filter(function (edge) {
+      return edge.kind === spec.edgeKind &&
+        candidateIds[edge.source] && candidateIds[edge.target];
+    });
+
+    var query = String(filter.query || "").trim();
+    if (!query) return { nodes: candidates, edges: modeEdges, spec: spec };
+
+    // A search result without its immediate graph context is just a list.
+    // Retain one dependency/ownership hop around every textual match while
+    // still respecting the selected chapter and status filters.
+    var matched = Object.create(null);
+    var visible = Object.create(null);
+    candidates.forEach(function (node) {
+      if (graphNodeMatches(node, filter, false)) {
+        matched[node.id] = true;
+        visible[node.id] = true;
+      }
+    });
+    modeEdges.forEach(function (edge) {
+      if (matched[edge.source] || matched[edge.target]) {
+        visible[edge.source] = true;
+        visible[edge.target] = true;
+      }
+    });
+    return {
+      nodes: candidates.filter(function (node) { return visible[node.id]; }),
+      edges: modeEdges.filter(function (edge) {
+        return visible[edge.source] && visible[edge.target];
+      }),
+      spec: spec,
+    };
+  }
+
+  function graphIsDependencyEdge(edge) {
+    return edge.kind === "issue-dependency" ||
+      edge.kind === "declaration-dependency";
+  }
+
   function graphLayout(nodes, edges) {
-    var byId = {};
-    var indegree = {};
-    var outgoing = {};
-    var rank = {};
+    var byId = Object.create(null);
+    var outgoing = Object.create(null);
     nodes.forEach(function (node) {
       byId[node.id] = node;
-      indegree[node.id] = 0;
       outgoing[node.id] = [];
-      rank[node.id] = 0;
     });
+    var seenEdges = Object.create(null);
     edges.forEach(function (edge) {
-      if (!byId[edge.source] || !byId[edge.target]) return;
+      // Ownership is useful context, but it must never manufacture a rank in
+      // a dependency graph. The mixed ownership mode has its own two-column
+      // layout below.
+      if (!graphIsDependencyEdge(edge) ||
+          !byId[edge.source] || !byId[edge.target]) return;
+      var key = edge.source + "\u0000" + edge.target;
+      if (seenEdges[key]) return;
+      seenEdges[key] = true;
       outgoing[edge.source].push(edge.target);
-      indegree[edge.target] += 1;
     });
-    var ready = nodes.filter(function (node) { return indegree[node.id] === 0; });
-    ready.sort(function (a, b) { return a.label.localeCompare(b.label); });
-    var placed = {};
-    while (ready.length) {
-      var node = ready.shift();
-      if (placed[node.id]) continue;
-      placed[node.id] = true;
-      outgoing[node.id].forEach(function (target) {
-        rank[target] = Math.max(rank[target], rank[node.id] + 1);
-        indegree[target] -= 1;
-        if (indegree[target] === 0) ready.push(byId[target]);
+    Object.keys(outgoing).forEach(function (id) { outgoing[id].sort(); });
+
+    // Tarjan SCCs turn a cyclic graph into an acyclic component graph. Rank
+    // that condensation so a cycle occupies one layer while its downstream
+    // dependents keep advancing through later layers. The old fallback put
+    // every cyclic *and downstream* node into one final column.
+    var nextIndex = 0;
+    var indices = Object.create(null);
+    var lowlink = Object.create(null);
+    var onStack = Object.create(null);
+    var stack = [];
+    var components = [];
+    function strongConnect(id) {
+      indices[id] = nextIndex;
+      lowlink[id] = nextIndex;
+      nextIndex += 1;
+      stack.push(id);
+      onStack[id] = true;
+      outgoing[id].forEach(function (target) {
+        if (indices[target] == null) {
+          strongConnect(target);
+          lowlink[id] = Math.min(lowlink[id], lowlink[target]);
+        } else if (onStack[target]) {
+          lowlink[id] = Math.min(lowlink[id], indices[target]);
+        }
       });
-      ready.sort(function (a, b) { return a.label.localeCompare(b.label); });
+      if (lowlink[id] !== indices[id]) return;
+      var component = [];
+      var member;
+      do {
+        member = stack.pop();
+        onStack[member] = false;
+        component.push(member);
+      } while (member !== id);
+      component.sort();
+      components.push(component);
     }
-    // A malformed/cyclic dependency snapshot must remain explorable. Put the
-    // cyclic remainder in a final layer; the backend's issue gating already
-    // removes cyclic issue edges, so this is normally declaration-only.
-    var maxRank = 0;
-    Object.keys(rank).forEach(function (id) { maxRank = Math.max(maxRank, rank[id]); });
-    nodes.forEach(function (node) {
-      if (!placed[node.id]) rank[node.id] = maxRank + 1;
+    Object.keys(byId).sort().forEach(function (id) {
+      if (indices[id] == null) strongConnect(id);
     });
+
+    var componentBy = Object.create(null);
+    var componentKey = [];
+    components.forEach(function (component, componentId) {
+      componentKey[componentId] = component.map(function (id) {
+        return String(byId[id].label || id);
+      }).sort()[0];
+      component.forEach(function (id) { componentBy[id] = componentId; });
+    });
+    var componentOutgoing = components.map(function () { return []; });
+    var componentIndegree = components.map(function () { return 0; });
+    var componentRank = components.map(function () { return 0; });
+    var componentEdges = Object.create(null);
+    Object.keys(outgoing).forEach(function (source) {
+      outgoing[source].forEach(function (target) {
+        var from = componentBy[source];
+        var to = componentBy[target];
+        var key = from + ":" + to;
+        if (from === to || componentEdges[key]) return;
+        componentEdges[key] = true;
+        componentOutgoing[from].push(to);
+        componentIndegree[to] += 1;
+      });
+    });
+    componentOutgoing.forEach(function (targets) {
+      targets.sort(function (a, b) {
+        return componentKey[a].localeCompare(componentKey[b]);
+      });
+    });
+    var ready = components.map(function (_component, id) { return id; })
+      .filter(function (id) { return componentIndegree[id] === 0; });
+    ready.sort(function (a, b) {
+      return componentKey[a].localeCompare(componentKey[b]);
+    });
+    while (ready.length) {
+      var componentId = ready.shift();
+      componentOutgoing[componentId].forEach(function (target) {
+        componentRank[target] = Math.max(
+          componentRank[target], componentRank[componentId] + 1
+        );
+        componentIndegree[target] -= 1;
+        if (componentIndegree[target] === 0) ready.push(target);
+      });
+      ready.sort(function (a, b) {
+        return componentKey[a].localeCompare(componentKey[b]);
+      });
+    }
+
     var layers = {};
     nodes.forEach(function (node) {
-      var r = rank[node.id];
+      var r = componentRank[componentBy[node.id]] || 0;
       if (!layers[r]) layers[r] = [];
       layers[r].push(node);
     });
     Object.keys(layers).forEach(function (key) {
       layers[key].sort(function (a, b) {
+        var acomp = componentKey[componentBy[a.id]];
+        var bcomp = componentKey[componentBy[b.id]];
         var ach = (a.chapters || [a.chapter == null ? 9999 : a.chapter])[0];
         var bch = (b.chapters || [b.chapter == null ? 9999 : b.chapter])[0];
-        return ach - bch || a.type.localeCompare(b.type) || a.label.localeCompare(b.label);
+        return acomp.localeCompare(bcomp) || ach - bch ||
+          a.type.localeCompare(b.type) || a.label.localeCompare(b.label);
       });
     });
     var positions = {};
@@ -5242,7 +5394,178 @@
       positions: positions,
       width: Math.max(520, 60 + (largestRank + 1) * 235),
       height: Math.max(220, 60 + widest * 76),
+      components: componentBy,
     };
+  }
+
+  function graphOwnershipLayout(nodes) {
+    var columns = { issue: [], declaration: [] };
+    nodes.forEach(function (node) {
+      (columns[node.type] || columns.declaration).push(node);
+    });
+    function order(a, b) {
+      var ach = (a.chapters || [a.chapter == null ? 9999 : a.chapter])[0];
+      var bch = (b.chapters || [b.chapter == null ? 9999 : b.chapter])[0];
+      return ach - bch || a.label.localeCompare(b.label);
+    }
+    columns.issue.sort(order);
+    columns.declaration.sort(order);
+    var positions = {};
+    columns.issue.forEach(function (node, index) {
+      positions[node.id] = { x: 30, y: 30 + index * 76, rank: 0 };
+    });
+    columns.declaration.forEach(function (node, index) {
+      positions[node.id] = { x: 265, y: 30 + index * 76, rank: 1 };
+    });
+    return {
+      positions: positions,
+      width: 520,
+      height: Math.max(220, 60 + Math.max(
+        columns.issue.length, columns.declaration.length, 1
+      ) * 76),
+    };
+  }
+
+  function graphConnectedSubset(nodes, edges, limit) {
+    if (nodes.length <= limit) {
+      return { nodes: nodes, edges: edges, capped: false, total: nodes.length };
+    }
+    var byId = Object.create(null);
+    var adjacent = Object.create(null);
+    nodes.forEach(function (node) {
+      byId[node.id] = node;
+      adjacent[node.id] = [];
+    });
+    edges.forEach(function (edge) {
+      if (!byId[edge.source] || !byId[edge.target]) return;
+      adjacent[edge.source].push(edge.target);
+      adjacent[edge.target].push(edge.source);
+    });
+    Object.keys(adjacent).forEach(function (id) {
+      adjacent[id] = Array.from(new Set(adjacent[id])).sort();
+    });
+    var seeds = nodes.slice().sort(function (a, b) {
+      function priority(node) {
+        if (node.changed || node.impact === "changed") return 0;
+        if (node.impact === "downstream") return 1;
+        if (node.status === "rejected") return 2;
+        return 3;
+      }
+      return priority(a) - priority(b) ||
+        adjacent[b.id].length - adjacent[a.id].length ||
+        a.label.localeCompare(b.label);
+    });
+    var selected = Object.create(null);
+    var count = 0;
+    seeds.forEach(function (seed) {
+      if (count >= limit || selected[seed.id]) return;
+      var queued = Object.create(null);
+      var queue = [seed.id];
+      queued[seed.id] = true;
+      while (queue.length && count < limit) {
+        var id = queue.shift();
+        if (selected[id]) continue;
+        selected[id] = true;
+        count += 1;
+        adjacent[id].forEach(function (neighbor) {
+          if (!selected[neighbor] && !queued[neighbor]) {
+            queued[neighbor] = true;
+            queue.push(neighbor);
+          }
+        });
+      }
+    });
+    var keptNodes = nodes.filter(function (node) { return selected[node.id]; });
+    var keptEdges = edges.filter(function (edge) {
+      return selected[edge.source] && selected[edge.target];
+    });
+    return {
+      nodes: keptNodes,
+      edges: keptEdges,
+      capped: true,
+      total: nodes.length,
+    };
+  }
+
+  function graphShortRevision(revision) {
+    var text = String(revision || "").trim();
+    return text ? text.slice(0, 12) : null;
+  }
+
+  function graphTopologyMeta(data, mode, dependencyEdgeCount) {
+    if (mode === "ownership") {
+      return { status: "ownership", revision: null, currentRevision: null };
+    }
+    var topology = data.topology || {};
+    var rawStatus = topology.status || topology.freshness ||
+      data.topology_status || "";
+    var hasExplicitStatus = Boolean(rawStatus);
+    var status = String(rawStatus).toLowerCase();
+    var explicitlyAvailable = topology.available === true ||
+      (hasExplicitStatus && topology.available !== false &&
+       status !== "missing" && status !== "none" && status !== "unavailable");
+    if (topology.available === false || status === "missing" ||
+        status === "none" || status === "unavailable") {
+      status = "unavailable";
+    } else if (status === "current" || status === "ok") {
+      status = "fresh";
+    } else if (status && status !== "fresh") {
+      status = "stale";
+    }
+    var revision = graphShortRevision(
+      topology.revision || topology.source_revision ||
+      topology.topology_revision || data.topology_revision ||
+      (data.audit && data.audit.source_revision)
+    );
+    var currentRevision = graphShortRevision(
+      topology.current_revision || data.current_revision
+    );
+    if (status === "fresh" && revision && currentRevision &&
+        revision !== currentRevision) status = "stale";
+
+    // Backward-compatible inference while older servers do not expose the
+    // topology object. Never silently turn a stale, edge-less ownership
+    // projection into something labelled a dependency graph.
+    if (!status) {
+      var auditStatus = String((data.audit && data.audit.status) || "missing");
+      if (dependencyEdgeCount === 0) {
+        status = "unavailable";
+      } else {
+        status = auditStatus === "fresh" ? "fresh" :
+          (auditStatus === "missing" ? "unavailable" : "stale");
+      }
+    } else if (dependencyEdgeCount === 0 && status === "stale" &&
+               !explicitlyAvailable) {
+      status = "unavailable";
+    }
+    return {
+      status: status,
+      revision: revision,
+      currentRevision: currentRevision,
+    };
+  }
+
+  function graphTopologyNotice(meta, spec) {
+    if (meta.status === "ownership") {
+      return el("div", { class: "graph-topology-note graph-topology-ownership", text:
+        "Ownership map: dashed lines connect issues to the declarations they review. " +
+        "These lines are not dependency edges." });
+    }
+    if (meta.status === "fresh") {
+      return el("div", { class: "graph-topology-note graph-topology-fresh", text:
+        "Dependency topology is fresh" +
+        (meta.revision ? " at " + meta.revision : "") + "." });
+    }
+    if (meta.status === "stale") {
+      return el("div", { class: "graph-topology-note graph-topology-stale", text:
+        "Showing last-known " + spec.title.toLowerCase() +
+        (meta.revision ? " from " + meta.revision : "") +
+        (meta.currentRevision ? "; current source is " + meta.currentRevision : "") +
+        ". Dashed dependency edges may be outdated." });
+    }
+    return el("div", { class: "graph-topology-note graph-topology-unavailable", text:
+      "Dependency topology is unavailable. The project audit has not captured " +
+      "dependency edges for this view." });
   }
 
   function graphSvg(tag, attrs, textValue) {
@@ -5415,23 +5738,22 @@
     openModal(panel);
   }
 
-  function renderGraphCanvas(host, data, nodes, edges) {
-    var capped = nodes.length > 220;
-    if (capped) nodes = nodes.slice(0, 220);
-    var included = {};
-    nodes.forEach(function (node) { included[node.id] = true; });
-    edges = edges.filter(function (edge) {
-      return included[edge.source] && included[edge.target];
-    });
+  function renderGraphCanvas(host, data, nodes, edges, mode, topology) {
+    var subset = graphConnectedSubset(nodes, edges, GRAPH_NODE_LIMIT);
+    nodes = subset.nodes;
+    edges = subset.edges;
     if (!nodes.length) {
       host.appendChild(el("div", { class: "dash-empty", text: "No graph nodes match these filters." }));
       return;
     }
-    if (capped) {
+    if (subset.capped) {
       host.appendChild(el("div", { class: "graph-cap", text:
-        "Showing the first 220 matching nodes. Narrow by chapter, status, type, or search to inspect the rest." }));
+        "Showing a connected " + GRAPH_NODE_LIMIT + "-node neighborhood out of " +
+        subset.total + " matching nodes. Narrow by chapter, status, or search to inspect the rest." }));
     }
-    var layout = graphLayout(nodes, edges);
+    var layout = mode === "ownership"
+      ? graphOwnershipLayout(nodes)
+      : graphLayout(nodes, edges);
     var viewport = el("div", { class: "graph-viewport" });
     var zoom = Math.max(0.5, Math.min(2.25, state.graphView.zoom || 1));
     var svg = graphSvg("svg", {
@@ -5442,7 +5764,7 @@
       "data-base-height": layout.height,
       viewBox: "0 0 " + layout.width + " " + layout.height,
       role: "img",
-      "aria-label": "Project issue and declaration dependency graph",
+      "aria-label": graphModeSpec(mode).title,
     });
     var defs = graphSvg("defs");
     var marker = graphSvg("marker", {
@@ -5461,7 +5783,9 @@
       var bend = Math.max(30, Math.abs(x2 - x1) / 2);
       svg.appendChild(graphSvg("path", {
         class: "graph-edge graph-edge-" + edge.kind +
-          (edge.cyclic ? " graph-edge-cyclic" : ""),
+          (edge.cyclic ? " graph-edge-cyclic" : "") +
+          (topology.status === "stale" && graphIsDependencyEdge(edge)
+            ? " graph-edge-topology-stale" : ""),
         d: "M" + x1 + "," + y1 + " C" + (x1 + bend) + "," + y1 +
           " " + (x2 - bend) + "," + y2 + " " + x2 + "," + y2,
         "marker-end": "url(#graph-arrow)",
@@ -5531,6 +5855,8 @@
     if (!host) return;
     host.innerHTML = "";
     var filter = state.graphFilter;
+    var mode = state.graphView.mode || "issues";
+    var spec = graphModeSpec(mode);
 
     var chapter = el("select", { class: "reader-select", "aria-label": "Graph chapter" });
     chapter.appendChild(el("option", { value: "all", text: "All chapters" }));
@@ -5541,17 +5867,21 @@
     var status = el("select", { class: "reader-select", "aria-label": "Graph status" });
     status.appendChild(el("option", { value: "all", text: "All statuses" }));
     var statuses = {};
-    (data.nodes || []).forEach(function (node) { statuses[node.status] = true; });
+    (data.nodes || []).forEach(function (node) {
+      if (!spec.nodeType || node.type === spec.nodeType) statuses[node.status] = true;
+    });
     Object.keys(statuses).sort().forEach(function (name) {
       status.appendChild(el("option", { value: name, text: name }));
     });
     status.value = filter.status;
-    var type = el("select", { class: "reader-select", "aria-label": "Graph node type" }, [
-      el("option", { value: "all", text: "Issues + declarations" }),
-      el("option", { value: "issue", text: "Issues only" }),
-      el("option", { value: "declaration", text: "Declarations only" }),
+    var modeSelect = el("select", {
+      class: "reader-select graph-mode", "aria-label": "Graph mode",
+    }, [
+      el("option", { value: "issues", text: "Issue graph" }),
+      el("option", { value: "declarations", text: "Declaration graph" }),
+      el("option", { value: "ownership", text: "Issues + declarations map" }),
     ]);
-    type.value = filter.type;
+    modeSelect.value = mode;
     var search = el("input", {
       class: "reader-search", type: "search", value: filter.query,
       placeholder: "Find issue, declaration, or file…",
@@ -5573,7 +5903,12 @@
     }, ["+"]);
     chapter.addEventListener("change", function () { filter.chapter = chapter.value; paintGraphTab(); });
     status.addEventListener("change", function () { filter.status = status.value; paintGraphTab(); });
-    type.addEventListener("change", function () { filter.type = type.value; paintGraphTab(); });
+    modeSelect.addEventListener("change", function () {
+      state.graphView.mode = modeSelect.value;
+      state.graphView.zoom = 1;
+      filter.status = "all";
+      paintGraphTab();
+    });
     search.addEventListener("input", function () {
       filter.query = search.value;
       paintGraphTab();
@@ -5585,7 +5920,7 @@
     });
     refresh.addEventListener("click", function () {
       state.graphData = null;
-      renderGraphTab();
+      renderGraphTab(true);
     });
     zoomOut.addEventListener("click", function () { graphChangeZoom(-0.2); });
     zoomIn.addEventListener("click", function () { graphChangeZoom(0.2); });
@@ -5595,14 +5930,38 @@
     });
     host.appendChild(el("div", { class: "reader-header graph-header" }, [
       el("div", {}, [
-        el("h2", { text: "Project dependency DAG" }),
-        el("p", { class: "reader-help", text:
-          "Edges point from predecessor to dependent. Drag or scroll to pan; click a node to expand relationships." }),
+        el("h2", { text: spec.title }),
+        el("p", { class: "reader-help", text: spec.help +
+          " Drag or scroll to pan; click a node to expand relationships." }),
       ]),
       el("div", { class: "reader-toolbar graph-toolbar" }, [
-        chapter, status, type, search, zoomOut, zoomValue, resetView, zoomIn, refresh,
+        modeSelect, chapter, status, search,
+        zoomOut, zoomValue, resetView, zoomIn, refresh,
       ]),
     ]));
+
+    var view = graphModeView(data, filter, mode);
+    var nodes = view.nodes;
+    var edges = view.edges;
+    var topology = graphTopologyMeta(data, mode, edges.length);
+    host.appendChild(graphTopologyNotice(topology, spec));
+    var cyclicVisible = edges.filter(function (edge) { return edge.cyclic; }).length;
+    var visibleNodeIds = Object.create(null);
+    nodes.forEach(function (node) { visibleNodeIds[node.id] = true; });
+    var unresolvedVisible = mode === "declarations"
+      ? (data.unresolved_edges || []).filter(function (edge) {
+          return visibleNodeIds[edge.target];
+        }).length
+      : 0;
+    if (cyclicVisible && mode !== "ownership") {
+      host.appendChild(el("div", {
+        class: "graph-topology-note graph-cycle-note",
+        text: cyclicVisible + " visible cyclic dependency edge" +
+          (cyclicVisible === 1 ? "" : "s") +
+          ". Strongly connected nodes share one layout layer; downstream " +
+          "dependencies continue in later layers.",
+      }));
+    }
 
     if (data.audit && data.audit.status !== "fresh") {
       host.appendChild(el("div", { class: "reader-errors graph-audit-warning", text:
@@ -5612,12 +5971,6 @@
             "; stale or unavailable build evidence is never presented as current." }));
     }
 
-    var nodes = (data.nodes || []).filter(function (node) { return graphNodeMatches(node, filter); });
-    var visibleIds = {};
-    nodes.forEach(function (node) { visibleIds[node.id] = true; });
-    var edges = (data.edges || []).filter(function (edge) {
-      return visibleIds[edge.source] && visibleIds[edge.target];
-    });
     host.appendChild(el("div", { class: "stat-row graph-stats" }, [
       statChip(nodes.length, "visible nodes"),
       statChip(edges.length, "visible edges"),
@@ -5625,18 +5978,30 @@
       statChip((data.counts && data.counts.by_type && data.counts.by_type.declaration) || 0, "declarations total"),
       statChip((data.counts && data.counts.impacted) || 0, "downstream impact"),
     ]));
-    host.appendChild(el("div", { class: "graph-legend" }, [
-      el("span", { class: "graph-key graph-key-issue", text: "issue" }),
-      el("span", { class: "graph-key graph-key-decl", text: "declaration" }),
-      el("span", { class: "graph-key graph-key-dependency", text: "dependency" }),
-      el("span", { class: "graph-key graph-key-contains", text: "reviews / contains" }),
-      el("span", { class: "graph-key graph-key-changed", text: "changed" }),
-      el("span", { class: "graph-key graph-key-impact", text: "changed downstream" }),
-      el("span", { class: "graph-key graph-key-warning", text:
-        ((data.counts && data.counts.unresolved_edges) || 0) + " unresolved · " +
-        ((data.counts && data.counts.cyclic_edges) || 0) + " cyclic" }),
-    ]));
-    renderGraphCanvas(host, data, nodes, edges);
+    var legend = [];
+    if (mode === "issues" || mode === "ownership") {
+      legend.push(el("span", { class: "graph-key graph-key-issue", text: "issue" }));
+    }
+    if (mode === "declarations" || mode === "ownership") {
+      legend.push(el("span", { class: "graph-key graph-key-decl", text: "declaration" }));
+    }
+    legend.push(mode === "ownership"
+      ? el("span", { class: "graph-key graph-key-contains", text: "reviews / contains" })
+      : el("span", { class: "graph-key graph-key-dependency", text:
+          topology.status === "stale" ? "dependency (last known)" : "dependency" }));
+    if (mode !== "issues") {
+      legend.push(el("span", { class: "graph-key graph-key-changed", text: "changed" }));
+      legend.push(el("span", { class: "graph-key graph-key-impact", text: "changed downstream" }));
+    }
+    legend.push(el("span", { class: "graph-key graph-key-warning", text:
+      unresolvedVisible + " unresolved · " + cyclicVisible + " cyclic" }));
+    host.appendChild(el("div", { class: "graph-legend" }, legend));
+    if (topology.status === "unavailable" && mode !== "ownership") {
+      host.appendChild(el("div", { class: "dash-empty graph-topology-empty", text:
+        "No dependency edges are available for this graph." }));
+    } else {
+      renderGraphCanvas(host, data, nodes, edges, mode, topology);
+    }
     if ((data.errors || []).length) {
       host.appendChild(el("div", { class: "reader-errors", text:
         data.errors.length + " issue payload" + (data.errors.length === 1 ? "" : "s") +
@@ -5644,14 +6009,14 @@
     }
   }
 
-  function renderGraphTab() {
+  function renderGraphTab(force) {
     if (state.activeTab !== "graph") return;
     if (state.graphData) return paintGraphTab();
     var host = dashHost("dash-graph");
     if (!host) return;
     host.innerHTML = "";
-    host.appendChild(el("div", { class: "dash-loading", text: "building project dependency DAG…" }));
-    fetchProjectGraph()
+    host.appendChild(el("div", { class: "dash-loading", text: "building project dependency graph…" }));
+    fetchProjectGraph(force)
       .then(function (data) {
         if (state.activeTab !== "graph") return;
         state.graphData = data;
@@ -6576,6 +6941,9 @@
     reconciliationProposalPanel: reconciliationProposalPanel,
     readerTargetMatches: readerTargetMatches,
     graphLayout: graphLayout,
+    graphModeView: graphModeView,
+    graphTopologyMeta: graphTopologyMeta,
+    graphConnectedSubset: graphConnectedSubset,
     switchTab: switchTab,   // dashboard tab navigation (pure read)
     _state: state,
   };

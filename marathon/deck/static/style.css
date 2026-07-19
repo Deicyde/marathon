@@ -1132,6 +1132,17 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .graph-key-changed { color: var(--reject); border-color: #d1374b88; }
 .graph-key-impact { color: var(--warn); border-color: #d2992288; }
 .graph-key-warning { color: var(--muted); border-style: dotted; }
+.graph-topology-note {
+  margin: 0 0 0.75rem; padding: 0.5rem 0.65rem; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--panel-2); color: var(--muted);
+  font-size: 0.76rem; line-height: 1.4;
+}
+.graph-topology-fresh { color: var(--verify); border-color: #2ea04366; }
+.graph-topology-stale { color: var(--warn); border-color: #d2992277; background: #d299220d; }
+.graph-topology-unavailable { color: var(--reject); border-color: #d1374b77; background: #d1374b0d; }
+.graph-topology-ownership { color: var(--accent); border-color: #6ea8fe66; }
+.graph-cycle-note { color: var(--reject); border-color: #d1374b77; }
+.graph-topology-empty { padding: 2rem 1rem; }
 .graph-zoom-value { min-width: 3.1rem; color: var(--muted); font: 0.72rem var(--mono); text-align: center; }
 .graph-viewport {
   width: 100%; max-height: calc(100vh - 15rem); min-height: 22rem;
@@ -1147,6 +1158,9 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .graph-edge-contains { stroke: #6ea8fe88; stroke-dasharray: 4 4; opacity: 0.5; }
 .graph-edge-issue-dependency { stroke: var(--accent); stroke-width: 1.8; }
 .graph-edge-declaration-dependency { stroke: #c297ff; }
+.graph-edge-topology-stale:not(.graph-edge-cyclic) {
+  stroke: var(--warn); stroke-dasharray: 7 4; opacity: 0.58;
+}
 .graph-edge-cyclic { stroke: var(--reject); stroke-width: 2.2; stroke-dasharray: 5 3; }
 .graph-arrow { fill: #758399; }
 .graph-node { cursor: pointer; outline: none; }

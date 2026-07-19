@@ -55,7 +55,7 @@ def _cfg(tmp_path) -> ReviewConfig:
     )
 
 
-def _install(cfg: ReviewConfig) -> None:
+def _install(cfg: ReviewConfig, *, revision: str | None = None) -> None:
     snapshot = AuditSnapshot(
         repo_dir=str(cfg.repo_dir),
         modules=["Demo.Chapter14"],
@@ -78,8 +78,37 @@ def _install(cfg: ReviewConfig) -> None:
             ),
         ],
         failures=[],
+        source_revision=revision,
+        module_revisions=(
+            {"Demo.Chapter14": revision} if revision is not None else {}
+        ),
+        attempted_modules=["Demo.Chapter14"],
     )
     save_snapshot(snapshot, cfg.repo_dir)
+
+
+def _decl(name: str, cone: list[str], *, kind: str = "def") -> DeclAudit:
+    return DeclAudit(
+        name=name, kind=kind, module="Demo.Chapter14", status="ok",
+        type_pp=name, value_pp=("0" if kind == "def" else None), cone=cone,
+        axioms=["propext"], has_sorry=False, tags=[], reason=None,
+    )
+
+
+def _snapshot(
+    cfg: ReviewConfig, decls: list[DeclAudit], *, revision: str | None = None
+) -> AuditSnapshot:
+    return AuditSnapshot(
+        repo_dir=str(cfg.repo_dir), modules=["Demo.Chapter14"],
+        toolchain="leanprover/lean4:v4.0.0", lean_version="4.0.0",
+        package_revs={}, trusted_prefixes=["Mathlib", "Init"],
+        created_at="2026-07-10T00:00:00+00:00", decls=decls, failures=[],
+        source_revision=revision,
+        module_revisions=(
+            {"Demo.Chapter14": revision} if revision is not None else {}
+        ),
+        attempted_modules=["Demo.Chapter14"],
+    )
 
 
 def _patch_issues(monkeypatch):
@@ -174,8 +203,252 @@ def test_project_graph_connects_issues_declarations_and_kernel(tmp_path, monkeyp
     assert ("issue:22", "decl:Demo.Chapter14.Foo", "contains") in edges
     assert graph["counts"]["by_type"] == {"declaration": 2, "issue": 2}
     assert graph["audit"]["status"] == "fresh"
+    assert graph["topology"] == {
+        "status": "fresh",
+        "available": True,
+        "source_revision": None,
+        "current_revision": None,
+        "authoritative": False,
+        "notice": (
+            "Dependency topology comes from the current audited source. "
+            "Exploratory only: dependency topology never affects trust, build "
+            "status, review readiness, or dependency gating."
+        ),
+        "targets": 2,
+        "resolved_targets": 2,
+        "declaration_edges": 1,
+        "issue_edges": 1,
+    }
+    for edge in graph["edges"]:
+        if edge["kind"] != "contains":
+            assert edge["topology_status"] == "fresh"
+            assert edge["freshness"] == "fresh"
+            assert edge["authoritative"] is False
     assert graph["unresolved_edges"] == []
     assert graph["cyclic_edges"] == []
+
+
+def test_stale_topology_remains_explorable_but_not_review_evidence(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    _install(cfg, revision="old-revision")
+    _patch_issues(monkeypatch)
+    import marathon.audit.engine as audit_engine
+
+    monkeypatch.setattr(
+        audit_engine, "source_state", lambda _repo: ("current-revision", True)
+    )
+
+    graph = build_project_graph(cfg)
+
+    assert graph["audit"]["status"] == "stale"
+    assert graph["topology"]["status"] == "stale"
+    assert graph["topology"]["available"] is True
+    assert graph["topology"]["source_revision"] == "old-revision"
+    assert graph["topology"]["current_revision"] == "current-revision"
+    assert graph["topology"]["authoritative"] is False
+    assert "may differ from the current code" in graph["topology"]["notice"]
+    declarations = [
+        node for node in graph["nodes"] if node["type"] == "declaration"
+    ]
+    # The validated snapshot still fails closed for every review signal.
+    assert {node["build_status"] for node in declarations} == {"stale"}
+    assert {node["tier"] for node in declarations} == {"-"}
+    dependency_edges = {
+        (edge["source"], edge["target"], edge["kind"]): edge
+        for edge in graph["edges"] if edge["kind"] != "contains"
+    }
+    declaration_key = (
+        "decl:Foo", "decl:Bar", "declaration-dependency",
+    )
+    issue_key = ("issue:22", "issue:23", "issue-dependency")
+    assert declaration_key in dependency_edges
+    assert issue_key in dependency_edges
+    for edge in dependency_edges.values():
+        assert edge["topology_status"] == "stale"
+        assert edge["freshness"] == "stale"
+        assert edge["authoritative"] is False
+
+
+def test_graph_projects_nearest_targets_and_rolls_edges_up_without_gating(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+
+    def target(name, issue):
+        return {
+            "name": name, "issue": issue, "chapter": 14,
+            "source_file": "Demo/Chapter14.lean", "source_line": issue,
+            "statement_pp": name, "source_block": name, "kind": "def",
+            "verdict": None, "tier": "T1", "build_status": "ok",
+            "blocked_by": [], "kernel": [], "changed_since_review": False,
+            "dependency_invalidated": False,
+        }
+
+    names = [("Demo.A", 10), ("Demo.B", 20), ("Demo.C", 30), ("Demo.D", 40)]
+    catalog = {
+        "repo": cfg.github_repo, "chapters": [14], "errors": [],
+        "audit": {"status": "fresh", "created_at": None,
+                  "source_revision": None, "failures": []},
+        "issues": [
+            {"id": issue, "title": name, "chapter": 14, "tier": "T1",
+             "status": "ready", "build_status": "ok", "permalink": None,
+             "blocked_reason": None, "graph_deps": []}
+            for name, issue in names
+        ],
+        "targets": [target(name, issue) for name, issue in names],
+    }
+    topology_snapshot = _snapshot(cfg, [
+        _decl("Demo.A", []),
+        _decl("Demo.Helper", ["Demo.A"]),
+        _decl("Demo.B", ["Demo.Helper"]),
+        _decl("Demo.C", ["Demo.B"]),
+        _decl("Demo.D", ["Demo.A"]),
+    ])
+    import marathon.audit.engine as audit_engine
+    import marathon.deck.workspace as workspace
+
+    monkeypatch.setattr(workspace, "_catalog", lambda _cfg, _chapter: catalog)
+    monkeypatch.setattr(
+        audit_engine, "load_snapshot", lambda *_args, **_kwargs: topology_snapshot
+    )
+    monkeypatch.setattr(audit_engine, "source_state", lambda _repo: (None, None))
+
+    graph = build_project_graph(cfg)
+
+    declaration_edges = {
+        (edge["source"], edge["target"])
+        for edge in graph["edges"]
+        if edge["kind"] == "declaration-dependency"
+    }
+    assert declaration_edges == {
+        ("decl:Demo.A", "decl:Demo.B"),
+        ("decl:Demo.B", "decl:Demo.C"),
+        ("decl:Demo.A", "decl:Demo.D"),
+    }
+    assert ("decl:Demo.A", "decl:Demo.C") not in declaration_edges
+    issue_edges = {
+        (edge["source"], edge["target"])
+        for edge in graph["edges"] if edge["kind"] == "issue-dependency"
+    }
+    assert issue_edges == {
+        ("issue:10", "issue:20"),
+        ("issue:20", "issue:30"),
+        ("issue:10", "issue:40"),
+    }
+    # Exploratory roll-up is not allowed to rewrite readiness supplied by the
+    # validated catalog.
+    assert {node["status"] for node in graph["nodes"] if node["type"] == "issue"} == {
+        "ready"
+    }
+
+
+def test_issue_rollup_uses_canonical_owner_instead_of_citation_product(
+    tmp_path, monkeypatch,
+):
+    """Duplicate citations cannot fabricate issue edges or issue cycles."""
+    cfg = _cfg(tmp_path)
+
+    def target(name, issue, registry_order):
+        return {
+            "name": name, "issue": issue, "chapter": 14,
+            "source_file": "Demo/Chapter14.lean", "source_line": issue,
+            "statement_pp": name, "source_block": name, "kind": "def",
+            "verdict": None, "tier": "T1", "build_status": "ok",
+            "blocked_by": [], "kernel": [], "changed_since_review": False,
+            "dependency_invalidated": False,
+            "registry_order": registry_order,
+        }
+
+    catalog = {
+        "repo": cfg.github_repo, "chapters": [14], "errors": [],
+        "audit": {"status": "fresh", "created_at": None,
+                  "source_revision": None, "failures": []},
+        "issues": [
+            {"id": issue, "title": str(issue), "chapter": 14, "tier": "T1",
+             "status": "ready", "build_status": "ok", "permalink": None,
+             "blocked_reason": None, "graph_deps": []}
+            for issue in (10, 20, 30)
+        ],
+        # #30 cites both declarations, but their canonical registered owners
+        # are #10 and #20 respectively.
+        "targets": [
+            target("Demo.A", 10, 0), target("Demo.A", 30, 2),
+            target("Demo.B", 20, 1), target("Demo.B", 30, 2),
+        ],
+    }
+    topology_snapshot = _snapshot(
+        cfg, [_decl("Demo.A", []), _decl("Demo.B", ["Demo.A"])]
+    )
+    import marathon.audit.engine as audit_engine
+    import marathon.deck.workspace as workspace
+
+    monkeypatch.setattr(workspace, "_catalog", lambda _cfg, _chapter: catalog)
+    monkeypatch.setattr(
+        audit_engine, "load_snapshot", lambda *_args, **_kwargs: topology_snapshot
+    )
+    monkeypatch.setattr(audit_engine, "source_state", lambda _repo: (None, None))
+
+    graph = build_project_graph(cfg)
+    issue_edges = {
+        (edge["source"], edge["target"])
+        for edge in graph["edges"] if edge["kind"] == "issue-dependency"
+    }
+    assert issue_edges == {("issue:10", "issue:20")}
+    assert not [edge for edge in graph["cyclic_edges"] if edge["kind"] == "issue-dependency"]
+
+
+def test_graph_does_not_transfer_old_edges_to_a_renamed_target(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    catalog = {
+        "repo": cfg.github_repo, "chapters": [14], "errors": [],
+        "audit": {"status": "stale", "created_at": None,
+                  "source_revision": "old", "failures": ["stale"]},
+        "issues": [
+            {"id": 22, "title": "Renamed", "chapter": 14, "tier": "-",
+             "status": "blocked", "build_status": "stale", "permalink": None,
+             "blocked_reason": "stale audit", "graph_deps": []},
+            {"id": 23, "title": "Dependent", "chapter": 14, "tier": "-",
+             "status": "blocked", "build_status": "stale", "permalink": None,
+             "blocked_reason": "stale audit", "graph_deps": []},
+        ],
+        "targets": [
+            {"name": "Demo.RenamedA", "issue": 22, "chapter": 14,
+             "source_file": "Demo/Chapter14.lean", "source_line": 2,
+             "statement_pp": "Demo.RenamedA", "source_block": "Demo.RenamedA",
+             "kind": "def", "verdict": None, "tier": "-",
+             "build_status": "stale", "blocked_by": [], "kernel": [],
+             "changed_since_review": False, "dependency_invalidated": False},
+            {"name": "Demo.B", "issue": 23, "chapter": 14,
+             "source_file": "Demo/Chapter14.lean", "source_line": 3,
+             "statement_pp": "Demo.B", "source_block": "Demo.B", "kind": "def",
+             "verdict": None, "tier": "-", "build_status": "stale",
+             "blocked_by": [], "kernel": [], "changed_since_review": False,
+             "dependency_invalidated": False},
+        ],
+    }
+    old_snapshot = _snapshot(
+        cfg, [_decl("Demo.A", []), _decl("Demo.B", ["Demo.A"])],
+        revision="old",
+    )
+    import marathon.audit.engine as audit_engine
+    import marathon.deck.workspace as workspace
+
+    monkeypatch.setattr(workspace, "_catalog", lambda _cfg, _chapter: catalog)
+    monkeypatch.setattr(
+        audit_engine, "load_snapshot", lambda *_args, **_kwargs: old_snapshot
+    )
+    monkeypatch.setattr(audit_engine, "source_state", lambda _repo: ("new", True))
+
+    graph = build_project_graph(cfg)
+
+    assert graph["topology"]["resolved_targets"] == 1
+    assert not [
+        edge for edge in graph["edges"] if edge["kind"] != "contains"
+    ]
 
 
 def test_graph_reports_cycles_unreviewed_targets_and_changed_impact(
@@ -213,8 +486,18 @@ def test_graph_reports_cycles_unreviewed_targets_and_changed_impact(
     }
     import marathon.deck.definitions as definitions
     import marathon.deck.workspace as workspace
+    import marathon.audit.engine as audit_engine
 
     monkeypatch.setattr(workspace, "_catalog", lambda _cfg, _chapter: catalog)
+    topology_snapshot = _snapshot(cfg, [
+        _decl("Demo.A", ["Demo.B", "Demo.Helper"]),
+        _decl("Demo.B", ["Demo.A"]),
+        _decl("Demo.Helper", []),
+    ])
+    monkeypatch.setattr(
+        audit_engine, "load_snapshot", lambda *_args, **_kwargs: topology_snapshot
+    )
+    monkeypatch.setattr(audit_engine, "source_state", lambda _repo: (None, None))
     monkeypatch.setattr(
         definitions, "_current_source_index",
         lambda _repo: {"Demo.A": [{}], "Demo.B": [{}], "Demo.Helper": [{}]},
@@ -228,6 +511,8 @@ def test_graph_reports_cycles_unreviewed_targets_and_changed_impact(
         "kind": "declaration-dependency", "dependency": "Demo.Helper",
         "status": "unreviewed-target",
         "reason": "current project dependency has no registered review target",
+        "topology_status": "fresh", "freshness": "fresh",
+        "authoritative": False,
     }]
     assert len(first["cyclic_edges"]) == 4  # two issue + two declaration edges
     nodes = {node["id"]: node for node in first["nodes"]}
@@ -258,11 +543,21 @@ def test_graph_degrades_honestly_without_audit_snapshot(tmp_path, monkeypatch):
     graph = build_project_graph(cfg)
 
     assert graph["audit"]["status"] == "missing"
+    assert graph["topology"]["status"] == "unavailable"
+    assert graph["topology"]["available"] is False
+    assert graph["topology"]["source_revision"] is None
+    assert graph["topology"]["current_revision"] is None
+    assert graph["topology"]["authoritative"] is False
+    assert "No audited dependency topology is available" in graph["topology"]["notice"]
+    assert graph["topology"]["resolved_targets"] == 0
+    assert graph["topology"]["declaration_edges"] == 0
+    assert graph["topology"]["issue_edges"] == 0
     declaration_nodes = [
         node for node in graph["nodes"] if node["type"] == "declaration"
     ]
     assert declaration_nodes
     assert {node["build_status"] for node in declaration_nodes} == {"unknown"}
+    assert {edge["kind"] for edge in graph["edges"]} == {"contains"}
 
 
 def test_source_line_index_refuses_traversal_and_symlink_escape(tmp_path):

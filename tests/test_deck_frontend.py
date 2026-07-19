@@ -34,13 +34,17 @@ What these tests enforce:
 * the completion summary renders the KEEP (verified) + FIX (rejected) lists;
 * the offline-LaTeX fallback path + source highlighting are still wired.
 
-No subprocess, no network, no browser. Pure file reads + string/loose
-structural assertions.
+No network and no browser. Most checks are pure structural assertions; when a
+Node runtime is available, one small offline subprocess executes the exported
+pure graph-layout helper against dependency and cycle fixtures.
 """
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -97,6 +101,30 @@ def _fn_body(code: str, header: str) -> str:
     assert s != -1, f"expected {header!r} in app.js"
     nxt = code.find("\n  function ", s + 1)
     return code[s: nxt if nxt != -1 else len(code)]
+
+
+def _run_graph_layout(app_js: str, nodes: list[dict], edges: list[dict]) -> dict:
+    """Execute the DOM-free graph layout in Node when available."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for graph-layout semantic test")
+    code = _strip_block_comments(app_js)
+    helpers = "\n".join((
+        _fn_body(code, "function graphIsDependencyEdge"),
+        _fn_body(code, "function graphLayout"),
+    ))
+    script = (
+        helpers + "\n" +
+        "const result = graphLayout(" + json.dumps(nodes) + "," +
+        json.dumps(edges) + ");\n" +
+        "process.stdout.write(JSON.stringify(result));\n"
+    )
+    proc = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=10,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
 
 
 # --- existence / serveability -----------------------------------------------
@@ -1817,9 +1845,10 @@ def test_project_graph_is_filterable_and_navigable(app_js: str):
     code = _strip_block_comments(app_js)
     assert "/api/project-graph" in code
     assert "function graphLayout" in code
+    assert "function graphModeView" in code
     assert "function renderGraphCanvas" in code
     paint = _fn_body(code, "function paintGraphTab")
-    for token in ("filter.chapter", "filter.status", "filter.type", "filter.query"):
+    for token in ("filter.chapter", "filter.status", "filter.query"):
         assert token in paint
     canvas = _fn_body(code, "function renderGraphCanvas")
     assert "project-graph" in canvas and "marker-end" in canvas
@@ -1830,12 +1859,113 @@ def test_project_graph_is_filterable_and_navigable(app_js: str):
     assert "unresolved_edges" in inspect and "cyclic_edges" in inspect
 
 
+def test_project_graph_defaults_to_issue_dependencies_and_separates_modes(
+    app_js: str,
+):
+    code = _strip_block_comments(app_js)
+    assert 'graphView: { zoom: 1, mode: "issues" }' in code
+    modes = _fn_body(code, "function graphModeSpec")
+    for label in (
+        "Issue dependency graph", "Declaration dependency graph",
+        "Issues + declarations map",
+    ):
+        assert label in modes
+    for edge_kind in (
+        'edgeKind: "issue-dependency"',
+        'edgeKind: "declaration-dependency"',
+        'edgeKind: "contains"',
+    ):
+        assert edge_kind in modes
+    assert "not a dependency graph" in modes
+    mode_view = _fn_body(code, "function graphModeView")
+    assert "edge.kind === spec.edgeKind" in mode_view
+    paint = _fn_body(code, "function paintGraphTab")
+    for option in (
+        "Issue graph", "Declaration graph", "Issues + declarations map",
+    ):
+        assert option in paint
+    assert '"aria-label": "Graph mode"' in paint
+    assert "cyclic dependency edge" in paint
+    assert "Strongly connected nodes share one layout layer" in paint
+
+
+def test_project_graph_manual_refresh_bypasses_server_cache(app_js: str):
+    code = _strip_block_comments(app_js)
+    fetch = _fn_body(code, "function fetchProjectGraph")
+    assert 'force ? "?refresh=1" : ""' in fetch
+    paint = _fn_body(code, "function paintGraphTab")
+    assert "renderGraphTab(true)" in paint
+
+
+def test_graph_layout_ignores_ownership_for_dependency_ranks(app_js: str):
+    nodes = [
+        {"id": "issue:1", "label": "#1", "type": "issue", "chapters": [1]},
+        {"id": "decl:A", "label": "A", "type": "declaration", "chapters": [1]},
+        {"id": "decl:B", "label": "B", "type": "declaration", "chapters": [1]},
+    ]
+    layout = _run_graph_layout(app_js, nodes, [
+        {"source": "issue:1", "target": "decl:A", "kind": "contains"},
+        {"source": "decl:A", "target": "decl:B", "kind": "declaration-dependency"},
+    ])
+    positions = layout["positions"]
+    assert positions["issue:1"]["rank"] == 0
+    assert positions["decl:A"]["rank"] == 0
+    assert positions["decl:B"]["rank"] == 1
+
+
+def test_graph_layout_ranks_scc_condensation_without_flattening_downstream(
+    app_js: str,
+):
+    nodes = [
+        {"id": name, "label": name, "type": "declaration", "chapters": [1]}
+        for name in ("root", "cycle-a", "cycle-b", "child", "leaf")
+    ]
+    dep = "declaration-dependency"
+    layout = _run_graph_layout(app_js, nodes, [
+        {"source": "root", "target": "cycle-a", "kind": dep},
+        {"source": "cycle-a", "target": "cycle-b", "kind": dep},
+        {"source": "cycle-b", "target": "cycle-a", "kind": dep},
+        {"source": "cycle-b", "target": "child", "kind": dep},
+        {"source": "child", "target": "leaf", "kind": dep},
+    ])
+    ranks = {name: position["rank"] for name, position in layout["positions"].items()}
+    assert ranks == {
+        "root": 0,
+        "cycle-a": 1,
+        "cycle-b": 1,
+        "child": 2,
+        "leaf": 3,
+    }
+
+
+def test_project_graph_topology_states_and_connected_cap_are_explicit(app_js: str):
+    code = _strip_block_comments(app_js)
+    topology = _fn_body(code, "function graphTopologyMeta")
+    for state in ('"fresh"', '"stale"', '"unavailable"', '"ownership"'):
+        assert state in topology
+    notice = _fn_body(code, "function graphTopologyNotice")
+    for text in (
+        "Dependency topology is fresh",
+        "Showing last-known",
+        "Dependency topology is unavailable",
+        "Ownership map:",
+    ):
+        assert text in notice
+    subset = _fn_body(code, "function graphConnectedSubset")
+    assert "queue" in subset and "adjacent" in subset
+    assert "GRAPH_NODE_LIMIT = 500" in code
+    assert "nodes.slice(0, 220)" not in code
+    canvas = _fn_body(code, "function renderGraphCanvas")
+    assert "graphConnectedSubset" in canvas
+    assert "graph-edge-topology-stale" in canvas
+
+
 def test_project_graph_supports_pan_zoom_and_changed_impact(app_js: str):
     code = _strip_block_comments(app_js)
     paint = _fn_body(code, "function paintGraphTab")
     for token in (
         "Zoom graph out", "Reset graph view", "Zoom graph in",
-        "changed downstream", "unresolved_edges", "cyclic_edges",
+        "changed downstream", "unresolved_edges", "cyclicVisible",
     ):
         assert token in paint
     canvas = _fn_body(code, "function renderGraphCanvas")
@@ -1854,7 +1984,10 @@ def test_wide_review_styles_exist(style_css: str):
         ".reader-batch", ".reader-full-file", ".graph-viewport",
         ".project-graph", ".graph-node",
         ".graph-impact-changed", ".graph-impact-downstream",
-        ".graph-edge-cyclic", ".graph-dragging",
+        ".graph-edge-cyclic", ".graph-edge-topology-stale",
+        ".graph-topology-fresh", ".graph-topology-stale",
+        ".graph-topology-unavailable", ".graph-topology-ownership",
+        ".graph-cycle-note", ".graph-dragging",
     ):
         assert cls in style_css
 

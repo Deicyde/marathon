@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -71,7 +73,7 @@ def mk_snapshot(decls, *, repo_dir="/r", failures=(), **kw) -> AuditSnapshot:
 
 @pytest.fixture
 def fake_lake(monkeypatch):
-    """Install a fake `lake` whose `subprocess.run` returns canned output.
+    """Install a fake `lake` whose isolated runner returns canned output.
     Returns the call-recording list."""
 
     def install(stdout=GOLDEN_TEXT, returncode=0, stderr="", exc=None):
@@ -98,15 +100,61 @@ def fake_lake(monkeypatch):
                 cmd, returncode, stdout=stdout, stderr=stderr
             )
 
-        monkeypatch.setattr(engine.subprocess, "run", fake_run)
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
         return calls
 
     return install
 
 
 # ---------------------------------------------------------------------------
+# Timeout-safe process launcher
+# ---------------------------------------------------------------------------
+
+
+class TestProcessGroupRunner:
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups")
+    def test_timeout_kills_descendant_process_group(self, tmp_path):
+        """The launcher and its child die together; no 60s sleep survives."""
+        child_code = "import time; time.sleep(60)"
+        parent_code = (
+            "import subprocess, sys, time\n"
+            f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+            "print(child.pid, flush=True)\n"
+            "time.sleep(60)\n"
+        )
+
+        started = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired) as raised:
+            engine._run_process_group(
+                [sys.executable, "-c", parent_code],
+                cwd=str(tmp_path),
+                timeout=0.5,
+            )
+        assert time.monotonic() - started < 5
+        child_pid = int((raised.value.output or "").strip())
+
+        # A just-killed orphan can briefly remain as a zombie until PID 1
+        # reaps it. Either absence or Z proves it is no longer executing.
+        deadline = time.monotonic() + 1
+        state = ""
+        while time.monotonic() < deadline:
+            inspected = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(child_pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            state = inspected.stdout.strip()
+            if not state or state.startswith("Z"):
+                break
+            time.sleep(0.01)
+        assert not state or state.startswith("Z")
+
+
+# ---------------------------------------------------------------------------
 # Golden end-to-end
 # ---------------------------------------------------------------------------
+
 
 class TestGoldenEndToEnd:
     def test_snapshot_counts_and_context(self, fake_lake):
@@ -497,7 +545,7 @@ class TestPartitionBuildable:
             rc = 0 if all(t in good for t in targets) else 1
             return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
 
-        monkeypatch.setattr(engine.subprocess, "run", fake_run)
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
         return calls
 
     def test_all_good_takes_batch_fast_path(self, monkeypatch):
@@ -528,12 +576,12 @@ class TestPartitionBuildable:
 
     def test_lake_build_ok_reads_exit_code(self, monkeypatch):
         monkeypatch.setattr(
-            engine.subprocess, "run",
+            engine, "_run_process_group",
             lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, "", ""),
         )
         assert engine._lake_build_ok("/fake/lake", Path("/r"), ["M"], 5)
         monkeypatch.setattr(
-            engine.subprocess, "run",
+            engine, "_run_process_group",
             lambda cmd, **k: subprocess.CompletedProcess(cmd, 1, "", ""),
         )
         assert not engine._lake_build_ok("/fake/lake", Path("/r"), ["M"], 5)
@@ -544,7 +592,7 @@ class TestPartitionBuildable:
         def boom(cmd, **k):
             raise subprocess.TimeoutExpired(cmd="lake", timeout=5)
 
-        monkeypatch.setattr(engine.subprocess, "run", boom)
+        monkeypatch.setattr(engine, "_run_process_group", boom)
         assert not engine._lake_build_ok("/fake/lake", Path("/r"), ["M"], 5)
 
 
@@ -568,7 +616,7 @@ class TestSkipBrokenIntegration:
             ran.append(cmd)
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        monkeypatch.setattr(engine.subprocess, "run", fake_run)
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
         snap = engine.run_audit(FIXTURE_DIR, "AuditFixture", timeout=5)
         assert snap.decls == []
         assert snap.modules == []
@@ -587,7 +635,7 @@ class TestSkipBrokenIntegration:
             ),
         )
         monkeypatch.setattr(
-            engine.subprocess, "run",
+            engine, "_run_process_group",
             lambda cmd, **k: subprocess.CompletedProcess(
                 cmd, 0, stdout=GOLDEN_TEXT, stderr=""
             ),

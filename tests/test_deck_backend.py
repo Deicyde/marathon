@@ -25,6 +25,7 @@ import json
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from http.client import HTTPConnection
 from threading import Event, Lock, Thread
 
 import pytest
@@ -938,6 +939,72 @@ def test_queue_invalidation_detaches_an_old_inflight_build(tmp_path):
         server.server_close()
 
 
+def test_project_graph_payload_coalesces_and_caches(tmp_path):
+    """Graph-tab reloads share one expensive project-wide catalog build."""
+    server = deck_server.make_server(make_cfg(tmp_path), port=0)
+    started = Event()
+    release = Event()
+    count_lock = Lock()
+    calls = 0
+
+    def build():
+        nonlocal calls
+        with count_lock:
+            calls += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return {"version": 1}
+
+    try:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = [
+                pool.submit(server.project_graph_payload, build) for _ in range(6)
+            ]
+            assert started.wait(timeout=2)
+            release.set()
+            assert [future.result(timeout=2) for future in futures] == [
+                {"version": 1}
+            ] * 6
+
+        assert server.project_graph_payload(
+            lambda: pytest.fail("unexpired project graph cache must be reused")
+        ) == {"version": 1}
+        assert calls == 1
+    finally:
+        release.set()
+        server.server_close()
+
+
+def test_project_graph_invalidation_detaches_an_old_inflight_build(tmp_path):
+    """A mutation generation cannot be overwritten by an older graph read."""
+    server = deck_server.make_server(make_cfg(tmp_path), port=0)
+    old_started = Event()
+    release_old = Event()
+
+    def build_old():
+        old_started.set()
+        assert release_old.wait(timeout=5)
+        return {"version": "old"}
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            old = pool.submit(server.project_graph_payload, build_old)
+            assert old_started.wait(timeout=2)
+            server.invalidate_project_graph_cache()
+            assert server.project_graph_payload(
+                lambda: {"version": "new"}
+            ) == {"version": "new"}
+            release_old.set()
+            assert old.result(timeout=2) == {"version": "old"}
+
+        assert server.project_graph_payload(
+            lambda: pytest.fail("old graph flight repopulated the cache")
+        ) == {"version": "new"}
+    finally:
+        release_old.set()
+        server.server_close()
+
+
 @pytest.fixture
 def running_server(tmp_path, monkeypatch):
     """A DeckServer on an ephemeral 127.0.0.1 port, with the bulk fetch
@@ -1055,6 +1122,101 @@ def test_successful_queue_mutation_invalidates_cache(running_server, monkeypatch
         14, lambda: builds.append(1) or {"version": 2}
     ) == {"version": 2}
     assert builds == [1]
+
+
+def test_successful_graph_mutation_invalidates_cache(running_server, monkeypatch):
+    """A declaration-local verdict evicts the cached project graph."""
+    server, base, token = running_server
+    server.project_graph_payload(lambda: {"version": 1})
+
+    from marathon.deck import subdeck as subdeck_mod
+
+    monkeypatch.setattr(
+        subdeck_mod,
+        "record_decl_verdict",
+        lambda cfg, issue, declaration, verdict, comment=None: {
+            "ok": True,
+            "updated": True,
+            "issue": issue,
+            "declaration": declaration,
+            "verdict": verdict,
+        },
+    )
+    status, raw = _post(
+        base + "/api/decl-verdict",
+        {"issue": 22, "decl": "Demo.Chapter14.Foo", "verdict": "verify"},
+        headers={deck_server.TOKEN_HEADER: token},
+    )
+    assert status == 200
+    assert json.loads(raw)["ok"] is True
+
+    builds = []
+    assert server.project_graph_payload(
+        lambda: builds.append(1) or {"version": 2}
+    ) == {"version": 2}
+    assert builds == [1]
+
+
+def test_project_graph_refresh_query_bypasses_cache(running_server, monkeypatch):
+    """The graph tab's explicit Refresh observes external project changes."""
+    _server, base, _token = running_server
+    import marathon.deck.workspace as workspace
+
+    calls = []
+
+    def build(_cfg):
+        calls.append(1)
+        return {"version": len(calls)}
+
+    monkeypatch.setattr(workspace, "build_project_graph", build)
+    status, raw = _get(base + "/api/project-graph")
+    assert status == 200 and json.loads(raw) == {"version": 1}
+    status, raw = _get(base + "/api/project-graph")
+    assert status == 200 and json.loads(raw) == {"version": 1}
+    status, raw = _get(base + "/api/project-graph?refresh=1")
+    assert status == 200 and json.loads(raw) == {"version": 2}
+    assert len(calls) == 2
+
+
+def test_failed_post_graph_marker_does_not_leak_into_keepalive_get(
+    running_server, monkeypatch,
+):
+    """One handler cannot carry a rejected POST marker into its next GET."""
+    server, _base, _token = running_server
+    invalidations = []
+    original = server.invalidate_project_graph_cache
+
+    def record_invalidation():
+        invalidations.append(1)
+        original()
+
+    monkeypatch.setattr(
+        server, "invalidate_project_graph_cache", record_invalidation
+    )
+    host, port = server.server_address[:2]
+    connection = HTTPConnection(host, port, timeout=5)
+    try:
+        body = json.dumps({
+            "issue": 22,
+            "decl": "Demo.Chapter14.Foo",
+            "verdict": "verify",
+        })
+        connection.request(
+            "POST", "/api/decl-verdict", body,
+            {"Content-Type": "application/json"},
+        )
+        rejected = connection.getresponse()
+        assert rejected.status == 403
+        rejected.read()
+
+        connection.request("GET", "/api/status")
+        observed = connection.getresponse()
+        assert observed.status == 200
+        observed.read()
+    finally:
+        connection.close()
+
+    assert invalidations == []
 
 
 def test_queue_cache_invalidates_before_mutation_response(

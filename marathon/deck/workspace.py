@@ -465,6 +465,154 @@ def _resolve_known(name: str, known: set[str]) -> Optional[str]:
     return matches[0] if len(matches) == 1 else None
 
 
+_TOPOLOGY_NOTICE = (
+    "Exploratory only: dependency topology never affects trust, build status, "
+    "review readiness, or dependency gating."
+)
+
+
+def _topology_source(cfg: "ReviewConfig", audit: dict) -> tuple[object | None, dict]:
+    """Load the last persisted dependency topology without trusting it.
+
+    The canonical catalog above deliberately consumes a revision-validated
+    snapshot: stale audit evidence must never make a declaration reviewable.
+    The project graph has a different job.  It is an exploratory map, so a
+    last-known cone remains useful as long as its age and non-authoritative
+    status are explicit.  Keeping this second read here prevents stale rows
+    from leaking back into tiers, readiness, or the review dependency gate.
+    """
+    from marathon.audit.engine import load_snapshot, source_state
+
+    try:
+        snapshot = load_snapshot(cfg.repo_dir, validate_revision=False)
+    except Exception:  # pragma: no cover - corrupt/unreadable cache is absence
+        snapshot = None
+    try:
+        current_revision, clean = source_state(cfg.repo_dir)
+    except Exception:  # pragma: no cover - git unavailable is explicit below
+        current_revision, clean = None, None
+
+    source_revision = getattr(snapshot, "source_revision", None)
+    if snapshot is None or not getattr(snapshot, "decls", None):
+        return None, {
+            "status": "unavailable",
+            "available": False,
+            "source_revision": source_revision,
+            "current_revision": current_revision,
+            "authoritative": False,
+            "notice": (
+                "No audited dependency topology is available. "
+                + _TOPOLOGY_NOTICE
+            ),
+        }
+
+    if current_revision is None:
+        # Outside a Git checkout there is no stronger revision comparison than
+        # the validated audit view already used by the catalog (notably in
+        # isolated/offline review workspaces and unit tests).
+        fresh = audit.get("status") == "fresh"
+    elif clean is not True:
+        fresh = False
+    else:
+        # Per-module bindings are authoritative after merged/partial audits.
+        # Requiring every represented module to match is deliberately
+        # conservative: an overall source_revision can describe the latest
+        # successful subset while older module rows remain in the same file.
+        represented = {decl.module for decl in snapshot.decls}
+        revisions = getattr(snapshot, "module_revisions", {}) or {}
+        fresh = bool(represented) and all(
+            revisions.get(module) == current_revision for module in represented
+        )
+
+    status = "fresh" if fresh else "stale"
+    qualifier = (
+        "Dependency topology comes from the current audited source. "
+        if fresh else
+        "Dependency topology is last-known data from an older or unverifiable "
+        "audit and may differ from the current code. "
+    )
+    return snapshot, {
+        "status": status,
+        "available": True,
+        "source_revision": source_revision,
+        "current_revision": current_revision,
+        "authoritative": False,
+        "notice": qualifier + _TOPOLOGY_NOTICE,
+    }
+
+
+def _nearest_review_dependencies(
+    snapshot: object | None, known: set[str]
+) -> tuple[set[tuple[str, str]], int]:
+    """Project a raw declaration cone onto the nearest review targets.
+
+    ``DeclAudit.cone`` is direct, but many direct constants are implementation
+    helpers without their own review card.  Walk transparently through those
+    helpers until another registered target is reached, then stop that branch.
+    This is the transitive reduction appropriate to the projected node set:
+    for ``A -> helper -> B -> C`` it emits ``A -> B`` and ``B -> C``, never the
+    redundant ``A -> C`` edge produced by the old transitive-kernel projection.
+
+    Current target names that do not resolve uniquely in the persisted
+    snapshot are omitted.  In particular, a renamed declaration never inherits
+    the old declaration's edges merely because both occupy the same issue.
+    """
+    if snapshot is None:
+        return set(), 0
+    by_raw = snapshot.by_name()
+    raw_names = set(by_raw)
+    if not raw_names:
+        return set(), 0
+
+    current_to_raw: dict[str, str] = {}
+    candidates_by_raw: dict[str, list[str]] = defaultdict(list)
+    for current in sorted(known):
+        resolved = _resolve_known(current, raw_names)
+        if resolved is not None:
+            current_to_raw[current] = resolved
+            candidates_by_raw[resolved].append(current)
+
+    # An ambiguous reverse projection would fabricate ownership.  Remove every
+    # current target sharing the same historical declaration instead.
+    ambiguous = {
+        raw for raw, currents in candidates_by_raw.items() if len(currents) != 1
+    }
+    for current, raw in list(current_to_raw.items()):
+        if raw in ambiguous:
+            del current_to_raw[current]
+    raw_to_current = {raw: current for current, raw in current_to_raw.items()}
+
+    dependencies: set[tuple[str, str]] = set()
+    for dependent in sorted(current_to_raw):
+        target_raw = current_to_raw[dependent]
+        target = by_raw.get(target_raw)
+        if target is None:
+            continue
+        frontier = sorted(set(target.cone))
+        visited: set[str] = set()
+        while frontier:
+            raw_name = frontier.pop(0)
+            resolved = _resolve_known(raw_name, raw_names)
+            if resolved is None or resolved in visited:
+                continue
+            visited.add(resolved)
+            predecessor = raw_to_current.get(resolved)
+            if predecessor is not None:
+                if predecessor != dependent:
+                    dependencies.add((predecessor, dependent))
+                # Stop at the nearest visible target.  Its own incoming edges
+                # describe everything farther upstream.
+                continue
+            intermediate = by_raw.get(resolved)
+            if intermediate is not None:
+                frontier.extend(
+                    name for name in sorted(set(intermediate.cone))
+                    if name not in visited
+                )
+                frontier.sort()
+    return dependencies, len(current_to_raw)
+
+
 def _cyclic_edge_keys(edges: list[dict]) -> set[tuple[str, str, str]]:
     """Dependency edges whose endpoints share a non-trivial SCC.
 
@@ -536,7 +684,7 @@ def _cyclic_edge_keys(edges: list[dict]) -> set[tuple[str, str, str]]:
 
 
 def build_project_graph(cfg: "ReviewConfig") -> dict:
-    """Project-wide issue/declaration dependency DAG (pure read).
+    """Project-wide issue/declaration dependency graph (pure read).
 
     Edge direction is predecessor -> dependent.  ``contains`` edges connect an
     issue to each declaration it reviews; declaration and issue dependency
@@ -547,12 +695,21 @@ def build_project_graph(cfg: "ReviewConfig") -> dict:
     edges: list[dict] = []
     edge_keys: set[tuple[str, str, str]] = set()
 
-    def add_edge(source: str, target: str, kind: str) -> None:
+    def add_edge(
+        source: str, target: str, kind: str, *, topology_status: Optional[str] = None
+    ) -> None:
         key = (source, target, kind)
         if source == target or key in edge_keys:
             return
         edge_keys.add(key)
-        edges.append({"source": source, "target": target, "kind": kind})
+        edge = {"source": source, "target": target, "kind": kind}
+        if topology_status is not None:
+            edge.update({
+                "topology_status": topology_status,
+                "freshness": topology_status,
+                "authoritative": False,
+            })
+        edges.append(edge)
 
     issues_by_id = {issue["id"]: issue for issue in catalog["issues"]}
     for issue in catalog["issues"]:
@@ -570,17 +727,13 @@ def build_project_graph(cfg: "ReviewConfig") -> dict:
             "permalink": issue["permalink"],
             "blocked_reason": issue["blocked_reason"],
         })
-        for predecessor in issue["graph_deps"]:
-            if predecessor in issues_by_id:
-                add_edge(f"issue:{predecessor}", f"issue:{issue['id']}", "issue-dependency")
-
     by_decl: dict[str, list[dict]] = defaultdict(list)
     for target in catalog["targets"]:
         by_decl[target["name"]].append(target)
     known = set(by_decl)
     # Only current project declarations can be truthfully described as an
     # unresolved review edge.  Kernel entries outside this set are ordinary
-    # external/library dependencies (or unavailable source), not missing DAG
+    # external/library dependencies (or unavailable source), not missing graph
     # nodes. Reuse the definition inspector's bounded, mtime-cached index.
     try:
         from marathon.deck.definitions import _current_source_index
@@ -634,18 +787,16 @@ def build_project_graph(cfg: "ReviewConfig") -> dict:
         for issue in issues:
             add_edge(f"issue:{issue}", "decl:" + name, "contains")
 
-    # The elaborated kernel is transitive; collapsing duplicate entries still
-    # produces a useful predecessor-first project graph and matches the current
-    # swipe deck's dependency ordering semantics.
+    # Retain fresh-kernel diagnostics for project declarations that do not yet
+    # have a review target.  Structural graph edges below come from the separate
+    # topology source; this block must never promote stale topology into review
+    # evidence or readiness.
     for dependent, records in sorted(by_decl.items()):
-        dependencies: set[str] = set()
         for record in records:
             for member in record.get("kernel") or []:
                 raw_name = member.get("name") or ""
                 resolved = _resolve_known(raw_name, known)
-                if resolved and resolved != dependent:
-                    dependencies.add(resolved)
-                elif (
+                if (
                     raw_name
                     and resolved is None
                     and current_project_match(raw_name) is not None
@@ -661,8 +812,79 @@ def build_project_graph(cfg: "ReviewConfig") -> dict:
                             "status": "unreviewed-target",
                             "reason": "current project dependency has no registered review target",
                         })
-        for dependency in sorted(dependencies):
-            add_edge("decl:" + dependency, "decl:" + dependent, "declaration-dependency")
+
+    # Topology is deliberately a second, non-authoritative read.  The catalog's
+    # validated snapshot remains the sole source for trust/build/readiness;
+    # stale last-known cones are useful only for this exploratory map.
+    topology_snapshot, topology = _topology_source(cfg, catalog["audit"])
+    declaration_dependencies, resolved_targets = _nearest_review_dependencies(
+        topology_snapshot, known
+    )
+    for dependency, dependent in sorted(declaration_dependencies):
+        add_edge(
+            "decl:" + dependency,
+            "decl:" + dependent,
+            "declaration-dependency",
+            topology_status=topology["status"],
+        )
+
+    # Roll visible declaration topology up to issue topology without touching
+    # ``catalog['issue_deps']`` or any readiness/gating state.  A declaration
+    # can be cited by more than one issue, but treating every citation as an
+    # owner and taking their Cartesian product fabricates edges (and even
+    # cycles) between duplicate review cards.  Choose its earliest registered
+    # issue as the one structural owner; the ownership-map ``contains`` edges
+    # above still retain every citation for inspection.
+    issue_dependency_pairs: set[tuple[int, int]] = set()
+    owners: dict[str, int] = {}
+    for name, records in by_decl.items():
+        ranked_issues: dict[int, int] = {}
+        for record in records:
+            issue = record["issue"]
+            rank = int(record.get("registry_order", 10**12))
+            ranked_issues[issue] = min(rank, ranked_issues.get(issue, rank))
+        if ranked_issues:
+            owners[name] = min(
+                ranked_issues, key=lambda issue: (ranked_issues[issue], issue)
+            )
+    for dependency, dependent in sorted(declaration_dependencies):
+        predecessor_issue = owners.get(dependency)
+        dependent_issue = owners.get(dependent)
+        if predecessor_issue is None or dependent_issue is None:
+            continue
+        if predecessor_issue == dependent_issue:
+            continue
+        predecessor = issues_by_id.get(predecessor_issue) or {}
+        successor = issues_by_id.get(dependent_issue) or {}
+        predecessor_chapter = predecessor.get("chapter")
+        dependent_chapter = successor.get("chapter")
+        if (
+            predecessor_chapter is not None
+            and dependent_chapter is not None
+            and predecessor_chapter > dependent_chapter
+        ):
+            continue
+        issue_dependency_pairs.add((predecessor_issue, dependent_issue))
+    for predecessor, dependent in sorted(issue_dependency_pairs):
+        add_edge(
+            f"issue:{predecessor}",
+            f"issue:{dependent}",
+            "issue-dependency",
+            topology_status=topology["status"],
+        )
+
+    topology.update({
+        "targets": len(known),
+        "resolved_targets": resolved_targets,
+        "declaration_edges": len(declaration_dependencies),
+        "issue_edges": len(issue_dependency_pairs),
+    })
+    for edge in unresolved_edges:
+        edge.update({
+            "topology_status": topology["status"],
+            "freshness": topology["status"],
+            "authoritative": False,
+        })
 
     cyclic_keys = _cyclic_edge_keys(edges)
     for edge in edges:
@@ -730,6 +952,7 @@ def build_project_graph(cfg: "ReviewConfig") -> dict:
         "unresolved_edges": unresolved_edges,
         "cyclic_edges": cyclic_edges,
         "audit": catalog["audit"],
+        "topology": topology,
         "counts": {
             "nodes": len(nodes),
             "edges": len(edges),

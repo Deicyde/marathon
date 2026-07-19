@@ -16,7 +16,7 @@ API surface (shared contract — the gate reconciles any drift):
 * ``GET  /api/subdeck/{id}``  → the issue's per-declaration SUBDECK (read)
 * ``GET  /api/review-workspace`` → source-ordered file/chapter review (read)
 * ``GET  /api/review-source`` → lazy repo-local whole-file Lean source (read)
-* ``GET  /api/project-graph`` → project issue/declaration dependency DAG (read)
+* ``GET  /api/project-graph`` → project issue/declaration dependency graph (read)
 * ``GET  /api/definition``    → current-source identifier lookup (read)
 * ``GET  /api/definition-terms`` → compact project identifier index (read)
 * ``GET  /api/verso-status``  → nonblocking semantic-doc build status
@@ -162,6 +162,14 @@ MAX_REVIEW_SOURCE_BYTES = 2 * 1024 * 1024
 # external GitHub changes.
 QUEUE_CACHE_TTL_SECONDS = 5.0
 
+# The project graph is substantially more expensive than the queue: it spans
+# every registered chapter, reconciles current source, and projects audit
+# topology.  Keep one completed read around long enough for graph-tab reloads
+# and coalesce concurrent browsers.  Like the queue cache this is process-local
+# only, generation-guarded, and invalidated before a successful mutation is
+# made visible to its caller.
+PROJECT_GRAPH_CACHE_TTL_SECONDS = 30.0
+
 # These successful POSTs change fields consumed by ``build_queue`` (issue
 # verdict/state/body, active recovery jobs, or the chapter registry).  Other
 # POST routes update declaration-review/intake/prover state that is not part of
@@ -177,9 +185,33 @@ _QUEUE_MUTATING_POST_ROUTES = frozenset({
     "/api/approve-chapter",
 })
 
+_PROJECT_GRAPH_MUTATING_POST_ROUTES = frozenset({
+    "/api/verdict",
+    "/api/decl-verdict",
+    "/api/batch-decl-verdict",
+    "/api/reconcile-proposal",
+    "/api/missing",
+    "/api/ship",
+    "/api/refresh-issue",
+    "/api/drop-citation",
+    "/api/requeue",
+    "/api/recovery",
+    "/api/approve-chapter",
+})
+
 
 class _QueueFlight:
     """One queue build shared by concurrent readers of the same chapter."""
+
+    def __init__(self, generation: int):
+        self.generation = generation
+        self.event = Event()
+        self.payload: Optional[dict] = None
+        self.error: Optional[BaseException] = None
+
+
+class _ProjectGraphFlight:
+    """One project-graph build shared by all concurrent readers."""
 
     def __init__(self, generation: int):
         self.generation = generation
@@ -307,6 +339,10 @@ class DeckServer(ThreadingHTTPServer):
         self._queue_cache: dict[Optional[int], tuple[float, dict]] = {}
         self._queue_flights: dict[Optional[int], _QueueFlight] = {}
         self._queue_generation = 0
+        self._project_graph_lock = Lock()
+        self._project_graph_cache: Optional[tuple[float, dict]] = None
+        self._project_graph_flight: Optional[_ProjectGraphFlight] = None
+        self._project_graph_generation = 0
 
         # Verso elaboration is deliberately isolated behind its artifact
         # manager.  Constructing the manager does no build work; only
@@ -422,6 +458,59 @@ class DeckServer(ThreadingHTTPServer):
             # still complete, while new readers start a fresh generation.
             self._queue_flights.clear()
 
+    def project_graph_payload(self, build: Callable[[], dict]) -> dict:
+        """Return a fresh-enough graph, sharing one project-wide build."""
+        with self._project_graph_lock:
+            cached = self._project_graph_cache
+            now = monotonic()
+            if cached is not None and cached[0] > now:
+                return cached[1]
+            if cached is not None:
+                self._project_graph_cache = None
+
+            flight = self._project_graph_flight
+            owner = flight is None
+            if owner:
+                flight = _ProjectGraphFlight(self._project_graph_generation)
+                self._project_graph_flight = flight
+
+        assert flight is not None
+        if not owner:
+            flight.event.wait()
+            if flight.error is not None:
+                raise flight.error
+            assert flight.payload is not None
+            return flight.payload
+
+        try:
+            payload = build()
+        except BaseException as exc:
+            with self._project_graph_lock:
+                flight.error = exc
+                if self._project_graph_flight is flight:
+                    self._project_graph_flight = None
+                flight.event.set()
+            raise
+
+        with self._project_graph_lock:
+            flight.payload = payload
+            if flight.generation == self._project_graph_generation:
+                self._project_graph_cache = (
+                    monotonic() + PROJECT_GRAPH_CACHE_TTL_SECONDS,
+                    payload,
+                )
+            if self._project_graph_flight is flight:
+                self._project_graph_flight = None
+            flight.event.set()
+        return payload
+
+    def invalidate_project_graph_cache(self) -> None:
+        """Make subsequent graph reads observe post-mutation project state."""
+        with self._project_graph_lock:
+            self._project_graph_generation += 1
+            self._project_graph_cache = None
+            self._project_graph_flight = None
+
 
 class DeckHandler(BaseHTTPRequestHandler):
     """Routes the deck's API + static surface. Every ``do_GET`` route is a
@@ -444,12 +533,11 @@ class DeckHandler(BaseHTTPRequestHandler):
         return self.server.cfg  # type: ignore[attr-defined]
 
     def _send_json(self, payload: dict, status: int = HTTPStatus.OK) -> None:
-        # A successful queue-affecting POST invalidates immediately after its
-        # durable work and *before* the response is visible.  The browser may
-        # refresh the queue as soon as it receives this response; invalidating
-        # in do_POST's finally block would leave a race where that refresh sees
-        # the old five-second cache entry.  Errors and read-only POSTs do not
-        # disturb an in-flight queue build.
+        # A successful read-model-affecting POST invalidates immediately after
+        # its durable work and *before* the response is visible.  The browser
+        # may refresh as soon as it receives this response; invalidating in
+        # do_POST's finally block would leave a race where that read sees an old
+        # queue/graph cache entry. Errors and read-only POSTs leave flights be.
         if (
             getattr(self, "_queue_invalidation_pending", False)
             and not getattr(self, "_queue_cache_invalidated", False)
@@ -459,6 +547,15 @@ class DeckHandler(BaseHTTPRequestHandler):
         ):
             self.server.invalidate_queue_cache()  # type: ignore[attr-defined]
             self._queue_cache_invalidated = True
+        if (
+            getattr(self, "_project_graph_invalidation_pending", False)
+            and not getattr(self, "_project_graph_cache_invalidated", False)
+            and HTTPStatus.OK <= int(status) < HTTPStatus.MULTIPLE_CHOICES
+            and payload.get("ok") is not False
+            and payload.get("updated") is not False
+        ):
+            self.server.invalidate_project_graph_cache()  # type: ignore[attr-defined]
+            self._project_graph_cache_invalidated = True
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -495,6 +592,8 @@ class DeckHandler(BaseHTTPRequestHandler):
         # requests; never carry a prior POST's invalidation marker into a GET.
         self._queue_invalidation_pending = False
         self._queue_cache_invalidated = False
+        self._project_graph_invalidation_pending = False
+        self._project_graph_cache_invalidated = False
         parsed = urlsplit(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -530,7 +629,7 @@ class DeckHandler(BaseHTTPRequestHandler):
             if path == "/api/review-source":
                 return self._api_review_source(query)
             if path == "/api/project-graph":
-                return self._api_project_graph()
+                return self._api_project_graph(query)
             if path == "/api/definition":
                 return self._api_definition(query)
             if path == "/api/definition-terms":
@@ -978,14 +1077,22 @@ class DeckHandler(BaseHTTPRequestHandler):
             "max_bytes": MAX_REVIEW_SOURCE_BYTES,
         })
 
-    def _api_project_graph(self) -> None:
-        """Project-wide issue/declaration dependency DAG — PURE read."""
+    def _api_project_graph(self, query: Optional[dict] = None) -> None:
+        """Project-wide issue/declaration dependency graph — PURE read."""
         if self._demo:
             return self._send_json({
                 "repo": None, "chapters": [], "nodes": [], "edges": [],
                 "unresolved_edges": [], "cyclic_edges": [],
                 "audit": {"status": "missing", "created_at": None,
                 "source_revision": None, "failures": []},
+                "topology": {
+                    "status": "unavailable", "available": False,
+                    "source_revision": None, "current_revision": None,
+                    "authoritative": False,
+                    "notice": "Demo mode has no audited dependency topology.",
+                    "targets": 0, "resolved_targets": 0,
+                    "declaration_edges": 0, "issue_edges": 0,
+                },
                 "counts": {"nodes": 0, "edges": 0, "by_status": {},
                 "by_type": {}, "by_build_status": {}, "changed": 0,
                 "impacted": 0, "unresolved_edges": 0,
@@ -993,7 +1100,15 @@ class DeckHandler(BaseHTTPRequestHandler):
             })
         from marathon.deck.workspace import build_project_graph
 
-        self._send_json(build_project_graph(self.cfg))
+        if _truthy_flag(((query or {}).get("refresh") or [None])[0]):
+            # The browser's explicit Refresh action is an observation point
+            # for external GitHub/source/audit changes.  Evict only this
+            # process-local read cache; the GET remains externally pure.
+            self.server.invalidate_project_graph_cache()  # type: ignore[attr-defined]
+        payload = self.server.project_graph_payload(  # type: ignore[attr-defined]
+            lambda: build_project_graph(self.cfg)
+        )
+        self._send_json(payload)
 
     def _api_definition(self, query: dict) -> None:
         """Current-source definition/signature lookup — PURE read."""
@@ -1082,6 +1197,8 @@ class DeckHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 (stdlib handler name)
         self._queue_invalidation_pending = False
         self._queue_cache_invalidated = False
+        self._project_graph_invalidation_pending = False
+        self._project_graph_cache_invalidated = False
         parsed = urlsplit(self.path)
         if parsed.path not in self._POST_ROUTES:
             return self._send_error_json(
@@ -1089,6 +1206,9 @@ class DeckHandler(BaseHTTPRequestHandler):
             )
         self._queue_invalidation_pending = (
             parsed.path in _QUEUE_MUTATING_POST_ROUTES
+        )
+        self._project_graph_invalidation_pending = (
+            parsed.path in _PROJECT_GRAPH_MUTATING_POST_ROUTES
         )
         # Bind the collaborator's forwarded GitHub OAuth token (if a proxy
         # supplied one) for the whole dispatch, so every GitHub write the handler

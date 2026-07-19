@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -97,6 +98,80 @@ _AUDIT_SOURCE_PATHS = (
     "lake-manifest.json",
 )
 
+# A timed-out ``subprocess.run`` kills only the immediate process.  Lake is a
+# launcher (``lake -> lean -> lean`` in the common audit path), so that leaves
+# the actual elaborator orphaned and consuming a core after Marathon has
+# already recorded the timeout.  Keep every audit/build invocation in its own
+# process group and tear down the whole group on timeout.
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Best-effort termination of *proc* and every descendant it launched.
+
+    POSIX sessions give us a reliable process-group boundary.  Windows does
+    not expose an equivalent through :mod:`subprocess`, so use ``taskkill /T``
+    when available and retain ``Popen.kill`` as a fail-soft fallback.  Cleanup
+    errors must never mask the original timeout.
+    """
+    killed_group = False
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            killed_group = True
+        except ProcessLookupError:
+            return
+        except OSError as exc:  # pragma: no cover - rare OS race/denial
+            logger.debug("could not kill process group %s: %s", proc.pid, exc)
+    elif os.name == "nt":  # pragma: no cover - exercised on Windows
+        try:
+            killed = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            killed_group = killed.returncode == 0
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.debug("could not taskkill process tree %s: %s", proc.pid, exc)
+    if not killed_group:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _run_process_group(
+    command: list[str], *, cwd: str, timeout: int | float
+) -> subprocess.CompletedProcess:
+    """Run a captured text command with a timeout-safe descendant boundary."""
+    kwargs: dict = {
+        "cwd": cwd,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+    elif os.name == "nt":  # pragma: no cover - exercised on Windows
+        kwargs["creationflags"] = getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    proc = subprocess.Popen(command, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        # Reap the immediate launcher and drain its pipes. Descendants share
+        # the killed group, so none can retain a pipe fd and make this hang.
+        stdout, stderr = proc.communicate()
+        raise subprocess.TimeoutExpired(
+            cmd=command,
+            timeout=timeout,
+            output=stdout,
+            stderr=stderr,
+        )
+    return subprocess.CompletedProcess(
+        command, proc.returncode, stdout=stdout, stderr=stderr
+    )
+
 
 # ---------------------------------------------------------------------------
 # Workspace derivation
@@ -126,12 +201,9 @@ def _lake_build_ok(
     if not targets:
         return True
     try:
-        proc = subprocess.run(
+        proc = _run_process_group(
             [lake, "build", *targets],
             cwd=str(repo),
-            capture_output=True,
-            text=True,
-            check=False,
             timeout=timeout,
         )
         return proc.returncode == 0
@@ -624,12 +696,9 @@ def run_audit(
         script_path = Path(td) / "marathon_audit.lean"
         script_path.write_text(script)
         try:
-            proc = subprocess.run(
+            proc = _run_process_group(
                 [lake, "env", "lean", str(script_path)],
                 cwd=str(repo),
-                capture_output=True,
-                text=True,
-                check=False,
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
