@@ -106,8 +106,12 @@ ASSET_VERSION_PLACEHOLDER = "__ASSET_VERSION__"
 # private sentinel distinguishes it from the normal "construct one" path.
 _DEFAULT_VERSO_MANAGER = object()
 _VERSO_ARTIFACT_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+# Keep generated documents scriptless, but retain their real origin so an
+# authenticated reverse proxy receives the session cookie on Verso's CSS/font
+# subrequests.  A bare ``sandbox`` gives the document an opaque origin; browsers
+# then omit the oauth2-proxy identity and the Blueprint styles fail with 403.
 _VERSO_HTML_CSP = (
-    "sandbox; default-src 'none'; script-src 'none'; connect-src 'none'; "
+    "sandbox allow-same-origin; default-src 'none'; script-src 'none'; connect-src 'none'; "
     "frame-src 'none'; form-action 'none'; base-uri 'self'; "
     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'"
 )

@@ -281,11 +281,20 @@ def test_verso_static_files_have_safe_headers_and_mime(
         assert headers["X-Content-Type-Options"] == "nosniff"
         if name.endswith(".html"):
             csp = headers["Content-Security-Policy"]
-            assert "sandbox" in csp
+            directives = [part.strip() for part in csp.split(";") if part.strip()]
+            # Direct Verso pages sit behind oauth2-proxy.  They must retain
+            # their origin so stylesheet requests carry the authenticated
+            # identity, while generated artifact scripts remain disabled.
+            assert [
+                directive for directive in directives
+                if directive.split()[0] == "sandbox"
+            ] == ["sandbox allow-same-origin"]
+            assert "allow-scripts" not in csp
             assert "script-src 'none'" in csp
             assert "connect-src 'none'" in csp
             assert "form-action 'none'" in csp
             assert "base-uri 'self'" in csp
+            assert "style-src 'self' 'unsafe-inline'" in csp
             assert headers["Cross-Origin-Opener-Policy"] == "same-origin"
             assert headers["X-Frame-Options"] == "DENY"
         else:
@@ -299,8 +308,14 @@ def test_active_non_html_verso_documents_are_also_sandboxed(tmp_path, name):
     with _running(_cfg(tmp_path), manager) as (_server, base):
         code, headers, _raw = _get(base, "/verso/" + name)
         assert code == 200
-        assert "sandbox" in headers["Content-Security-Policy"]
-        assert "script-src 'none'" in headers["Content-Security-Policy"]
+        csp = headers["Content-Security-Policy"]
+        directives = [part.strip() for part in csp.split(";") if part.strip()]
+        assert [
+            directive for directive in directives
+            if directive.split()[0] == "sandbox"
+        ] == ["sandbox allow-same-origin"]
+        assert "allow-scripts" not in csp
+        assert "script-src 'none'" in csp
         assert headers["X-Frame-Options"] == "DENY"
 
 
@@ -323,6 +338,39 @@ def test_verso_static_route_pins_the_manifest_artifact_token(tmp_path):
         code, _headers, raw = _get(base, "/api/verso-manifest")
         assert code == 200
         assert json.loads(raw)["root_url"] == f"/verso/{token}/"
+
+
+def test_token_pinned_definition_deep_link_serves_blueprint_page_and_css(tmp_path):
+    """The URL fragment stays in the browser; its page and CSS must both be
+    available beneath the same authenticated, token-pinned Verso mount."""
+    token = "a" * 64
+    manager = _FakeVersoManager(tmp_path / "artifact")
+    module_path = "GeometricAnalysis/LeeSM/Chapter16/IntegrationRn/"
+    page = manager.root / module_path / "index.html"
+    page.parent.mkdir(parents=True)
+    page.write_text(
+        '<!doctype html><head><base href="../../../../">'
+        '<link rel="stylesheet" href="code.css"></head>'
+        '<body><span id="IsOrientedDiffeomorphOn">structure</span></body>',
+        encoding="utf-8",
+    )
+    manager.root.joinpath("code.css").write_text(
+        ".hl.lean { color: blue; }", encoding="utf-8"
+    )
+
+    with _running(_cfg(tmp_path), manager) as (_server, base):
+        code, headers, raw = _get(base, f"/verso/{token}/{module_path}")
+        assert code == 200
+        assert headers["Content-Type"] == "text/html; charset=utf-8"
+        assert b'<base href="../../../../">' in raw
+        assert b'id="IsOrientedDiffeomorphOn"' in raw
+
+        code, headers, raw = _get(base, f"/verso/{token}/code.css")
+        assert code == 200
+        assert headers["Content-Type"] == "text/css; charset=utf-8"
+        assert raw == b".hl.lean { color: blue; }"
+        assert manager.resolve_calls == [module_path, "code.css"]
+        assert manager.resolve_tokens == [token, token]
 
 
 def test_verso_directory_url_preserves_slash_for_index_resolution(tmp_path):
