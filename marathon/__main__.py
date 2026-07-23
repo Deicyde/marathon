@@ -948,13 +948,23 @@ def _add_deck_subparser(subparsers) -> None:
     p_deck.add_argument(
         "--no-host-conductor", action="store_true",
         help=(
-            "Do NOT spawn a conductor on this host when a reject is fired (sets "
+            "Do NOT automatically spawn a conductor on this host when a reject "
+            "is fired (sets "
             "MARATHON_NO_HOST_CONDUCTOR). For a SHARED deck (recommended with "
             "--trusted-origin): the rejection is recorded for a collaborator's "
-            "OWN conductor to refine under their own Aristotle key. PRECONDITION: "
-            "don't also run a host conductor here — an already-running one drains "
-            "the shared queue under the host's credentials; this flag only stops "
-            "THIS process from spawning one."
+            "OWN conductor to refine under their own Aristotle key. This does not "
+            "stop an already-running conductor or the separately opt-in manual "
+            "host control; either can drain the queue with the host's credentials."
+        ),
+    )
+    p_deck.add_argument(
+        "--allow-host-conductor-control", action="store_true",
+        help=(
+            "Expose a token-protected Restart orchestrator button in the Status "
+            "tab. This permits an authenticated deck user to explicitly start "
+            "the host conductor with the host's credentials. It is independent "
+            "of --no-host-conductor, which still prevents automatic starts when "
+            "a rejection is submitted."
         ),
     )
     p_deck.set_defaults(func=_run_deck)
@@ -982,6 +992,9 @@ def _run_deck(args) -> None:
         trusted_origins=getattr(args, "trusted_origin", []) or [],
         pull_every=getattr(args, "pull_every", 0),
         audit_from=getattr(args, "audit_from", None),
+        allow_host_conductor_control=getattr(
+            args, "allow_host_conductor_control", False
+        ),
     )
     if rc:
         raise SystemExit(rc)

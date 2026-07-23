@@ -26,6 +26,8 @@ API surface (shared contract — the gate reconciles any drift):
 * ``GET  /api/reconciliation/{id}`` → pending identity proposals (read)
 * ``GET  /api/status``        → live conductor/landing events (poll)
 * ``GET  /api/events``        → the same, as Server-Sent Events
+* ``POST /api/conductor-start`` → ensure the conductor is running (guarded,
+                                  operator opt-in)
 * ``POST /api/verdict``       → route a verdict (IRREVERSIBLE — guarded)
 * ``POST /api/decl-verdict``  → record one per-decl verdict (LOCAL — guarded)
 * ``POST /api/batch-decl-verdict`` → atomically record many (LOCAL — guarded)
@@ -321,11 +323,17 @@ class DeckServer(ThreadingHTTPServer):
         token: str,
         default_chapter: Optional[int] = None,
         demo: bool = False,
+        allow_host_conductor_control: bool = False,
         verso_manager=_DEFAULT_VERSO_MANAGER,
     ):
         self.cfg = cfg
         self.token = token
         self.default_chapter = default_chapter
+        # Manual host lifecycle control is an explicit operator capability.
+        # It is independent of MARATHON_NO_HOST_CONDUCTOR, which only prevents
+        # automatic reject-triggered starts on shared decks.
+        self.allow_host_conductor_control = bool(allow_host_conductor_control)
+        self._conductor_start_lock = Lock()
         # Demo mode: the API routes to marathon.deck.demo (synthetic cards,
         # in-memory verdicts, a SIMULATED ship that fires nothing). No cfg /
         # repo / GitHub / Aristotle is touched.
@@ -1010,7 +1018,12 @@ class DeckHandler(BaseHTTPRequestHandler):
         """The Status tab: is the global conductor alive, its concurrency +
         per-job table + recent landings. Pure read (jobs.json + lock + log)."""
         from marathon.deck.dashboard import conductor_status
-        self._send_json(conductor_status(self.cfg))
+        payload = conductor_status(self.cfg)
+        payload["restart_allowed"] = bool(
+            getattr(self.server, "allow_host_conductor_control", False)
+            and not self._demo
+        )
+        self._send_json(payload)
 
     def _api_run_detail(self, raw_id: str) -> None:
         """Drill-down for one conductor run (clicking a Status-tab job): its live
@@ -1195,7 +1208,7 @@ class DeckHandler(BaseHTTPRequestHandler):
         "/api/refresh-issue", "/api/drop-citation", "/api/requeue",
         "/api/recovery",
         "/api/add-chapter", "/api/chapter-intake-status", "/api/approve-chapter",
-        "/api/prover-toggle", "/api/verso-retry",
+        "/api/prover-toggle", "/api/verso-retry", "/api/conductor-start",
     )
 
     def do_POST(self) -> None:  # noqa: N802 (stdlib handler name)
@@ -1250,6 +1263,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                     self._api_approve_chapter()
                 elif parsed.path == "/api/prover-toggle":
                     self._api_prover_toggle()
+                elif parsed.path == "/api/conductor-start":
+                    self._api_conductor_start()
                 elif parsed.path == "/api/verso-retry":
                     self._api_verso_retry()
                 else:  # /api/ship
@@ -2417,6 +2432,55 @@ class DeckHandler(BaseHTTPRequestHandler):
                         "prover branch only)"}
         )
 
+    def _api_conductor_start(self) -> None:
+        """Ensure the host conductor is running after an explicit UI click.
+
+        The request cannot supply a command, PID, repository, or concurrency;
+        all launch details come from this server's trusted configuration.  The
+        normal origin + session-token guard applies before any lifecycle work.
+        """
+
+        data = self._read_guarded_body()
+        if data is None:
+            return
+        if self._demo:
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                "orchestrator restart is unavailable in demo mode",
+            )
+        if not getattr(self.server, "allow_host_conductor_control", False):
+            return self._send_error_json(
+                HTTPStatus.FORBIDDEN,
+                "host orchestrator control is disabled; restart it outside the deck",
+            )
+
+        try:
+            from marathon.review.review import start_conductor
+
+            with self.server._conductor_start_lock:  # type: ignore[attr-defined]
+                result = start_conductor(self.cfg)
+        except Exception as exc:  # noqa: BLE001 — return a retryable failure
+            return self._send_error_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                f"orchestrator start failed: {exc}",
+            )
+
+        started = bool(result.started)
+        self._send_json(
+            {
+                "ok": True,
+                "state": "starting" if started else "running",
+                "started": started,
+                "pid": result.pid,
+                "message": (
+                    f"orchestrator starting as pid {result.pid}"
+                    if started
+                    else f"orchestrator already running as pid {result.pid}"
+                ),
+            },
+            status=HTTPStatus.ACCEPTED if started else HTTPStatus.OK,
+        )
+
     # --- helpers ----------------------------------------------------------
 
     def _chapter_from_query(self, query: dict) -> Optional[int]:
@@ -2532,6 +2596,7 @@ def make_server(
     default_chapter: Optional[int] = None,
     demo: bool = False,
     trusted_origins: "Sequence[str]" = (),
+    allow_host_conductor_control: bool = False,
     verso_manager=_DEFAULT_VERSO_MANAGER,
 ) -> DeckServer:
     """Construct (do not start) a :class:`DeckServer` bound to 127.0.0.1
@@ -2545,6 +2610,7 @@ def make_server(
         token = secrets.token_urlsafe(32)
     server = DeckServer(
         (BIND_HOST, port), cfg, token, default_chapter, demo=demo,
+        allow_host_conductor_control=allow_host_conductor_control,
         verso_manager=verso_manager,
     )
     server.trusted_origins = tuple(trusted_origins or ())
@@ -2561,6 +2627,7 @@ def serve(
     trusted_origins: "Sequence[str]" = (),
     pull_every: int = 0,
     audit_from: Optional[str] = None,
+    allow_host_conductor_control: bool = False,
 ) -> int:
     """Start the deck server and block in ``serve_forever`` until Ctrl-C.
 
@@ -2570,10 +2637,13 @@ def serve(
     (``marathon deck``) is a thin wrapper over this. ``trusted_origins`` widen
     the same-origin POST guard for a fronting proxy (see ``--trusted-origin``).
     ``pull_every`` > 0 starts a background loop that fast-forwards the repo every
-    that-many seconds, keeping a HOSTED deck's working tree current."""
+    that-many seconds, keeping a HOSTED deck's working tree current.
+    ``allow_host_conductor_control`` exposes an authenticated, explicit
+    ensure-running action; it never starts from a GET or status poll."""
     server = make_server(
         cfg, port=port, default_chapter=default_chapter, demo=demo,
         trusted_origins=trusted_origins,
+        allow_host_conductor_control=allow_host_conductor_control,
     )
     host, bound_port = server.server_address[:2]
     url = f"http://{host}:{bound_port}/"
@@ -2601,6 +2671,11 @@ def serve(
     if trusted_origins:
         print("  trusted proxy origins (same-origin guard widened): "
               + ", ".join(trusted_origins))
+    if allow_host_conductor_control:
+        print(
+            "  host orchestrator control: ENABLED — authenticated users may\n"
+            "  explicitly start the conductor with this host's credentials."
+        )
     # A fronted (shared) deck without --no-host-conductor is an attribution
     # footgun: a collaborator's REJECT spawns/feeds the HOST's conductor, so the
     # PR merge that lands their refine + the Aristotle spend are billed to the

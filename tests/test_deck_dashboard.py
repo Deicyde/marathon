@@ -84,6 +84,44 @@ def test_conductor_status_dead_pid_marks_running_job(tmp_path, monkeypatch):
     assert d["running"] == 0                          # the dead one is not counted
 
 
+def test_conductor_status_reaps_deck_child_before_pid_probe(tmp_path, monkeypatch):
+    """A crashed child must not stay green merely because its zombie PID exists."""
+    from marathon.review import review
+
+    cfg = _cfg(tmp_path)
+    lock = tmp_path / "conductor.lock"
+    lock.write_text("7331")
+    repo_key = str(tmp_path.resolve())
+    order = []
+
+    class ExitedChild:
+        pid = 7331
+
+        def poll(self):
+            order.append("poll")
+            return 1
+
+    monkeypatch.setattr(
+        review,
+        "_pending_conductor_starts",
+        {repo_key: (ExitedChild(), tmp_path / "conductor.log")},
+    )
+    monkeypatch.setattr("marathon.conductor.conductor_lock_path", lambda _cfg: lock)
+    monkeypatch.setattr("marathon.conductor.load_jobs_snapshot", lambda _repo: None)
+
+    def process_alive(_pid):
+        order.append("pid-probe")
+        return False
+
+    monkeypatch.setattr("marathon.review.daemon.process_alive", process_alive)
+
+    result = dash.conductor_status(cfg)
+
+    assert result["alive"] is False
+    assert order == ["poll", "pid-probe"]
+    assert repo_key not in review._pending_conductor_starts
+
+
 def test_conductor_status_no_snapshot_degrades(tmp_path, monkeypatch):
     monkeypatch.setattr("marathon.conductor.conductor_lock_path",
                         lambda cfg: tmp_path / "absent.lock")

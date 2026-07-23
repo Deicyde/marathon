@@ -16,8 +16,10 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
 from marathon.review.automerge import _head_build_verdict
@@ -876,6 +878,119 @@ def _live_conductor_pid(cfg: ReviewConfig) -> Optional[int]:
     return pid if _process_alive(pid) else None
 
 
+@dataclass(frozen=True)
+class ConductorStartResult:
+    """Outcome of an idempotent conductor start request.
+
+    ``started`` is true only for the caller that actually spawned a child.
+    Other callers receive the already-live (or still-starting) PID so a
+    double-click cannot create a second launch attempt.
+    """
+
+    pid: int
+    started: bool
+    log_path: Optional[Path] = None
+
+
+_conductor_start_lock = Lock()
+_pending_conductor_starts: dict[str, tuple[subprocess.Popen, Path]] = {}
+
+
+def _pending_conductor_pid_locked(repo_key: str) -> Optional[int]:
+    """Return a still-starting child PID, reaping an exited child first.
+
+    Caller holds ``_conductor_start_lock``. Retaining and polling the Popen is
+    essential for a long-lived deck process: ``kill(pid, 0)`` reports a zombie
+    as alive until its parent reaps it.
+    """
+
+    pending = _pending_conductor_starts.get(repo_key)
+    if pending is None:
+        return None
+    pending_proc, _pending_log = pending
+    if pending_proc.poll() is None:
+        return pending_proc.pid
+    _pending_conductor_starts.pop(repo_key, None)
+    return None
+
+
+def refresh_pending_conductor_start(cfg: ReviewConfig) -> Optional[int]:
+    """Observe/reap a deck-launched child; return its PID while still running.
+
+    This never launches, signals, or removes a lock. The dashboard calls it
+    before reading ``conductor.lock`` so a crashed child cannot remain a zombie
+    that is permanently displayed as a live conductor.
+    """
+
+    repo_key = str(Path(cfg.repo_dir).resolve())
+    with _conductor_start_lock:
+        return _pending_conductor_pid_locked(repo_key)
+
+
+def start_conductor(cfg: ReviewConfig) -> ConductorStartResult:
+    """Idempotently start the repo-level conductor, detached from this process.
+
+    This is the explicit lifecycle primitive used by both the CLI/rejection
+    wrapper and the deck's opt-in manual recovery control.  It deliberately
+    does not inspect ``MARATHON_NO_HOST_CONDUCTOR``: that variable governs
+    *automatic* reject-triggered launches in :func:`_ensure_conductor`, while a
+    server must separately opt in before exposing the authenticated manual
+    control.
+    """
+
+    with _conductor_start_lock:
+        repo_dir = getattr(cfg, "repo_dir", None)
+        repo_key = str(Path(repo_dir).resolve()) if repo_dir is not None else None
+        pending_pid = (
+            _pending_conductor_pid_locked(repo_key)
+            if repo_key is not None
+            else None
+        )
+
+        # Poll/reap our retained child *before* consulting the PID lock:
+        # kill(pid, 0) reports an unreaped zombie as alive.
+        pid = _live_conductor_pid(cfg)
+        if pid is not None:
+            return ConductorStartResult(pid=pid, started=False)
+        if pending_pid is not None:
+            pending_log = _pending_conductor_starts[repo_key][1]
+            return ConductorStartResult(
+                pid=pending_pid, started=False, log_path=pending_log
+            )
+
+        if repo_key is None:
+            # A real ReviewConfig always has repo_dir; keeping this lookup here
+            # preserves the cheap already-live probe used by focused callers.
+            repo_key = str(Path(cfg.repo_dir).resolve())
+
+        cfg.runner_log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = (
+            cfg.runner_log_dir
+            / f"conductor-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.log"
+        )
+        with log_path.open("w") as log_fh:
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "marathon",
+                    "conductor",
+                    "run",
+                    "--repo-dir",
+                    str(cfg.repo_dir),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                cwd=str(cfg.repo_dir),
+            )
+        _pending_conductor_starts[repo_key] = (proc, log_path)
+        return ConductorStartResult(
+            pid=proc.pid, started=True, log_path=log_path
+        )
+
+
 def _ensure_conductor(cfg: ReviewConfig) -> None:
     """Ensure the single repo-level CONDUCTOR — the global orchestrator that
     replaces the old per-chapter refine daemons — is running.
@@ -904,31 +1019,17 @@ def _ensure_conductor(cfg: ReviewConfig) -> None:
             "conductor to refine under their own key"
         )
         return
-    pid = _live_conductor_pid(cfg)
-    if pid is not None:
+    result = start_conductor(cfg)
+    if not result.started:
         print(
-            f"  repo-level conductor already active (pid {pid}); this rejection "
+            f"  repo-level conductor already active (pid {result.pid}); this rejection "
             "is queued in state.json — it dispatches on its next poll"
         )
         return
-
-    cfg.runner_log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = (
-        cfg.runner_log_dir
-        / f"conductor-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
-    )
-    log_fh = log_path.open("w")
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "marathon", "conductor", "run",
-         "--repo-dir", str(cfg.repo_dir)],
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        cwd=str(cfg.repo_dir),
-    )
     print(
-        f"  repo-level conductor launched (pid {proc.pid}); it dispatches "
-        f"refines + auto-merges PRs across all chapters. log: {log_path}"
+        f"  repo-level conductor launched (pid {result.pid}); it dispatches "
+        "refines + auto-merges PRs across all chapters. "
+        f"log: {result.log_path}"
     )
 
 

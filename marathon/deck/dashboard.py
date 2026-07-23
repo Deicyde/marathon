@@ -134,6 +134,17 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
     )
     from marathon.review import daemon
 
+    # A conductor launched by the long-lived deck remains its child. Observe
+    # the retained Popen before the PID-file probe so an early crash is reaped;
+    # otherwise kill(pid, 0) reports the zombie as alive forever and hides the
+    # manual restart control. This performs no launch, signal, or repo write.
+    try:
+        from marathon.review.review import refresh_pending_conductor_start
+
+        refresh_pending_conductor_start(cfg)
+    except Exception:  # noqa: BLE001 — status remains fail-soft
+        pass
+
     # Liveness: the conductor lock holds the live pid (same check the conductor
     # itself uses to enforce the singleton).
     pid: Optional[int] = None

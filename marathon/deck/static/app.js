@@ -373,6 +373,8 @@
     currentDecl: null,  // the DeclCard currently on the stage (or null)
     showSummary: false, // the confirm-and-ship summary card is up
     busy: false,        // a POST is in flight (locks input)
+    conductorStartBusy: false, // explicit Status-tab recovery POST is in flight
+    conductorStartError: "",   // durable across the five-second status rerender
     skipApi: false,     // "Skip API" view toggle (default OFF; per-session)
     informalActive: false,   // the leading informal-approval card is on the stage
     informalDismissed: false, // "decide later" on the informal card (this session)
@@ -6249,6 +6251,61 @@
     })]);
   }
 
+  // A successful start POST returns as soon as the detached process exists;
+  // the conductor may need a moment to acquire and publish its lock. Poll a
+  // bounded number of PURE status reads before declaring the recovery failed.
+  function pollConductorUntilLive(attempts) {
+    return getJSON("/api/conductor-status").then(function (d) {
+      if (d.alive || attempts <= 1) return d;
+      return new Promise(function (resolve) {
+        setTimeout(resolve, 500);
+      }).then(function () { return pollConductorUntilLive(attempts - 1); });
+    });
+  }
+
+  function startConductorFromStatus() {
+    if (state.conductorStartBusy) return;
+    state.conductorStartBusy = true;
+    state.conductorStartError = "";
+    renderStatusTab();
+    postJSON("/api/conductor-start", {})
+      .then(function () { return pollConductorUntilLive(16); })
+      .then(function (d) {
+        if (!d.alive) {
+          throw new Error("the launch was accepted, but no live conductor appeared");
+        }
+        state.conductorStartBusy = false;
+        state.conductorStartError = "";
+        flashToast("Orchestrator restarted");
+        renderStatusTab();
+      })
+      .catch(function (e) {
+        state.conductorStartBusy = false;
+        state.conductorStartError = (e && e.message) ? e.message : String(e);
+        renderStatusTab();
+      });
+  }
+
+  function conductorStartControl(d) {
+    if (d.alive || !d.restart_allowed) return null;
+    var button = el("button", {
+      class: "btn btn-tiny cond-restart",
+      type: "button",
+      text: state.conductorStartBusy ? "Restarting…" : "Restart orchestrator",
+      title: "Start the host conductor and resume its existing queued work",
+    });
+    button.disabled = state.conductorStartBusy;
+    button.addEventListener("click", startConductorFromStatus);
+    return el("div", { class: "cond-actions" }, [
+      button,
+      state.conductorStartError ? el("span", {
+        class: "cond-start-error",
+        role: "status",
+        text: state.conductorStartError,
+      }) : null,
+    ]);
+  }
+
   function renderStatusTab() {
     if (state.activeTab !== "status") return; // a stale poll after a switch
     getJSON("/api/conductor-status").then(function (d) {
@@ -6257,20 +6314,24 @@
       if (!host) return;
       host.innerHTML = "";
       var up = !!d.alive;
+      if (up) state.conductorStartError = "";
       // DEGRADED beats "running": a conductor with a broken dispatch env
       // (e.g. no Aristotle key) is alive but can't refine — a green chip
       // here hid exactly that during the 2026-07-07 incident.
       var degraded = up && d.degraded;
       host.appendChild(el("div", { class: "cond-banner" + (degraded ? " cond-degraded" : "") }, [
         el("span", { class: "cond-dot " + (degraded ? "degraded" : (up ? "up" : "down")) }),
-        el("div", {}, [
+        el("div", { class: "cond-summary" }, [
           el("div", { class: "cond-title",
             text: degraded ? "conductor DEGRADED — not dispatching"
                 : up ? "conductor running" : "conductor stopped" }),
           el("div", { class: "dash-empty",
             text: degraded ? String(d.degraded)
                 : up ? "dispatches refines + auto-merges PRs across all chapters"
-                     : "no live orchestrator — rejecting an issue starts one" }),
+                     : d.restart_allowed
+                       ? "no live orchestrator — restart it here to resume queued work"
+                       : "no live orchestrator — host restart control is disabled" }),
+          conductorStartControl(d),
         ]),
         el("div", { class: "cond-meta" }, [
           el("div", {}, ["pid ", el("span", { class: "mono",

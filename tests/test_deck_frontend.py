@@ -1780,6 +1780,7 @@ def test_card_actions_gated_to_review_tab(app_js: str):
 def test_dashboard_endpoints_referenced(app_js: str):
     code = _strip_block_comments(app_js)
     assert "/api/conductor-status" in code
+    assert "/api/conductor-start" in code
     assert "/api/issues-overview" in code
     assert "/api/history" in code
 
@@ -1788,6 +1789,61 @@ def test_style_has_tab_and_dashboard_classes(style_css: str):
     for cls in (".tab-nav", ".tab-btn", ".cond-banner", ".issue-row",
                 ".hist-row", ".sb-verified"):
         assert cls in style_css
+
+
+def test_stopped_conductor_has_opt_in_restart_button(app_js: str, style_css: str):
+    """The server capability, not a dead status alone, gates host compute."""
+    code = _strip_block_comments(app_js)
+    headers = re.findall(r"(?m)^  function [A-Za-z0-9_$]+", code)
+    control_bodies = [
+        _fn_body(code, header)
+        for header in headers
+        if "cond-restart" in _fn_body(code, header)
+    ]
+    assert control_bodies, "expected a dedicated conductor restart control"
+    control = control_bodies[0]
+    assert "restart_allowed" in control
+    assert ".alive" in control
+    assert "Restart orchestrator" in control
+    assert "addEventListener" in control
+    assert ".cond-restart" in style_css
+
+
+def test_conductor_restart_post_is_isolated_from_status_renderer(app_js: str):
+    """Ordinary five-second status refreshes must remain pure GETs."""
+    code = _strip_block_comments(app_js)
+    render = _fn_body(code, "function renderStatusTab")
+    assert "postJSON" not in render
+    assert code.count('"/api/conductor-start"') == 1
+
+    headers = re.findall(r"(?m)^  function [A-Za-z0-9_$]+", code)
+    start_bodies = [
+        _fn_body(code, header)
+        for header in headers
+        if 'postJSON("/api/conductor-start"' in _fn_body(code, header)
+    ]
+    assert len(start_bodies) == 1
+    start = start_bodies[0]
+    assert "conductorStartBusy" in start
+    assert "renderStatusTab" in start
+
+
+def test_conductor_restart_waits_for_confirmed_liveness(app_js: str):
+    """Popen success is not yet readiness; poll for a bounded period."""
+    code = _strip_block_comments(app_js)
+    assert "conductorStartBusy" in code
+    headers = re.findall(r"(?m)^  function [A-Za-z0-9_$]+", code)
+    pollers = [
+        _fn_body(code, header)
+        for header in headers
+        if '/api/conductor-status' in _fn_body(code, header)
+        and "setTimeout" in _fn_body(code, header)
+    ]
+    assert pollers, "restart should poll the status endpoint after launch"
+    poller = pollers[0]
+    assert "getJSON(" in poller
+    assert ".alive" in poller
+    assert re.search(r"attempt|tries|remaining", poller, flags=re.IGNORECASE)
 
 
 # --- wide-angle file/chapter review + project dependency DAG ---------------

@@ -830,7 +830,13 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .cond-dot.degraded { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
 .cond-banner.cond-degraded { border-color: #d2992288; }
 .cond-banner.cond-degraded .cond-title { color: var(--warn); }
+.cond-summary { min-width: 0; }
 .cond-title { font-weight: 700; }
+.cond-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 0.55rem;
+  margin-top: 0.25rem; }
+.cond-restart { border-color: #6ea8fe99;
+  color: var(--accent); white-space: nowrap; }
+.cond-start-error { color: var(--reject); font-size: 0.76rem; }
 .cond-meta { color: var(--muted); font-size: 0.8rem; margin-left: auto; text-align: right; }
 .cond-meta .mono { font-family: var(--mono); }
 .prover-toggle { display: inline-flex; align-items: center; gap: 0.35rem;
