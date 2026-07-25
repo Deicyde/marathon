@@ -27,6 +27,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.client import HTTPConnection
 from threading import Event, Lock, Thread
+from time import monotonic
 
 import pytest
 
@@ -805,6 +806,30 @@ def test_verify_routes_through_cmd_verify(tmp_path, monkeypatch):
     assert calls["verify"].close is False  # deck keeps the issue OPEN
 
 
+def test_apply_verdict_can_skip_queue_advance_rebuild(tmp_path, monkeypatch):
+    """Ordinary verdicts still advance; ship callers can opt out."""
+    cfg = make_cfg(tmp_path)
+    from marathon.review import review as review_mod
+
+    monkeypatch.setattr(review_mod, "cmd_verify", lambda args: None)
+    next_card = object()
+    rebuilds = []
+    monkeypatch.setattr(
+        verdicts,
+        "_next_ready_card",
+        lambda c, issue: (rebuilds.append((c, issue)) or next_card),
+    )
+
+    regular = verdicts.apply_verdict(cfg, 22, "verify")
+    shipped = verdicts.apply_verdict(
+        cfg, 22, "verify", compute_advance=False
+    )
+
+    assert regular.advanced_to is next_card
+    assert shipped.advanced_to is None
+    assert rebuilds == [(cfg, 22)]
+
+
 def test_reject_routes_note_verbatim(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path)
     install_snapshot(cfg, make_snapshot([
@@ -1097,6 +1122,58 @@ def test_index_injects_token(running_server):
     # The placeholder is gone, the real token is present.
     assert deck_server.TOKEN_PLACEHOLDER not in html
     assert token in html
+
+
+def test_ship_http_ack_is_fast_while_worker_is_blocked(running_server):
+    """Slow GitHub work stays off the request thread and is polled by GET."""
+    server, base, token = running_server
+    from marathon.deck.ship_jobs import ShipJobRegistry
+
+    entered = Event()
+    release = Event()
+
+    def slow_ship(_cfg, issue, *, skip_api=False):
+        assert issue == 22
+        entered.set()
+        assert release.wait(timeout=5)
+        return {"ok": True, "outcome": "shipped"}
+
+    server.ship_jobs = ShipJobRegistry(runner=slow_ship)
+    try:
+        bad_status, _bad_raw = _post(
+            base + "/api/ship",
+            {"issue": 22, "review_token": "not-a-token"},
+            headers={deck_server.TOKEN_HEADER: token},
+        )
+        assert bad_status == 400
+
+        started = monotonic()
+        status, raw = _post(
+            base + "/api/ship",
+            {"issue": 22},
+            headers={deck_server.TOKEN_HEADER: token},
+        )
+        elapsed = monotonic() - started
+
+        assert status == 202
+        assert elapsed < 1.0
+        ack = json.loads(raw)
+        assert ack["status"] == "running"
+        assert entered.wait(timeout=1)
+
+        poll_status, poll_raw = _get(base + ack["status_url"])
+        assert poll_status == 200
+        assert json.loads(poll_raw)["status"] == "running"
+
+        conflict_status, conflict_raw = _post(
+            base + "/api/ship",
+            {"issue": 22, "skip_api": True},
+            headers={deck_server.TOKEN_HEADER: token},
+        )
+        assert conflict_status == 409
+        assert "different" in json.loads(conflict_raw)["error"].lower()
+    finally:
+        release.set()
 
 
 def test_get_queue_is_pure_no_verdict(running_server, monkeypatch):

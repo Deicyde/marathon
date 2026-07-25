@@ -16,7 +16,9 @@
  *   POST /api/decl-verdict {issue,decl,verdict,note?}  (LOCAL ONLY — no GitHub/Aristotle/ledger)
  *                                       -> {ok, progress, complete, summary, next_decl}
  *   POST /api/ship {issue}              (THE IRREVERSIBLE REVIEW side-effect)
- *                                       -> {ok, outcome, message, advanced_to_issue}
+ *                                       -> 200 {ok,outcome,message,advanced_to_issue}
+ *                                       or 202 {issue,operation_id,status,status_url}
+ *   GET  /api/ship-status?...           -> durable async ship-job status
  *   POST /api/recovery {issue,action,recovery_token,confirm_destructive}
  *                                       -> {ok, accepted, queue_state, message}
  *   POST /api/verso-retry {}            -> retry one failed semantic-doc build
@@ -111,6 +113,84 @@
     }).then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status + " for " + url);
       return r.json();
+    });
+  }
+
+  // A bounded variant for job-status reads. Ordinary read models can use the
+  // browser's normal fetch lifetime, but a ship poll must always settle so one
+  // wedged proxy connection cannot leave the irreversible-action UI locked
+  // forever. Errors preserve the HTTP status + parsed JSON when available,
+  // which lets the caller distinguish a confirmed "no job" 404 from an
+  // unknown network/proxy failure.
+  function getJSONWithTimeout(url, timeoutMs) {
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var controller = typeof AbortController === "function"
+        ? new AbortController() : null;
+      var timer = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        if (controller) controller.abort();
+        var timeoutError = new Error(
+          "Timed out after " + timeoutMs + "ms while reading " + url
+        );
+        timeoutError.name = "TimeoutError";
+        reject(timeoutError);
+      }, timeoutMs);
+
+      var options = {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      };
+      if (controller) options.signal = controller.signal;
+
+      fetch(url, options)
+        .then(function (r) {
+          return r.text().then(function (raw) {
+            var data = null;
+            if (raw) {
+              try {
+                data = JSON.parse(raw);
+              } catch (parseError) {
+                var invalid = new Error(
+                  "HTTP " + r.status + " returned non-JSON data for " + url
+                );
+                invalid.status = r.status;
+                invalid.responseText = raw.slice(0, 240);
+                throw invalid;
+              }
+            }
+            if (!r.ok) {
+              var requestError = new Error(
+                (data && (data.message || data.reason || data.error)) ||
+                  "HTTP " + r.status + " for " + url
+              );
+              requestError.status = r.status;
+              requestError.data = data;
+              throw requestError;
+            }
+            if (!data || typeof data !== "object") {
+              var empty = new Error(
+                "HTTP " + r.status + " returned no JSON object for " + url
+              );
+              empty.status = r.status;
+              throw empty;
+            }
+            return data;
+          });
+        })
+        .then(function (data) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(data);
+        }, function (err) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+        });
     });
   }
   function fetchQueue(chapter) {
@@ -282,8 +362,12 @@
   // API auto-approval AT SHIP (folding un-verdicted API decls into KEEP). The
   // toggle itself never POSTs; auto-approval happens ONLY here, at the
   // explicit token-bearing ship — never on the GET that assembled the view.
-  function postShip(issue, skipApi) {
-    return postJSON("/api/ship", { issue: issue, skip_api: !!skipApi });
+  function postShip(issue, skipApi, reviewToken) {
+    return postJSON("/api/ship", {
+      issue: issue,
+      skip_api: !!skipApi,
+      review_token: reviewToken || null,
+    });
   }
 
   // postDropCitation — A GitHub WRITE (token-gated, HUMAN-TRIGGERED). Drops a
@@ -373,6 +457,8 @@
     currentDecl: null,  // the DeclCard currently on the stage (or null)
     showSummary: false, // the confirm-and-ship summary card is up
     busy: false,        // a POST is in flight (locks input)
+    activeShip: null,   // durable non-secret {issue,operationId,statusUrl}
+    shipPollSeq: 0,     // cancels stale poll continuations after terminal state
     conductorStartBusy: false, // explicit Status-tab recovery POST is in flight
     conductorStartError: "",   // durable across the five-second status rerender
     skipApi: false,     // "Skip API" view toggle (default OFF; per-session)
@@ -4186,6 +4272,475 @@
     openModal(el("div", { class: "modal-panel" }, kids));
   }
 
+  var SHIP_POLL_DELAY_MS = 900;
+  var SHIP_POLL_MAX_FAILURES = 6;
+  var SHIP_STATUS_TIMEOUT_MS = 6000;
+  var SHIP_CONTEXT_KEY = "marathon-deck-active-ship";
+
+  function shipPollDelay(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function normalizedShipStatus(job) {
+    return String((job && job.status) || "").toLowerCase().replace(/-/g, "_");
+  }
+
+  function shipStatusUrl(url) {
+    if (!url) return null;
+    try {
+      var parsed = new URL(url, window.location.href);
+      // Ship-status polling is deliberately same-origin and token-free. Never
+      // follow a status URL away from the deck origin.
+      if (parsed.origin !== window.location.origin ||
+          parsed.pathname !== "/api/ship-status") return null;
+      return parsed.pathname + parsed.search;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function issueShipStatusUrl(issue) {
+    return "/api/ship-status?issue=" + encodeURIComponent(issue);
+  }
+
+  function shipContextsMatch(a, b) {
+    if (!a || !b || a.issue !== b.issue) return false;
+    if (a.operationId && b.operationId) return a.operationId === b.operationId;
+    return a.statusUrl === b.statusUrl;
+  }
+
+  function normalizeShipContext(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    var issue = Number(raw.issue);
+    var statusUrl = shipStatusUrl(raw.statusUrl || raw.status_url);
+    if (!Number.isInteger(issue) || issue <= 0 || !statusUrl) return null;
+    var operationId = raw.operationId || raw.operation_id || null;
+    if (operationId != null && typeof operationId !== "string") return null;
+    return {
+      issue: issue,
+      operationId: operationId,
+      statusUrl: statusUrl,
+    };
+  }
+
+  function persistShipContext(ctx) {
+    ctx = normalizeShipContext(ctx);
+    if (!ctx) return null;
+    state.activeShip = ctx;
+    try {
+      window.sessionStorage.setItem(SHIP_CONTEXT_KEY, JSON.stringify(ctx));
+    } catch (e) { /* storage unavailable — the in-memory poll remains safe */ }
+    return ctx;
+  }
+
+  function readShipContext() {
+    try {
+      var raw = window.sessionStorage.getItem(SHIP_CONTEXT_KEY);
+      return raw ? normalizeShipContext(JSON.parse(raw)) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function clearShipContext(ctx) {
+    if (ctx && state.activeShip && !shipContextsMatch(ctx, state.activeShip)) {
+      return false;
+    }
+    state.activeShip = null;
+    state.shipPollSeq += 1;
+    try {
+      var saved = readShipContext();
+      if (!ctx || !saved || shipContextsMatch(ctx, saved)) {
+        window.sessionStorage.removeItem(SHIP_CONTEXT_KEY);
+      }
+    } catch (e) { /* storage unavailable */ }
+    return true;
+  }
+
+  function shipContextFromJob(issue, job) {
+    if (job && job.issue != null && Number(job.issue) !== Number(issue)) {
+      throw new Error("ship status returned a different issue");
+    }
+    return normalizeShipContext({
+      issue: issue,
+      operationId: job && job.operation_id,
+      statusUrl: (job && job.status_url) || issueShipStatusUrl(issue),
+    });
+  }
+
+  function confirmedShipStatusNotFound(err) {
+    return !!(
+      err && err.status === 404 && err.data && err.data.ok === false &&
+      /no matching ship job/i.test(err.data.error || err.data.message || "")
+    );
+  }
+
+  function shipResult(job) {
+    if (job && job.result && typeof job.result === "object") return job.result;
+    if (job && job.response && typeof job.response === "object") return job.response;
+    return job || {};
+  }
+
+  function isConfirmedShipResult(result) {
+    return !!(
+      result && result.ok !== false &&
+      (result.outcome === "shipped" || result.outcome === "verified")
+    );
+  }
+
+  function shipProgressText(status, job) {
+    if (job && (job.message || job.detail)) return job.message || job.detail;
+    if (status === "queued" || status === "pending") {
+      return "Your review is saved and waiting to be published.";
+    }
+    return "Publishing the review to GitHub and updating the Aristotle queue. "
+      + "This can take a minute when GitHub is busy.";
+  }
+
+  // Keep slow GitHub work visible instead of replacing it with a short-lived
+  // toast. The review state remains in memory until the durable job succeeds.
+  function showShipProgressCard(issue, status, job, reconnecting) {
+    var detail = reconnecting
+      ? "The ship job is still running. Reconnecting to its status…"
+      : shipProgressText(status, job);
+    var current = stage().querySelector(".ship-progress-card");
+    if (current && Number(current.getAttribute("data-ship-issue")) === Number(issue)) {
+      var currentDetail = current.querySelector(".msg-body");
+      if (currentDetail && currentDetail.textContent !== detail) {
+        currentDetail.textContent = detail;
+      }
+      return;
+    }
+    stage().innerHTML = "";
+    var card = el("article", {
+      class: "card card-message ship-progress-card",
+      "data-ship-issue": String(issue),
+      "aria-busy": "true",
+    }, [
+      el("div", { class: "ship-spinner", "aria-hidden": "true" }),
+      el("h2", { class: "msg-title", text: "Shipping issue #" + issue + "…" }),
+      el("p", { class: "msg-body", text: detail }),
+      el("p", { class: "ship-progress-note", text:
+        "You do not need to click Ship again. This page will advance when the job finishes." }),
+    ]);
+    stage().appendChild(card);
+    setActionsEnabled(false);
+  }
+
+  function shipFailureMessage(status, job) {
+    var detail = job && (job.message || job.error || job.detail);
+    if (status === "awaiting_retry") {
+      return (detail ? detail + " " : "")
+        + "The deck restarted before it could confirm completion. Your review decisions "
+        + "are saved; use the Ship button below to resume safely.";
+    }
+    return (detail ? detail + " " : "")
+      + "Your review decisions are still saved. Check them below, then use the Ship "
+      + "button again when you are ready to retry.";
+  }
+
+  // Restore the exact summary/subdeck that produced the job. A notice remains
+  // visible above it, while the normal Ship button provides the only explicit
+  // retry path (there is never an automatic second POST).
+  function restoreShipSummary(issue, title, body, checkStatus, allowRetry) {
+    allowRetry = allowRetry !== false;
+    if (state.issue !== issue) {
+      state.busy = false;
+      flashToast(title + " for issue #" + issue);
+      return;
+    }
+    state.busy = !allowRetry;
+    if (!state.subdeck) {
+      var messageActions = [];
+      if (checkStatus) {
+        messageActions.push({
+          label: "Check shipping status",
+          kind: "btn-primary",
+          onClick: checkStatus,
+        });
+      }
+      if (allowRetry) {
+        messageActions.push({
+          label: "Reload saved review",
+          onClick: function () { openIssue(issue); },
+        });
+      }
+      showMessageCard({
+        title: title,
+        body: body,
+        actions: messageActions,
+      });
+      return;
+    }
+    state.showSummary = true;
+    renderSummaryCard();
+    var bannerActions = [];
+    if (checkStatus) {
+      bannerActions.push(el("button", {
+        class: "btn btn-primary",
+        type: "button",
+        onclick: checkStatus,
+      }, ["Check shipping status"]));
+    }
+    var banner = el("section", {
+      class: "ship-status-banner",
+      role: "alert",
+    }, [
+      el("div", { class: "ship-status-copy" }, [
+        el("strong", { text: title }),
+        el("p", { text: body }),
+      ]),
+      bannerActions.length ? el("div", { class: "ship-status-actions" }, bannerActions) : null,
+    ]);
+    stage().insertBefore(banner, stage().firstChild);
+    if (!allowRetry) {
+      var ship = document.getElementById("btn-ship");
+      if (ship) {
+        ship.disabled = true;
+        ship.setAttribute("aria-disabled", "true");
+      }
+    }
+  }
+
+  function finishShipSuccess(issue, resp, ctx) {
+    clearShipContext(ctx || state.activeShip);
+    state.busy = false;
+    resp = resp || {};
+    var outcome = resp.outcome || "shipped";
+    var msg = resp.message || ("issue #" + issue + " " + outcome);
+    // The shipped issue left the ready queue.
+    state.queue = state.queue.filter(function (c) { return c.id !== issue; });
+    state.filesData = null;
+    state.graphData = null;
+    flashToast(msg);
+    refreshStatus();
+    // A ship may finish after the human moved to another issue. Update the
+    // caches and status, but never erase or repaint that newer review.
+    if (state.issue !== issue) return;
+
+    state.subdeckRequestSeq += 1;
+    state.subdeck = null;
+    state.issue = null;
+    state.showSummary = false;
+    var adv = resp.advanced_to_issue;
+    if (adv != null) {
+      openIssue(adv);
+    } else {
+      // Refresh the queue; if empty -> "all caught up".
+      refreshQueue();
+    }
+  }
+
+  function pollShipJob(ctx, failedPolls, pollSeq) {
+    if (pollSeq !== state.shipPollSeq ||
+        !shipContextsMatch(ctx, state.activeShip)) {
+      var cancelled = new Error("ship status poll superseded");
+      cancelled.shipPollCancelled = true;
+      return Promise.reject(cancelled);
+    }
+    return getJSONWithTimeout(ctx.statusUrl, SHIP_STATUS_TIMEOUT_MS).then(function (job) {
+      var operationId = job && job.operation_id;
+      if (ctx.operationId && operationId && operationId !== ctx.operationId) {
+        throw new Error("ship status changed to a different operation");
+      }
+      var status = normalizedShipStatus(job);
+      if (status === "succeeded" || status === "complete" || status === "completed") {
+        if (!isConfirmedShipResult(shipResult(job))) {
+          throw new Error("completed ship returned no recognized outcome");
+        }
+        return { terminal: "succeeded", job: job };
+      }
+      if (status === "failed" || status === "awaiting_retry") {
+        return { terminal: status, job: job };
+      }
+      if (["running", "queued", "pending", "starting"].indexOf(status) === -1) {
+        throw new Error("unrecognized ship status " + JSON.stringify(status));
+      }
+      if (state.issue === ctx.issue) {
+        showShipProgressCard(ctx.issue, status, job, false);
+      }
+      return shipPollDelay(SHIP_POLL_DELAY_MS).then(function () {
+        return pollShipJob(ctx, 0, pollSeq);
+      });
+    }, function (err) {
+      if (confirmedShipStatusNotFound(err)) throw err;
+      var failures = failedPolls + 1;
+      if (failures > SHIP_POLL_MAX_FAILURES) throw err;
+      if (state.issue === ctx.issue) {
+        showShipProgressCard(ctx.issue, "running", null, true);
+      }
+      // Back off mildly during a connectivity wobble, but keep the normal
+      // successful poll cadence responsive.
+      var delay = Math.min(2500, SHIP_POLL_DELAY_MS * failures);
+      return shipPollDelay(delay).then(function () {
+        return pollShipJob(ctx, failures, pollSeq);
+      });
+    });
+  }
+
+  function resumeShipStatusPoll(ctx) {
+    ctx = persistShipContext(ctx);
+    if (!ctx) {
+      return Promise.reject(new Error("invalid ship status context"));
+    }
+    state.busy = state.issue === ctx.issue;
+    setActionsEnabled(false);
+    if (state.issue === ctx.issue) {
+      showShipProgressCard(ctx.issue, "running", null, false);
+    }
+    var pollSeq = ++state.shipPollSeq;
+    return pollShipJob(ctx, 0, pollSeq)
+      .then(function (terminal) {
+        if (terminal.terminal === "succeeded") {
+          finishShipSuccess(ctx.issue, shipResult(terminal.job), ctx);
+          return;
+        }
+        clearShipContext(ctx);
+        restoreShipSummary(
+          ctx.issue,
+          terminal.terminal === "awaiting_retry"
+            ? "Shipping paused — safe retry needed"
+            : "Shipping failed",
+          shipFailureMessage(terminal.terminal, terminal.job),
+          null,
+          true
+        );
+      })
+      .catch(function (err) {
+        if (err && err.shipPollCancelled) return;
+        if (confirmedShipStatusNotFound(err) && ctx.operationId) {
+          // The exact operation disappeared or changed. Reconcile by issue
+          // before drawing any conclusion or enabling the irreversible button.
+          return reconcileAmbiguousShip(ctx.issue, err);
+        }
+        if (confirmedShipStatusNotFound(err)) {
+          clearShipContext(ctx);
+          restoreShipSummary(
+            ctx.issue,
+            "Ship was not accepted",
+            "The server confirmed that no durable shipping job exists for issue #"
+              + ctx.issue + ". Your saved review was not submitted, so it is safe to try again.",
+            null,
+            true
+          );
+          return;
+        }
+        restoreShipSummary(
+          ctx.issue,
+          "Could not read shipping status",
+          ((err && err.message) || "network error")
+            + ". The job may still be running. Ship remains disabled until its "
+            + "durable status can be confirmed.",
+          function () { resumeShipStatusPoll(ctx); },
+          false
+        );
+      });
+  }
+
+  // A failed POST response is ambiguous: the server may have durably accepted
+  // the job before a proxy/browser connection failed. Resolve that ambiguity
+  // with the issue-only PURE GET. Only a specific backend JSON 404 proves that
+  // no job exists and makes an explicit retry safe.
+  function reconcileAmbiguousShip(issue, postError) {
+    var provisional = persistShipContext({
+      issue: issue,
+      operationId: null,
+      statusUrl: issueShipStatusUrl(issue),
+    });
+    state.busy = state.issue === issue;
+    if (state.issue === issue) {
+      showShipProgressCard(issue, "running", null, true);
+    }
+    return getJSONWithTimeout(
+      provisional.statusUrl, SHIP_STATUS_TIMEOUT_MS
+    ).then(function (job) {
+      var status = normalizedShipStatus(job);
+      var ctx = shipContextFromJob(issue, job) || provisional;
+      persistShipContext(ctx);
+      if (status === "succeeded" || status === "complete" || status === "completed") {
+        var completedResult = shipResult(job);
+        if (!isConfirmedShipResult(completedResult)) {
+          throw new Error("completed ship returned no recognized outcome");
+        }
+        finishShipSuccess(issue, completedResult, ctx);
+        return;
+      }
+      if (status === "failed" || status === "awaiting_retry") {
+        clearShipContext(ctx);
+        restoreShipSummary(
+          issue,
+          status === "awaiting_retry"
+            ? "Shipping paused — safe retry needed"
+            : "Shipping failed",
+          shipFailureMessage(status, job),
+          null,
+          true
+        );
+        return;
+      }
+      if (["running", "queued", "pending", "starting"].indexOf(status) !== -1) {
+        return resumeShipStatusPoll(ctx);
+      }
+      restoreShipSummary(
+        issue,
+        "Could not confirm shipping status",
+        "The status service returned an unrecognized state. Ship remains disabled "
+          + "until a durable result can be confirmed.",
+        function () { reconcileAmbiguousShip(issue, postError); },
+        false
+      );
+    }).catch(function (statusError) {
+      if (confirmedShipStatusNotFound(statusError)) {
+        clearShipContext(provisional);
+        restoreShipSummary(
+          issue,
+          "Ship was not accepted",
+          "The publish request could not be confirmed ("
+            + ((postError && postError.message) || "network error")
+            + "), and the server confirmed that no durable shipping job exists. "
+            + "Your review was not submitted, so it is safe to press Ship again.",
+          null,
+          true
+        );
+        return;
+      }
+      // Timeout, 5xx, non-JSON proxy page, and connection failures are UNKNOWN,
+      // not evidence that the irreversible request failed.
+      persistShipContext(provisional);
+      restoreShipSummary(
+        issue,
+        "Could not confirm whether shipping started",
+        ((postError && postError.message) || "The publish request lost its response")
+          + ". The status check also failed: "
+          + ((statusError && statusError.message) || "network error")
+          + ". Ship remains disabled; checking status is a pure read and will not submit again.",
+        function () { reconcileAmbiguousShip(issue, postError); },
+        false
+      );
+    });
+  }
+
+  function resumeSavedShipContext(ctx) {
+    ctx = persistShipContext(ctx);
+    if (!ctx) return false;
+    state.issue = ctx.issue;
+    state.showSummary = true;
+    state.busy = true;
+    showShipProgressCard(ctx.issue, "running", null, true);
+    // Rehydrate the summary in parallel so a failed/paused terminal state can
+    // restore the exact saved decisions. The status poll never waits on this
+    // potentially slower read.
+    fetchSubdeck(ctx.issue, state.skipApi)
+      .then(function (sd) {
+        if (!shipContextsMatch(ctx, state.activeShip)) return;
+        state.subdeck = normalizeSubdeck(sd);
+        state.showSummary = true;
+      })
+      .catch(function () { /* status remains authoritative; offer reload later */ });
+    resumeShipStatusPoll(ctx);
+    return true;
+  }
+
   // shipIssue — THE SOLE CALLER OF postShip. This is the irreversible review
   // action. Reached ONLY from the confirm dialog opened by
   // the ship button on the completion summary — never on load, navigation,
@@ -4199,40 +4754,55 @@
     // view. An overridden decl carries its own human verdict, so the backend
     // will not auto-approve it.
     var skipApi = !!state.skipApi;
+    // Bind the irreversible action to the exact declarations + issue body the
+    // human reviewed. The backend rejects a stale token instead of silently
+    // shipping a newer/different subdeck.
+    var reviewToken = state.subdeck && state.subdeck.review_token;
     state.busy = true;
     setActionsEnabled(false);
-    flashToast("shipping issue #" + issue + "…");
-    postShip(issue, skipApi)
+    var shipButton = document.getElementById("btn-ship");
+    if (shipButton) {
+      shipButton.disabled = true;
+      shipButton.setAttribute("aria-disabled", "true");
+    }
+    showShipProgressCard(issue, "starting", null, false);
+    postShip(issue, skipApi, reviewToken)
       .then(function (resp) {
-        state.busy = false;
-        var outcome = (resp && resp.outcome) || "shipped";
-        var msg = (resp && resp.message) || ("issue #" + issue + " " + outcome);
-        // The shipped issue left the ready queue.
-        state.queue = state.queue.filter(function (c) { return c.id !== issue; });
-        state.subdeckRequestSeq += 1;
-        state.subdeck = null;
-        state.issue = null;
-        state.showSummary = false;
-        state.filesData = null;
-        state.graphData = null;
-        flashToast(msg);
-        var adv = resp && resp.advanced_to_issue;
-        if (adv != null) {
-          openIssue(adv);
-        } else {
-          // Refresh the queue; if empty -> "all caught up".
-          refreshQueue();
+        var status = normalizedShipStatus(resp);
+        if (status === "succeeded" || status === "complete" || status === "completed") {
+          var completedResult = shipResult(resp);
+          if (!isConfirmedShipResult(completedResult)) {
+            throw new Error("completed ship returned no recognized outcome");
+          }
+          finishShipSuccess(issue, completedResult);
+          return;
         }
-        refreshStatus();
+        var statusUrl = shipStatusUrl(resp && resp.status_url);
+        if (statusUrl || status === "queued" || status === "pending" || status === "running") {
+          if (!statusUrl) {
+            throw new Error("ship was accepted, but no status URL was returned");
+          }
+          resumeShipStatusPoll({
+            issue: issue,
+            operationId: resp && resp.operation_id,
+            statusUrl: statusUrl,
+          });
+          return;
+        }
+        // Compatibility with an older/local deck that still completes the
+        // entire ship request synchronously with a 200 response. Never infer
+        // success from an arbitrary/malformed {ok:true} payload.
+        if (isConfirmedShipResult(resp)) {
+          finishShipSuccess(issue, resp);
+          return;
+        }
+        throw new Error("ship returned an unrecognized response");
       })
       .catch(function (err) {
-        state.busy = false;
-        // Nothing shipped on failure; return to the summary so the human can
-        // retry or revisit.
-        showErrorCard("Ship failed for issue #" + issue, err, function () {
-          state.showSummary = true;
-          renderSubdeckStage();
-        });
+        // Never equate a lost response with a failed irreversible operation.
+        // The issue-only status GET is pure and tells us whether a durable job
+        // was accepted before the connection failed.
+        return reconcileAmbiguousShip(issue, err);
       });
   }
 
@@ -4509,6 +5079,13 @@
       var needsDecl = id === "btn-deps" || id === "btn-deepdive";
       if (b) b.disabled = !on || (needsDecl && state.informalActive);
     });
+    // Summary rendering disables the declaration action bar, but its Ship
+    // button remains available unless a ship is actually in flight.
+    var ship = document.getElementById("btn-ship");
+    if (ship) {
+      ship.disabled = !!state.busy;
+      ship.setAttribute("aria-disabled", state.busy ? "true" : "false");
+    }
   }
 
   // === toast / animation ===================================================
@@ -6973,11 +7550,18 @@
     attachKeys();
     attachSwipe();
     setActionsEnabled(false);
+    var savedShip = readShipContext();
     // Prime the compact current-source identifier index before rendering code,
     // so project terms (including ambiguous short names) are clickable on the
     // first card. Lookup failure never blocks the review deck; kernel links
     // remain available as the honest fallback.
-    refreshQueue();   // pure read — opens the first ready issue's subdeck immediately
+    if (!savedShip) {
+      refreshQueue(); // pure read — opens the first ready issue's subdeck immediately
+    } else {
+      // A reload must reconnect to the durable job with PURE GET polling,
+      // never fire a second POST or misleadingly offer Ship again.
+      resumeSavedShipContext(savedShip);
+    }
     refreshDefinitionTerms(null, true);
     ensureVersoMetadata(false); // optional semantic source; raw source never waits on it
     startStatus();    // pure read (SSE/poll)

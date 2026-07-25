@@ -51,6 +51,7 @@ belong in Python and must be testable without either service.
 | Project configuration and chapter registry | `.marathon/review/config.toml` | Review configuration commands |
 | Issue verdict/retry state | `.marathon/review/state.json` plus ledger events | Review/conductor compatibility layer |
 | In-progress declaration verdicts | `.marathon/review/deck-subdecks.json` | Deck only; local until SHIP |
+| Accepted ship outbox | `.marathon/review/runner-logs/deck-ship-jobs/` | Deck; token-free, atomic, restart-detecting |
 | Trust snapshot | `.marathon/audit/latest.json` | Audit engine |
 | Durable event/evidence cache | `.marathon/marathon.db` | Ledger |
 | Running job snapshot and logs | `.marathon/conductor/` | Conductor |

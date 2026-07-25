@@ -127,6 +127,67 @@ def _run_graph_layout(app_js: str, nodes: list[dict], edges: list[dict]) -> dict
     return json.loads(proc.stdout)
 
 
+def _run_ship_status_transport(app_js: str) -> dict:
+    """Execute the DOM-free bounded GET + confirmed-404 classifier in Node."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for ship-status transport test")
+    code = _strip_block_comments(app_js)
+    helpers = "\n".join((
+        _fn_body(code, "function getJSONWithTimeout"),
+        _fn_body(code, "function confirmedShipStatusNotFound"),
+    ))
+    script = helpers + r"""
+(async function () {
+  global.fetch = function () {
+    return Promise.resolve({
+      ok: false,
+      status: 404,
+      text: function () {
+        return Promise.resolve(JSON.stringify({
+          ok: false,
+          error: "no matching ship job for issue #171"
+        }));
+      }
+    });
+  };
+  var missing;
+  try {
+    await getJSONWithTimeout("/api/ship-status?issue=171", 100);
+  } catch (err) {
+    missing = {
+      status: err.status,
+      confirmed: confirmedShipStatusNotFound(err)
+    };
+  }
+
+  global.fetch = function () { return new Promise(function () {}); };
+  var timeoutName = null;
+  try {
+    await getJSONWithTimeout("/api/ship-status?issue=171", 10);
+  } catch (err) {
+    timeoutName = err.name;
+  }
+  process.stdout.write(JSON.stringify({
+    missing: missing,
+    timeoutName: timeoutName
+  }));
+})().catch(function (err) {
+  process.stderr.write(String(err && err.stack || err));
+  process.exit(1);
+});
+"""
+    proc = subprocess.run(
+        [node, "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
 # --- existence / serveability -----------------------------------------------
 
 def test_all_static_assets_exist():
@@ -307,6 +368,92 @@ def test_ship_button_is_the_ship_entrypoint(app_js: str):
     assert "confirmAndShip(" in summary, "ship button must open the confirm dialog"
     confirm = _fn_body(code, "function confirmAndShip")
     assert "shipIssue()" in confirm, "the confirm dialog fires shipIssue on confirm"
+
+
+def test_ambiguous_ship_post_reconciles_with_pure_issue_status_get(app_js: str):
+    """A lost POST response is not evidence that the irreversible write failed."""
+    code = _strip_block_comments(app_js)
+    ship = _fn_body(code, "function shipIssue")
+    reconcile = _fn_body(code, "function reconcileAmbiguousShip")
+
+    assert "reconcileAmbiguousShip(issue, err)" in ship
+    assert "Nothing will be submitted again" not in ship
+    assert "issueShipStatusUrl(issue)" in reconcile
+    assert "getJSONWithTimeout(" in reconcile
+    assert "confirmedShipStatusNotFound" in reconcile
+    assert "safe to press Ship again" in reconcile
+    assert "Ship remains disabled" in reconcile
+    # Reconciliation is a pure read. It must never silently retry the POST.
+    assert "postShip(" not in reconcile
+    assert "postJSON(" not in reconcile
+
+
+def test_ship_status_poll_has_a_finite_fetch_timeout(app_js: str):
+    code = _strip_block_comments(app_js)
+    bounded_get = _fn_body(code, "function getJSONWithTimeout")
+    poll = _fn_body(code, "function pollShipJob")
+
+    assert "setTimeout" in bounded_get
+    assert "AbortController" in bounded_get
+    assert "timeoutMs" in bounded_get
+    assert "getJSONWithTimeout(ctx.statusUrl, SHIP_STATUS_TIMEOUT_MS)" in poll
+
+
+def test_ship_status_transport_distinguishes_confirmed_404_from_timeout(
+    app_js: str,
+):
+    result = _run_ship_status_transport(app_js)
+    assert result["missing"] == {"status": 404, "confirmed": True}
+    assert result["timeoutName"] == "TimeoutError"
+
+
+def test_ship_requires_an_explicit_known_outcome_before_success(app_js: str):
+    code = _strip_block_comments(app_js)
+    confirmed = _fn_body(code, "function isConfirmedShipResult")
+    ship = _fn_body(code, "function shipIssue")
+
+    assert '"shipped"' in confirmed and '"verified"' in confirmed
+    assert "isConfirmedShipResult(resp)" in ship
+    assert "ship returned an unrecognized response" in ship
+
+
+def test_ship_terminal_handlers_do_not_clobber_a_newer_issue(app_js: str):
+    code = _strip_block_comments(app_js)
+    success = _fn_body(code, "function finishShipSuccess")
+    failure = _fn_body(code, "function restoreShipSummary")
+
+    guard = success.index("if (state.issue !== issue) return")
+    destructive_clear = success.index("state.subdeck = null")
+    assert guard < destructive_clear
+    assert "if (state.issue !== issue)" in failure
+    assert "showMessageCard" not in failure[:failure.index("if (!state.subdeck)")]
+
+
+def test_active_ship_context_survives_reload_without_reposting(app_js: str):
+    code = _strip_block_comments(app_js)
+    persist = _fn_body(code, "function persistShipContext")
+    clear = _fn_body(code, "function clearShipContext")
+    resume = _fn_body(code, "function resumeSavedShipContext")
+    init = _fn_body(code, "function init")
+
+    assert "sessionStorage.setItem" in persist
+    assert "sessionStorage.removeItem" in clear
+    assert "readShipContext()" in init
+    assert "resumeSavedShipContext(savedShip)" in init
+    assert "resumeShipStatusPoll(ctx)" in resume
+    assert "postShip(" not in resume and "postJSON(" not in resume
+
+
+def test_ship_spinner_stops_for_reduced_motion(style_css: str):
+    reduced_blocks = re.findall(
+        r"@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{(.*?)\n\}",
+        style_css,
+        flags=re.DOTALL,
+    )
+    assert any(
+        ".ship-spinner" in block and "animation: none" in block
+        for block in reduced_blocks
+    )
 
 
 def test_decl_verdict_post_uses_post_method(app_js: str):
@@ -1471,11 +1618,14 @@ def test_ship_body_includes_skip_api(app_js: str):
     code = _strip_block_comments(app_js)
     body = _fn_body(code, "function postShip")
     assert "skip_api" in body, "postShip must include skip_api in the ship body"
+    assert "review_token" in body, "postShip must bind to the reviewed subdeck token"
     assert "/api/ship" in body
     # shipIssue passes the live toggle state into postShip
     ship = _fn_body(code, "function shipIssue")
     assert "postShip(" in ship
     assert "skipApi" in ship and "state.skipApi" in ship
+    assert "state.subdeck.review_token" in ship
+    assert "postShip(issue, skipApi, reviewToken)" in ship
 
 
 def test_progress_pill_counts_main_only_under_skip_api(app_js: str):

@@ -24,6 +24,7 @@ API surface (shared contract — the gate reconciles any drift):
 * ``GET  /verso/<path>``      → last-good generated Verso artifact
 * ``POST /api/verso-retry``   → explicitly retry a failed semantic-doc build
 * ``GET  /api/reconciliation/{id}`` → pending identity proposals (read)
+* ``GET  /api/ship-status``    → durable background ship status (read)
 * ``GET  /api/status``        → live conductor/landing events (poll)
 * ``GET  /api/events``        → the same, as Server-Sent Events
 * ``POST /api/conductor-start`` → ensure the conductor is running (guarded,
@@ -341,8 +342,13 @@ class DeckServer(ThreadingHTTPServer):
         # Per-deck registry of in-flight headless chapter-intake jobs (the
         # "Add Chapter" feature). Lazily exercised; harmless when unused.
         from marathon.deck.intake_jobs import IntakeRegistry
+        from marathon.deck.ship_jobs import ShipJobRegistry
 
         self.intake = IntakeRegistry()
+        # GitHub-backed shipping is accepted durably and completed off the
+        # request thread.  This keeps a slow GitHub API from freezing the
+        # review UI or colliding with the reverse proxy's request timeout.
+        self.ship_jobs = ShipJobRegistry()
         # ThreadingHTTPServer gives every request its own thread.  Coalesce
         # expensive queue reads by chapter instead of letting those threads
         # stampede GitHub and the local audit store.  Builders run outside this
@@ -626,6 +632,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                 return self._api_missing_suggestions(
                     path[len("/api/missing-suggestions/"):]
                 )
+            if path == "/api/ship-status":
+                return self._api_ship_status(query)
             if path == "/api/status":
                 return self._api_status()
             if path == "/api/events":
@@ -995,6 +1003,26 @@ class DeckHandler(BaseHTTPRequestHandler):
         """Poll endpoint: the live conductor/landing events as one JSON
         blob. Pure read from jobs.json + landings.jsonl + bounce reports."""
         self._send_json(collect_status(self.cfg))
+
+    def _api_ship_status(self, query: dict) -> None:
+        """Pure-read poll endpoint for one durably accepted ship job."""
+        issue_raw = (query.get("issue") or [None])[0]
+        try:
+            issue_num = int(issue_raw)
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad or missing issue {issue_raw!r}"
+            )
+        operation_id = (query.get("operation_id") or [None])[0]
+        snapshot = self.server.ship_jobs.status(  # type: ignore[attr-defined]
+            self.cfg, issue_num, operation_id=operation_id
+        )
+        if snapshot is None:
+            return self._send_error_json(
+                HTTPStatus.NOT_FOUND,
+                f"no matching ship job for issue #{issue_num}",
+            )
+        self._send_json(snapshot)
 
     def _api_events(self) -> None:
         """Server-Sent Events: one ``data:`` frame carrying the same status
@@ -2007,20 +2035,41 @@ class DeckHandler(BaseHTTPRequestHandler):
         # decls (the realization of the toggle). It is read from the BODY of
         # this explicit, token-bearing POST — never inferred from a GET.
         skip_api = _truthy_flag(data.get("skip_api"))
+        review_token = data.get("review_token")
+        if review_token is not None and (
+            not isinstance(review_token, str)
+            or re.fullmatch(r"[0-9a-f]{64}", review_token) is None
+        ):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "bad subdeck review token"
+            )
 
         if self._demo:
             from marathon.deck.demo import demo_ship
             return self._send_json(demo_ship(issue_num, skip_api=skip_api))
 
-        from marathon.deck.subdeck import ship_issue
+        from marathon.deck.ship_jobs import ShipJobConflict
 
         try:
-            result = ship_issue(self.cfg, issue_num, skip_api=skip_api)
+            result = self.server.ship_jobs.start(  # type: ignore[attr-defined]
+                self.cfg,
+                issue_num,
+                skip_api=skip_api,
+                review_token=review_token,
+                actor_token=self.headers.get(ACCESS_TOKEN_HEADER),
+                on_complete=lambda: (
+                    self.server.invalidate_queue_cache(),  # type: ignore[attr-defined]
+                    self.server.invalidate_project_graph_cache(),  # type: ignore[attr-defined]
+                ),
+            )
+        except ShipJobConflict as exc:
+            return self._send_error_json(HTTPStatus.CONFLICT, str(exc))
         except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
             return self._send_error_json(
-                HTTPStatus.INTERNAL_SERVER_ERROR, f"ship failed: {exc}"
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"could not accept ship job: {exc}",
             )
-        self._send_json(result)
+        self._send_json(result, status=HTTPStatus.ACCEPTED)
 
     def _api_refresh_issue(self) -> None:
         """Push-refresh the issue body's ``### Lean signatures`` section to the

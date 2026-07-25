@@ -179,6 +179,7 @@ def apply_verdict(
     note: Optional[str] = None,
     *,
     operation_id: Optional[str] = None,
+    compute_advance: bool = True,
 ) -> VerdictResult:
     """Route one deck verdict and return the next ready card.
 
@@ -192,8 +193,10 @@ def apply_verdict(
     * ``defer`` → a local marker only (:func:`_record_defer`): no
       Aristotle, no GitHub verdict, no ledger verdict event.
 
-    Returns a :class:`VerdictResult` whose ``advanced_to`` is the next
-    ready card in the same chapter (or None when the queue is drained).
+    By default, returns a :class:`VerdictResult` whose ``advanced_to`` is the
+    next ready card in the same chapter (or None when the queue is drained).
+    Callers that refresh the queue independently may pass
+    ``compute_advance=False`` to skip that potentially expensive rebuild.
     Raises :class:`VerdictError` on an unknown verdict or an empty reject
     note — BEFORE any side effect fires."""
     if verdict not in VERDICTS:
@@ -225,7 +228,9 @@ def apply_verdict(
         _record_defer(cfg, issue_num)
         message = f"#{issue_num} deferred"
 
-    advanced_to = _next_ready_card(cfg, issue_num)
+    advanced_to = (
+        _next_ready_card(cfg, issue_num) if compute_advance else None
+    )
     return VerdictResult(
         ok=True,
         verdict=verdict,

@@ -346,7 +346,6 @@ def _patch_ship_common(monkeypatch):
     )
     monkeypatch.setattr(subdeck, "build_subdeck", lambda c, i, **k: _complete_subdeck())
     monkeypatch.setattr(subdeck, "clear_issue", lambda cfg, issue: None)
-    monkeypatch.setattr(subdeck, "_next_ready_issue", lambda cfg, issue: None)
 
 
 def test_ship_flips_marker_when_informal_approved(tmp_path, monkeypatch):

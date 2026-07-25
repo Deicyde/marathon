@@ -31,11 +31,13 @@ def actor_github_token(token: Optional[str]) -> "Iterator[None]":
     falls back to the host's ambient auth — so the local single-user path is
     completely unchanged.
 
-    SCOPE: this covers only SYNCHRONOUS gh() writes made within the context (the
-    deck's verdict/ship/refresh handlers). It deliberately does NOT reach the
-    detached conductor (a separate process spawned with start_new_session) — its
-    later PR merges + Aristotle refines run under whatever credentials launched
-    it, never this short-lived per-request token. On a shared deck, run the
+    SCOPE: this covers gh() writes made on the thread where the context is
+    entered. The deck's asynchronous ship worker explicitly re-enters this
+    context with the request's captured token; raw tokens are never persisted
+    in its durable job record. It deliberately does NOT reach the detached
+    conductor (a separate process spawned with start_new_session) — its later
+    PR merges + Aristotle refines run under whatever credentials launched it,
+    never this short-lived per-request token. On a shared deck, run the
     conductor per-collaborator (see ``--no-host-conductor``) for that half."""
     tok = (token or "").strip() or None
     reset = _ACTOR_GH_TOKEN.set(tok)

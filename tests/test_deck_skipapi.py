@@ -24,6 +24,7 @@ threaded server on an ephemeral 127.0.0.1 port via urllib.
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from threading import Thread
@@ -439,6 +440,20 @@ def _post(url, body: dict, headers=None):
         return exc.code, exc.read().decode("utf-8")
 
 
+def _await_ship(base: str, ack_body: str) -> dict:
+    ack = json.loads(ack_body)
+    assert ack["status"] == "running"
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        status, body = _get(base + ack["status_url"])
+        assert status == 200
+        job = json.loads(body)
+        if job["status"] in {"succeeded", "failed", "awaiting_retry"}:
+            return job.get("result") or job
+        time.sleep(0.01)
+    raise AssertionError("background ship did not finish")
+
+
 def test_get_subdeck_skipapi_is_pure(running_server, monkeypatch):
     server, base, _token, cfg = running_server
     from marathon.review import review as review_mod
@@ -485,8 +500,8 @@ def test_ship_endpoint_threads_skipapi_from_body(running_server, monkeypatch):
         base + "/api/ship", {"issue": 22, "skip_api": True},
         headers={deck_server.TOKEN_HEADER: token},
     )
-    assert status == 200
-    payload = json.loads(body)
+    assert status == 202
+    payload = _await_ship(base, body)
     assert payload["ok"] is True
     assert payload["outcome"] == "verified"
     assert set(payload["auto_approved"]) == {
@@ -505,7 +520,7 @@ def test_ship_endpoint_without_skipapi_refuses_unreviewed_api(running_server, mo
         base + "/api/ship", {"issue": 22},  # no skip_api
         headers={deck_server.TOKEN_HEADER: token},
     )
-    assert status == 200
-    payload = json.loads(body)
+    assert status == 202
+    payload = _await_ship(base, body)
     assert payload["ok"] is False  # API decls unreviewed → incomplete
     assert calls == {}

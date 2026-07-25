@@ -26,6 +26,7 @@ server on an ephemeral 127.0.0.1 port via urllib.
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -556,6 +557,32 @@ def test_ship_refuses_when_a_decl_only_deferred(tmp_path, monkeypatch):
     assert calls == {}  # a deferred decl keeps the issue from shipping
 
 
+def test_ship_refuses_a_changed_review_surface(tmp_path, monkeypatch):
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    calls = patch_no_verdict_handlers(monkeypatch)
+    opened = subdeck.build_subdeck(cfg, 22)
+    for decl in ("Foo", "Bar", "Baz"):
+        subdeck.record_decl_verdict(
+            cfg, 22, f"Demo.Chapter14.{decl}", "verify"
+        )
+    reviewed = subdeck.build_subdeck(cfg, 22)
+    assert len(reviewed["review_token"]) == 64
+    # Human decisions are bound separately and do not invalidate the source /
+    # issue surface token captured when the subdeck was opened.
+    assert reviewed["review_token"] == opened["review_token"]
+    changed = json.loads(json.dumps(reviewed))
+    changed["cards"][0]["source_block"] = "-- Aristotle changed this"
+    assert subdeck.subdeck_review_token(changed) != reviewed["review_token"]
+
+    out = subdeck.ship_issue(
+        cfg, 22, expected_review_token="0" * 64
+    )
+
+    assert out["ok"] is False
+    assert "changed" in out["reason"].lower()
+    assert calls == {}
+
+
 def test_ship_partial_reject_stops_before_later_declarations(tmp_path, monkeypatch):
     """Once an upstream declaration is rejected, the fix can ship without
     forcing decisions on later declarations whose meaning may change."""
@@ -743,14 +770,12 @@ def test_ship_any_rejected_routes_cmd_reject_verbatim(tmp_path, monkeypatch):
         assert persisted[name].get("fingerprint")          # pinned to source
 
 
-def test_ship_advances_to_next_ready_issue(tmp_path, monkeypatch):
-    """After shipping, advanced_to_issue is the next ready issue in the
-    chapter (reusing the queue's readiness)."""
+def test_ship_skips_redundant_next_queue_rebuild(tmp_path, monkeypatch):
+    """Shipping leaves queue advancement to the client's post-ship refresh."""
     cfg = make_cfg(tmp_path)
     # Each issue's decl lives in its OWN namespace (FooNs/BarNs/BazNs) so the
     # reconciliation's namespace surfacing never pulls another issue's decl into
-    # issue 22's subdeck — this test exercises ship → advanced_to_issue (queue
-    # readiness), not surfacing, so #22 must stay a single-card complete subdeck.
+    # issue 22's subdeck, leaving a complete single-card subdeck.
     install_snapshot(cfg, make_snapshot([
         _decl("Demo.FooNs.Foo", kind="def", value_pp="x"),
         _decl("Demo.BarNs.Bar", kind="def", value_pp="y"),
@@ -765,12 +790,20 @@ def test_ship_advances_to_next_ready_issue(tmp_path, monkeypatch):
              "body": _bundle_body("Baz"), "labels": set()},
     })
     patch_no_verdict_handlers(monkeypatch)
+    from marathon.deck import verdicts as verdicts_mod
+
+    monkeypatch.setattr(
+        verdicts_mod,
+        "_next_ready_card",
+        lambda *args, **kwargs: pytest.fail(
+            "ship must not synchronously rebuild the queue"
+        ),
+    )
     subdeck.record_decl_verdict(cfg, 22, "Demo.FooNs.Foo", "verify")
 
     out = subdeck.ship_issue(cfg, 22)
     assert out["ok"] is True
-    # Some other ready issue in the chapter (23 or 24), never 22 itself.
-    assert out["advanced_to_issue"] in (23, 24)
+    assert out["advanced_to_issue"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +848,20 @@ def _post(url, body: dict, headers=None):
             return resp.status, resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8")
+
+
+def _await_ship(base: str, ack_body: str) -> dict:
+    ack = json.loads(ack_body)
+    assert ack["status"] == "running"
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        status, body = _get(base + ack["status_url"])
+        assert status == 200
+        job = json.loads(body)
+        if job["status"] in {"succeeded", "failed", "awaiting_retry"}:
+            return job.get("result") or job
+        time.sleep(0.01)
+    raise AssertionError("background ship did not finish")
 
 
 def test_get_subdeck_is_pure_no_verdict(running_server, monkeypatch):
@@ -964,8 +1011,8 @@ def test_ship_endpoint_routes_through_verdict_path(running_server, monkeypatch):
         base + "/api/ship", {"issue": 22},
         headers={deck_server.TOKEN_HEADER: token},
     )
-    assert status == 200
-    payload = json.loads(body)
+    assert status == 202
+    payload = _await_ship(base, body)
     assert payload["ok"] is True
     assert payload["outcome"] == "verified"
     # Routed through the committed cmd_verify; cmd_reject NOT.
@@ -988,8 +1035,8 @@ def test_ship_endpoint_accepts_partial_reject(running_server, monkeypatch):
         headers={deck_server.TOKEN_HEADER: token},
     )
 
-    assert status == 200
-    payload = json.loads(body)
+    assert status == 202
+    payload = _await_ship(base, body)
     assert payload["ok"] is True and payload["partial"] is True
     assert "reject" in calls and "verify" not in calls
     assert "Demo.Chapter14.Baz" not in calls["reject"].notes
@@ -1004,8 +1051,8 @@ def test_ship_endpoint_incomplete_returns_ok_false(running_server, monkeypatch):
         base + "/api/ship", {"issue": 22},
         headers={deck_server.TOKEN_HEADER: token},
     )
-    assert status == 200  # a graceful refusal, not an error
-    payload = json.loads(body)
+    assert status == 202  # durably accepted; worker then reports refusal
+    payload = _await_ship(base, body)
     assert payload["ok"] is False
     assert "reason" in payload
     assert calls == {}  # NO irreversible action fired

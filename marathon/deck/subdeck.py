@@ -896,6 +896,51 @@ def _informal_slot(detail, records: dict) -> Optional[dict]:
     }
 
 
+def subdeck_review_token(subdeck: dict) -> str:
+    """Fingerprint the exact code/issue surface presented to the reviewer.
+
+    Local verdicts and notes are intentionally excluded (the ship operation id
+    binds those separately). This token changes when declarations, signatures,
+    kernels, citation-vs-surfaced identity, stale citations, dependencies, or
+    the issue's informal statement change between review and SHIP.
+    """
+    cards = []
+    for lane in ("cards", "auto_approved"):
+        for card in subdeck.get(lane) or []:
+            cards.append({
+                "lane": lane,
+                "name": card.get("name"),
+                "fingerprint": _decl_fingerprint(card),
+                "surfaced": bool(card.get("surfaced")),
+                "api": bool(card.get("api")),
+            })
+    payload = {
+        "version": 1,
+        "issue": subdeck.get("issue"),
+        "title": subdeck.get("title"),
+        "chapter": subdeck.get("chapter"),
+        "cards": cards,
+        "stale": sorted(
+            str(item.get("name") if isinstance(item, dict) else item)
+            for item in (subdeck.get("stale_citations") or [])
+        ),
+        "reconcile": subdeck.get("reconcile"),
+        "deps": sorted(
+            int(dep["id"])
+            for dep in (subdeck.get("deps") or [])
+            if isinstance(dep, dict) and isinstance(dep.get("id"), int)
+        ),
+        "informal": {
+            "statement": (subdeck.get("informal") or {}).get("statement"),
+            "is_llm": bool((subdeck.get("informal") or {}).get("is_llm")),
+        },
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def build_subdeck(
     cfg: "ReviewConfig", issue_num: int, *, skip_api: bool = False
 ) -> dict:
@@ -1075,7 +1120,7 @@ def build_subdeck(
         elif verdict == "defer":
             deferred.append(view.name)
 
-    return {
+    result = {
         "issue": issue_num,
         "title": detail.title,
         "chapter": detail.chapter,
@@ -1107,6 +1152,8 @@ def build_subdeck(
         "stale_citations": stale_citations,
         "reconcile": reconcile,
     }
+    result["review_token"] = subdeck_review_token(result)
+    return result
 
 
 def next_unreviewed_card(subdeck: dict) -> Optional[dict]:
@@ -1196,30 +1243,12 @@ def _ship_operation_id(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _next_ready_issue(cfg: "ReviewConfig", just_shipped: int) -> Optional[int]:
-    """The next ready issue to enter (its subdeck) after shipping
-    ``just_shipped``, scoped to that issue's chapter. Rebuilds the ISSUE
-    queue freshly (shipping just changed the readiness graph — a verify may
-    have unblocked a dependent) and returns the first ready card that isn't
-    the one just shipped. ``None`` when the chapter's ready queue is drained.
-
-    Reuses the queue's readiness (:func:`marathon.deck.cards.build_queue`) so
-    "ready" means exactly what it means everywhere else in the deck."""
-    from marathon.deck.cards import build_queue
-
-    chapter = cfg.chapter_of_issue(just_shipped)
-    try:
-        queue = build_queue(cfg, chapter)
-    except Exception:  # noqa: BLE001 — a queue-rebuild failure must not abort a ship
-        return None
-    for card in queue.cards:
-        if card.id != just_shipped and card.ready:
-            return card.id
-    return None
-
-
 def _ship_issue_once(
-    cfg: "ReviewConfig", issue_num: int, *, skip_api: bool = False
+    cfg: "ReviewConfig",
+    issue_num: int,
+    *,
+    skip_api: bool = False,
+    expected_review_token: Optional[str] = None,
 ) -> dict:
     """Compose and SHIP the per-issue outcome from the subdeck — the single
     irreversible step (reached only from an explicit ``POST /api/ship``).
@@ -1255,12 +1284,26 @@ def _ship_issue_once(
     composed note's KEEP list) states the auto-approved names. Auto-approval
     is NOT realized on a GET or in decl-verdict — only here.
 
-    On success clears the issue's subdeck store and reports the next ready
-    issue to enter. Routing through ``apply_verdict`` (never a second verdict
-    path) preserves the daemon/conductor dispatch and the Claude-bypass."""
+    On success clears the issue's subdeck store. The client refreshes the queue
+    after the asynchronous ship completes, so this path deliberately skips
+    rebuilding the full queue. Routing through ``apply_verdict`` (never a
+    second verdict path) preserves the daemon/conductor dispatch and the
+    Claude-bypass."""
     from marathon.deck.verdicts import apply_verdict
 
     subdeck = build_subdeck(cfg, issue_num, skip_api=skip_api)
+    if (
+        expected_review_token is not None
+        and subdeck.get("review_token") != expected_review_token
+    ):
+        return {
+            "ok": False,
+            "reason": (
+                "The declarations or issue text changed after this review was "
+                "opened. Nothing was shipped; reload the issue and review the "
+                "current version."
+            ),
+        }
     summary = subdeck["summary"]
     invalidated = list(summary.get("invalidated", []))
     auto_candidates = [c["name"] for c in subdeck.get("auto_approved", [])]
@@ -1342,6 +1385,7 @@ def _ship_issue_once(
             "reject",
             note=note,
             operation_id=operation_id,
+            compute_advance=False,
         )
         outcome = "shipped"
         n_fix = len(summary["rejected"])
@@ -1366,6 +1410,7 @@ def _ship_issue_once(
             issue_num,
             "verify",
             operation_id=_ship_operation_id(cfg, issue_num, "verify", None),
+            compute_advance=False,
         )
         outcome = "verified"
         message = (
@@ -1444,12 +1489,18 @@ def _ship_issue_once(
         "carried_over": carried_over,
         "partial": partial_reject,
         "waiting": waiting if partial_reject else [],
-        "advanced_to_issue": _next_ready_issue(cfg, issue_num),
+        # The client refreshes the authoritative queue after the background
+        # ship completes; avoid another expensive synchronous queue rebuild.
+        "advanced_to_issue": None,
     }
 
 
 def ship_issue(
-    cfg: "ReviewConfig", issue_num: int, *, skip_api: bool = False
+    cfg: "ReviewConfig",
+    issue_num: int,
+    *,
+    skip_api: bool = False,
+    expected_review_token: Optional[str] = None,
 ) -> dict:
     """Single-flight, idempotent wrapper around the irreversible ship.
 
@@ -1471,7 +1522,12 @@ def ship_issue(
 
         # Rebuild only after winning single-flight: no stale pre-lock decision
         # can cross the irreversible boundary.
-        response = _ship_issue_once(cfg, issue_num, skip_api=skip_api)
+        response = _ship_issue_once(
+            cfg,
+            issue_num,
+            skip_api=skip_api,
+            expected_review_token=expected_review_token,
+        )
         if response.get("ok"):
             response = dict(response)
             response["duplicate"] = False

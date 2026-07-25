@@ -55,7 +55,6 @@ def _install_common_patches(monkeypatch, refresh_calls):
         lambda cfg, issue, verdict, note=None, **kwargs: None,
     )
     monkeypatch.setattr(subdeck, "clear_issue", lambda cfg, issue: None)
-    monkeypatch.setattr(subdeck, "_next_ready_issue", lambda cfg, issue: None)
 
     def fake_refresh(cfg, issue, *, only_surfaced=None):
         refresh_calls.append(only_surfaced)
