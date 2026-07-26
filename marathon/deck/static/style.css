@@ -65,6 +65,36 @@ html, body {
 }
 .card-stage { position: relative; flex: 1; }
 
+/* Stable background refresh: keep the current Review/Issues content mounted
+   and show only this compact progress pill. */
+.surface-refresh-indicator {
+  position: absolute;
+  z-index: 4;
+  top: 0.55rem;
+  right: 0.6rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.38rem;
+  padding: 0.28rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--panel-2) 92%, transparent);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1;
+  pointer-events: none;
+}
+.surface-refresh-spinner {
+  width: 0.68rem;
+  height: 0.68rem;
+  border: 1.5px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: surface-refresh-spin 0.8s linear infinite;
+}
+@keyframes surface-refresh-spin { to { transform: rotate(360deg); } }
+
 .card {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -797,7 +827,7 @@ html, body {
 .ship-status-actions { flex: 0 0 auto; }
 @keyframes ship-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
-  .ship-spinner { animation: none; }
+  .ship-spinner, .surface-refresh-spinner { animation: none; }
 }
 @media (max-width: 620px) {
   .ship-status-banner { align-items: stretch; flex-direction: column; }
@@ -836,12 +866,21 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .tab-pane { display: block; }
 
 /* --- dashboard container --- */
-.dash { max-width: 880px; margin: 0 auto; padding: 1.1rem 1rem 3rem; }
+.dash { position: relative; max-width: 880px; margin: 0 auto; padding: 1.1rem 1rem 3rem; }
 .dash-section { margin-bottom: 1.6rem; }
 .dash-h { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 0.6rem; font-weight: 700; }
 .dash-empty { color: var(--muted); font-style: italic; font-size: 0.88rem; padding: 0.5rem 0; }
 .dash-loading { color: var(--muted); padding: 1.5rem 0; text-align: center; }
 .dash-refresh { float: right; font-size: 0.72rem; color: var(--muted); font-style: normal; text-transform: none; letter-spacing: 0; }
+.status-refresh-error {
+  margin: -0.75rem 0 1.1rem;
+  padding: 0.45rem 0.65rem;
+  border: 1px solid color-mix(in srgb, var(--warn) 52%, var(--line));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warn) 9%, var(--panel));
+  color: var(--warn);
+  font-size: 0.78rem;
+}
 
 /* --- stat chips row --- */
 .stat-row { display: flex; flex-wrap: wrap; gap: 0.6rem; }
@@ -1117,6 +1156,12 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .reader-status-deferred { border-left-color: var(--defer); }
 .reader-status-unreviewed { border-left-color: var(--muted); }
 .reader-blocked { border-color: #d2992255; border-left-color: var(--warn); }
+.reader-unavailable { opacity: 0.76; border-left-color: var(--muted); }
+.reader-provisional {
+  border-color: #6ea8fe55;
+  border-left-color: var(--accent);
+  background: linear-gradient(180deg, #6ea8fe0c, transparent 10rem), var(--panel);
+}
 .reader-focused { animation: reader-focus 1.7s ease-out; box-shadow: 0 0 0 2px var(--accent); }
 @keyframes reader-focus { from { background: #6ea8fe33; } to { background: var(--panel); } }
 .reader-decl-head, .reader-decl-identity, .reader-badges, .reader-context, .reader-actions {
@@ -1129,6 +1174,18 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
 .reader-issue-link { color: var(--accent); text-decoration: none; font-family: var(--mono); font-weight: 700; }
 .reader-issue-link:hover { text-decoration: underline; }
 .reader-line { margin-left: auto; }
+.provisional-badge {
+  padding: 0.13rem 0.45rem; border: 1px solid #6ea8fe77;
+  border-radius: 999px; color: var(--accent); background: #6ea8fe12;
+  font: 700 0.64rem var(--mono); text-transform: uppercase; letter-spacing: 0.04em;
+}
+.reader-provisional-note {
+  margin: 0.45rem 0 0.65rem; padding: 0.55rem 0.7rem;
+  border: 1px solid #6ea8fe55; border-left: 3px solid var(--accent);
+  border-radius: 7px; background: #6ea8fe0d; color: var(--muted);
+  font-size: 0.78rem; line-height: 1.48;
+}
+.reader-provisional-note strong { color: var(--accent); }
 .reader-source { max-height: 36rem; overflow-y: auto; touch-action: auto; }
 .reader-elab { margin-top: 0.45rem; }
 .reader-elab > summary { cursor: pointer; color: var(--muted); font-size: 0.76rem; padding: 0.3rem 0; }

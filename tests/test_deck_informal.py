@@ -138,14 +138,25 @@ def test_informal_slot_uses_the_issue_top_level_statement():
     assert slot["statement"] == "Prop 12.19: the result says foo."
     assert "items" not in slot
     # verdict overlaid + mapped to the past-tense wire form the frontend reads
+    fingerprint = slot["context_fingerprint"]
     approved = subdeck._informal_slot(
-        detail, {subdeck.INFORMAL_KEY: {"verdict": "verify", "note": None}}
+        detail, {subdeck.INFORMAL_KEY: {
+            "verdict": "verify", "note": None, "fingerprint": fingerprint,
+        }}
     )
     assert approved["verdict"] == "verified"
     rejected = subdeck._informal_slot(
-        detail, {subdeck.INFORMAL_KEY: {"verdict": "reject", "note": "wrong"}}
+        detail, {subdeck.INFORMAL_KEY: {
+            "verdict": "reject", "note": "wrong", "fingerprint": fingerprint,
+        }}
     )
     assert rejected["verdict"] == "rejected" and rejected["note"] == "wrong"
+    changed = _detail("Prop 12.19: a changed claim.", True)
+    assert subdeck._informal_slot(
+        changed, {subdeck.INFORMAL_KEY: {
+            "verdict": "verify", "note": None, "fingerprint": fingerprint,
+        }}
+    )["verdict"] is None
 
 
 def test_informal_slot_falls_back_to_headline_when_no_body_section():
@@ -352,8 +363,12 @@ def test_ship_flips_marker_when_informal_approved(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     _patch_ship_common(monkeypatch)
     monkeypatch.setattr(
-        subdeck, "issue_verdicts",
-        lambda c, i: {subdeck.INFORMAL_KEY: {"verdict": "verify"}},
+        subdeck,
+        "build_subdeck",
+        lambda c, i, **k: {
+            **_complete_subdeck(),
+            "informal": {"verdict": "verified"},
+        },
     )
     marks: list = []
     monkeypatch.setattr(

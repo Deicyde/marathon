@@ -188,6 +188,406 @@ def _run_ship_status_transport(app_js: str) -> dict:
     return json.loads(proc.stdout)
 
 
+def _run_queue_refresh_race(app_js: str) -> dict:
+    """Execute the queue coordinator with two overlapping retries in Node."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for queue race semantic test")
+    code = _strip_block_comments(app_js)
+    helpers = "\n".join((
+        _fn_body(code, "function withReadDeadline"),
+        _fn_body(code, "function newReadController"),
+        _fn_body(code, "function readOptions"),
+        _fn_body(code, "function refreshQueue"),
+        _fn_body(code, "function startQueueRefresh"),
+    ))
+    script = "var QUEUE_READ_TIMEOUT_MS = 100;\n" + helpers + r"""
+function deferred() {
+  var resolve, reject;
+  var promise = new Promise(function (yes, no) {
+    resolve = yes; reject = no;
+  });
+  return { promise: promise, resolve: resolve, reject: reject };
+}
+var queueReads = [];
+var stuckReads = [];
+var renders = 0;
+var ended = 0;
+var abortedReads = 0;
+var host = {};
+var state = {
+  queue: [], building: 0, viewBuilding: 0, landedToday: 0,
+  unresolved: 0, awaitingRefinement: 0, needsAttention: 0,
+  needsCitationMapping: 0, awaitingAudit: 0, dependencyBlocked: 0,
+  otherUnresolved: 0, reviewStuck: { issues: [], repo: null },
+  queueRequest: null, queueAbortController: null,
+  queueRequestSeq: 0, queueSnapshotKey: null,
+  issue: null, activeTab: "review"
+};
+function stage() { return host; }
+function setActionsEnabled() {}
+function beginSurfaceRefresh() { return true; }
+function surfaceHasStableContent() { return true; }
+function endSurfaceRefresh() { ended += 1; }
+function applyStatus() {}
+function flashToast(message) { throw new Error(message); }
+function showErrorCard(title, err) { throw err || new Error(title); }
+function openFirstReadyIssue() { renders += 1; }
+function abortableRead(options, bucket) {
+  var read = deferred();
+  bucket.push(read);
+  var signal = options && options.signal;
+  if (signal) {
+    var abort = function () {
+      abortedReads += 1;
+      var err = new Error("aborted");
+      err.name = "AbortError";
+      read.reject(err);
+    };
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  }
+  return read.promise;
+}
+function fetchQueue(chapter, options) {
+  return abortableRead(options, queueReads);
+}
+function getJSON(url, options) {
+  if (url !== "/api/stuck") throw new Error("unexpected URL " + url);
+  return abortableRead(options, stuckReads);
+}
+(async function () {
+  var first = refreshQueue();
+  var second = refreshQueue();
+  if (queueReads.length !== 2 || stuckReads.length !== 2) {
+    throw new Error("retry did not supersede the hung read immediately");
+  }
+  queueReads[1].resolve({
+    cards: [{ id: 2, ready: false, marker: "new" }],
+    unresolved: 1
+  });
+  stuckReads[1].resolve({ issues: [], repo: "new/repo" });
+  await Promise.all([first, second]);
+  process.stdout.write(JSON.stringify({
+    queueReads: queueReads.length,
+    stuckReads: stuckReads.length,
+    renders: renders,
+    installedMarker: state.queue[0] && state.queue[0].marker,
+    stuckCount: state.reviewStuck.issues.length,
+    requestCleared: state.queueRequest === null,
+    ended: ended,
+    abortedReads: abortedReads
+  }));
+})().catch(function (err) {
+  process.stderr.write(String(err && err.stack || err));
+  process.exit(1);
+});
+"""
+    proc = subprocess.run(
+        [node, "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _run_definition_terms_race(app_js: str) -> dict:
+    """Execute a source-token change while the prior term read is pending."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for definition race semantic test")
+    code = _strip_block_comments(app_js)
+    refresh = _fn_body(code, "function refreshDefinitionTerms")
+    script = refresh + r"""
+function deferred() {
+  var resolve, reject;
+  var promise = new Promise(function (yes, no) {
+    resolve = yes; reject = no;
+  });
+  return { promise: promise, resolve: resolve, reject: reject };
+}
+var state = {
+  definitionTerms: { names: [], short: {} },
+  definitionSourceToken: null,
+  definitionTermsRequest: null,
+  definitionTermsRequestToken: null,
+  definitionTermsQueued: null,
+  definitionTermsRequestSeq: 0
+};
+var reads = [];
+var installs = [];
+function fetchDefinitionTerms() {
+  var read = deferred();
+  reads.push(read);
+  return read.promise;
+}
+function installDefinitionTerms(terms) {
+  installs.push(terms && terms.source_token);
+}
+(async function () {
+  var first = refreshDefinitionTerms("token-a", false);
+  var coalesced = refreshDefinitionTerms("token-b", false);
+  var reverted = refreshDefinitionTerms("token-a", false);
+  if (first !== coalesced || first !== reverted || reads.length !== 1) {
+    throw new Error("overlap was not coalesced into one active read");
+  }
+  reads[0].resolve({ source_token: "token-a", names: ["First"] });
+  await first;
+  await new Promise(setImmediate);
+  if (reads.length !== 2) {
+    throw new Error("new source token did not schedule one follow-up");
+  }
+  var followup = state.definitionTermsRequest;
+  reads[1].resolve({ source_token: "token-a", names: ["Latest"] });
+  await followup;
+  process.stdout.write(JSON.stringify({
+    reads: reads.length,
+    installs: installs,
+    requestCleared: state.definitionTermsRequest === null,
+    sequence: state.definitionTermsRequestSeq
+  }));
+})().catch(function (err) {
+  process.stderr.write(String(err && err.stack || err));
+  process.exit(1);
+});
+"""
+    proc = subprocess.run(
+        [node, "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _run_issues_refresh_race(app_js: str) -> dict:
+    """Execute two Issues retries and verify the aborted snapshot stays inert."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for Issues race semantic test")
+    code = _strip_block_comments(app_js)
+    helpers = "\n".join((
+        _fn_body(code, "function withReadDeadline"),
+        _fn_body(code, "function newReadController"),
+        _fn_body(code, "function readOptions"),
+        _fn_body(code, "function renderIssuesTab"),
+    ))
+    script = "var ISSUES_READ_TIMEOUT_MS = 100;\n" + helpers + r"""
+function deferred() {
+  var resolve, reject;
+  var promise = new Promise(function (yes, no) {
+    resolve = yes; reject = no;
+  });
+  return { promise: promise, resolve: resolve, reject: reject };
+}
+var overviewReads = [];
+var stuckReads = [];
+var abortedReads = 0;
+var stuckRenders = 0;
+var ended = 0;
+var renderedStuck = null;
+var host = {
+  innerHTML: "mounted",
+  appendChild: function () {}
+};
+var state = {
+  activeTab: "issues",
+  issuesRequest: null,
+  issuesAbortController: null,
+  issuesRequestSeq: 0,
+  issuesSnapshotKey: null,
+  issuesStuck: { issues: [], repo: null }
+};
+function dashHost() { return host; }
+function beginSurfaceRefresh() { return true; }
+function endSurfaceRefresh() { ended += 1; }
+function surfaceHasStableContent() { return true; }
+function flashToast(message) { throw new Error(message); }
+function dashError(id, err) { throw err || new Error(id); }
+function el() { return {}; }
+function renderStuckSection(target, repo, snapshot) {
+  stuckRenders += 1;
+  renderedStuck = snapshot;
+}
+function abortableRead(options, bucket) {
+  var read = deferred();
+  bucket.push(read);
+  var signal = options && options.signal;
+  if (signal) {
+    var abort = function () {
+      abortedReads += 1;
+      var err = new Error("aborted");
+      err.name = "AbortError";
+      read.reject(err);
+    };
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  }
+  return read.promise;
+}
+function getJSON(url, options) {
+  if (url === "/api/issues-overview") {
+    return abortableRead(options, overviewReads);
+  }
+  if (url === "/api/stuck") {
+    return abortableRead(options, stuckReads);
+  }
+  throw new Error("unexpected URL " + url);
+}
+(async function () {
+  var first = renderIssuesTab();
+  var second = renderIssuesTab();
+  if (overviewReads.length !== 2 || stuckReads.length !== 2) {
+    throw new Error("retry did not supersede the pending Issues read");
+  }
+  overviewReads[1].resolve({
+    repo: "new/repo", counts: {}, chapters: []
+  });
+  stuckReads[1].resolve({
+    repo: "new/repo", issues: [{ num: 240 }]
+  });
+  await Promise.all([first, second]);
+  process.stdout.write(JSON.stringify({
+    overviewReads: overviewReads.length,
+    stuckReads: stuckReads.length,
+    abortedReads: abortedReads,
+    stuckRenders: stuckRenders,
+    installedIssue: renderedStuck && renderedStuck.issues[0].num,
+    requestCleared: state.issuesRequest === null,
+    ended: ended
+  }));
+})().catch(function (err) {
+  process.stderr.write(String(err && err.stack || err));
+  process.exit(1);
+});
+"""
+    proc = subprocess.run(
+        [node, "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _run_status_refresh_race(app_js: str) -> dict:
+    """Execute poll coalescing plus a forced post-mutation Status refresh."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for Status race semantic test")
+    code = _strip_block_comments(app_js)
+    helpers = "\n".join((
+        _fn_body(code, "function withReadDeadline"),
+        _fn_body(code, "function newReadController"),
+        _fn_body(code, "function readOptions"),
+        _fn_body(code, "function renderStatusTab"),
+    ))
+    script = "var STATUS_READ_TIMEOUT_MS = 100;\n" + helpers + r"""
+function deferred() {
+  var resolve, reject;
+  var promise = new Promise(function (yes, no) {
+    resolve = yes; reject = no;
+  });
+  return { promise: promise, resolve: resolve, reject: reject };
+}
+var reads = [];
+var abortedReads = 0;
+var ended = 0;
+var clears = 0;
+var heartbeat = { textContent: "" };
+var host = {
+  querySelector: function (selector) {
+    return selector === ".cond-updated" ? heartbeat : null;
+  }
+};
+var newest = {
+  alive: true,
+  running: 0,
+  jobs: [],
+  queued: [],
+  landings: [],
+  updated_ts: "new-heartbeat"
+};
+var stable = {};
+Object.keys(newest).forEach(function (key) {
+  if (key !== "updated_ts") stable[key] = newest[key];
+});
+var state = {
+  activeTab: "status",
+  conductorStartBusy: false,
+  conductorStartError: "",
+  statusDashboardRequest: null,
+  statusDashboardAbortController: null,
+  statusDashboardRequestSeq: 0,
+  statusDashboardSnapshotKey: JSON.stringify([stable, false, ""])
+};
+function dashHost() { return host; }
+function beginSurfaceRefresh() {}
+function endSurfaceRefresh() { ended += 1; }
+function surfaceHasStableContent() { return true; }
+function clearStatusRefreshError() { clears += 1; }
+function showStatusRefreshError(target, err) { throw err; }
+function fmtTs(value) { return value; }
+function getJSON(url, options) {
+  if (url !== "/api/conductor-status") throw new Error("unexpected URL " + url);
+  var read = deferred();
+  reads.push(read);
+  var signal = options && options.signal;
+  if (signal) {
+    var abort = function () {
+      abortedReads += 1;
+      var err = new Error("aborted");
+      err.name = "AbortError";
+      read.reject(err);
+    };
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  }
+  return read.promise;
+}
+(async function () {
+  var first = renderStatusTab();
+  var coalesced = renderStatusTab();
+  if (first !== coalesced || reads.length !== 1) {
+    throw new Error("ordinary poll did not coalesce");
+  }
+  var forced = renderStatusTab(true);
+  if (reads.length !== 2) {
+    throw new Error("forced refresh did not supersede the pending poll");
+  }
+  reads[1].resolve(newest);
+  await Promise.all([first, forced]);
+  process.stdout.write(JSON.stringify({
+    reads: reads.length,
+    abortedReads: abortedReads,
+    heartbeat: heartbeat.textContent,
+    clears: clears,
+    requestCleared: state.statusDashboardRequest === null,
+    ended: ended
+  }));
+})().catch(function (err) {
+  process.stderr.write(String(err && err.stack || err));
+  process.exit(1);
+});
+"""
+    proc = subprocess.run(
+        [node, "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
 # --- existence / serveability -----------------------------------------------
 
 def test_all_static_assets_exist():
@@ -375,17 +775,37 @@ def test_ambiguous_ship_post_reconciles_with_pure_issue_status_get(app_js: str):
     code = _strip_block_comments(app_js)
     ship = _fn_body(code, "function shipIssue")
     reconcile = _fn_body(code, "function reconcileAmbiguousShip")
+    context = _fn_body(code, "function normalizeShipContext")
 
-    assert "reconcileAmbiguousShip(issue, err)" in ship
+    assert "newShipRequestId()" in ship
+    assert "requestId: requestId" in ship
+    assert "reconcileAmbiguousShip(issue, requestId, err)" in ship
     assert "Nothing will be submitted again" not in ship
-    assert "issueShipStatusUrl(issue)" in reconcile
+    assert "issueShipStatusUrl(issue, requestId)" in reconcile
     assert "getJSONWithTimeout(" in reconcile
     assert "confirmedShipStatusNotFound" in reconcile
     assert "safe to press Ship again" in reconcile
     assert "Ship remains disabled" in reconcile
+    assert "requestId" in context
     # Reconciliation is a pure read. It must never silently retry the POST.
     assert "postShip(" not in reconcile
     assert "postJSON(" not in reconcile
+
+
+def test_known_ship_4xx_never_enters_lost_response_reconciliation(app_js: str):
+    code = _strip_block_comments(app_js)
+    ship = _fn_body(code, "function shipIssue")
+    known = _fn_body(code, "function definiteShipPostRejection")
+
+    assert "err.status >= 400" in known
+    assert "err.status < 500" in known
+    rejection = ship.index("if (definiteShipPostRejection(err))")
+    reconcile = ship.index("reconcileAmbiguousShip(issue, requestId, err)")
+    assert rejection < reconcile
+    between = ship[rejection:reconcile]
+    assert "clearShipContext(provisionalContext)" in between
+    assert '"Ship was not accepted"' in between
+    assert "return;" in between
 
 
 def test_ship_status_poll_has_a_finite_fetch_timeout(app_js: str):
@@ -1273,6 +1693,8 @@ def test_definition_terms_refresh_is_single_flight_and_source_aware(app_js: str)
     refresh = _fn_body(code, "function refreshDefinitionTerms")
     assert "definitionTermsRequest" in refresh
     assert "definitionTermsQueued" in refresh
+    assert "definitionTermsRequestSeq" in refresh
+    assert "generation === state.definitionTermsRequestSeq" in refresh
     assert "definitionSourceToken" in refresh
     assert "fetchDefinitionTerms" in refresh
     install = _fn_body(code, "function installDefinitionTerms")
@@ -1287,6 +1709,34 @@ def test_definition_terms_refresh_is_single_flight_and_source_aware(app_js: str)
     assert "refreshDefinitionTerms(null, true)" in _fn_body(
         code, "function fetchReviewSource"
     )
+
+
+def test_definition_term_race_never_installs_superseded_index(app_js: str):
+    assert _run_definition_terms_race(app_js) == {
+        "reads": 2,
+        "installs": ["token-a"],
+        "requestCleared": True,
+        "sequence": 4,
+    }
+
+
+def test_definition_link_refresh_preserves_active_review_surface(app_js: str):
+    code = _strip_block_comments(app_js)
+    repaint = _fn_body(code, "function repaintDefinitionSurfaces")
+    assert "refreshReviewDefinitionLinks" in repaint
+    assert "refreshReaderDefinitionLinks" in repaint
+    for teardown in ("revisitDecl", "renderSubdeckStage", "paintFilesTab"):
+        assert teardown not in repaint
+    assert "rejectComposerOpen" not in repaint
+    assert "state.busy" not in repaint
+
+    patch_review = _fn_body(code, "function refreshReviewDefinitionLinks")
+    patch_reader = _fn_body(code, "function refreshReaderDefinitionLinks")
+    replace = _fn_body(code, "function replaceLeanHighlight")
+    assert "replaceLeanHighlight" in patch_review
+    assert "replaceLeanHighlight" in patch_reader
+    assert "document.activeElement" in replace
+    assert 'querySelectorAll(".lh-ref")' in replace
 
 
 def test_every_definition_modal_close_path_cancels_pending_lookup(app_js: str):
@@ -1625,7 +2075,8 @@ def test_ship_body_includes_skip_api(app_js: str):
     assert "postShip(" in ship
     assert "skipApi" in ship and "state.skipApi" in ship
     assert "state.subdeck.review_token" in ship
-    assert "postShip(issue, skipApi, reviewToken)" in ship
+    assert "state.subdeck.shippable === false" in ship
+    assert "postShip(issue, skipApi, reviewToken, requestId)" in ship
 
 
 def test_progress_pill_counts_main_only_under_skip_api(app_js: str):
@@ -1935,6 +2386,155 @@ def test_dashboard_endpoints_referenced(app_js: str):
     assert "/api/history" in code
 
 
+def test_review_retry_supersedes_hung_read_and_paints_atomic_snapshot(
+    app_js: str,
+):
+    """Retry must not tear down Review or let an older queue/stuck pair win."""
+    code = _strip_block_comments(app_js)
+    refresh = _fn_body(code, "function refreshQueue")
+    start = _fn_body(code, "function startQueueRefresh")
+    drained = _fn_body(code, "function openFirstReadyIssue")
+
+    assert "beginSurfaceRefresh(" in refresh
+    assert "stage().innerHTML" not in refresh
+    assert "state.queueRequest" in refresh
+    assert "++state.queueRequestSeq" in refresh
+    assert "queueAbortController" in refresh
+    assert ".abort()" in refresh
+
+    assert "Promise.all(" in start
+    assert "withReadDeadline(" in start
+    assert "QUEUE_READ_TIMEOUT_MS" in start
+    assert "fetchQueue(null, options)" in start
+    assert 'getJSON("/api/stuck", options)' in start
+    assert "generation !== state.queueRequestSeq" in start
+    assert "state.queueRequest = completion" in start
+
+    # Parked recovery is already part of the installed snapshot; the drained
+    # renderer performs no late GET that could replace the card a second time.
+    assert 'getJSON("/api/stuck")' not in drained
+    assert "state.reviewStuck" in drained
+    assert "state.queueRenderedKey === state.queueSnapshotKey" in drained
+
+
+def test_review_refresh_race_installs_only_newest_snapshot(app_js: str):
+    result = _run_queue_refresh_race(app_js)
+    assert result == {
+        "queueReads": 2,
+        "stuckReads": 2,
+        "renders": 1,
+        "installedMarker": "new",
+        "stuckCount": 0,
+        "requestCleared": True,
+        "ended": 1,
+        "abortedReads": 2,
+    }
+
+
+def test_issues_retry_supersedes_hung_atomic_read_and_is_generation_guarded(
+    app_js: str,
+):
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function renderIssuesTab")
+    assert "beginSurfaceRefresh(" in body
+    assert "state.issuesRequest" in body
+    assert "++state.issuesRequestSeq" in body
+    assert "issuesAbortController" in body
+    assert ".abort()" in body
+    assert "Promise.all(" in body
+    assert "withReadDeadline(" in body
+    assert "ISSUES_READ_TIMEOUT_MS" in body
+    assert 'getJSON("/api/issues-overview", options)' in body
+    assert 'getJSON("/api/stuck", options)' in body
+    assert "requestGeneration !== state.issuesRequestSeq" in body
+    assert "snapshotKey === state.issuesSnapshotKey" in body
+
+    stuck = _fn_body(code, "function renderStuckSection")
+    assert "getJSON(" not in stuck
+    assert "stuckSnapshot" in stuck
+
+
+def test_issues_retry_race_installs_only_newest_atomic_snapshot(app_js: str):
+    assert _run_issues_refresh_race(app_js) == {
+        "overviewReads": 2,
+        "stuckReads": 2,
+        "abortedReads": 2,
+        "stuckRenders": 1,
+        "installedIssue": 240,
+        "requestCleared": True,
+        "ended": 1,
+    }
+
+
+def test_recovery_completion_refreshes_origin_exactly_once(app_js: str):
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function openRecoveryDialog")
+    assert "refreshedAfterCompletion" in body
+    assert "function refreshOriginOnce" in body
+    assert body.count("refreshOriginOnce()") == 3  # definition + two race paths
+
+
+def test_status_poll_keeps_unchanged_dom_mounted(app_js: str):
+    code = _strip_block_comments(app_js)
+    body = _fn_body(code, "function renderStatusTab")
+    assert "state.statusDashboardRequest" in body
+    assert "state.statusDashboardRequestSeq" in body
+    assert "statusDashboardAbortController" in body
+    assert "withReadDeadline(" in body
+    assert "STATUS_READ_TIMEOUT_MS" in body
+    assert "state.statusDashboardRequest && !force" in body
+    assert body.count("generation === state.statusDashboardRequestSeq") >= 3
+    assert 'key !== "updated_ts"' in body
+    assert "snapshotKey === state.statusDashboardSnapshotKey" in body
+    assert 'querySelector(".cond-updated")' in body
+    assert "syncDomChildren(host, nextHost)" in body
+    assert "data-status-key" in body
+    assert "host.innerHTML" not in body
+
+
+def test_forced_status_refresh_supersedes_stale_poll(app_js: str):
+    assert _run_status_refresh_race(app_js) == {
+        "reads": 2,
+        "abortedReads": 1,
+        "heartbeat": "updated new-heartbeat",
+        "clears": 1,
+        "requestCleared": True,
+        "ended": 1,
+    }
+
+
+def test_status_transient_failure_keeps_last_good_snapshot(
+    app_js: str, style_css: str,
+):
+    code = _strip_block_comments(app_js)
+    warning = _fn_body(code, "function showStatusRefreshError")
+    assert "state.statusDashboardSnapshotKey" in warning
+    assert "surfaceHasStableContent(host)" in warning
+    assert "status-refresh-error" in warning
+    assert "dashError(" in warning
+    assert "innerHTML" not in warning
+    assert ".status-refresh-error" in style_css
+
+
+def test_status_mutations_force_a_new_generation(app_js: str):
+    code = _strip_block_comments(app_js)
+    switch = _fn_body(code, "function switchTab")
+    restart = _fn_body(code, "function startConductorFromStatus")
+    toggle = _fn_body(code, "function proverToggle")
+    assert "renderStatusTab(true)" in switch
+    assert restart.count("renderStatusTab(true)") == 3
+    assert "renderStatusTab(true)" in toggle
+
+
+def test_background_refresh_indicator_is_compact_and_reduced_motion_safe(
+    style_css: str,
+):
+    assert ".surface-refresh-indicator" in style_css
+    assert ".surface-refresh-spinner" in style_css
+    reduced = style_css[style_css.find("@media (prefers-reduced-motion: reduce)"):]
+    assert ".surface-refresh-spinner" in reduced
+
+
 def test_style_has_tab_and_dashboard_classes(style_css: str):
     for cls in (".tab-nav", ".tab-btn", ".cond-banner", ".issue-row",
                 ".hist-row", ".sb-verified"):
@@ -2031,18 +2631,93 @@ def test_files_reader_guards_rejected_predecessors(app_js: str):
     code = _strip_block_comments(app_js)
     single = _fn_body(code, "function readerVerdict")
     assert "blocked_by" in single and 'verdict !== "defer"' in single
+    assert "target.inspectable === false" in single
+    assert "inspection_blocked_reason" in single
+
+
+def test_provisional_review_is_discoverable_and_cannot_masquerade_as_ship_ready(
+    app_js: str,
+):
+    code = _strip_block_comments(app_js)
+    provisional = _fn_body(code, "function provisionalIssues")
+    assert "inspectable" in provisional
+    assert "provisional" in provisional
+    assert "!c.ready" in provisional
+
+    drained = _fn_body(code, "function openFirstReadyIssue")
+    assert "Review blocked code" in drained
+    assert 'state.filesFilter = "provisional"' in drained
+    assert 'switchTab("files")' in drained
+    assert "shipping stays blocked" in drained
+    # Parked recovery remains available, but no longer replaces Review's
+    # drained-state surface or becomes the only apparent task.
+    assert "Open recovery (" in drained
+    assert "showStuckAttentionCard(" not in drained
+
+    target = _fn_body(code, "function renderReaderTarget")
+    for label in (
+        "PROVISIONAL REVIEW",
+        "Provisional keep",
+        "Provisional fix",
+        "reopens it automatically",
+    ):
+        assert label in target
+    assert "ship_blocked_reason" in target
+    assert "inspection_blocked_reason" in target
+    assert "reader-unavailable" in target
+    assert "disabled: decisionBlocked" in target
+
+    summary = _fn_body(code, "function renderSummaryCard")
+    assert "SAVED, NOT SHIPPED" in summary
+    assert "var shipBtn = provisionalReview ? null" in summary
+    assert "if (shipBtn) summaryActions.push(shipBtn)" in summary
+
+
+def test_decl_mutations_send_the_visible_context_fingerprint(app_js: str):
+    code = _strip_block_comments(app_js)
+    post = _fn_body(code, "function postDeclVerdict")
+    assert "declFingerprint" in post
+    assert "body.decl_fingerprint" in post
+
+    commit = _fn_body(code, "function commitDeclVerdict")
+    assert "state.currentDecl.context_fingerprint" in commit
+    assert "postDeclVerdict(issue, decl, verdict, note, contextFingerprint)" in commit
+    assert "resp.review_token" in commit
+
+    reader = _fn_body(code, "function readerVerdict")
+    assert "target.context_fingerprint" in reader
+    batch = _fn_body(code, "function readerBatch")
+    assert "decl_fingerprint: target.context_fingerprint" in batch
+
+    lock_post = _fn_body(code, "function postDeclLock")
+    assert "body.decl_fingerprint" in lock_post
+    lock = _fn_body(code, "function toggleDeclLock")
+    assert "context_fingerprint" in lock
+    assert "resp.review_token" in lock
+    assert "err.status === 409" in lock
+    assert "refetchSubdeck()" in lock
+
+    # A stale fingerprint is a normal concurrent-code-change outcome. The UI
+    # must fetch the new surface instead of offering an infinite retry against
+    # the same stale card.
+    assert "err.status === 409" in commit
+    assert "refetchSubdeck()" in commit
+    assert "err.status === 409" in reader
+    assert "renderFilesTab()" in reader
+    assert "err.status === 409" in batch
+    assert "renderFilesTab()" in batch
 
 
 def test_files_reader_filters_and_restores_overview_position(app_js: str):
     code = _strip_block_comments(app_js)
     match = _fn_body(code, "function readerTargetMatches")
     for token in (
-        'filter === "unreviewed"', 'filter === "rejected"',
+        'filter === "provisional"', 'filter === "unreviewed"', 'filter === "rejected"',
         'filter === "changed"', 'filter === "surfaced"',
     ):
         assert token in match
     paint = _fn_body(code, "function paintFilesTab")
-    for label in ("Unreviewed", "Rejected", "Changed", "Surfaced"):
+    for label in ("Provisional", "Unreviewed", "Rejected", "Changed", "Surfaced"):
         assert label in paint
     target = _fn_body(code, "function renderReaderTarget")
     assert "filesResumeScroll" in target and "filesResumeName" in target
@@ -2223,6 +2898,8 @@ def test_missing_note_is_a_local_post(app_js: str):
     # saving the note never ships
     save = _fn_body(code, "function saveMissing")
     assert "postMissing(" in save and "postShip" not in save
+    assert "resp.review_token" in save
+    assert "state.subdeck.review_token" in save
 
 
 def test_missing_endpoint_is_a_post_route(index_html: str, app_js: str):

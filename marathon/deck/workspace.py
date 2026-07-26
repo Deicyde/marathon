@@ -22,7 +22,6 @@ review semantics.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Optional
 
@@ -188,32 +187,11 @@ def _decl_build_status(cards, ctx, name: str, audit_status: str) -> str:
     return "unaudited"
 
 
-def _surface_views(cards, ctx, ledger, cfg, issue: int, cited: list[str]):
-    """Run the canonical, batched reconciliation surfacing step."""
-    chapter = cfg.chapter_of_issue(issue)
-    chapter_issues = _issue_numbers(cfg, chapter)
-    exclude: set[str] = set()
-    for other in chapter_issues:
-        if other == issue:
-            continue
-        for raw in cards._decls_for_issue(ctx, other):
-            exclude.add(cards._resolve_to_snapshot(ctx, raw) or raw)
-    meta = ctx.issue_meta.get(issue) or {}
-    keys = cards._textbook_result_keys(meta.get("title") or "")
-    return cards._surface_namespace_decls(
-        ctx,
-        cited,
-        ledger,
-        Path(cfg.repo_dir),
-        exclude_names=exclude,
-        result_keys=keys,
-    )
-
-
 def _catalog(cfg: "ReviewConfig", chapter: Optional[int]) -> dict:
     """Build the shared issue/declaration catalog behind both public views."""
     from marathon.deck import cards
     from marathon.deck.subdeck import (
+        DECL_FINGERPRINT_VERSION,
         _load_store,
         _decl_card,
         _decl_fingerprint,
@@ -221,80 +199,78 @@ def _catalog(cfg: "ReviewConfig", chapter: Optional[int]) -> dict:
     )
 
     issue_nums = _issue_numbers(cfg, chapter)
-    ctx = cards._load_context(cfg, issue_nums)
+    # The reader displays only the requested chapter, but ship authorization
+    # must still see owners and unresolved predecessors from every registered
+    # chapter.  One global context provides that evidence without constructing
+    # rich declaration cards for out-of-scope issues.
+    global_nums = _issue_numbers(cfg, None)
+    for issue in issue_nums:
+        if issue not in global_nums:
+            global_nums.append(issue)
+    ctx = cards._load_context(cfg, global_nums)
     audit = _audit_summary(ctx)
     ledger = cards._ledger(cfg)
     verdict_store = _load_store(cfg)
 
-    decl_to_issues = cards._decl_to_issues(ctx, issue_nums)
-    raw_issue_deps = {
-        issue: cards._predecessor_issues(ctx, issue, issue_nums, decl_to_issues)
+    errors: list[dict] = []
+    surfaces = {
+        issue: cards._build_reconciled_issue_surface(
+            cfg, ctx, ledger, issue
+        )
         for issue in issue_nums
     }
-    issue_deps = cards._gating_deps(raw_issue_deps)
+    (
+        _dependency_surfaces,
+        _owned_decls,
+        global_raw_issue_deps,
+        global_issue_deps,
+    ) = cards._global_reconciled_dependency_model(
+        cfg, ctx, ledger, issue_nums, surfaces
+    )
+    # Keep the payload scoped to the visible issues while retaining
+    # out-of-chapter predecessor IDs in each visible issue's dependency list.
+    raw_issue_deps = {
+        issue: list(global_raw_issue_deps.get(issue, []))
+        for issue in issue_nums
+    }
+    issue_deps = {
+        issue: list(global_issue_deps.get(issue, []))
+        for issue in issue_nums
+    }
 
     issue_rows: list[dict] = []
     targets: list[dict] = []
-    errors: list[dict] = []
     registry_rank = {issue: rank for rank, issue in enumerate(issue_nums)}
 
     for issue in issue_nums:
         meta = ctx.issue_meta.get(issue) or {}
-        cited = cards._decls_for_issue(ctx, issue)
-        views = []
-        seen: set[str] = set()
-        for raw in cited:
-            try:
-                view = cards._build_decl_view(ctx, ledger, raw, Path(cfg.repo_dir))
-            except Exception as exc:  # retain healthy sibling declarations
-                errors.append({"issue": issue, "declaration": raw, "error": str(exc)})
-                continue
-            if view.name in seen:
-                continue
-            seen.add(view.name)
-            views.append(view)
-        try:
-            surfaced = _surface_views(cards, ctx, ledger, cfg, issue, cited)
-        except Exception as exc:  # reconciliation is advisory for this view
-            errors.append({"issue": issue, "phase": "surfacing", "error": str(exc)})
-            surfaced = []
-        for view in surfaced:
-            if view.name not in seen:
-                seen.add(view.name)
-                views.append(view)
-        stale = [view.name for view in views if not view.in_code]
-        views = [view for view in views if view.in_code]
-
-        # Match build_subdeck's headline rule so its main result is not marked
-        # as easy API in the wide view either.
-        if views:
-            from marathon.audit.trust import TIER_ORDER
-
-            views.sort(key=lambda view: (
-                TIER_ORDER.index(view.tier) if view.tier in TIER_ORDER else 0,
-                view.name,
-            ))
-            headline = views[0].name
-            views = [
-                replace(
-                    view,
-                    **dict(zip(
-                        ("api", "api_reason"),
-                        cards.classify_api(view, headline),
-                    )),
-                )
-                for view in views
-            ]
+        surface = surfaces[issue]
+        views = list(surface.review_views)
+        stale = [view.name for view in surface.stale_views]
+        if surface.error:
+            errors.append({
+                "issue": issue,
+                "phase": "reconciliation",
+                "error": surface.error,
+            })
 
         records = verdict_store.get(str(issue), {})
         effective: dict[str, tuple[Optional[dict], Optional[str]]] = {}
         for view in views:
             record = records.get(view.name)
             carry = None
-            if record and record.get("fingerprint") is not None:
-                if _decl_fingerprint(view) != record["fingerprint"]:
+            if record:
+                if (
+                    record.get("fingerprint") is None
+                    or record.get("fingerprint_version")
+                    != DECL_FINGERPRINT_VERSION
+                ):
+                    # Legacy/current-session records that were not bound to an
+                    # exact code + kernel surface cannot authorize a decision.
                     record, carry = None, "changed"
-                else:
+                elif _decl_fingerprint(view) != record["fingerprint"]:
+                    record, carry = None, "changed"
+                elif record.get("carried_over"):
                     carry = "carried_over"
             effective[view.name] = (record, carry)
 
@@ -338,8 +314,22 @@ def _catalog(cfg: "ReviewConfig", chapter: Optional[int]) -> dict:
             card["blocked_by"] = sorted(set(blocked_by))
             targets.append(card)
 
-        tier, qualifiers, _headline = cards._issue_tier(ctx, issue)
-        ready, reason = cards._readiness(ctx, issue, tier, issue_deps.get(issue, []))
+        tier = surface.tier
+        qualifiers = surface.qualifiers
+        ready, reason = cards._readiness(
+            ctx, issue, tier, issue_deps.get(issue, [])
+        )
+        inspectable, inspection_reason = cards._inspectability(
+            ctx, issue, tier
+        )
+        for card in cards_for_issue:
+            card.update({
+                "inspectable": inspectable,
+                "shippable": ready,
+                "provisional": inspectable and not ready,
+                "ship_blocked_reason": reason,
+                "inspection_blocked_reason": inspection_reason,
+            })
         issue_rows.append({
             "id": issue,
             "title": meta.get("title") or f"#{issue}",
@@ -354,7 +344,11 @@ def _catalog(cfg: "ReviewConfig", chapter: Optional[int]) -> dict:
                 ),
             ),
             "ready": ready,
+            "inspectable": inspectable,
+            "shippable": ready,
+            "provisional": inspectable and not ready,
             "blocked_reason": reason,
+            "inspection_blocked_reason": inspection_reason,
             "deps": list(issue_deps.get(issue, [])),
             "graph_deps": list(raw_issue_deps.get(issue, [])),
             "permalink": cards._issue_permalink(cfg, issue),
@@ -372,13 +366,33 @@ def _catalog(cfg: "ReviewConfig", chapter: Optional[int]) -> dict:
     rejected_names = {
         target["name"] for target in targets if target.get("verdict") == "rejected"
     }
+    target_names = {target["name"] for target in targets}
     # A chapter-scoped view must still respect rejected definitions owned by an
     # earlier/later registered chapter. The sidecar is already keyed by the
     # fully-qualified declaration name, so this adds the global pending-FIX set
     # without another GitHub/audit read.
     for records in verdict_store.values():
         for name, record in records.items():
-            if not name.startswith("__") and (record or {}).get("verdict") == "reject":
+            if name.startswith("__") or (record or {}).get("verdict") != "reject":
+                continue
+            fingerprint = (record or {}).get("fingerprint")
+            if fingerprint is None:
+                # An unbound legacy decision is not authoritative and must not
+                # continue blocking otherwise-current declarations.
+                continue
+            if name in target_names:
+                # In-scope records were already validated through ``effective``.
+                continue
+            # A chapter-scoped reader may depend on a rejected declaration from
+            # another chapter. Validate that out-of-scope record against the
+            # same current audit/source context before allowing it to block.
+            try:
+                view = cards._build_decl_view(
+                    ctx, ledger, name, Path(cfg.repo_dir)
+                )
+            except Exception:
+                continue
+            if view.in_code and _decl_fingerprint(view) == fingerprint:
                 rejected_names.add(name)
     for target in targets:
         target["source_line"] = _line_for(

@@ -91,6 +91,7 @@ import marathon.review.daemon as daemon
 from marathon.post_pipeline import (
     PUBLICATION_JOURNAL_SCHEMA_VERSION,
     _branch_name_for_issue,
+    find_lake_executable,
 )
 from marathon.recovery import (
     UPDATE_RECOVERY_MARKER_FILENAME,
@@ -270,7 +271,7 @@ class ConductorJob:
     finished_ts: Optional[str] = None        # ISO 8601
     status: str = "running"                  # running | succeeded | failed |
                                              # stalled | interrupted |
-                                             # publication_pending
+                                             # publication_pending | superseded
     exit_code: Optional[int] = None
     error: Optional[str] = None              # log tail of a FAILED job (for the
                                              # snapshot/deck + the stall comment)
@@ -1016,6 +1017,11 @@ def _recover_retry_worktrees(
     rows = list((snap or {}).get("jobs", []))
     # Newest row wins if an old snapshot somehow contains duplicate attempts.
     for raw in reversed(rows):
+        # A compare-and-swap loser belongs to an older verdict/recovery
+        # generation. Even if best-effort worktree cleanup left the directory
+        # behind, it must never be adopted as the checkpoint for the winner.
+        if raw.get("status") == "superseded":
+            continue
         autonomous = bool(raw.get("fill") or raw.get("repair"))
         try:
             issue = int(raw.get("issue_num"))
@@ -2085,24 +2091,25 @@ def _prime_mathlib_cache(
     worktree's OWN ``.lake``, so concurrent worktrees don't race.
 
     FAIL-SAFE: returns True only on a clean cache-get; False on EVERYTHING else
-    (skip flag set, no ``lake`` on PATH, non-zero exit, timeout, any exception)
-    and NEVER raises — a prime failure must never abort a dispatch (the refine
-    then just does its normal, slower build). On a timeout the ENTIRE cache-get
-    subtree (lake + its lean/leanc/curl workers) is killed via its process group,
-    so no orphaned compiler/downloader is left racing the refine's build in the
-    same worktree. No-op when ``MARATHON_SKIP_CACHE_GET`` is set."""
-    import shutil
+    (skip flag set, no ``lake`` on PATH or in ``~/.elan/bin``, non-zero exit,
+    timeout, any exception) and NEVER raises — a prime failure must never abort
+    a dispatch (the refine then just does its normal, slower build). On a
+    timeout the ENTIRE cache-get subtree (lake + its lean/leanc/curl workers) is
+    killed via its process group, so no orphaned compiler/downloader is left
+    racing the refine's build in the same worktree. No-op when
+    ``MARATHON_SKIP_CACHE_GET`` is set."""
 
     if os.environ.get("MARATHON_SKIP_CACHE_GET"):
         return False
-    if shutil.which("lake") is None:
+    lake = find_lake_executable()
+    if lake is None:
         return False
     try:
         # Own process group (start_new_session) so a timeout can kill the WHOLE
         # subtree, not just the lake parent — subprocess.run's timeout would
         # SIGKILL only the direct child and orphan its lean/curl workers.
         proc = subprocess.Popen(
-            ["lake", "exe", "cache", "get"],
+            [lake, "exe", "cache", "get"],
             cwd=str(worktree),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -4013,13 +4020,21 @@ def _reap_adopted_job(
                 expected_verdict_ts=job.expected_verdict_ts,
                 expected_recovery_id=job.expected_recovery_id,
             )
-            job.status = "stalled" if stalled is not None else "failed"
+            job.status = "stalled" if stalled is not None else "superseded"
             _remove_worktree(cfg.repo_dir, Path(job.worktree))
-            print(
-                f"--- adopted build-only recovery #{job.issue_num} has a "
-                "trusted red status; parked for the next recovery choice ---",
-                flush=True,
-            )
+            if stalled is not None:
+                print(
+                    f"--- adopted build-only recovery #{job.issue_num} has a "
+                    "trusted red status; parked for the next recovery choice ---",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"--- adopted build-only recovery #{job.issue_num} was "
+                    "superseded by newer review state; its stale completion "
+                    "changed nothing ---",
+                    flush=True,
+                )
             return
         if build_status != "OK":
             job.status = "failed"
@@ -4461,20 +4476,27 @@ def _reap_finished(
             # aborted on a changed SHA). Re-running it three times cannot
             # improve code; return the issue to the recovery chooser so the
             # next rung can preserve and continue the PR.
-            record_stall(
+            stalled = record_stall(
                 cfg,
                 job.issue_num,
                 expected_verdict_ts=job.expected_verdict_ts,
                 expected_recovery_id=job.expected_recovery_id,
             )
-            job.status = "stalled"
+            job.status = "stalled" if stalled is not None else "superseded"
             _clear_worktree_pid_marker(job.worktree)
             _remove_worktree(cfg.repo_dir, Path(job.worktree))
-            print(
-                f"    build-only recovery for #{job.issue_num} did not pass; "
-                "parked for the next explicit recovery choice",
-                flush=True,
-            )
+            if stalled is not None:
+                print(
+                    f"    build-only recovery for #{job.issue_num} did not pass; "
+                    "parked for the next explicit recovery choice",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"    build-only recovery for #{job.issue_num} was "
+                    "superseded by newer review state; stale completion ignored",
+                    flush=True,
+                )
             continue
         backoff = daemon._handle_refine_exit(
             cfg, job.issue_num, rc, max_attempts=max_attempts,

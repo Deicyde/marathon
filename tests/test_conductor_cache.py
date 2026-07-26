@@ -92,7 +92,26 @@ def test_prime_no_lake_on_path_returns_false(tmp_path, monkeypatch):
     # A PATH with no `lake` at all.
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     monkeypatch.delenv("MARATHON_SKIP_CACHE_GET", raising=False)
+    monkeypatch.setattr(conductor, "find_lake_executable", lambda: None)
     assert conductor._prime_mathlib_cache(tmp_path / "wt") is False
+
+
+def test_prime_uses_resolved_elan_lake_when_path_omits_it(
+    tmp_path, monkeypatch,
+):
+    bindir = tmp_path / "home" / ".elan" / "bin"
+    record = tmp_path / "rec.txt"
+    _write_lake_stub(bindir, record, exit_code=0)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.delenv("MARATHON_SKIP_CACHE_GET", raising=False)
+    monkeypatch.setattr(
+        conductor, "find_lake_executable", lambda: str(bindir / "lake")
+    )
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert conductor._prime_mathlib_cache(worktree) is True
+    assert "ARGV: exe cache get" in record.read_text()
 
 
 def test_mathlib_already_built_marker(tmp_path):

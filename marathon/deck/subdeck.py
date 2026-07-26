@@ -74,6 +74,16 @@ SUBDECK_RELPATH = Path(".marathon") / "review" / "deck-subdecks.json"
 #: declaration exactly as written; ``reject`` = it needs a fix (note
 #: required); ``defer`` = skip for now (the subdeck stays incomplete).
 DECL_VERDICTS = ("verify", "reject", "defer")
+DECL_FINGERPRINT_VERSION = 2
+
+
+class ReviewContextChanged(ValueError):
+    """The declaration shown to the reviewer is no longer current.
+
+    This is a conflict, rather than a malformed verdict: callers should reload
+    the current subdeck and ask the human to decide against that exact source
+    and elaborated dependency context.
+    """
 
 #: The per-decl verdicts that count a declaration as REVIEWED (toward
 #: progress / completeness). ``defer`` does NOT count — a deferred decl
@@ -279,15 +289,20 @@ def _load_ship_receipt(cfg: "ReviewConfig", issue_num: int) -> Optional[dict]:
 
 
 def _save_ship_receipt(
-    cfg: "ReviewConfig", issue_num: int, response: dict
+    cfg: "ReviewConfig",
+    issue_num: int,
+    response: dict,
+    *,
+    review_token: Optional[str] = None,
 ) -> None:
-    """Persist a per-issue idempotency receipt; caller holds the issue lock."""
+    """Persist a generation-bound idempotency receipt under the issue lock."""
     path = _ship_receipt_path(cfg, issue_num)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     payload = {
         "issue": issue_num,
         "completed_at": datetime.now(timezone.utc).isoformat(),
+        "review_token": review_token,
         "response": response,
     }
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -380,6 +395,121 @@ def issue_verdicts(cfg: "ReviewConfig", issue_num: int) -> dict:
     """``{decl_name: {"verdict", "note", "ts"}}`` for one issue, or ``{}``.
     Read-only; the per-decl LOCAL review state the subdeck overlays."""
     return _load_store(cfg).get(str(issue_num), {})
+
+
+def _current_decl_cards(
+    cfg: "ReviewConfig",
+    issue_num: int,
+    *,
+    current_subdeck: Optional[dict] = None,
+) -> dict[str, dict]:
+    """Return the current code-backed declaration cards for one issue.
+
+    Store-only callers used by migrations/tests may target an issue outside the
+    configured registry.  Such a target has no authoritative review surface,
+    so avoid a GitHub/audit lookup and return an empty mapping. Production deck
+    handlers pass ``require_current=True`` and therefore fail closed.
+    """
+    if cfg.chapter_of_issue(issue_num) is None:
+        return {}
+    subdeck = (
+        current_subdeck
+        if current_subdeck is not None
+        else build_subdeck(cfg, issue_num, skip_api=False)
+    )
+    cards = [
+        {
+            **card,
+            "_issue_inspectable": bool(subdeck.get("inspectable")),
+            "_inspection_blocked_reason": subdeck.get(
+                "inspection_blocked_reason"
+            ),
+        }
+        for card in (
+            list(subdeck.get("cards") or [])
+            + list(subdeck.get("auto_approved") or [])
+        )
+        if isinstance(card.get("name"), str)
+    ]
+    counts: dict[str, int] = {}
+    for card in cards:
+        counts[card["name"]] = counts.get(card["name"], 0) + 1
+    return {
+        card["name"]: card
+        for card in cards
+        if counts.get(card["name"]) == 1
+    }
+
+
+def _current_decl_card(
+    cfg: "ReviewConfig",
+    issue_num: int,
+    decl: str,
+    *,
+    current_subdeck: Optional[dict] = None,
+) -> Optional[dict]:
+    """Return the unique current code-backed card for ``decl``, if present."""
+    return _current_decl_cards(
+        cfg, issue_num, current_subdeck=current_subdeck
+    ).get(decl)
+
+
+def _bound_context_fingerprint(
+    cfg: "ReviewConfig",
+    issue_num: int,
+    decl: str,
+    *,
+    expected_fingerprint: Optional[str],
+    require_current: bool,
+    require_inspectable: bool = False,
+    current_subdeck: Optional[dict] = None,
+) -> Optional[str]:
+    """Resolve and optionally compare the declaration's current fingerprint."""
+    if require_current and expected_fingerprint is None:
+        raise ReviewContextChanged(
+            "This review request is missing the declaration context that was "
+            "shown. Reload the review and decide again."
+        )
+    if (
+        current_subdeck is None
+        and not require_current
+        and expected_fingerprint is None
+        and not require_inspectable
+    ):
+        return None
+    try:
+        card = _current_decl_card(
+            cfg,
+            issue_num,
+            decl,
+            current_subdeck=current_subdeck,
+        )
+    except Exception:
+        if require_current or expected_fingerprint is not None:
+            raise
+        return None
+    current = _decl_fingerprint(card) if card is not None else None
+    if expected_fingerprint is not None and current != expected_fingerprint:
+        raise ReviewContextChanged(
+            "The declaration or one of its elaborated dependencies changed "
+            "after it was shown. Reload the review and decide again."
+        )
+    if require_current and current is None:
+        raise ReviewContextChanged(
+            f"{decl!r} is not a unique declaration in the current code-backed "
+            f"subdeck for issue #{issue_num}; reload the review."
+        )
+    if require_inspectable and card is not None and not card.get(
+        "_issue_inspectable"
+    ):
+        raise ReviewContextChanged(
+            str(
+                card.get("_inspection_blocked_reason")
+                or "This issue does not currently have machine-audited code "
+                "that is eligible for review."
+            )
+        )
+    return current
 
 
 def reconcile_decl_verdict_ownership(
@@ -504,7 +634,11 @@ def record_decl_verdict(
     decl: str,
     verdict: str,
     note: Optional[str] = None,
-) -> dict:
+    *,
+    expected_fingerprint: Optional[str] = None,
+    require_current: bool = False,
+    return_subdeck: bool = False,
+):
     """Record one per-(issue,decl) verdict to the local sidecar and return
     the stored record.
 
@@ -528,7 +662,7 @@ def record_decl_verdict(
             "note carried verbatim to Aristotle)"
         )
 
-    def mutate(store: dict) -> tuple[dict, bool]:
+    def mutate(store: dict, fingerprint: Optional[str]) -> tuple[dict, bool]:
         decls = store.setdefault(str(issue_num), {})
         prev = decls.get(decl) or {}
         entry = {
@@ -536,6 +670,13 @@ def record_decl_verdict(
             "note": str(note) if note is not None else None,
             "ts": datetime.now(timezone.utc).isoformat(),
         }
+        # Every verdict accepted from the live code-backed deck is pinned to
+        # the exact declaration + elaborated kernel the reviewer saw.  A
+        # subsequent source, statement, definition-value, or kernel change
+        # makes build_subdeck ignore it until the human decides again.
+        if fingerprint is not None:
+            entry["fingerprint"] = fingerprint
+            entry["fingerprint_version"] = DECL_FINGERPRINT_VERSION
         # The hard-freeze LOCK is a modifier on a verify: carry it over on a
         # re-verify, but DROP it when the verdict changes to reject/defer (a decl
         # the human now wants changed must not be frozen).
@@ -545,12 +686,85 @@ def record_decl_verdict(
         return entry, True
 
     with _issue_operation_lock(cfg, issue_num):
+        inputs = None
+        current_subdeck = None
+        if (
+            (
+                decl != INFORMAL_KEY
+                or require_current
+                or expected_fingerprint is not None
+                or return_subdeck
+            )
+            and cfg.chapter_of_issue(issue_num) is not None
+        ):
+            try:
+                inputs = _load_subdeck_inputs(cfg, issue_num)
+                current_subdeck = build_subdeck(
+                    cfg, issue_num, skip_api=False, _inputs=inputs
+                )
+            except Exception:
+                if require_current or expected_fingerprint is not None:
+                    raise
+        if decl == INFORMAL_KEY and (
+            require_current or expected_fingerprint is not None
+        ):
+            informal = (
+                (current_subdeck or {}).get("informal") or {}
+            )
+            current_fingerprint = informal.get("context_fingerprint")
+            if expected_fingerprint is None:
+                raise ReviewContextChanged(
+                    "This informal-text review is missing the exact prose that "
+                    "was shown. Reload the review and decide again."
+                )
+            if (
+                current_fingerprint is None
+                or expected_fingerprint != current_fingerprint
+            ):
+                raise ReviewContextChanged(
+                    "The informal text changed after it was shown. Reload the "
+                    "review and decide again."
+                )
+            fingerprint = current_fingerprint
+        elif decl == INFORMAL_KEY:
+            # Store-only compatibility for migrations/tests. The unbound record
+            # is deliberately ignored by _informal_slot until reviewed live.
+            fingerprint = None
+        else:
+            fingerprint = _bound_context_fingerprint(
+                cfg,
+                issue_num,
+                decl,
+                expected_fingerprint=expected_fingerprint,
+                require_current=require_current,
+                require_inspectable=(
+                    require_current and verdict in REVIEWED_DECL_VERDICTS
+                ),
+                current_subdeck=(
+                    current_subdeck
+                    if current_subdeck is not None
+                    else ({} if require_current else None)
+                ),
+            )
         _clear_ship_receipt(cfg, issue_num)
-        return _mutate_store(cfg, mutate)
+        stored = _mutate_store(
+            cfg, lambda store: mutate(store, fingerprint)
+        )
+        if not return_subdeck:
+            return stored
+        if inputs is None:
+            inputs = _load_subdeck_inputs(cfg, issue_num)
+        refreshed = build_subdeck(
+            cfg, issue_num, skip_api=False, _inputs=inputs
+        )
+        return stored, refreshed
 
 
 def record_decl_verdict_batch(
-    cfg: "ReviewConfig", items: list[dict]
+    cfg: "ReviewConfig",
+    items: list[dict],
+    *,
+    require_current: bool = False,
 ) -> list[dict]:
     """Atomically record several LOCAL per-declaration verdicts.
 
@@ -601,12 +815,15 @@ def record_decl_verdict_batch(
             "decl": decl,
             "verdict": verdict,
             "note": str(note) if note is not None else None,
+            "expected_fingerprint": raw.get("expected_fingerprint"),
         })
 
     issues = sorted({item["issue"] for item in normalized})
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    def mutate(store: dict) -> tuple[list[dict], bool]:
+    def mutate(
+        store: dict, fingerprints: dict[tuple[int, str], Optional[str]]
+    ) -> tuple[list[dict], bool]:
         results: list[dict] = []
         for item in normalized:
             decls = store.setdefault(str(item["issue"]), {})
@@ -616,10 +833,20 @@ def record_decl_verdict_batch(
                 "note": item["note"],
                 "ts": timestamp,
             }
+            fingerprint = fingerprints[(item["issue"], item["decl"])]
+            if fingerprint is not None:
+                entry["fingerprint"] = fingerprint
+                entry["fingerprint_version"] = DECL_FINGERPRINT_VERSION
             if item["verdict"] == "verify" and previous.get("locked"):
                 entry["locked"] = True
             decls[item["decl"]] = entry
-            results.append({**item, "record": dict(entry)})
+            results.append({
+                "issue": item["issue"],
+                "decl": item["decl"],
+                "verdict": item["verdict"],
+                "note": item["note"],
+                "record": dict(entry),
+            })
         return results, True
 
     # Numeric lock order prevents two overlapping multi-issue batches from
@@ -628,14 +855,55 @@ def record_decl_verdict_batch(
     with ExitStack() as stack:
         for issue_num in issues:
             stack.enter_context(_issue_operation_lock(cfg, issue_num))
+        # One authoritative subdeck build per issue, not per declaration: a
+        # chapter-sized DEFER batch may contain hundreds of cards.
+        current_cards: dict[int, dict[str, dict]] = {}
+        for issue_num in issues:
+            try:
+                current_cards[issue_num] = _current_decl_cards(
+                    cfg, issue_num
+                )
+            except Exception:
+                if require_current or any(
+                    item.get("expected_fingerprint") is not None
+                    for item in normalized
+                    if item["issue"] == issue_num
+                ):
+                    raise
+                current_cards[issue_num] = {}
+        fingerprints: dict[tuple[int, str], Optional[str]] = {}
+        for item in normalized:
+            card = current_cards[item["issue"]].get(item["decl"])
+            current = _decl_fingerprint(card) if card is not None else None
+            expected = item.get("expected_fingerprint")
+            if expected is not None and expected != current:
+                raise ReviewContextChanged(
+                    "A declaration or one of its elaborated dependencies "
+                    "changed after the batch was shown. Reload the review."
+                )
+            if require_current and current is None:
+                raise ReviewContextChanged(
+                    f"{item['decl']!r} is not a unique current code-backed "
+                    f"declaration for issue #{item['issue']}."
+                )
+            fingerprints[(item["issue"], item["decl"])] = current
         for issue_num in issues:
             _clear_ship_receipt(cfg, issue_num)
-        return _mutate_store(cfg, mutate)
+        return _mutate_store(
+            cfg, lambda store: mutate(store, fingerprints)
+        )
 
 
 def set_decl_lock(
-    cfg: "ReviewConfig", issue_num: int, decl: str, locked: bool
-) -> dict:
+    cfg: "ReviewConfig",
+    issue_num: int,
+    decl: str,
+    locked: bool,
+    *,
+    expected_fingerprint: Optional[str] = None,
+    require_current: bool = False,
+    return_subdeck: bool = False,
+):
     """Toggle the HARD-FREEZE lock on a declaration (opt-in, per-decl).
 
     A LOCKED decl's signature is frozen into the approved-statements manifest at
@@ -644,9 +912,30 @@ def set_decl_lock(
     may re-type it and the change re-surfaces for review. Locking implies KEEP,
     so an unreviewed decl is recorded ``verify`` when first locked. LOCAL ONLY —
     the sidecar; the freeze is realized at :func:`ship_issue`."""
-    def mutate(store: dict) -> tuple[dict, bool]:
+    def mutate(
+        store: dict, fingerprint: Optional[str]
+    ) -> tuple[dict, bool]:
         decls = store.setdefault(str(issue_num), {})
         entry = decls.get(decl)
+        if (
+            not locked
+            and entry is not None
+            and fingerprint is not None
+            and entry.get("fingerprint") is None
+        ):
+            raise ReviewContextChanged(
+                "This legacy decision was not bound to the current "
+                "declaration. Review it again before changing its lock."
+            )
+        if (
+            entry is not None
+            and fingerprint is not None
+            and entry.get("fingerprint") not in (None, fingerprint)
+        ):
+            raise ReviewContextChanged(
+                "The declaration changed since this decision was recorded. "
+                "Reload and review it again before changing its lock."
+            )
         if entry is None or entry.get("verdict") not in (
             "verify", "reject", "defer"
         ):
@@ -656,6 +945,9 @@ def set_decl_lock(
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
             decls[decl] = entry
+        if fingerprint is not None:
+            entry["fingerprint"] = fingerprint
+            entry["fingerprint_version"] = DECL_FINGERPRINT_VERSION
         if locked:
             entry["locked"] = True
         else:
@@ -663,8 +955,42 @@ def set_decl_lock(
         return entry, True
 
     with _issue_operation_lock(cfg, issue_num):
+        inputs = None
+        current_subdeck = None
+        if cfg.chapter_of_issue(issue_num) is not None:
+            try:
+                inputs = _load_subdeck_inputs(cfg, issue_num)
+                current_subdeck = build_subdeck(
+                    cfg, issue_num, skip_api=False, _inputs=inputs
+                )
+            except Exception:
+                if require_current or expected_fingerprint is not None:
+                    raise
+        fingerprint = _bound_context_fingerprint(
+            cfg,
+            issue_num,
+            decl,
+            expected_fingerprint=expected_fingerprint,
+            require_current=require_current,
+            require_inspectable=require_current,
+            current_subdeck=(
+                current_subdeck
+                if current_subdeck is not None
+                else ({} if require_current else None)
+            ),
+        )
         _clear_ship_receipt(cfg, issue_num)
-        return _mutate_store(cfg, mutate)
+        stored = _mutate_store(
+            cfg, lambda store: mutate(store, fingerprint)
+        )
+        if not return_subdeck:
+            return stored
+        if inputs is None:
+            inputs = _load_subdeck_inputs(cfg, issue_num)
+        refreshed = build_subdeck(
+            cfg, issue_num, skip_api=False, _inputs=inputs
+        )
+        return stored, refreshed
 
 
 def record_missing(
@@ -730,6 +1056,7 @@ def _persist_kept_verdicts(
             *subdeck.get("auto_approved", []),
         ]
     }
+    informal_slot = subdeck.get("informal") or {}
 
     def mutate(store: dict) -> tuple[list[str], bool]:
         old = store.get(str(issue_num), {})
@@ -740,17 +1067,27 @@ def _persist_kept_verdicts(
             if not rec or rec.get("verdict") != "verify":
                 continue
             card = card_by_name.get(name)
-            new_entry[name] = {
+            carried_entry = {
                 "verdict": "verify",
                 "note": rec.get("note"),
                 "ts": rec.get("ts"),
                 "fingerprint": _decl_fingerprint(card) if card else None,
+                "fingerprint_version": DECL_FINGERPRINT_VERSION,
+                "carried_over": True,
             }
+            if rec.get("locked"):
+                carried_entry["locked"] = True
+            new_entry[name] = carried_entry
             carried.append(name)
         # The informal approval is issue-level (the body marker was flipped at
         # ship) — keep it so the human is not re-asked to approve the same text.
-        if INFORMAL_KEY in old:
-            new_entry[INFORMAL_KEY] = old[INFORMAL_KEY]
+        informal_rec = old.get(INFORMAL_KEY) or {}
+        if (
+            informal_slot.get("verdict") in {"verified", "rejected"}
+            and informal_rec.get("fingerprint")
+            == informal_slot.get("context_fingerprint")
+        ):
+            new_entry[INFORMAL_KEY] = informal_rec
         if new_entry:
             store[str(issue_num)] = new_entry
         else:
@@ -794,6 +1131,12 @@ def _decl_fingerprint(view_or_card) -> str:
         "name": field(view_or_card, "name") or "",
         "kind": field(view_or_card, "kind") or "",
         "source_block": field(view_or_card, "source_block"),
+        # Live DeclViews carry a digest of the complete declaration even when
+        # the browser source block is capped at 400 lines.  Legacy/test dicts
+        # without it remain bound to their complete ``source_block`` value.
+        "source_fingerprint": field(
+            view_or_card, "source_fingerprint"
+        ),
         "statement_pp": field(view_or_card, "statement_pp"),
         "kernel": kernel,
     }
@@ -842,6 +1185,7 @@ def _decl_card(view, record: Optional[dict], carry: Optional[str] = None) -> dic
     or ``"changed"`` (approved before but its source changed — the verdict was
     dropped by the caller, so this is shown unreviewed with a re-review flag)."""
     card = view.to_json()
+    card["context_fingerprint"] = _decl_fingerprint(view)
     stored = (record or {}).get("verdict")
     card["verdict"] = _VERDICT_WIRE.get(stored, stored)
     card["note"] = (record or {}).get("note")
@@ -856,6 +1200,18 @@ def _is_reviewed(record: Optional[dict]) -> bool:
     """True iff this declaration carries a verify/reject verdict (a defer or
     no-verdict leaves it unreviewed — the contract's progress rule)."""
     return bool(record) and record.get("verdict") in REVIEWED_DECL_VERDICTS
+
+
+def _informal_fingerprint(statement: str, is_llm: bool) -> str:
+    """Bind one informal approval to the exact normalized prose shown."""
+    normalized = str(statement).replace("\r\n", "\n").replace("\r", "\n").strip()
+    encoded = json.dumps(
+        {"statement": normalized, "is_llm": bool(is_llm)},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _informal_slot(detail, records: dict) -> Optional[dict]:
@@ -886,36 +1242,57 @@ def _informal_slot(detail, records: dict) -> Optional[dict]:
             statement, is_llm = head.informal_rendering, True
     if not statement:
         return None
+    context_fingerprint = _informal_fingerprint(statement, bool(is_llm))
     rec = records.get(INFORMAL_KEY) or {}
+    if rec.get("fingerprint") != context_fingerprint:
+        # Legacy/unbound approval or changed prose: fail closed and ask again.
+        rec = {}
     stored = rec.get("verdict")
     return {
         "is_llm": bool(is_llm),
         "verdict": _VERDICT_WIRE.get(stored, stored),
         "note": rec.get("note"),
         "statement": statement,
+        "context_fingerprint": context_fingerprint,
     }
 
 
 def subdeck_review_token(subdeck: dict) -> str:
     """Fingerprint the exact code/issue surface presented to the reviewer.
 
-    Local verdicts and notes are intentionally excluded (the ship operation id
-    binds those separately). This token changes when declarations, signatures,
-    kernels, citation-vs-surfaced identity, stale citations, dependencies, or
-    the issue's informal statement change between review and SHIP.
+    The token binds both the code/issue surface and the effective LOCAL decisions
+    visible in this exact subdeck.  That second half is load-bearing: a second
+    browser tab may change a KEEP/FIX note after the first tab rendered its
+    summary, and the first tab must not silently ship the newer decisions.  The
+    worker operation id additionally fences mid-flight mutations, but only this
+    submitted token proves which decisions the human actually confirmed.
     """
     cards = []
     for lane in ("cards", "auto_approved"):
         for card in subdeck.get(lane) or []:
             cards.append({
-                "lane": lane,
                 "name": card.get("name"),
                 "fingerprint": _decl_fingerprint(card),
                 "surfaced": bool(card.get("surfaced")),
                 "api": bool(card.get("api")),
+                "verdict": card.get("verdict"),
+                "note": card.get("note"),
+                "locked": bool(card.get("locked")),
+                "carried_over": bool(card.get("carried_over")),
+                "changed_since_review": bool(
+                    card.get("changed_since_review")
+                ),
+                "dependency_invalidated": bool(
+                    card.get("dependency_invalidated")
+                ),
             })
+    # ``skip_api`` changes only which presentation lane contains an untouched
+    # API card. The explicit ship body/operation id binds that choice separately,
+    # so the review token stays canonical across mutation responses (which
+    # rebuild the full, non-skip presentation) and the browser's skip-API view.
+    cards.sort(key=lambda card: str(card.get("name") or ""))
     payload = {
-        "version": 1,
+        "version": 2,
         "issue": subdeck.get("issue"),
         "title": subdeck.get("title"),
         "chapter": subdeck.get("chapter"),
@@ -933,7 +1310,10 @@ def subdeck_review_token(subdeck: dict) -> str:
         "informal": {
             "statement": (subdeck.get("informal") or {}).get("statement"),
             "is_llm": bool((subdeck.get("informal") or {}).get("is_llm")),
+            "verdict": (subdeck.get("informal") or {}).get("verdict"),
+            "note": (subdeck.get("informal") or {}).get("note"),
         },
+        "missing": subdeck.get("missing"),
     }
     encoded = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -941,8 +1321,28 @@ def subdeck_review_token(subdeck: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _load_subdeck_inputs(
+    cfg: "ReviewConfig", issue_num: int
+) -> tuple[object, list]:
+    """Load the GitHub/audit-backed half of a subdeck exactly once.
+
+    A declaration mutation needs the same immutable review surface both before
+    and after its local sidecar write.  Keeping these inputs separate from the
+    cheap verdict overlay avoids repeating GitHub metadata and source
+    reconciliation fetches on every swipe.
+    """
+    from marathon.deck.cards import build_card_detail
+
+    detail = build_card_detail(cfg, issue_num)
+    return detail, list(detail.surfaced_decls)
+
+
 def build_subdeck(
-    cfg: "ReviewConfig", issue_num: int, *, skip_api: bool = False
+    cfg: "ReviewConfig",
+    issue_num: int,
+    *,
+    skip_api: bool = False,
+    _inputs: Optional[tuple[object, list]] = None,
 ) -> dict:
     """Assemble the per-declaration subdeck for ``issue_num`` (the shared API
     contract).
@@ -989,9 +1389,11 @@ def build_subdeck(
 
     ``skip_api`` partitions the RECONCILED card set AFTER reconciliation."""
     from marathon.audit.trust import TIER_ORDER
-    from marathon.deck.cards import build_card_detail, surfaced_decls_for_issue
 
-    detail = build_card_detail(cfg, issue_num)
+    detail, loaded_surfaced_views = (
+        _inputs if _inputs is not None
+        else _load_subdeck_inputs(cfg, issue_num)
+    )
     records = issue_verdicts(cfg, issue_num)
 
     # --- RECONCILIATION (pure, read-only) ---------------------------------
@@ -1009,8 +1411,7 @@ def build_subdeck(
     # e.g. Prop_16_1 → Prop_16_1_preserving/_reversing) — otherwise a split
     # result whose only citation went stale is left with ZERO reviewable cards.
     # Never re-surfaces a decl the body already cites. PURE — writes nothing.
-    cited_names = [v.name for v in detail.decls]
-    surfaced_views = surfaced_decls_for_issue(cfg, issue_num, cited_names)
+    surfaced_views = list(loaded_surfaced_views)
     # Defensive: never surface a name that is already a kept cited card.
     _kept_names = {v.name for v in cited_in_code}
     surfaced_views = [v for v in surfaced_views if v.name not in _kept_names]
@@ -1022,13 +1423,11 @@ def build_subdeck(
     # decls (stale dropped). This is what the partition below operates on.
     reconciled_views = list(cited_in_code) + list(surfaced_views)
 
-    # CARRIED-OVER verdicts: a verdict persisted from a prior ship carries a
-    # ``fingerprint`` and only STANDS while the decl is unchanged. Compute the
-    # effective record + a carry-status per decl ONCE, and read it everywhere
-    # the store is consulted (partition / cards / progress / summary) — so a
-    # 'kept' decl Aristotle actually altered is re-reviewed, while an untouched
-    # one is not. An ordinary current-session verdict (no fingerprint) is
-    # unaffected.
+    # Every code-backed verdict carries a context fingerprint and only STANDS
+    # while the declaration + elaborated dependency kernel are unchanged.
+    # Legacy unbound records are deliberately fail-closed: they are shown as
+    # changed and must be decided again.  A record explicitly carried through a
+    # reject/refine round additionally receives the ``carried_over`` badge.
     view_by_name = {v.name: v for v in reconciled_views}
 
     def _effective(name):
@@ -1037,12 +1436,20 @@ def build_subdeck(
             return None, None
         if rec.get("requires_review"):
             return None, "changed"
-        if rec.get("fingerprint") is None:
-            return rec, None
+        if (
+            rec.get("fingerprint") is None
+            or rec.get("fingerprint_version") != DECL_FINGERPRINT_VERSION
+        ):
+            return None, "changed"
         view = view_by_name.get(name)
         if view is not None and _decl_fingerprint(view) != rec["fingerprint"]:
             return None, "changed"
-        return rec, "carried_over"
+        carry = (
+            "carried_over"
+            if rec.get("carried_over")
+            else None
+        )
+        return rec, carry
 
     eff = {v.name: _effective(v.name) for v in reconciled_views}
 
@@ -1125,6 +1532,11 @@ def build_subdeck(
         "title": detail.title,
         "chapter": detail.chapter,
         "card_tier": detail.tier,
+        "inspectable": detail.inspectable,
+        "inspection_blocked_reason": detail.inspection_blocked_reason,
+        "shippable": detail.shippable,
+        "ship_blocked_reason": detail.ship_blocked_reason,
+        "provisional": detail.provisional,
         # Read-only navigation/dependency metadata from CardDetail.  These were
         # previously dropped while adapting the issue card into a subdeck,
         # leaving the frontend's "deps" and "open" controls with no data.
@@ -1452,9 +1864,8 @@ def _ship_issue_once(
     # failure never fails the landed verdict); independent of the KEEP/FIX
     # outcome (the informal English is verified whatever the Lean verdicts).
     # Read the verdict BEFORE clear_issue wipes the store.
-    informal_rec = issue_verdicts(cfg, issue_num).get(INFORMAL_KEY) or {}
     informal_verified = False
-    if informal_rec.get("verdict") == "verify":
+    if (subdeck.get("informal") or {}).get("verdict") == "verified":
         try:
             from marathon.deck.refresh import mark_informal_verified
 
@@ -1511,7 +1922,10 @@ def ship_issue(
     """
     with _issue_operation_lock(cfg, issue_num):
         receipt = _load_ship_receipt(cfg, issue_num)
-        if receipt is not None:
+        if receipt is not None and (
+            expected_review_token is None
+            or receipt.get("review_token") == expected_review_token
+        ):
             duplicate = dict(receipt["response"])
             duplicate["duplicate"] = True
             duplicate["message"] = (
@@ -1531,5 +1945,10 @@ def ship_issue(
         if response.get("ok"):
             response = dict(response)
             response["duplicate"] = False
-            _save_ship_receipt(cfg, issue_num, response)
+            _save_ship_receipt(
+                cfg,
+                issue_num,
+                response,
+                review_token=expected_review_token,
+            )
         return response

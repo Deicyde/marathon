@@ -187,6 +187,25 @@ def test_skipapi_true_splits_main_and_api(tmp_path, monkeypatch):
     assert sd["complete"] is False
 
 
+def test_review_token_is_canonical_across_skipapi_presentation_lanes(
+    tmp_path, monkeypatch,
+):
+    """Mutation responses rebuild the full deck but must remain ship-valid."""
+    cfg = make_mix_cfg(tmp_path, monkeypatch)
+
+    full = subdeck.build_subdeck(cfg, 22, skip_api=False)
+    skipped = subdeck.build_subdeck(cfg, 22, skip_api=True)
+    assert full["review_token"] == skipped["review_token"]
+
+    subdeck.record_decl_verdict(
+        cfg, 22, "Demo.Chapter14.AbelTheorem", "verify"
+    )
+    refreshed_full = subdeck.build_subdeck(cfg, 22, skip_api=False)
+    refreshed_skipped = subdeck.build_subdeck(cfg, 22, skip_api=True)
+    assert refreshed_full["review_token"] == refreshed_skipped["review_token"]
+    assert refreshed_full["review_token"] != full["review_token"]
+
+
 def test_skipapi_complete_over_mains_only(tmp_path, monkeypatch):
     cfg = make_mix_cfg(tmp_path, monkeypatch)
     # Verify ONLY the main headline; leave the two API decls unreviewed.
@@ -495,9 +514,16 @@ def test_ship_endpoint_threads_skipapi_from_body(running_server, monkeypatch):
     calls = patch_no_verdict_handlers(monkeypatch)
     # Review only the MAIN headline; ship with skip_api in the body.
     subdeck.record_decl_verdict(cfg, 22, "Demo.Chapter14.AbelTheorem", "verify")
+    review_token = subdeck.build_subdeck(
+        cfg, 22, skip_api=True
+    )["review_token"]
 
     status, body = _post(
-        base + "/api/ship", {"issue": 22, "skip_api": True},
+        base + "/api/ship", {
+            "issue": 22,
+            "skip_api": True,
+            "review_token": review_token,
+        },
         headers={deck_server.TOKEN_HEADER: token},
     )
     assert status == 202
@@ -515,9 +541,13 @@ def test_ship_endpoint_without_skipapi_refuses_unreviewed_api(running_server, mo
     server, base, token, cfg = running_server
     calls = patch_no_verdict_handlers(monkeypatch)
     subdeck.record_decl_verdict(cfg, 22, "Demo.Chapter14.AbelTheorem", "verify")
+    review_token = subdeck.build_subdeck(cfg, 22)["review_token"]
 
     status, body = _post(
-        base + "/api/ship", {"issue": 22},  # no skip_api
+        base + "/api/ship", {
+            "issue": 22,
+            "review_token": review_token,
+        },  # no skip_api
         headers={deck_server.TOKEN_HEADER: token},
     )
     assert status == 202

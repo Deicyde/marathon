@@ -37,7 +37,9 @@ def test_run_lake_build_starts_isolated_group_and_logs_status(
         targets=["Demo.One", "Demo.Two"],
     )
 
-    assert spawned["command"] == ["lake", "build", "Demo.One", "Demo.Two"]
+    assert spawned["command"] == [
+        "/bin/lake", "build", "Demo.One", "Demo.Two"
+    ]
     kwargs = spawned["kwargs"]
     assert isinstance(kwargs, dict)
     assert kwargs["start_new_session"] is True
@@ -52,6 +54,34 @@ def test_run_lake_build_starts_isolated_group_and_logs_status(
     assert "build: starting lake build" in status
     assert "2 explicit target(s): Demo.One, Demo.Two" in status
     assert "timeout 17s" in status
+
+
+def test_run_lake_build_finds_elan_shim_when_service_path_omits_it(
+    monkeypatch, tmp_path,
+):
+    home = tmp_path / "home"
+    lake = home / ".elan" / "bin" / "lake"
+    lake.parent.mkdir(parents=True)
+    lake.write_text("#!/bin/sh\n")
+    lake.chmod(0o755)
+    spawned: dict[str, object] = {}
+
+    monkeypatch.setattr(post_pipeline.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        post_pipeline.Path, "home", classmethod(lambda cls: home)
+    )
+    monkeypatch.setattr(
+        post_pipeline.subprocess,
+        "Popen",
+        lambda command, **kwargs: (
+            spawned.update(command=command, kwargs=kwargs) or _FinishedBuild()
+        ),
+    )
+
+    result = post_pipeline.run_lake_build(tmp_path, timeout=17)
+
+    assert result.ok is True
+    assert spawned["command"] == [str(lake), "build"]
 
 
 class _StubbornBuild:

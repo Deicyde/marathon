@@ -1168,3 +1168,122 @@ def test_reap_finished_passes_expected_recovery_id_to_daemon(
     assert captured["issue"] == ISSUE
     assert captured["expected_recovery_id"] == RECOVERY_ID
     assert captured["expected_verdict_ts"] == job.expected_verdict_ts
+
+
+def test_failed_retry_build_does_not_claim_stall_after_recovery_cas_loses(
+    tmp_path, monkeypatch, capsys,
+):
+    cfg = make_cfg(tmp_path)
+    queued = _queue_recovery(cfg, review_state.RECOVERY_RETRY_BUILD)
+    replacement_id = "replacement-recovery-operation-31"
+    replacement = review_state.request_recovery_if_current(
+        cfg,
+        ISSUE,
+        expected_status="rejected",
+        expected_verdict_ts=queued.verdict_ts,
+        expected_recovery_id=RECOVERY_ID,
+        recovery_id=replacement_id,
+        recovery_mode=review_state.RECOVERY_RETRY_BUILD,
+        recovery_pr=277,
+        recovery_branch=BRANCH,
+        recovery_head_sha=HEAD,
+        recovery_base=BASE,
+    )
+    assert replacement is not None
+
+    worktree = tmp_path / "wt-i31-stale-build"
+    worktree.mkdir()
+
+    class Failed:
+        def poll(self):
+            return 9
+
+    job = conductor.ConductorJob(
+        issue_num=ISSUE,
+        chapter=CHAPTER,
+        target="Demo/Chapter15",
+        worktree=str(worktree),
+        workdir=str(tmp_path / "wd-i31-stale-build"),
+        branch=BRANCH,
+        status="running",
+        pgid=4310,
+        expected_verdict_ts=queued.verdict_ts,
+        expected_recovery_id=RECOVERY_ID,
+        recovery_mode=review_state.RECOVERY_RETRY_BUILD,
+        proc=Failed(),
+    )
+    removed: list[Path] = []
+    monkeypatch.setattr(conductor, "_process_group_alive", lambda pgid: False)
+    monkeypatch.setattr(conductor, "_refresh_job_runtime", lambda job: None)
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda repo, path: removed.append(path),
+    )
+
+    reaped = conductor._reap_finished(
+        cfg, [job], {}, {}, max_attempts=3, reconcile=False
+    )
+
+    current = review_state.load_state(cfg).issues[ISSUE]
+    assert reaped == 1
+    assert job.status == "superseded"
+    assert current.status == "rejected"
+    assert current.recovery_id == replacement_id
+    assert removed == [worktree]
+    output = capsys.readouterr().out
+    assert "superseded by newer review state" in output
+    assert "parked for the next explicit recovery choice" not in output
+
+
+def test_superseded_recovery_worktree_is_not_adopted_after_restart(
+    tmp_path, monkeypatch,
+):
+    cfg = make_cfg(tmp_path)
+    queued = _queue_recovery(cfg, review_state.RECOVERY_RETRY_BUILD)
+    replacement_id = "replacement-recovery-operation-31"
+    replacement = review_state.request_recovery_if_current(
+        cfg,
+        ISSUE,
+        expected_status="rejected",
+        expected_verdict_ts=queued.verdict_ts,
+        expected_recovery_id=RECOVERY_ID,
+        recovery_id=replacement_id,
+        recovery_mode=review_state.RECOVERY_RETRY_BUILD,
+        recovery_pr=277,
+        recovery_branch=BRANCH,
+        recovery_head_sha=HEAD,
+        recovery_base=BASE,
+    )
+    assert replacement is not None
+
+    runs = tmp_path / "runs"
+    worktree = runs / "wt-i31-superseded"
+    workdir = runs / "wd-i31-superseded"
+    worktree.mkdir(parents=True)
+    workdir.mkdir(parents=True)
+    conductor.write_jobs_snapshot(
+        cfg.repo_dir,
+        [
+            conductor.ConductorJob(
+                issue_num=ISSUE,
+                chapter=CHAPTER,
+                target="Demo/Chapter15",
+                worktree=str(worktree),
+                workdir=str(workdir),
+                branch=BRANCH,
+                status="superseded",
+                expected_verdict_ts=queued.verdict_ts,
+                expected_recovery_id=RECOVERY_ID,
+                recovery_mode=review_state.RECOVERY_RETRY_BUILD,
+            )
+        ],
+        concurrency=1,
+    )
+    monkeypatch.setattr(conductor, "_worktree_live_pid", lambda _path: None)
+
+    recovered = conductor._recover_retry_worktrees(
+        cfg, runs, busy_issues=set()
+    )
+
+    assert recovered == {}

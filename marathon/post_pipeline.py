@@ -395,6 +395,29 @@ def _summarize_build_log(stdout: str, stderr: str) -> str:
     return summary
 
 
+def find_lake_executable() -> Optional[str]:
+    """Return an executable ``lake`` even under a GUI service's reduced PATH.
+
+    macOS launch services commonly omit ``~/.elan/bin`` even when Lean is
+    installed normally for the current user. Prefer the inherited PATH, then
+    fall back to elan's conventional shim without mutating the process-wide
+    environment. Returning the absolute fallback path is important: merely
+    discovering it and later spawning ``"lake"`` would still fail under the
+    same reduced PATH.
+    """
+
+    found = shutil.which("lake")
+    if found:
+        return found
+    try:
+        candidate = Path.home() / ".elan" / "bin" / "lake"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    except (OSError, RuntimeError):
+        pass
+    return None
+
+
 def run_lake_build(
     repo_dir: Path, timeout: int, targets: Optional[list[str]] = None
 ) -> BuildResult:
@@ -409,8 +432,11 @@ def run_lake_build(
     only compiles the default target's import closure, so a refine that edits
     a leaf file nothing in that closure imports would never get compiled and
     would be wrongly tagged ``[build:OK]`` at rc=0."""
-    if not shutil.which("lake"):
-        return BuildResult(skipped_reason="lake CLI not on PATH")
+    lake = find_lake_executable()
+    if lake is None:
+        return BuildResult(
+            skipped_reason="lake CLI not found on PATH or in ~/.elan/bin"
+        )
 
     selected_targets = targets or []
     if selected_targets:
@@ -430,7 +456,7 @@ def run_lake_build(
     # compiler children; killing only the direct ``lake`` process on a timeout
     # leaves those children orphaned and still writing artifacts.
     proc = subprocess.Popen(
-        ["lake", "build", *selected_targets],
+        [lake, "build", *selected_targets],
         cwd=str(repo_dir),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

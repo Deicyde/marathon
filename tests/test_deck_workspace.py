@@ -579,8 +579,11 @@ def test_batch_store_is_atomic_and_rejects_duplicate_targets(tmp_path, monkeypat
         {"issue": 23, "decl": "Demo.Chapter14.Bar", "verdict": "defer"},
     ])
     assert len(stored) == 2
-    assert issue_verdicts(cfg, 22)["Demo.Chapter14.Foo"]["verdict"] == "verify"
-    assert issue_verdicts(cfg, 23)["Demo.Chapter14.Bar"]["verdict"] == "defer"
+    foo = issue_verdicts(cfg, 22)["Demo.Chapter14.Foo"]
+    bar = issue_verdicts(cfg, 23)["Demo.Chapter14.Bar"]
+    assert foo["verdict"] == "verify"
+    assert bar["verdict"] == "defer"
+    assert len(foo["fingerprint"]) == len(bar["fingerprint"]) == 64
 
     before = json.loads((cfg.review_dir / "deck-subdecks.json").read_text())
     with pytest.raises(ValueError, match="duplicate declaration target"):
@@ -626,6 +629,12 @@ def test_workspace_routes_and_batch_dependency_guard(tmp_path, monkeypatch):
     try:
         status, workspace = _get(base + "/api/review-workspace?chapter=14")
         assert status == 200 and workspace["chapter"] == 14
+        bar_target = next(
+            target
+            for file in workspace["files"]
+            for target in file["declarations"]
+            if target["name"] == "Demo.Chapter14.Bar"
+        )
         status, source = _get(
             base + "/api/review-source?path=Demo%2FChapter14.lean"
         )
@@ -659,10 +668,14 @@ def test_workspace_routes_and_batch_dependency_guard(tmp_path, monkeypatch):
             base + "/api/batch-decl-verdict",
             {"items": [{
                 "issue": 23, "decl": "Demo.Chapter14.Bar", "verdict": "defer",
+                "decl_fingerprint": bar_target["context_fingerprint"],
             }]},
             server.token,
         )
         assert status == 200 and payload["count"] == 1
+        stored = issue_verdicts(cfg, 23)["Demo.Chapter14.Bar"]
+        assert len(stored["fingerprint"]) == 64
+        assert stored["fingerprint_version"] == 2
     finally:
         server.shutdown()
         server.server_close()

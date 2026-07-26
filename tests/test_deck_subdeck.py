@@ -160,6 +160,15 @@ def make_bundle_cfg(tmp_path, monkeypatch, *, issue=22):
     return cfg
 
 
+def install_inspectable_bundle(cfg):
+    """Replace the deliberately mixed-tier bundle with an all-T1 surface."""
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="def", type_pp="Nat", value_pp="0"),
+        _decl("Demo.Chapter14.Bar", kind="def", type_pp="Int", value_pp="1"),
+        _decl("Demo.Chapter14.Baz", kind="theorem", type_pp="Foo = Foo"),
+    ]))
+
+
 # ---------------------------------------------------------------------------
 # Per-(issue,decl) verdict store
 # ---------------------------------------------------------------------------
@@ -567,9 +576,9 @@ def test_ship_refuses_a_changed_review_surface(tmp_path, monkeypatch):
         )
     reviewed = subdeck.build_subdeck(cfg, 22)
     assert len(reviewed["review_token"]) == 64
-    # Human decisions are bound separately and do not invalidate the source /
-    # issue surface token captured when the subdeck was opened.
-    assert reviewed["review_token"] == opened["review_token"]
+    # The irreversible token binds the visible decisions as well as the source:
+    # a stale tab must not ship choices made later in another tab.
+    assert reviewed["review_token"] != opened["review_token"]
     changed = json.loads(json.dumps(reviewed))
     changed["cards"][0]["source_block"] = "-- Aristotle changed this"
     assert subdeck.subdeck_review_token(changed) != reviewed["review_token"]
@@ -581,6 +590,79 @@ def test_ship_refuses_a_changed_review_surface(tmp_path, monkeypatch):
     assert out["ok"] is False
     assert "changed" in out["reason"].lower()
     assert calls == {}
+
+
+def test_stale_tab_cannot_ship_another_tabs_changed_decisions(
+    tmp_path, monkeypatch,
+):
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    calls = patch_no_verdict_handlers(monkeypatch)
+    for decl in ("Foo", "Bar", "Baz"):
+        subdeck.record_decl_verdict(
+            cfg, 22, f"Demo.Chapter14.{decl}", "verify"
+        )
+    tab_a = subdeck.build_subdeck(cfg, 22)
+    assert tab_a["complete"] is True
+    assert not tab_a["summary"]["rejected"]
+
+    # Another tab changes the exact summary after tab A rendered its confirm UI.
+    subdeck.record_decl_verdict(
+        cfg,
+        22,
+        "Demo.Chapter14.Bar",
+        "reject",
+        note="the statement is too weak",
+    )
+    tab_b = subdeck.build_subdeck(cfg, 22)
+    assert tab_b["review_token"] != tab_a["review_token"]
+    assert tab_b["summary"]["rejected"] == [{
+        "name": "Demo.Chapter14.Bar",
+        "note": "the statement is too weak",
+    }]
+
+    out = subdeck.ship_issue(
+        cfg, 22, expected_review_token=tab_a["review_token"]
+    )
+
+    assert out["ok"] is False
+    assert "changed" in out["reason"].lower()
+    assert calls == {}
+
+
+def test_ship_receipt_only_suppresses_its_bound_review_generation(
+    tmp_path, monkeypatch,
+):
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    old_token = "a" * 64
+    new_token = "b" * 64
+    subdeck._save_ship_receipt(
+        cfg,
+        22,
+        {"ok": True, "outcome": "shipped", "message": "old round"},
+        review_token=old_token,
+    )
+    calls = []
+
+    def fresh_attempt(
+        _cfg, issue_num, *, skip_api=False, expected_review_token=None
+    ):
+        calls.append((issue_num, skip_api, expected_review_token))
+        return {"ok": False, "reason": "fresh generation checked"}
+
+    monkeypatch.setattr(subdeck, "_ship_issue_once", fresh_attempt)
+
+    same = subdeck.ship_issue(
+        cfg, 22, expected_review_token=old_token
+    )
+    assert same["ok"] is True
+    assert same["duplicate"] is True
+    assert calls == []
+
+    newer = subdeck.ship_issue(
+        cfg, 22, expected_review_token=new_token
+    )
+    assert newer == {"ok": False, "reason": "fresh generation checked"}
+    assert calls == [(22, False, new_token)]
 
 
 def test_ship_partial_reject_stops_before_later_declarations(tmp_path, monkeypatch):
@@ -890,6 +972,7 @@ def test_get_subdeck_is_pure_no_verdict(running_server, monkeypatch):
 
 def test_decl_verdict_endpoint_records_locally(running_server, monkeypatch):
     server, base, token, cfg = running_server
+    install_inspectable_bundle(cfg)
     # A decl-verdict must NEVER route to the committed handlers.
     from marathon.review import review as review_mod
 
@@ -901,9 +984,20 @@ def test_decl_verdict_endpoint_records_locally(running_server, monkeypatch):
         review_mod, "cmd_reject",
         lambda args: pytest.fail("decl-verdict must not reject"),
     )
+    status, opened = _get(base + "/api/subdeck/22")
+    assert status == 200
+    foo = next(
+        card for card in json.loads(opened)["cards"]
+        if card["name"] == "Demo.Chapter14.Foo"
+    )
     status, body = _post(
         base + "/api/decl-verdict",
-        {"issue": 22, "decl": "Demo.Chapter14.Foo", "verdict": "verify"},
+        {
+            "issue": 22,
+            "decl": "Demo.Chapter14.Foo",
+            "verdict": "verify",
+            "decl_fingerprint": foo["context_fingerprint"],
+        },
         headers={deck_server.TOKEN_HEADER: token},
     )
     assert status == 200
@@ -914,8 +1008,193 @@ def test_decl_verdict_endpoint_records_locally(running_server, monkeypatch):
     assert payload["next_decl"] is not None
     assert payload["next_decl"]["verdict"] is None
     # Recorded to the LOCAL sidecar.
-    assert subdeck.issue_verdicts(cfg, 22)["Demo.Chapter14.Foo"]["verdict"] \
-        == "verify"
+    stored = subdeck.issue_verdicts(cfg, 22)["Demo.Chapter14.Foo"]
+    assert stored["verdict"] == "verify"
+    assert len(stored["fingerprint"]) == 64
+    assert stored["fingerprint_version"] == 2
+
+
+def test_decl_verdict_reuses_one_authoritative_source_surface(
+    running_server, monkeypatch
+):
+    _server, base, token, cfg = running_server
+    install_inspectable_bundle(cfg)
+    status, raw = _get(base + "/api/subdeck/22")
+    assert status == 200
+    foo = next(
+        card for card in json.loads(raw)["cards"]
+        if card["name"] == "Demo.Chapter14.Foo"
+    )
+
+    real_load = subdeck._load_subdeck_inputs
+    calls = 0
+
+    def counted_load(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(subdeck, "_load_subdeck_inputs", counted_load)
+    status, _body = _post(
+        base + "/api/decl-verdict",
+        {
+            "issue": 22,
+            "decl": foo["name"],
+            "verdict": "verify",
+            "decl_fingerprint": foo["context_fingerprint"],
+        },
+        headers={deck_server.TOKEN_HEADER: token},
+    )
+
+    assert status == 200
+    assert calls == 1
+
+
+def test_decl_verdict_endpoint_rejects_stale_card_fingerprint(
+    running_server,
+):
+    _server, base, token, cfg = running_server
+    status, raw = _get(base + "/api/subdeck/22")
+    assert status == 200
+    current = json.loads(raw)
+    foo = next(
+        card for card in current["cards"]
+        if card["name"] == "Demo.Chapter14.Foo"
+    )
+    assert len(foo["context_fingerprint"]) == 64
+
+    status, body = _post(
+        base + "/api/decl-verdict",
+        {
+            "issue": 22,
+            "decl": foo["name"],
+            "verdict": "verify",
+            "decl_fingerprint": "0" * 64,
+        },
+        headers={deck_server.TOKEN_HEADER: token},
+    )
+
+    assert status == 409
+    assert "changed" in json.loads(body)["error"].lower()
+    assert subdeck.issue_verdicts(cfg, 22) == {}
+
+
+def test_decl_verdict_endpoint_requires_shown_context_and_inspectable_issue(
+    running_server,
+):
+    _server, base, token, cfg = running_server
+    status, raw = _get(base + "/api/subdeck/22")
+    assert status == 200
+    payload = json.loads(raw)
+    assert payload["inspectable"] is False
+    foo = next(
+        card for card in payload["cards"]
+        if card["name"] == "Demo.Chapter14.Foo"
+    )
+
+    status, body = _post(
+        base + "/api/decl-verdict",
+        {"issue": 22, "decl": foo["name"], "verdict": "verify"},
+        headers={deck_server.TOKEN_HEADER: token},
+    )
+    assert status == 409
+    assert "context" in json.loads(body)["error"].lower()
+
+    status, body = _post(
+        base + "/api/decl-verdict",
+        {
+            "issue": 22,
+            "decl": foo["name"],
+            "verdict": "verify",
+            "decl_fingerprint": foo["context_fingerprint"],
+        },
+        headers={deck_server.TOKEN_HEADER: token},
+    )
+    assert status == 409
+    assert "tier t0" in json.loads(body)["error"].lower()
+    assert subdeck.issue_verdicts(cfg, 22) == {}
+
+
+def test_informal_verdict_remains_a_non_declaration_local_slot(
+    running_server, monkeypatch,
+):
+    _server, base, token, cfg = running_server
+    patch_bulk(monkeypatch, {
+        22: {
+            "title": "#22 bundle",
+            "state": "OPEN",
+            "labels": set(),
+            "body": _bundle_body("Foo", "Bar", "Baz") + """
+
+### Informal Statement
+
+*⚠️ LLM-rendered from common knowledge; verification pending.*
+
+> The bundled result has the stated three parts.
+""",
+        },
+    })
+    status, raw = _get(base + "/api/subdeck/22")
+    assert status == 200
+    informal = json.loads(raw)["informal"]
+    status, body = _post(
+        base + "/api/decl-verdict",
+        {
+            "issue": 22,
+            "decl": subdeck.INFORMAL_KEY,
+            "verdict": "verify",
+            "decl_fingerprint": informal["context_fingerprint"],
+        },
+        headers={deck_server.TOKEN_HEADER: token},
+    )
+
+    assert status == 200
+    assert json.loads(body)["ok"] is True
+    stored = subdeck.issue_verdicts(cfg, 22)[subdeck.INFORMAL_KEY]
+    assert stored["verdict"] == "verify"
+    assert stored["fingerprint"] == informal["context_fingerprint"]
+
+
+def test_decl_lock_endpoint_binds_and_checks_context_fingerprint(
+    running_server,
+):
+    _server, base, token, cfg = running_server
+    install_inspectable_bundle(cfg)
+    status, raw = _get(base + "/api/subdeck/22")
+    assert status == 200
+    foo = next(
+        card for card in json.loads(raw)["cards"]
+        if card["name"] == "Demo.Chapter14.Foo"
+    )
+
+    status, _body = _post(
+        base + "/api/decl-lock",
+        {
+            "issue": 22,
+            "decl": foo["name"],
+            "locked": True,
+            "decl_fingerprint": "f" * 64,
+        },
+        headers={deck_server.TOKEN_HEADER: token},
+    )
+    assert status == 409
+    assert subdeck.issue_verdicts(cfg, 22) == {}
+
+    status, body = _post(
+        base + "/api/decl-lock",
+        {
+            "issue": 22,
+            "decl": foo["name"],
+            "locked": True,
+            "decl_fingerprint": foo["context_fingerprint"],
+        },
+        headers={deck_server.TOKEN_HEADER: token},
+    )
+    assert status == 200
+    assert json.loads(body)["locked"] is True
+    stored = subdeck.issue_verdicts(cfg, 22)[foo["name"]]
+    assert stored["locked"] is True
+    assert stored["fingerprint"] == foo["context_fingerprint"]
 
 
 def test_run_detail_is_a_pure_get(running_server):
@@ -975,9 +1254,20 @@ def test_missing_endpoint_records_locally_and_needs_token(running_server, monkey
 
 def test_decl_verdict_reject_without_note_is_400(running_server):
     _server, base, token, _cfg = running_server
+    status, raw = _get(base + "/api/subdeck/22")
+    assert status == 200
+    bar = next(
+        card for card in json.loads(raw)["cards"]
+        if card["name"] == "Demo.Chapter14.Bar"
+    )
     status, _ = _post(
         base + "/api/decl-verdict",
-        {"issue": 22, "decl": "Demo.Chapter14.Bar", "verdict": "reject"},
+        {
+            "issue": 22,
+            "decl": "Demo.Chapter14.Bar",
+            "verdict": "reject",
+            "decl_fingerprint": bar["context_fingerprint"],
+        },
         headers={deck_server.TOKEN_HEADER: token},
     )
     assert status == 400
@@ -1001,14 +1291,32 @@ def test_ship_endpoint_requires_token(running_server):
     assert status == 403
 
 
+def test_ship_endpoint_requires_exact_review_context(running_server):
+    _server, base, token, _cfg = running_server
+    status, body = _post(
+        base + "/api/ship",
+        {"issue": 22},
+        headers={deck_server.TOKEN_HEADER: token},
+    )
+    assert status == 409
+    assert "review context" in json.loads(body)["error"].lower()
+
+
 def test_ship_endpoint_routes_through_verdict_path(running_server, monkeypatch):
     server, base, token, cfg = running_server
     calls = patch_no_verdict_handlers(monkeypatch)
+    # This fixture deliberately contains a T0 declaration to exercise subdeck
+    # rendering. This test targets verdict routing, so isolate it from the
+    # independently-tested authoritative machine gate.
+    server.ship_jobs._readiness_checker = lambda _cfg, _issue: {
+        "shippable": True
+    }
     for d in ("Foo", "Bar", "Baz"):
         subdeck.record_decl_verdict(cfg, 22, f"Demo.Chapter14.{d}", "verify")
+    review_token = subdeck.build_subdeck(cfg, 22)["review_token"]
 
     status, body = _post(
-        base + "/api/ship", {"issue": 22},
+        base + "/api/ship", {"issue": 22, "review_token": review_token},
         headers={deck_server.TOKEN_HEADER: token},
     )
     assert status == 202
@@ -1023,15 +1331,19 @@ def test_ship_endpoint_routes_through_verdict_path(running_server, monkeypatch):
 
 
 def test_ship_endpoint_accepts_partial_reject(running_server, monkeypatch):
-    _server, base, token, cfg = running_server
+    server, base, token, cfg = running_server
     calls = patch_no_verdict_handlers(monkeypatch)
+    server.ship_jobs._readiness_checker = lambda _cfg, _issue: {
+        "shippable": True
+    }
     subdeck.record_decl_verdict(cfg, 22, "Demo.Chapter14.Foo", "verify")
     subdeck.record_decl_verdict(
         cfg, 22, "Demo.Chapter14.Bar", "reject", note="repair the upstream def"
     )
+    review_token = subdeck.build_subdeck(cfg, 22)["review_token"]
 
     status, body = _post(
-        base + "/api/ship", {"issue": 22},
+        base + "/api/ship", {"issue": 22, "review_token": review_token},
         headers={deck_server.TOKEN_HEADER: token},
     )
 
@@ -1045,10 +1357,14 @@ def test_ship_endpoint_accepts_partial_reject(running_server, monkeypatch):
 def test_ship_endpoint_incomplete_returns_ok_false(running_server, monkeypatch):
     server, base, token, cfg = running_server
     calls = patch_no_verdict_handlers(monkeypatch)
+    server.ship_jobs._readiness_checker = lambda _cfg, _issue: {
+        "shippable": True
+    }
     subdeck.record_decl_verdict(cfg, 22, "Demo.Chapter14.Foo", "verify")
+    review_token = subdeck.build_subdeck(cfg, 22)["review_token"]
 
     status, body = _post(
-        base + "/api/ship", {"issue": 22},
+        base + "/api/ship", {"issue": 22, "review_token": review_token},
         headers={deck_server.TOKEN_HEADER: token},
     )
     assert status == 202  # durably accepted; worker then reports refusal
@@ -1117,6 +1433,7 @@ def test_carried_verdict_reopens_when_only_upstream_kernel_value_changes(
     subdeck._save_store(cfg, {"22": {result["name"]: {
         "verdict": "verify", "note": None, "ts": "t",
         "fingerprint": subdeck._decl_fingerprint(result),
+        "fingerprint_version": 2,
     }}})
 
     # Result's own source/type is unchanged; only an upstream definition's
@@ -1129,17 +1446,99 @@ def test_carried_verdict_reopens_when_only_upstream_kernel_value_changes(
     assert reopened["carried_over"] is False
 
 
-def test_persist_kept_verdicts_keeps_verified_drops_rejected(tmp_path, monkeypatch):
+def test_current_session_verdict_reopens_when_dependency_context_changes(
+    tmp_path, monkeypatch
+):
+    cfg = make_cfg(tmp_path)
+
+    def snapshot(upstream_value):
+        return make_snapshot([
+            _decl(
+                "Demo.Chapter14.Upstream", kind="def", type_pp="Nat",
+                value_pp=upstream_value,
+            ),
+            _decl(
+                "Demo.Chapter14.Result", type_pp="Upstream = Upstream",
+                cone=["Demo.Chapter14.Upstream"],
+            ),
+        ])
+
+    patch_bulk(monkeypatch, {
+        22: {
+            "title": "#22 live context", "state": "OPEN",
+            "body": _bundle_body("Upstream", "Result"), "labels": set(),
+        },
+    })
+    install_snapshot(cfg, snapshot("0"))
+    stored = subdeck.record_decl_verdict(
+        cfg, 22, "Demo.Chapter14.Result", "verify"
+    )
+    assert len(stored["fingerprint"]) == 64
+    assert stored["fingerprint_version"] == 2
+
+    install_snapshot(cfg, snapshot("1"))
+    refreshed = subdeck.build_subdeck(cfg, 22)
+    result = next(
+        card for card in refreshed["cards"]
+        if card["name"] == "Demo.Chapter14.Result"
+    )
+    assert result["verdict"] is None
+    assert result["changed_since_review"] is True
+    assert "Demo.Chapter14.Result" not in refreshed["summary"]["kept"]
+
+
+def test_legacy_unbound_declaration_verdict_is_invalidated(
+    tmp_path, monkeypatch
+):
     cfg = make_bundle_cfg(tmp_path, monkeypatch)
     subdeck._save_store(cfg, {"22": {
-        "Demo.Chapter14.Foo": {"verdict": "verify", "note": None, "ts": "t"},
-        "Demo.Chapter14.Bar": {"verdict": "reject", "note": "fix", "ts": "t"},
-        subdeck.INFORMAL_KEY: {"verdict": "verify", "note": None, "ts": "t"},
+        "Demo.Chapter14.Foo": {
+            "verdict": "verify", "note": None, "ts": "legacy",
+        },
     }})
-    sd = {"cards": [
-        {"name": "Demo.Chapter14.Foo", "source_block": "def Foo := 0"},
-        {"name": "Demo.Chapter14.Bar", "source_block": "def Bar := 1"},
-    ]}
+
+    current = subdeck.build_subdeck(cfg, 22)
+    foo = next(
+        card for card in current["cards"]
+        if card["name"] == "Demo.Chapter14.Foo"
+    )
+    assert foo["verdict"] is None
+    assert foo["changed_since_review"] is True
+
+
+def test_persist_kept_verdicts_keeps_verified_drops_rejected(tmp_path, monkeypatch):
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    informal_statement = "The exact informal statement."
+    informal_fingerprint = subdeck._informal_fingerprint(
+        informal_statement, True
+    )
+    subdeck._save_store(cfg, {"22": {
+        "Demo.Chapter14.Foo": {
+            "verdict": "verify",
+            "note": None,
+            "ts": "t",
+            "locked": True,
+        },
+        "Demo.Chapter14.Bar": {"verdict": "reject", "note": "fix", "ts": "t"},
+        subdeck.INFORMAL_KEY: {
+            "verdict": "verify",
+            "note": None,
+            "ts": "t",
+            "fingerprint": informal_fingerprint,
+        },
+    }})
+    sd = {
+        "cards": [
+            {"name": "Demo.Chapter14.Foo", "source_block": "def Foo := 0"},
+            {"name": "Demo.Chapter14.Bar", "source_block": "def Bar := 1"},
+        ],
+        "informal": {
+            "statement": informal_statement,
+            "is_llm": True,
+            "verdict": "verified",
+            "context_fingerprint": informal_fingerprint,
+        },
+    }
     carried = subdeck._persist_kept_verdicts(cfg, 22, sd, ["Demo.Chapter14.Foo"])
 
     assert carried == ["Demo.Chapter14.Foo"]
@@ -1149,7 +1548,8 @@ def test_persist_kept_verdicts_keeps_verified_drops_rejected(tmp_path, monkeypat
     assert store["Demo.Chapter14.Foo"]["fingerprint"] == subdeck._decl_fingerprint(
         sd["cards"][0]
     )
-    assert subdeck.INFORMAL_KEY in store                   # informal kept
+    assert store["Demo.Chapter14.Foo"]["locked"] is True
+    assert subdeck.INFORMAL_KEY in store                   # exact prose kept
 
 
 def test_carried_over_verdict_stands_when_source_unchanged(tmp_path, monkeypatch):
@@ -1158,9 +1558,11 @@ def test_carried_over_verdict_stands_when_source_unchanged(tmp_path, monkeypatch
     foo = next(c for c in sd["cards"] if c["name"] == "Demo.Chapter14.Foo")
     # craft a persisted verdict pinned to Foo's CURRENT source → unchanged
     subdeck._save_store(cfg, {"22": {"Demo.Chapter14.Foo": {
-        "verdict": "verify", "note": None, "ts": "t",
-        "fingerprint": subdeck._decl_fingerprint(foo),
-    }}})
+            "verdict": "verify", "note": None, "ts": "t",
+            "fingerprint": subdeck._decl_fingerprint(foo),
+            "fingerprint_version": 2,
+            "carried_over": True,
+        }}})
 
     sd2 = subdeck.build_subdeck(cfg, 22)
     foo2 = next(c for c in sd2["cards"] if c["name"] == "Demo.Chapter14.Foo")

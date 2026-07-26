@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
+from urllib.parse import urlencode
 
 if TYPE_CHECKING:  # pragma: no cover - type-only imports
     from marathon.review.config import ReviewConfig
@@ -216,7 +217,37 @@ def _redact(value, secret: Optional[str]):
     return value
 
 
-def _public_snapshot(record: dict, *, interrupted: bool = False) -> dict:
+def _request_ids(record: dict) -> list[str]:
+    """Normalized click identifiers accepted into one review generation."""
+    raw = record.get("request_ids")
+    values = raw if isinstance(raw, list) else []
+    legacy = record.get("request_id")
+    if isinstance(legacy, str):
+        values = [legacy, *values]
+    return list(dict.fromkeys(
+        value for value in values if isinstance(value, str) and value
+    ))
+
+
+def _with_request_id(record: dict, request_id: Optional[str]) -> tuple[dict, bool]:
+    """Return ``record`` with ``request_id`` durably aliased to this job."""
+    if request_id is None:
+        return record, False
+    ids = _request_ids(record)
+    if request_id in ids and record.get("request_ids") == ids:
+        return record, False
+    out = dict(record)
+    out["request_ids"] = [*ids, request_id] if request_id not in ids else ids
+    out["updated_at"] = _now()
+    return out, True
+
+
+def _public_snapshot(
+    record: dict,
+    *,
+    interrupted: bool = False,
+    request_id: Optional[str] = None,
+) -> dict:
     out = dict(record)
     # An OAuth credential is never part of a record.  Keep this defensive
     # filter so even a malformed old/manual record cannot echo one to a client.
@@ -229,11 +260,19 @@ def _public_snapshot(record: dict, *, interrupted: bool = False) -> dict:
             "The deck restarted while this review was being published. "
             "Press “Ship to Aristotle” again to safely resume it."
         )
+    # The full alias list is orchestration detail. Echo only the identifier this
+    # caller supplied so the browser can persist an exact lost-response lookup.
+    out.pop("request_ids", None)
+    if request_id is not None:
+        out["request_id"] = request_id
     out["ok"] = True
-    out["status_url"] = (
-        f"/api/ship-status?issue={out['issue']}"
-        f"&operation_id={out['operation_id']}"
-    )
+    query = {
+        "issue": out["issue"],
+        "operation_id": out["operation_id"],
+    }
+    if request_id is not None:
+        query["request_id"] = request_id
+    out["status_url"] = "/api/ship-status?" + urlencode(query)
     return out
 
 
@@ -248,12 +287,26 @@ class ShipJobRegistry:
         self,
         runner: Optional[Callable[..., dict]] = None,
         thread_factory: Callable[..., threading.Thread] = threading.Thread,
+        readiness_checker: Optional[Callable[["ReviewConfig", int], dict]] = None,
+        acceptance_checker: Optional[
+            Callable[["ReviewConfig", int], Optional[dict]]
+        ] = None,
     ) -> None:
+        using_default_runner = runner is None
         if runner is None:
             from marathon.deck.subdeck import ship_issue
 
             runner = ship_issue
+        if readiness_checker is None and using_default_runner:
+            from marathon.deck.cards import issue_reviewability
+
+            readiness_checker = issue_reviewability
         self._runner = runner
+        self._readiness_checker = readiness_checker
+        # Acceptance checks must be cache/local-only. The fresh checker may
+        # query GitHub/audit state and therefore belongs exclusively in the
+        # background worker, preserving the fast 202 contract.
+        self._acceptance_checker = acceptance_checker
         self._thread_factory = thread_factory
         self._lock = threading.Lock()
         # repo + issue is the single-flight key.  Persisted state is authoritative
@@ -271,6 +324,7 @@ class ShipJobRegistry:
         *,
         skip_api: bool = False,
         review_token: Optional[str] = None,
+        request_id: Optional[str] = None,
         actor_token: Optional[str] = None,
         on_complete: Optional[Callable[[], None]] = None,
     ) -> dict:
@@ -299,7 +353,16 @@ class ShipJobRegistry:
                             "Skip easy API declarations setting. Wait for that "
                             "job to finish, then review the result."
                         )
-                    return _public_snapshot(record)
+                    if record.get("review_token") != review_token:
+                        raise ShipJobConflict(
+                            "This issue is already shipping a different review "
+                            "generation. Wait for that job to finish before "
+                            "shipping the newer review."
+                        )
+                    record, changed = _with_request_id(record, request_id)
+                    if changed:
+                        _atomic_write(path, record)
+                    return _public_snapshot(record, request_id=request_id)
             elif live is not None:
                 self._live.pop(key, None)
 
@@ -318,13 +381,47 @@ class ShipJobRegistry:
                     "This issue is already shipping with a different "
                     "Skip easy API declarations setting."
                 )
-            return _public_snapshot(external)
+            if external.get("review_token") != review_token:
+                raise ShipJobConflict(
+                    "This issue is already shipping a different review "
+                    "generation."
+                )
+            coalesced = False
+            with _record_lock(path):
+                current = _load(path)
+                if (
+                    current is not None
+                    and current.get("operation_id")
+                    == external.get("operation_id")
+                    and current.get("attempt_id") == external.get("attempt_id")
+                ):
+                    current, changed = _with_request_id(current, request_id)
+                    if changed:
+                        _atomic_write(path, current)
+                    external = current
+                    coalesced = True
+            if coalesced:
+                return _public_snapshot(external, request_id=request_id)
 
         # Capture the human-review generation under the SAME per-issue lock
         # used by declaration/missing/lock mutations and ship_issue itself.
         from marathon.deck.subdeck import _issue_operation_lock
 
         with _issue_operation_lock(cfg, issue_num):
+            if self._acceptance_checker is not None:
+                readiness = self._acceptance_checker(cfg, issue_num)
+            else:
+                readiness = None
+            if readiness is not None:
+                if not readiness.get("shippable"):
+                    reason = (
+                        readiness.get("blocked_reason")
+                        or "the issue is not currently ready to ship"
+                    )
+                    raise ShipJobConflict(
+                        f"Issue #{issue_num} may be reviewed provisionally but "
+                        f"cannot be shipped yet: {reason}"
+                    )
             operation_id = _generation_id(
                 cfg,
                 issue_num,
@@ -345,7 +442,14 @@ class ShipJobRegistry:
                                 "generation in flight. Wait for it to finish "
                                 "before shipping the newer decisions."
                             )
-                        return _public_snapshot(current)
+                        current, changed = _with_request_id(
+                            current, request_id
+                        )
+                        if changed:
+                            _atomic_write(path, current)
+                        return _public_snapshot(
+                            current, request_id=request_id
+                        )
                 elif live is not None:
                     self._live.pop(key, None)
 
@@ -356,7 +460,14 @@ class ShipJobRegistry:
                         and previous.get("operation_id") == operation_id
                         and previous.get("status") == "succeeded"
                     ):
-                        return _public_snapshot(previous)
+                        previous, changed = _with_request_id(
+                            previous, request_id
+                        )
+                        if changed:
+                            _atomic_write(path, previous)
+                        return _public_snapshot(
+                            previous, request_id=request_id
+                        )
 
                     accepted_at = (
                         previous.get("accepted_at")
@@ -372,6 +483,9 @@ class ShipJobRegistry:
                         "owner_pid": os.getpid(),
                         "skip_api": bool(skip_api),
                         "review_token": review_token,
+                        "request_ids": (
+                            [request_id] if request_id is not None else []
+                        ),
                         "status": "running",
                         "accepted_at": accepted_at,
                         "started_at": _now(),
@@ -389,6 +503,12 @@ class ShipJobRegistry:
                     # while a caller can still coalesce onto this generation.
                     with _issue_operation_lock(cfg, issue_num):
                         try:
+                            if self._readiness_checker is not None:
+                                readiness = self._readiness_checker(
+                                    cfg, issue_num
+                                )
+                            else:
+                                readiness = {"shippable": True}
                             # Revalidate at the irreversible boundary. A review
                             # edited after acceptance is never shipped under a
                             # stale operation id.
@@ -398,7 +518,19 @@ class ShipJobRegistry:
                                 skip_api=skip_api,
                                 review_token=review_token,
                             )
-                            if current_operation != operation_id:
+                            if not readiness.get("shippable"):
+                                result = {
+                                    "ok": False,
+                                    "reason": (
+                                        f"Issue #{issue_num} is no longer ready "
+                                        "to ship. Nothing was published: "
+                                        + str(
+                                            readiness.get("blocked_reason")
+                                            or "its readiness gate changed"
+                                        )
+                                    ),
+                                }
+                            elif current_operation != operation_id:
                                 result = {
                                     "ok": False,
                                     "reason": (
@@ -475,7 +607,18 @@ class ShipJobRegistry:
                                     and current_record.get("attempt_id")
                                     == record["attempt_id"]
                                 ):
-                                    _atomic_write(path, finished)
+                                    # A second tab/click may have coalesced while
+                                    # the worker ran. Preserve every accepted
+                                    # request alias in the terminal snapshot so
+                                    # each lost response can reconcile exactly.
+                                    terminal = dict(finished)
+                                    terminal["request_ids"] = list(dict.fromkeys(
+                                        [
+                                            *_request_ids(record),
+                                            *_request_ids(current_record),
+                                        ]
+                                    ))
+                                    _atomic_write(path, terminal)
                         finally:
                             with self._lock:
                                 current = self._live.get(key)
@@ -515,13 +658,14 @@ class ShipJobRegistry:
                         ):
                             _atomic_write(path, failed)
                     raise
-                return _public_snapshot(record)
+                return _public_snapshot(record, request_id=request_id)
 
     def status(
         self,
         cfg: "ReviewConfig",
         issue_num: int,
         operation_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> Optional[dict]:
         """Return a pure-read job snapshot, or ``None`` for no matching job."""
         path = _job_path(cfg, issue_num)
@@ -532,6 +676,8 @@ class ShipJobRegistry:
         if record is None:
             return None
         if operation_id is not None and record.get("operation_id") != operation_id:
+            return None
+        if request_id is not None and request_id not in _request_ids(record):
             return None
 
         key = self._key(cfg, issue_num)
@@ -557,4 +703,8 @@ class ShipJobRegistry:
             ):
                 record = latest
                 interrupted = record.get("status") == "running"
-        return _public_snapshot(record, interrupted=interrupted)
+        return _public_snapshot(
+            record,
+            interrupted=interrupted,
+            request_id=request_id,
+        )

@@ -45,6 +45,7 @@ carries its issue title/body, so the deck works on an unaudited chapter.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field, replace
@@ -166,6 +167,15 @@ class CardSummary:
     ready: bool
     blocked_reason: Optional[str]
     title: str
+    # ``ready`` remains the backwards-compatible shipping predicate.
+    # ``inspectable`` deliberately ignores unresolved predecessor issues while
+    # preserving every machine-audit/current-code gate, allowing a human to
+    # review downstream work provisionally. ``shippable`` is an explicit alias
+    # for ``ready`` so clients never mistake visibility for permission.
+    inspectable: bool = False
+    shippable: bool = False
+    provisional: bool = False
+    inspection_blocked_reason: Optional[str] = None
 
     def to_json(self) -> dict:
         return {
@@ -177,6 +187,10 @@ class CardSummary:
             "ready": self.ready,
             "blocked_reason": self.blocked_reason,
             "title": self.title,
+            "inspectable": self.inspectable,
+            "shippable": self.shippable,
+            "provisional": self.provisional,
+            "inspection_blocked_reason": self.inspection_blocked_reason,
         }
 
 
@@ -252,6 +266,10 @@ class DeclView:
     # ``surfaced=False`` / ``surfaced_reason=None``.
     surfaced: bool = False
     surfaced_reason: Optional[str] = None
+    # Hash of the complete declaration source, even when ``source_block`` is
+    # truncated for the browser payload.  Review decisions bind this value so
+    # an edit below the rendering limit cannot preserve a stale approval.
+    source_fingerprint: Optional[str] = None
 
     def to_json(self) -> dict:
         return {
@@ -272,6 +290,7 @@ class DeclView:
             "api_reason": self.api_reason,
             "surfaced": self.surfaced,
             "surfaced_reason": self.surfaced_reason,
+            "source_fingerprint": self.source_fingerprint,
         }
 
 
@@ -288,13 +307,25 @@ class CardDetail:
     decl: str  # the headline (worst-tier) decl name — decls[0].name
     title: str  # the issue title (the card's human headline)
     chapter: Optional[int]
-    tier: str  # the WORST tier over all cited decls (the card's gate)
+    tier: str  # the WORST tier over the reconciled current-code review set
     qualifiers: list[str]
+    # Issue-level inspection gate.  Unlike shipping readiness this ignores
+    # unresolved predecessor issues, but still requires current, build-clean,
+    # machine-audited code and an unresolved review-state issue.
+    inspectable: bool
+    inspection_blocked_reason: Optional[str]
+    shippable: bool
+    ship_blocked_reason: Optional[str]
+    provisional: bool
     # Every declaration this issue bundles, each with its own source /
     # kernel / evidence / tier / informal rendering, ordered worst-tier
-    # first. The top-level scalar fields below mirror ``decls[0]`` (the
-    # headline) for backward compatibility / degraded rendering.
+    # first. The top-level scalar fields below mirror the reconciled headline
+    # (which may be surfaced when every body citation went stale).
     decls: list[DeclView]
+    # Current code declarations recovered by the rename/split reconciler.
+    # Kept separate from ``decls`` so older detail consumers can still inspect
+    # body-cited stale names, while subdeck/workspace gates use both sets.
+    surfaced_decls: list[DeclView]
     statement_pp: Optional[str]
     source_block: Optional[str]
     source_file: Optional[str]  # repo-relative path of the .lean file
@@ -323,7 +354,13 @@ class CardDetail:
             "chapter": self.chapter,
             "tier": self.tier,
             "qualifiers": list(self.qualifiers),
+            "inspectable": self.inspectable,
+            "inspection_blocked_reason": self.inspection_blocked_reason,
+            "shippable": self.shippable,
+            "ship_blocked_reason": self.ship_blocked_reason,
+            "provisional": self.provisional,
             "decls": [d.to_json() for d in self.decls],
+            "surfaced_decls": [d.to_json() for d in self.surfaced_decls],
             "statement_pp": self.statement_pp,
             "source_block": self.source_block,
             "source_file": self.source_file,
@@ -338,6 +375,22 @@ class CardDetail:
             "deps": [d.to_json() for d in self.deps],
             "iteration_log": list(self.iteration_log),
         }
+
+
+@dataclass(frozen=True)
+class _ReconciledIssueSurface:
+    """One canonical current-code surface shared by every review view."""
+
+    issue: int
+    cited_names: list[str]
+    cited_views: list[DeclView]
+    surfaced_views: list[DeclView]
+    review_views: list[DeclView]
+    stale_views: list[DeclView]
+    tier: str
+    qualifiers: list[str]
+    headline: str
+    error: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -710,17 +763,54 @@ def _issue_tier(
 # ---------------------------------------------------------------------------
 
 
-def _decl_to_issues(ctx: _DeckContext, issue_nums: list[int]) -> dict:
+def _decl_to_issues(
+    ctx: _DeckContext,
+    issue_nums: list[int],
+    owned_decls: Optional[dict[int, list[str]]] = None,
+) -> dict:
     """``{snapshot_decl_name: set[issue_num]}`` — which issue(s) cite each
     decl. Used to resolve a card's cone/planner deps (decl names) back to
     predecessor CARDS (issues)."""
     out: dict[str, set] = {}
     for num in issue_nums:
-        for raw in _decls_for_issue(ctx, num):
+        names = (
+            owned_decls.get(num, [])
+            if owned_decls is not None
+            else _decls_for_issue(ctx, num)
+        )
+        for raw in names:
             resolved = _resolve_to_snapshot(ctx, raw)
             key = resolved if resolved is not None else raw
             out.setdefault(key, set()).add(num)
     return out
+
+
+def _dependency_declarations(
+    ctx: _DeckContext,
+    num: int,
+    owned_decls: Optional[dict[int, list[str]]] = None,
+) -> set[str]:
+    """Project-local declarations issue ``num`` depends on, excluding itself."""
+    dep_decls: set[str] = set()
+    own_names = (
+        owned_decls.get(num, [])
+        if owned_decls is not None
+        else _decls_for_issue(ctx, num)
+    )
+    own_decls = {
+        _resolve_to_snapshot(ctx, raw) or raw for raw in own_names
+    }
+    if ctx.snapshot is not None:
+        from marathon.audit.kernel import compute_kernel
+
+        for decl in own_decls:
+            if decl is None:
+                continue
+            kernel = compute_kernel(decl, ctx.snapshot)
+            dep_decls.update(m.name for m in kernel.members)
+            dep_decls.update(kernel.local_lemmas)
+    dep_decls -= own_decls
+    return dep_decls
 
 
 def _predecessor_issues(
@@ -728,6 +818,7 @@ def _predecessor_issues(
     num: int,
     issue_nums: list[int],
     decl_to_issues: dict,
+    owned_decls: Optional[dict[int, list[str]]] = None,
 ) -> list[int]:
     """The predecessor issues card ``num`` depends on.
 
@@ -739,29 +830,9 @@ def _predecessor_issues(
     decl is mapped back to the issue(s) that cite it; self-edges and
     dependencies the queue does not contain are dropped. Deterministic
     (sorted)."""
-    dep_decls: set[str] = set()
-    own_decls = {
-        _resolve_to_snapshot(ctx, raw) or raw
-        for raw in _decls_for_issue(ctx, num)
-    }
-    # (a) statement cone — only when a snapshot exists.
-    if ctx.snapshot is not None:
-        from marathon.audit.kernel import compute_kernel
-
-        for decl in own_decls:
-            if decl is None:
-                continue
-            kernel = compute_kernel(decl, ctx.snapshot)
-            dep_decls.update(m.name for m in kernel.members)
-            dep_decls.update(kernel.local_lemmas)
-
-    # A decl the issue OWNS is not an external dependency. The kernel cone of a
-    # card's decls includes those decls themselves, and decl→issue ownership maps
-    # a decl to every issue that CITES it — so without this, a card's own decl
-    # cited by a DOWNSTREAM issue (e.g. #170 defines `hypersurfaceInducedOrientation`,
-    # which Stokes #244 references) makes that downstream issue a BACKWARDS
-    # predecessor, wrongly blocking the upstream card behind its own dependents.
-    dep_decls -= own_decls
+    # A decl the issue OWNS is not an external dependency. The shared helper
+    # removes those self declarations before ownership is projected to issues.
+    dep_decls = _dependency_declarations(ctx, num, owned_decls)
 
     in_queue = set(issue_nums)
     a_chapter = ctx.issue_chapter.get(num)
@@ -820,19 +891,12 @@ def _topo_order(
 # ---------------------------------------------------------------------------
 
 
-def _readiness(
+def _base_review_eligibility(
     ctx: _DeckContext,
     num: int,
     tier: str,
-    preds: list[int],
 ) -> tuple[bool, Optional[str]]:
-    """``(ready, blocked_reason)`` for one card (the shared-contract
-    predicate). A card is ready iff it is at a green/gated state (grounded
-    in tier ≥ T1 — the plan's machine-audit floor) AND every
-    dependency-predecessor card is verified-or-deferred. An
-    already-reviewed card (the human has a verdict) is non-ready: it is no
-    longer in the swipe queue. Each non-ready reason is a single human
-    sentence."""
+    """Current-code/machine-audit gates shared by inspect and ship."""
     from marathon.audit.trust import TIER_ORDER
 
     status = ctx.verdict_status.get(num)
@@ -866,6 +930,40 @@ def _readiness(
             f"tier {tier} below the machine-audit floor {READY_TIER_FLOOR} "
             "(not yet axiom-clean / deception-free)"
         )
+    return True, None
+
+
+def _inspectability(
+    ctx: _DeckContext,
+    num: int,
+    tier: str,
+) -> tuple[bool, Optional[str]]:
+    """Whether the current card may be read and decided provisionally.
+
+    Dependency predecessors are intentionally not a visibility gate.  Every
+    other readiness condition still applies, so the provisional lane never
+    asks a reviewer to bless stale, unelaborated, broken, or already-resolved
+    code.
+    """
+    return _base_review_eligibility(ctx, num, tier)
+
+
+def _readiness(
+    ctx: _DeckContext,
+    num: int,
+    tier: str,
+    preds: list[int],
+) -> tuple[bool, Optional[str]]:
+    """``(ready, blocked_reason)`` for the authoritative SHIP predicate.
+
+    A card must pass the current-code/machine-audit gate and have every
+    dependency predecessor resolved.  The browser may expose an ``inspectable``
+    dependency-blocked card, but this function remains the server authority for
+    irreversible shipping.
+    """
+    eligible, reason = _base_review_eligibility(ctx, num, tier)
+    if not eligible:
+        return False, reason
 
     unresolved = [
         p for p in preds
@@ -944,38 +1042,6 @@ def _gating_deps(deps: "dict[int, list[int]]") -> "dict[int, list[int]]":
     }
 
 
-def _surfaced_issue_tier(
-    cfg: "ReviewConfig", ctx: _DeckContext, ledger, num: int
-) -> "tuple[Optional[str], Optional[str]]":
-    """``(tier, headline_decl)`` from the SURFACED (rename/split-recovered) decls
-    of an issue whose cited decls are all stale (``_issue_tier`` → '-'), or
-    ``(None, None)``. Lets the QUEUE card reflect the same reconciled set the
-    subdeck reviews — e.g. #236 cites a stale ``Prop_16_1`` but the split
-    ``Prop_16_1_preserving``/``_reversing`` surface as T1, so the card should read
-    T1/ready, not '-'. Best-effort; only invoked on a '-' card so the extra
-    surfacing pass is rare.
-
-    Queue assembly already loaded every issue in scope.  Reuse that context and
-    the queue's shared ledger here: routing through the public
-    :func:`surfaced_decls_for_issue` entry point would reload the audit snapshot
-    and refetch the chapter from GitHub once for *every* stale card."""
-    from marathon.audit.trust import TIER_ORDER
-    try:
-        surfaced = _surfaced_decls_from_context(
-            cfg, ctx, ledger, num, _decls_for_issue(ctx, num)
-        )
-    except Exception:  # noqa: BLE001
-        return None, None
-    matched = [
-        (v.name, ctx.tiers_by_decl[v.name].tier)
-        for v in surfaced if v.name in ctx.tiers_by_decl
-    ]
-    if not matched:
-        return None, None
-    worst = min(matched, key=lambda m: TIER_ORDER.index(m[1]))
-    return worst[1], worst[0]
-
-
 def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
     """Assemble the dep-ordered card queue for ``chapter`` (or every
     registered chapter when None), plus the status-pane counters.
@@ -1006,9 +1072,29 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
         except Exception:  # noqa: BLE001 — no ledger means no surfaced tier
             pass
 
-    decl_to_issues = _decl_to_issues(ctx, issue_nums)
+    surfaces: dict[int, _ReconciledIssueSurface] = {}
+    if surface_ledger is not None:
+        surfaces = {
+            num: _build_reconciled_issue_surface(
+                cfg, ctx, surface_ledger, num
+            )
+            for num in issue_nums
+        }
+    owned_decls = {
+        num: [view.name for view in surface.review_views]
+        for num, surface in surfaces.items()
+    }
+    decl_to_issues = _decl_to_issues(
+        ctx, issue_nums, owned_decls if surfaces else None
+    )
     deps: dict[int, list[int]] = {
-        num: _predecessor_issues(ctx, num, issue_nums, decl_to_issues)
+        num: _predecessor_issues(
+            ctx,
+            num,
+            issue_nums,
+            decl_to_issues,
+            owned_decls if surfaces else None,
+        )
         for num in issue_nums
     }
     ordered = _topo_order(issue_nums, {n: set(d) for n, d in deps.items()})
@@ -1016,17 +1102,22 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
 
     cards: list[CardSummary] = []
     for num in ordered:
-        tier, qualifiers, decl = _issue_tier(ctx, num)
-        if tier == "-" and surface_ledger is not None:
-            # All cited decls stale/absent → reflect the reconciled (surfaced)
-            # set the subdeck reviews, so a split/rename-recovered issue (#236)
-            # surfaces in the queue instead of reading '-'/not-ready.
-            s_tier, s_decl = _surfaced_issue_tier(
-                cfg, ctx, surface_ledger, num
-            )
-            if s_tier is not None:
-                tier, decl = s_tier, s_decl
+        surface = surfaces.get(num)
+        if surface is not None:
+            tier = surface.tier
+            qualifiers = surface.qualifiers
+            decl = surface.headline
+        else:
+            tier, qualifiers, decl = _issue_tier(ctx, num)
+            # If a validated snapshot exists but its ledger/surface assembly
+            # failed, raw citations are not enough to rule out an unaudited
+            # surfaced rename/addition.  Hold the gate closed.
+            if getattr(ctx.snapshot, "decls", None):
+                tier, qualifiers = "-", []
         ready, blocked_reason = _readiness(ctx, num, tier, gating[num])
+        inspectable, inspection_blocked_reason = _inspectability(
+            ctx, num, tier
+        )
         meta = ctx.issue_meta.get(num) or {}
         cards.append(CardSummary(
             id=num,
@@ -1037,6 +1128,10 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
             ready=ready,
             blocked_reason=blocked_reason,
             title=meta.get("title") or f"#{num}",
+            inspectable=inspectable,
+            shippable=ready,
+            provisional=inspectable and not ready,
+            inspection_blocked_reason=inspection_blocked_reason,
         ))
     live_jobs = _live_building_jobs(cfg)
     live_issue_ids: set[int] = set()
@@ -1096,6 +1191,40 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
         dependency_blocked=len(dependency_ids),
         other_unresolved=len(unresolved_ids - categorized_ids),
     )
+
+
+def issue_reviewability(
+    cfg: "ReviewConfig", issue_num: int
+) -> dict:
+    """Fresh, global server-authoritative review/ship metadata for one issue.
+
+    Shipping must use the global dependency graph even when the browser opened
+    a chapter-filtered view.  This helper intentionally rebuilds the pure queue
+    at the irreversible boundary and returns a small stable shape.
+    """
+    queue = build_queue(cfg, chapter=None)
+    card = next((item for item in queue.cards if item.id == issue_num), None)
+    if card is None:
+        return {
+            "issue": issue_num,
+            "inspectable": False,
+            "shippable": False,
+            "provisional": False,
+            "blocked_reason": (
+                f"issue #{issue_num} is not in the current review registry"
+            ),
+            "inspection_blocked_reason": (
+                f"issue #{issue_num} is not in the current review registry"
+            ),
+        }
+    return {
+        "issue": issue_num,
+        "inspectable": card.inspectable,
+        "shippable": card.shippable,
+        "provisional": card.provisional,
+        "blocked_reason": card.blocked_reason,
+        "inspection_blocked_reason": card.inspection_blocked_reason,
+    }
 
 
 def _module_to_lean_path(repo_dir: Path, module: str) -> Optional[Path]:
@@ -1207,7 +1336,9 @@ def _locate_decl_site(text: str, decl_name: str):
     return sites, None
 
 
-def _slice_decl_block(text: str, sites, target_i: int) -> str:
+def _slice_decl_block(
+    text: str, sites, target_i: int, *, truncate: bool = True
+) -> str:
     """The verbatim source block for ``sites[target_i]``: the full
     ``def``/``theorem``/… body plus the docstring + attribute/modifier lines
     immediately above it, with trailing blanks, next-decl comments, and trailing
@@ -1307,12 +1438,54 @@ def _slice_decl_block(text: str, sites, target_i: int) -> str:
             break
 
     block_lines = lines[start - 1 : end]
-    if len(block_lines) > _SOURCE_BLOCK_MAX_LINES:
+    if truncate and len(block_lines) > _SOURCE_BLOCK_MAX_LINES:
         block_lines = block_lines[:_SOURCE_BLOCK_MAX_LINES] + [
             f"  -- … ({len(block_lines) - _SOURCE_BLOCK_MAX_LINES} more "
             "lines truncated — open the deep-dive to read the rest) …"
         ]
     return "\n".join(block_lines)
+
+
+def _complete_source_fingerprint(
+    repo_dir: Optional[Path],
+    source_file: Optional[str],
+    decl_name: str,
+    rendered_block: Optional[str],
+) -> Optional[str]:
+    """Hash the complete declaration slice behind a rendered source block.
+
+    Most declarations fit in ``rendered_block`` and need no second read.  For
+    the rare block truncated at 400 lines, reopen only its known source file
+    and slice without the payload cap.  If that best-effort lookup fails, hash
+    the rendered block: conservative callers still retain statement/kernel
+    binding, while normal live cards receive the full-source pin.
+    """
+    if rendered_block is None:
+        return None
+    complete = rendered_block
+    if (
+        "more lines truncated — open the deep-dive" in rendered_block
+        and repo_dir is not None
+        and source_file
+    ):
+        try:
+            root = Path(repo_dir).resolve()
+            path = (root / source_file).resolve(strict=True)
+            path.relative_to(root)
+            if (
+                path.is_file()
+                and path.suffix.lower() == ".lean"
+                and path.stat().st_size <= _REPO_SCAN_MAX_FILE_BYTES
+            ):
+                text = path.read_text(encoding="utf-8", errors="replace")
+                sites, target_i = _locate_decl_site(text, decl_name)
+                if target_i is not None:
+                    complete = _slice_decl_block(
+                        text, sites, target_i, truncate=False
+                    )
+        except (OSError, RuntimeError, ValueError):
+            pass
+    return hashlib.sha256(complete.encode("utf-8")).hexdigest()
 
 
 def _read_decl_source(
@@ -1592,12 +1765,16 @@ def _build_decl_view(
         # source of truth, so trust its resolution.
         in_code = not _scan_dir_has_lean(scan_dir)
 
+    source_fingerprint = _complete_source_fingerprint(
+        scan_dir, source_file, name, source_block
+    )
     view = DeclView(
         name=name, kind=kind, tier=tier, qualifiers=qualifiers,
         source_block=source_block, source_file=source_file,
         statement_pp=statement_pp, kernel=kernel, evidence=evidence,
         informal_rendering=informal_rendering, informal_is_llm=informal_is_llm,
         semantic_delta=semantic_delta, in_code=in_code,
+        source_fingerprint=source_fingerprint,
     )
     # Classify api WITHOUT a headline here (single-card detail also carries
     # api/api_reason); build_card_detail re-classifies with the real headline
@@ -1787,6 +1964,188 @@ def _surfaced_decls_from_context(
     )
 
 
+def _fallback_decl_view(name: str) -> DeclView:
+    """Fail-closed name-only view used when current source assembly errors."""
+    return DeclView(
+        name=name,
+        kind=None,
+        tier="-",
+        qualifiers=[],
+        source_block=None,
+        source_file=None,
+        statement_pp=None,
+        kernel=[],
+        evidence={
+            "axioms_beyond_whitelist": [],
+            "sorry": None,
+            "deception_tags": [],
+        },
+        informal_rendering=None,
+        informal_is_llm=False,
+        semantic_delta=None,
+        # An assembly failure is not evidence that the citation is obsolete.
+        # Keep it in the review surface at tier '-' so the gate fails closed.
+        in_code=True,
+    )
+
+
+def _build_reconciled_issue_surface(
+    cfg: "ReviewConfig",
+    ctx: _DeckContext,
+    ledger,
+    issue_num: int,
+) -> _ReconciledIssueSurface:
+    """Build the exact current-code declaration set reviewed for one issue.
+
+    Queue, focused detail, file/chapter workspace, dependency ownership, and
+    ship authorization all consume this object.  That prevents a stale cited
+    name or a surfaced split/rename from having one tier in the list and a
+    different tier at the irreversible boundary.
+    """
+    from marathon.audit.trust import TIER_ORDER
+
+    cited_names = _decls_for_issue(ctx, issue_num)
+    cited_views: list[DeclView] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for raw in cited_names:
+        try:
+            view = _build_decl_view(ctx, ledger, raw, Path(cfg.repo_dir))
+        except Exception as exc:  # noqa: BLE001 - preserve a fail-closed card
+            view = _fallback_decl_view(raw)
+            errors.append(f"{raw}: {exc}")
+        if view.name in seen:
+            continue
+        seen.add(view.name)
+        cited_views.append(view)
+
+    try:
+        surfaced_views = _surfaced_decls_from_context(
+            cfg, ctx, ledger, issue_num, cited_names
+        )
+    except Exception as exc:  # noqa: BLE001 - no guessed reviewability
+        surfaced_views = []
+        errors.append(f"reconciliation: {exc}")
+    surfaced_views = [
+        view for view in surfaced_views if view.name not in seen and view.in_code
+    ]
+
+    stale_views = [view for view in cited_views if not view.in_code]
+    review_views = [
+        view for view in cited_views if view.in_code
+    ] + surfaced_views
+
+    def tier_rank(view: DeclView) -> tuple[int, str]:
+        try:
+            rank = TIER_ORDER.index(view.tier)
+        except ValueError:
+            rank = -1
+        return rank, view.name
+
+    review_views.sort(key=tier_rank)
+    headline = (
+        review_views[0].name
+        if review_views
+        else (stale_views[0].name if stale_views else (cited_names[0] if cited_names else ""))
+    )
+    classified = {
+        view.name: replace(
+            view,
+            **dict(zip(
+                ("api", "api_reason"),
+                classify_api(view, headline),
+            )),
+        )
+        for view in review_views
+    }
+    review_views = [classified[view.name] for view in review_views]
+    cited_views = [
+        classified.get(view.name, view) for view in cited_views
+    ]
+    surfaced_views = [
+        classified.get(view.name, view) for view in surfaced_views
+    ]
+    cited_views.sort(key=tier_rank)
+    surfaced_views.sort(key=tier_rank)
+
+    def covered_by_current_replacement(stale: DeclView) -> bool:
+        """Whether surfacing gives this exact stale citation a safe identity.
+
+        Split children retain the old qualified/bare name as a prefix.  A
+        namespace-only rename retains the leaf and is accepted only when that
+        leaf identifies one unique surfaced declaration.  Different-leaf
+        renames remain blocked until reconciliation rewrites the issue body;
+        merely finding some same-result declaration must never cover every
+        stale citation in a multi-declaration issue.
+        """
+        old = stale.name
+        old_leaf = old.rsplit(".", 1)[-1]
+        old_is_qualified = "." in old
+        split_matches = [
+            view for view in surfaced_views
+            if (
+                view.name.startswith(old + "_")
+                or (
+                    not old_is_qualified
+                    and view.name.rsplit(".", 1)[-1].startswith(
+                        old_leaf + "_"
+                    )
+                )
+            )
+        ]
+        if split_matches:
+            if old_is_qualified:
+                # A qualified stale citation can only be covered by children
+                # of that exact qualified name.  A same-leaf child in another
+                # namespace belongs to a different declaration.
+                return True
+            # Bare-name recovery is safe only when the stale leaf is unique.
+            # Multiple qualified citations with the same leaf must not all be
+            # "covered" by one surfaced split in one namespace.
+            stale_with_leaf = [
+                view for view in stale_views
+                if view.name.rsplit(".", 1)[-1] == old_leaf
+            ]
+            return len(stale_with_leaf) == 1
+        same_leaf = [
+            view for view in surfaced_views
+            if view.name.rsplit(".", 1)[-1] == old_leaf
+        ]
+        stale_with_leaf = [
+            view for view in stale_views
+            if view.name.rsplit(".", 1)[-1] == old_leaf
+        ]
+        return len(same_leaf) == 1 and len(stale_with_leaf) == 1
+
+    broken_decl = _issue_build_broken(ctx, issue_num)
+    unmapped_stale = any(
+        not covered_by_current_replacement(stale)
+        for stale in stale_views
+    )
+    if errors or broken_decl is not None or unmapped_stale or not review_views:
+        tier = "-"
+        qualifiers: list[str] = []
+        if broken_decl is not None:
+            headline = broken_decl
+    else:
+        worst = review_views[0]
+        tier = worst.tier
+        qualifiers = list(worst.qualifiers)
+
+    return _ReconciledIssueSurface(
+        issue=issue_num,
+        cited_names=cited_names,
+        cited_views=cited_views,
+        surfaced_views=surfaced_views,
+        review_views=review_views,
+        stale_views=stale_views,
+        tier=tier,
+        qualifiers=qualifiers,
+        headline=headline,
+        error="; ".join(errors) if errors else None,
+    )
+
+
 def missing_suggestions_for_issue(
     cfg: "ReviewConfig", issue_num: int
 ) -> list[dict]:
@@ -1890,52 +2249,145 @@ def _textbook_result_keys(title: str) -> "set[str]":
     return set(re.findall(r"\b\d+\.\d+\b", title or ""))
 
 
+def _global_reconciled_dependency_model(
+    cfg: "ReviewConfig",
+    ctx: _DeckContext,
+    ledger,
+    target_issue_nums: list[int],
+    target_surfaces: "dict[int, _ReconciledIssueSurface]",
+) -> tuple[
+    dict[int, _ReconciledIssueSurface],
+    dict[int, list[str]],
+    dict[int, list[int]],
+    dict[int, list[int]],
+]:
+    """Project-wide ownership and readiness gates for a scoped review surface.
+
+    Rich declaration views are supplied only for ``target_issue_nums``.  Other
+    registered issues start with their inexpensive issue-body citations and
+    are reconciled only when they could own a currently unowned dependency of
+    a target.  This keeps chapter/file views cheap while ensuring that every
+    irreversible review surface observes earlier-chapter gates, including a
+    surfaced rename or split that no longer appears in its issue body.
+
+    Returns ``(surfaces, owned_decls, raw_deps, gating_deps)``.  Dependency
+    dictionaries include every registered issue so a target's predecessor list
+    may truthfully contain an out-of-scope issue.
+    """
+    global_nums = _chapter_issue_nums(cfg, None)
+    for issue_num in target_issue_nums:
+        if issue_num not in global_nums:
+            global_nums.append(issue_num)
+
+    surfaces = dict(target_surfaces)
+    owned_decls = {
+        num: list(_decls_for_issue(ctx, num))
+        for num in global_nums
+    }
+    owned_decls.update({
+        num: [view.name for view in surface.review_views]
+        for num, surface in surfaces.items()
+    })
+
+    raw_owners = _decl_to_issues(ctx, global_nums, owned_decls)
+    target_dependency_decls: set[str] = set()
+    for issue_num in target_issue_nums:
+        target_dependency_decls.update(
+            _dependency_declarations(ctx, issue_num, owned_decls)
+        )
+    unowned_dependencies = {
+        name for name in target_dependency_decls
+        if name not in raw_owners
+    }
+
+    if unowned_dependencies:
+        for num in global_nums:
+            if num in surfaces:
+                continue
+            meta_for_owner = ctx.issue_meta.get(num) or {}
+            if not _textbook_result_keys(meta_for_owner.get("title") or ""):
+                continue
+            cited_resolved = {
+                _resolve_to_snapshot(ctx, raw) or raw
+                for raw in _decls_for_issue(ctx, num)
+            }
+            namespaces = _namespace_prefixes(sorted(cited_resolved))
+            could_surface = any(
+                (
+                    any(
+                        dep.startswith(namespace + ".")
+                        and "." not in dep[len(namespace) + 1:]
+                        for namespace in namespaces
+                    )
+                    or any(
+                        dep.startswith(cited_name + "_")
+                        for cited_name in cited_resolved
+                    )
+                )
+                for dep in unowned_dependencies
+            )
+            if not could_surface:
+                continue
+            candidate_surface = _build_reconciled_issue_surface(
+                cfg, ctx, ledger, num
+            )
+            candidate_names = {
+                view.name for view in candidate_surface.review_views
+            }
+            if not (candidate_names & unowned_dependencies):
+                continue
+            surfaces[num] = candidate_surface
+            owned_decls[num] = sorted(candidate_names)
+
+    decl_to_issues = _decl_to_issues(ctx, global_nums, owned_decls)
+    raw_deps = {
+        num: _predecessor_issues(
+            ctx, num, global_nums, decl_to_issues, owned_decls
+        )
+        for num in global_nums
+    }
+    return surfaces, owned_decls, raw_deps, _gating_deps(raw_deps)
+
+
 def build_card_detail(cfg: "ReviewConfig", issue_num: int) -> CardDetail:
     """Assemble the full spec card for one issue.
 
-    A card carries a :class:`DeclView` for EVERY declaration the issue cites
-    (an issue bundles all the decls of one textbook result), each with its
-    own source / kernel / evidence / tier / informal rendering, ordered
-    worst-tier first. The card-level ``tier`` is the worst of these (the
-    gate). The top-level scalar fields mirror the headline (``decls[0]``)
-    for backward-compatible / degraded rendering. Pure + read-only."""
-    from marathon.audit.trust import TIER_ORDER
-
-    ctx = _load_context(cfg, [issue_num])
-    tier, qualifiers, decl = _issue_tier(ctx, issue_num)
+    ``decls`` retains every body-cited declaration for compatibility and stale
+    citation diagnostics; ``surfaced_decls`` contains current-code declarations
+    recovered by rename/split reconciliation.  The card tier, headline, gates,
+    and top-level scalar fields all come from the union of in-code cited and
+    surfaced declarations—the exact set the subdeck reviews. Pure + read-only.
+    """
     chapter = cfg.chapter_of_issue(issue_num)
-
-    # One view per cited declaration, de-duplicated by resolved name,
-    # ordered worst-tier first (the gating decl leads), then by name.
+    chapter_nums = _chapter_issue_nums(cfg, chapter)
+    if issue_num not in chapter_nums:
+        chapter_nums = [issue_num, *chapter_nums]
+    # Rich declaration rendering stays scoped to the target chapter, but
+    # shipping dependencies are project-wide: a Chapter 16 theorem can depend
+    # on an unresolved Chapter 15 definition. Load metadata/audit context once
+    # for the complete registry, then build full DeclViews only where needed.
+    global_nums = _chapter_issue_nums(cfg, None)
+    if issue_num not in global_nums:
+        global_nums = [issue_num, *global_nums]
+    ctx = _load_context(cfg, global_nums)
     ledger = _ledger(cfg)
-    repo_dir = Path(cfg.repo_dir)
-    views: list[DeclView] = []
-    seen: set[str] = set()
-    for raw in _decls_for_issue(ctx, issue_num):
-        view = _build_decl_view(ctx, ledger, raw, repo_dir)
-        if view.name in seen:
-            continue
-        seen.add(view.name)
-        views.append(view)
-    views.sort(
-        key=lambda v: (
-            TIER_ORDER.index(v.tier) if v.tier in TIER_ORDER else 0,
-            v.name,
-        )
-    )
-
-    # Re-classify api with the issue's HEADLINE decl now known (the worst-tier
-    # decl that leads the sorted views) so the headline is never auto-approved.
-    headline_name = views[0].name if views else None
-    views = [
-        replace(v, **dict(zip(("api", "api_reason"),
-                             classify_api(v, headline_name))))
-        for v in views
-    ]
+    surfaces = {
+        num: _build_reconciled_issue_surface(cfg, ctx, ledger, num)
+        for num in chapter_nums
+    }
+    surface = surfaces[issue_num]
+    tier = surface.tier
+    qualifiers = surface.qualifiers
+    decl = surface.headline
+    # Preserve the body-cited list for detail/backward compatibility, while
+    # the headline and all gates come from the exact reconciled review set.
+    views = list(surface.cited_views)
+    surfaced_views = list(surface.surfaced_views)
+    review_views = list(surface.review_views)
 
     # Top-level scalar fields mirror the headline view (decls[0]) for
     # backward-compatible / degraded clients.
-    head = views[0] if views else None
+    head = review_views[0] if review_views else (views[0] if views else None)
     statement_pp = head.statement_pp if head else None
     source_block = head.source_block if head else None
     source_file = head.source_file if head else None
@@ -1957,19 +2409,38 @@ def build_card_detail(cfg: "ReviewConfig", issue_num: int) -> CardDetail:
         meta.get("body")
     )
 
-    # Deps back to predecessor cards (same chapter scope as the queue).
-    chapter_nums = _chapter_issue_nums(cfg, chapter)
-    if issue_num not in chapter_nums:
-        chapter_nums = [issue_num, *chapter_nums]
-    ctx_full = _load_context(cfg, chapter_nums)
-    decl_to_issues = _decl_to_issues(ctx_full, chapter_nums)
-    pred_ids = _predecessor_issues(
-        ctx_full, issue_num, chapter_nums, decl_to_issues
+    # Dependency ownership and ship gates are project-wide even though the
+    # detail's rich source rendering remains scoped to its chapter.
+    surfaces, _owned_decls, issue_deps, gating_deps = (
+        _global_reconciled_dependency_model(
+            cfg, ctx, ledger, chapter_nums, surfaces
+        )
     )
+    pred_ids = issue_deps.get(issue_num, [])
     deps: list[DepRef] = []
     for pid in pred_ids:
-        ptier, _q, pdecl = _issue_tier(ctx_full, pid)
-        deps.append(DepRef(id=pid, decl=pdecl, tier=ptier))
+        predecessor = surfaces.get(pid)
+        if predecessor is None:
+            pred_tier, _pred_qualifiers, pred_headline = _issue_tier(
+                ctx, pid
+            )
+        else:
+            pred_tier = predecessor.tier
+            pred_headline = predecessor.headline
+        deps.append(DepRef(
+            id=pid,
+            decl=pred_headline,
+            tier=pred_tier,
+        ))
+    inspectable, inspection_blocked_reason = _inspectability(
+        ctx, issue_num, tier
+    )
+    shippable, ship_blocked_reason = _readiness(
+        ctx,
+        issue_num,
+        tier,
+        gating_deps.get(issue_num, []),
+    )
 
     return CardDetail(
         id=issue_num,
@@ -1978,7 +2449,13 @@ def build_card_detail(cfg: "ReviewConfig", issue_num: int) -> CardDetail:
         chapter=chapter,
         tier=tier,
         qualifiers=qualifiers,
+        inspectable=inspectable,
+        inspection_blocked_reason=inspection_blocked_reason,
+        shippable=shippable,
+        ship_blocked_reason=ship_blocked_reason,
+        provisional=inspectable and not shippable,
         decls=views,
+        surfaced_decls=surfaced_views,
         statement_pp=statement_pp,
         source_block=source_block,
         source_file=source_file,

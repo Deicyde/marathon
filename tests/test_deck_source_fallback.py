@@ -454,6 +454,58 @@ def test_card_decl_view_serializes_new_fields(tmp_path, monkeypatch):
     detail = cards.build_card_detail(cfg, 22)
     js = detail.decls[0].to_json()
     assert "in_code" in js and "api" in js and "api_reason" in js
+    assert len(js["source_fingerprint"]) == 64
+
+
+def test_truncated_card_binds_complete_declaration_source(
+    tmp_path, monkeypatch
+):
+    """An edit below the 400-line UI cap must invalidate the review context."""
+    from marathon.deck.subdeck import _decl_fingerprint
+
+    cfg = make_cfg(tmp_path)
+    path = cfg.repo_dir / "Demo" / "Chapter14.lean"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def source(changed: bool) -> str:
+        filler = [
+            f"  -- filler {index}{' changed' if changed and index == 430 else ''}"
+            for index in range(1, 451)
+        ]
+        return "\n".join([
+            "namespace Demo.Chapter14",
+            "/-- A deliberately long declaration. -/",
+            "theorem LongResult : True := by",
+            *filler,
+            "  trivial",
+            "end Demo.Chapter14",
+            "",
+        ])
+
+    path.write_text(source(False))
+    install_snapshot(
+        cfg,
+        make_snapshot(
+            [_decl("Demo.Chapter14.LongResult")], cfg.repo_dir
+        ),
+    )
+    patch_bulk(monkeypatch, {
+        22: {
+            "title": "#22 long source",
+            "state": "OPEN",
+            "body": _bundle_body("LongResult"),
+            "labels": set(),
+        },
+    })
+
+    before = cards.build_card_detail(cfg, 22).decls[0]
+    assert "more lines truncated" in before.source_block
+    path.write_text(source(True))
+    after = cards.build_card_detail(cfg, 22).decls[0]
+
+    assert before.source_block == after.source_block
+    assert before.source_fingerprint != after.source_fingerprint
+    assert _decl_fingerprint(before) != _decl_fingerprint(after)
 
 
 # ---------------------------------------------------------------------------

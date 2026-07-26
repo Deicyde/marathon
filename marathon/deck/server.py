@@ -348,7 +348,9 @@ class DeckServer(ThreadingHTTPServer):
         # GitHub-backed shipping is accepted durably and completed off the
         # request thread.  This keeps a slow GitHub API from freezing the
         # review UI or colliding with the reverse proxy's request timeout.
-        self.ship_jobs = ShipJobRegistry()
+        self.ship_jobs = ShipJobRegistry(
+            acceptance_checker=self.cached_issue_reviewability
+        )
         # ThreadingHTTPServer gives every request its own thread.  Coalesce
         # expensive queue reads by chapter instead of letting those threads
         # stampede GitHub and the local audit store.  Builders run outside this
@@ -475,6 +477,42 @@ class DeckServer(ThreadingHTTPServer):
             # Do not cancel old builders: detach them.  Their existing callers
             # still complete, while new readers start a fresh generation.
             self._queue_flights.clear()
+
+    def cached_issue_reviewability(
+        self, _cfg: "ReviewConfig", issue_num: int
+    ) -> Optional[dict]:
+        """Return a nonblocking cached ship gate, or ``None`` when unknown.
+
+        POST /api/ship must acknowledge quickly even when rebuilding the queue
+        would need GitHub.  A still-live queue snapshot can reject an obviously
+        dependency-blocked request immediately; a cache miss is accepted into
+        the durable outbox and the worker performs the mandatory fresh global
+        check before any irreversible action.
+        """
+        now = monotonic()
+        chapter = self.cfg.chapter_of_issue(issue_num)
+        with self._queue_lock:
+            snapshots = []
+            for key in (None, chapter):
+                cached = self._queue_cache.get(key)
+                if cached is not None and cached[0] > now:
+                    snapshots.append(cached[1])
+        for payload in snapshots:
+            for card in payload.get("cards") or []:
+                if card.get("id") != issue_num:
+                    continue
+                ready = bool(card.get("shippable", card.get("ready")))
+                return {
+                    "issue": issue_num,
+                    "inspectable": bool(card.get("inspectable", ready)),
+                    "shippable": ready,
+                    "provisional": bool(card.get("provisional")),
+                    "blocked_reason": card.get("blocked_reason"),
+                    "inspection_blocked_reason": card.get(
+                        "inspection_blocked_reason"
+                    ),
+                }
+        return None
 
     def project_graph_payload(self, build: Callable[[], dict]) -> dict:
         """Return a fresh-enough graph, sharing one project-wide build."""
@@ -1014,8 +1052,19 @@ class DeckHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST, f"bad or missing issue {issue_raw!r}"
             )
         operation_id = (query.get("operation_id") or [None])[0]
+        request_id = (query.get("request_id") or [None])[0]
+        if request_id is not None and (
+            not isinstance(request_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
+        ):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "bad ship request id"
+            )
         snapshot = self.server.ship_jobs.status(  # type: ignore[attr-defined]
-            self.cfg, issue_num, operation_id=operation_id
+            self.cfg,
+            issue_num,
+            operation_id=operation_id,
+            request_id=request_id,
         )
         if snapshot is None:
             return self._send_error_json(
@@ -1605,6 +1654,7 @@ class DeckHandler(BaseHTTPRequestHandler):
         decl = data.get("decl")
         verdict = data.get("verdict")
         note = data.get("note")
+        decl_fingerprint = data.get("decl_fingerprint")
         try:
             issue_num = int(issue_raw)
         except (TypeError, ValueError):
@@ -1615,6 +1665,13 @@ class DeckHandler(BaseHTTPRequestHandler):
             return self._send_error_json(
                 HTTPStatus.BAD_REQUEST, f"bad or missing decl {decl!r}"
             )
+        if decl_fingerprint is not None and (
+            not isinstance(decl_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", decl_fingerprint) is None
+        ):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "bad declaration context fingerprint"
+            )
 
         if self._demo:
             from marathon.deck.demo import demo_record_verdict
@@ -1624,15 +1681,34 @@ class DeckHandler(BaseHTTPRequestHandler):
                 )
             except ValueError as exc:
                 return self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        if decl_fingerprint is None:
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                "This review request is missing the exact context that was "
+                "shown. Reload the review and decide again.",
+            )
 
         from marathon.deck.subdeck import (
-            build_subdeck,
+            ReviewContextChanged,
             next_unreviewed_card,
             record_decl_verdict,
         )
 
         try:
-            record_decl_verdict(self.cfg, issue_num, decl, verdict, note)
+            _stored, subdeck = record_decl_verdict(
+                self.cfg,
+                issue_num,
+                decl,
+                verdict,
+                note,
+                expected_fingerprint=decl_fingerprint,
+                # Real declarations bind source + kernel; the informal slot
+                # binds the exact normalized prose shown.
+                require_current=True,
+                return_subdeck=True,
+            )
+        except ReviewContextChanged as exc:
+            return self._send_error_json(HTTPStatus.CONFLICT, str(exc))
         except ValueError as exc:  # unknown verdict / empty reject note
             return self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
         except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
@@ -1640,8 +1716,6 @@ class DeckHandler(BaseHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 f"decl-verdict failed: {exc}",
             )
-
-        subdeck = build_subdeck(self.cfg, issue_num)
         self._send_json({
             "ok": True,
             "progress": subdeck["progress"],
@@ -1652,6 +1726,7 @@ class DeckHandler(BaseHTTPRequestHandler):
             # it is OUTSIDE progress/complete/summary (see _informal_slot).
             "informal": subdeck.get("informal"),
             "next_decl": next_unreviewed_card(subdeck),
+            "review_token": subdeck.get("review_token"),
         })
 
     def _api_batch_decl_verdict(self) -> None:
@@ -1686,6 +1761,7 @@ class DeckHandler(BaseHTTPRequestHandler):
 
         from marathon.deck.subdeck import (
             DECL_VERDICTS,
+            ReviewContextChanged,
             build_subdeck,
             record_decl_verdict_batch,
         )
@@ -1707,6 +1783,7 @@ class DeckHandler(BaseHTTPRequestHandler):
             decl = raw.get("decl")
             verdict = raw.get("verdict")
             note = raw.get("note")
+            expected_fingerprint = raw.get("decl_fingerprint")
             if not isinstance(decl, str) or not decl.strip():
                 return self._send_error_json(
                     HTTPStatus.BAD_REQUEST, f"bad or missing decl {decl!r}"
@@ -1727,6 +1804,20 @@ class DeckHandler(BaseHTTPRequestHandler):
                     HTTPStatus.BAD_REQUEST,
                     f"a reject for {decl} requires a non-empty note",
                 )
+            if expected_fingerprint is not None and (
+                not isinstance(expected_fingerprint, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint) is None
+            ):
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    f"bad declaration context fingerprint for {decl}",
+                )
+            if expected_fingerprint is None:
+                return self._send_error_json(
+                    HTTPStatus.CONFLICT,
+                    f"#{issue_num}: declaration context missing for {decl}; "
+                    "reload the review",
+                )
             key = (issue_num, decl)
             if key in seen:
                 return self._send_error_json(
@@ -1737,6 +1828,7 @@ class DeckHandler(BaseHTTPRequestHandler):
             normalized.append({
                 "issue": issue_num, "decl": decl,
                 "verdict": verdict, "note": note,
+                "expected_fingerprint": expected_fingerprint,
             })
 
         grouped: dict[int, list[dict]] = {}
@@ -1760,6 +1852,20 @@ class DeckHandler(BaseHTTPRequestHandler):
                         HTTPStatus.CONFLICT,
                         f"#{issue_num}: declaration {item['decl']!r} is not in the current code-backed subdeck",
                     )
+                current_fingerprint = by_name[item["decl"]].get(
+                    "context_fingerprint"
+                )
+                if (
+                    item.get("expected_fingerprint") is not None
+                    and item["expected_fingerprint"] != current_fingerprint
+                ):
+                    return self._send_error_json(
+                        HTTPStatus.CONFLICT,
+                        f"#{issue_num}: {item['decl']} changed after it was shown; reload the review",
+                    )
+                # Carry the server-observed fingerprint into the locked batch
+                # transaction, which recomputes and compares it once more.
+                item["expected_fingerprint"] = current_fingerprint
 
             projected = {name: card.get("verdict") for name, card in by_name.items()}
             wire = {"verify": "verified", "reject": "rejected", "defer": "deferred"}
@@ -1839,7 +1945,11 @@ class DeckHandler(BaseHTTPRequestHandler):
             )
 
         try:
-            stored = record_decl_verdict_batch(self.cfg, normalized)
+            stored = record_decl_verdict_batch(
+                self.cfg, normalized, require_current=True
+            )
+        except ReviewContextChanged as exc:
+            return self._send_error_json(HTTPStatus.CONFLICT, str(exc))
         except ValueError as exc:
             return self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
         except Exception as exc:  # noqa: BLE001 - surface, never crash server
@@ -1948,6 +2058,7 @@ class DeckHandler(BaseHTTPRequestHandler):
         issue_raw = data.get("issue")
         decl = data.get("decl")
         locked = bool(data.get("locked"))
+        decl_fingerprint = data.get("decl_fingerprint")
         try:
             issue_num = int(issue_raw)
         except (TypeError, ValueError):
@@ -1958,26 +2069,51 @@ class DeckHandler(BaseHTTPRequestHandler):
             return self._send_error_json(
                 HTTPStatus.BAD_REQUEST, f"bad or missing decl {decl!r}"
             )
+        if decl_fingerprint is not None and (
+            not isinstance(decl_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", decl_fingerprint) is None
+        ):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "bad declaration context fingerprint"
+            )
         if self._demo:
             return self._send_error_json(
                 HTTPStatus.BAD_REQUEST, "decl-lock is not available in demo mode"
             )
+        if decl_fingerprint is None:
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                "This lock request is missing the declaration context that "
+                "was shown. Reload the review.",
+            )
 
-        from marathon.deck.subdeck import build_subdeck, set_decl_lock
+        from marathon.deck.subdeck import (
+            ReviewContextChanged,
+            set_decl_lock,
+        )
 
         try:
-            set_decl_lock(self.cfg, issue_num, decl, locked)
+            _stored, subdeck = set_decl_lock(
+                self.cfg,
+                issue_num,
+                decl,
+                locked,
+                expected_fingerprint=decl_fingerprint,
+                require_current=True,
+                return_subdeck=True,
+            )
+        except ReviewContextChanged as exc:
+            return self._send_error_json(HTTPStatus.CONFLICT, str(exc))
         except Exception as exc:  # noqa: BLE001 — surface, never crash the loop
             return self._send_error_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR, f"decl-lock failed: {exc}"
             )
-
-        subdeck = build_subdeck(self.cfg, issue_num)
         self._send_json({
             "ok": True,
             "decl": decl,
             "locked": locked,
             "summary": subdeck["summary"],
+            "review_token": subdeck.get("review_token"),
         })
 
     def _api_missing(self) -> None:
@@ -2009,7 +2145,11 @@ class DeckHandler(BaseHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR, f"missing-note failed: {exc}"
             )
         subdeck = build_subdeck(self.cfg, issue_num)
-        self._send_json({"ok": True, "missing": subdeck.get("missing")})
+        self._send_json({
+            "ok": True,
+            "missing": subdeck.get("missing"),
+            "review_token": subdeck.get("review_token"),
+        })
 
     def _api_ship(self) -> None:
         """Ship a subdeck's issue (the contract's POST /api/ship) — the ONLY
@@ -2043,10 +2183,24 @@ class DeckHandler(BaseHTTPRequestHandler):
             return self._send_error_json(
                 HTTPStatus.BAD_REQUEST, "bad subdeck review token"
             )
+        request_id = data.get("request_id")
+        if request_id is not None and (
+            not isinstance(request_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
+        ):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, "bad ship request id"
+            )
 
         if self._demo:
             from marathon.deck.demo import demo_ship
             return self._send_json(demo_ship(issue_num, skip_api=skip_api))
+        if review_token is None:
+            return self._send_error_json(
+                HTTPStatus.CONFLICT,
+                "This ship request is missing the exact review context. "
+                "Reload the review before shipping.",
+            )
 
         from marathon.deck.ship_jobs import ShipJobConflict
 
@@ -2056,6 +2210,7 @@ class DeckHandler(BaseHTTPRequestHandler):
                 issue_num,
                 skip_api=skip_api,
                 review_token=review_token,
+                request_id=request_id,
                 actor_token=self.headers.get(ACCESS_TOKEN_HEADER),
                 on_complete=lambda: (
                     self.server.invalidate_queue_cache(),  # type: ignore[attr-defined]

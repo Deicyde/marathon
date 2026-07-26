@@ -355,6 +355,10 @@ def test_queue_ready_and_dep_ordering(tmp_path, monkeypatch):
     assert by_id[24].ready is True
     # Bar (23) waits on its predecessor Foo (22) (unreviewed) → NON-ready.
     assert by_id[23].ready is False
+    assert by_id[23].shippable is False
+    assert by_id[23].inspectable is True
+    assert by_id[23].provisional is True
+    assert by_id[23].inspection_blocked_reason is None
     assert by_id[23].blocked_reason is not None
     assert "#22" in by_id[23].blocked_reason
     assert queue.unresolved == 3
@@ -365,6 +369,16 @@ def test_queue_ready_and_dep_ordering(tmp_path, monkeypatch):
     assert queue.awaiting_audit == 0
     assert queue.dependency_blocked == 1
     assert queue.other_unresolved == 2
+
+    authoritative = cards.issue_reviewability(cfg, 23)
+    assert authoritative == {
+        "issue": 23,
+        "inspectable": True,
+        "shippable": False,
+        "provisional": True,
+        "blocked_reason": by_id[23].blocked_reason,
+        "inspection_blocked_reason": None,
+    }
 
 
 def test_blocked_card_carries_blocked_reason_below_floor(tmp_path, monkeypatch):
@@ -465,6 +479,14 @@ def test_built_decl_sharing_name_with_broken_module_not_blocked(tmp_path, monkey
     src = cfg.repo_dir / "Demo/Chapter14/Broken.lean"
     src.parent.mkdir(parents=True, exist_ok=True)
     src.write_text("theorem Shared : True := sorry\n")   # broken module ALSO has `Shared`
+    # The snapshot's built declaration must also exist in its current module;
+    # reviewability is now deliberately bound to current source, not snapshot
+    # identity alone.
+    (cfg.repo_dir / "Demo/Chapter14.lean").write_text(
+        "namespace Demo.Chapter14\n"
+        "theorem Shared : True := trivial\n"
+        "end Demo.Chapter14\n"
+    )
     # but the issue's `Shared` is the BUILT one (present in the snapshot).
     install_snapshot(cfg, _snap_with_failure(
         cfg, [_decl("Demo.Chapter14.Shared")], "Demo.Chapter14.Broken"))
@@ -1132,14 +1154,20 @@ def test_ship_http_ack_is_fast_while_worker_is_blocked(running_server):
     entered = Event()
     release = Event()
 
-    def slow_ship(_cfg, issue, *, skip_api=False):
+    def slow_ship(
+        _cfg, issue, *, skip_api=False, expected_review_token=None
+    ):
         assert issue == 22
+        assert expected_review_token == review_token
         entered.set()
         assert release.wait(timeout=5)
         return {"ok": True, "outcome": "shipped"}
 
     server.ship_jobs = ShipJobRegistry(runner=slow_ship)
     try:
+        from marathon.deck.subdeck import build_subdeck
+
+        review_token = build_subdeck(server.cfg, 22)["review_token"]
         bad_status, _bad_raw = _post(
             base + "/api/ship",
             {"issue": 22, "review_token": "not-a-token"},
@@ -1148,9 +1176,14 @@ def test_ship_http_ack_is_fast_while_worker_is_blocked(running_server):
         assert bad_status == 400
 
         started = monotonic()
+        request_id = "c" * 32
         status, raw = _post(
             base + "/api/ship",
-            {"issue": 22},
+            {
+                "issue": 22,
+                "review_token": review_token,
+                "request_id": request_id,
+            },
             headers={deck_server.TOKEN_HEADER: token},
         )
         elapsed = monotonic() - started
@@ -1159,15 +1192,28 @@ def test_ship_http_ack_is_fast_while_worker_is_blocked(running_server):
         assert elapsed < 1.0
         ack = json.loads(raw)
         assert ack["status"] == "running"
+        assert ack["request_id"] == request_id
+        assert f"request_id={request_id}" in ack["status_url"]
         assert entered.wait(timeout=1)
 
         poll_status, poll_raw = _get(base + ack["status_url"])
         assert poll_status == 200
         assert json.loads(poll_raw)["status"] == "running"
 
+        try:
+            _get(base + "/api/ship-status?issue=22&request_id=" + ("d" * 32))
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404
+        else:
+            raise AssertionError("an unrelated request id must not match this job")
+
         conflict_status, conflict_raw = _post(
             base + "/api/ship",
-            {"issue": 22, "skip_api": True},
+            {
+                "issue": 22,
+                "skip_api": True,
+                "review_token": review_token,
+            },
             headers={deck_server.TOKEN_HEADER: token},
         )
         assert conflict_status == 409
@@ -1248,17 +1294,35 @@ def test_successful_graph_mutation_invalidates_cache(running_server, monkeypatch
     monkeypatch.setattr(
         subdeck_mod,
         "record_decl_verdict",
-        lambda cfg, issue, declaration, verdict, comment=None: {
-            "ok": True,
-            "updated": True,
-            "issue": issue,
-            "declaration": declaration,
-            "verdict": verdict,
-        },
+        lambda cfg, issue, declaration, verdict, comment=None, **_kwargs: (
+            {
+                "verdict": verdict,
+                "note": comment,
+            },
+            {
+                "progress": {"reviewed": 1, "total": 1},
+                "complete": True,
+                "summary": {
+                    "kept": [declaration],
+                    "locked": [],
+                    "rejected": [],
+                    "deferred": [],
+                    "invalidated": [],
+                },
+                "informal": None,
+                "cards": [],
+                "review_token": "0" * 64,
+            },
+        ),
     )
     status, raw = _post(
         base + "/api/decl-verdict",
-        {"issue": 22, "decl": "Demo.Chapter14.Foo", "verdict": "verify"},
+        {
+            "issue": 22,
+            "decl": "Demo.Chapter14.Foo",
+            "verdict": "verify",
+            "decl_fingerprint": "0" * 64,
+        },
         headers={deck_server.TOKEN_HEADER: token},
     )
     assert status == 200

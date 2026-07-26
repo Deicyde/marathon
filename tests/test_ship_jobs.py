@@ -19,6 +19,8 @@ import json
 import threading
 import time
 
+import pytest
+
 import marathon.review.github as github
 from marathon.deck import subdeck
 from marathon.deck import ship_jobs
@@ -93,6 +95,78 @@ def test_start_acknowledges_quickly_after_durable_write(tmp_path):
     assert completed["result"] == {"ok": True, "outcome": "shipped"}
 
 
+def test_slow_fresh_readiness_check_runs_only_in_worker(tmp_path):
+    """A GitHub-backed readiness rebuild must never delay the HTTP ack path."""
+    cfg = _cfg(tmp_path)
+    gate_entered = threading.Event()
+    release_gate = threading.Event()
+    runner_called = threading.Event()
+
+    def slow_gate(_cfg, _issue):
+        gate_entered.set()
+        assert release_gate.wait(3)
+        return {"shippable": True}
+
+    registry = ShipJobRegistry(
+        runner=lambda *_args, **_kwargs: (
+            runner_called.set() or {"ok": True}
+        ),
+        readiness_checker=slow_gate,
+    )
+    before = time.perf_counter()
+    started = registry.start(cfg, 171)
+    elapsed = time.perf_counter() - before
+
+    assert elapsed < 0.5
+    assert started["status"] == "running"
+    assert gate_entered.wait(1)
+    assert not runner_called.is_set()
+    release_gate.set()
+    _wait_for(registry, cfg, 171, "succeeded")
+    assert runner_called.is_set()
+
+
+def test_fresh_worker_readiness_refuses_irreversible_ship(tmp_path):
+    cfg = _cfg(tmp_path)
+    runner_called = threading.Event()
+    registry = ShipJobRegistry(
+        runner=lambda *_args, **_kwargs: (
+            runner_called.set() or {"ok": True}
+        ),
+        readiness_checker=lambda _cfg, _issue: {
+            "shippable": False,
+            "blocked_reason": "waiting on dependency-predecessor card(s) #170",
+        },
+    )
+
+    started = registry.start(cfg, 171)
+    assert started["status"] == "running"
+    failed = _wait_for(registry, cfg, 171, "failed")
+
+    assert "waiting on dependency" in failed["error"]
+    assert not runner_called.is_set()
+
+
+def test_cached_acceptance_gate_rejects_without_starting_worker(tmp_path):
+    cfg = _cfg(tmp_path)
+    runner_called = threading.Event()
+    registry = ShipJobRegistry(
+        runner=lambda *_args, **_kwargs: (
+            runner_called.set() or {"ok": True}
+        ),
+        acceptance_checker=lambda _cfg, _issue: {
+            "shippable": False,
+            "blocked_reason": "waiting on dependency-predecessor card(s) #170",
+        },
+    )
+
+    with pytest.raises(ShipJobConflict, match="waiting on dependency"):
+        registry.start(cfg, 171)
+
+    assert not runner_called.is_set()
+    assert registry.status(cfg, 171) is None
+
+
 def test_unknown_status_is_a_pure_read(tmp_path):
     cfg = _cfg(tmp_path)
     registry = ShipJobRegistry(runner=lambda *_a, **_kw: {"ok": True})
@@ -131,6 +205,63 @@ def test_same_generation_double_start_coalesces_to_one_worker(tmp_path):
     assert calls == [240]
 
 
+def test_coalesced_click_ids_survive_terminal_publication(tmp_path):
+    """Every accepted click can reconcile a lost response to the same job."""
+    cfg = _cfg(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    first_request = "1" * 32
+    second_request = "2" * 32
+
+    def slow_runner(_cfg, _issue, *, skip_api=False):
+        entered.set()
+        assert release.wait(3)
+        return {"ok": True, "outcome": "shipped"}
+
+    registry = ShipJobRegistry(runner=slow_runner)
+    try:
+        first = registry.start(cfg, 240, request_id=first_request)
+        assert entered.wait(1)
+        second = registry.start(cfg, 240, request_id=second_request)
+
+        assert first["operation_id"] == second["operation_id"]
+        assert second["request_id"] == second_request
+        assert registry.status(
+            cfg, 240, request_id=second_request
+        )["status"] == "running"
+    finally:
+        release.set()
+
+    assert _wait_for(registry, cfg, 240, "succeeded")["status"] == "succeeded"
+    assert registry.status(
+        cfg, 240, request_id=first_request
+    )["status"] == "succeeded"
+    assert registry.status(
+        cfg, 240, request_id=second_request
+    )["status"] == "succeeded"
+    assert _job_record(cfg, 240)["request_ids"] == [
+        first_request, second_request,
+    ]
+
+
+def test_request_id_cannot_match_an_older_issue_job(tmp_path):
+    """Issue-only history must not authorize a different lost POST click."""
+    cfg = _cfg(tmp_path)
+    registry = ShipJobRegistry(
+        runner=lambda *_args, **_kwargs: {
+            "ok": True, "outcome": "shipped",
+        }
+    )
+    accepted = "a" * 32
+    unrelated = "b" * 32
+
+    registry.start(cfg, 171, request_id=accepted)
+    _wait_for(registry, cfg, 171, "succeeded")
+
+    assert registry.status(cfg, 171, request_id=accepted) is not None
+    assert registry.status(cfg, 171, request_id=unrelated) is None
+
+
 def test_live_job_refuses_a_different_skip_api_generation(tmp_path):
     cfg = _cfg(tmp_path)
     entered = threading.Event()
@@ -151,6 +282,32 @@ def test_live_job_refuses_a_different_skip_api_generation(tmp_path):
             pass
         else:
             raise AssertionError("a different live generation must not coalesce")
+    finally:
+        release.set()
+
+
+def test_live_job_refuses_a_different_review_surface_token(tmp_path):
+    cfg = _cfg(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_runner(
+        _cfg,
+        _issue,
+        *,
+        skip_api=False,
+        expected_review_token=None,
+    ):
+        entered.set()
+        assert release.wait(3)
+        return {"ok": True}
+
+    registry = ShipJobRegistry(runner=slow_runner)
+    try:
+        registry.start(cfg, 171, review_token="a" * 64)
+        assert entered.wait(1)
+        with pytest.raises(ShipJobConflict, match="different review generation"):
+            registry.start(cfg, 171, review_token="b" * 64)
     finally:
         release.set()
 

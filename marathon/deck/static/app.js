@@ -105,15 +105,58 @@
   // --- network: PURE READS -------------------------------------------------
   // These GET helpers never mutate; they are safe to call on load,
   // navigation, and polling. They MUST NOT be used to issue a verdict/ship.
-  function getJSON(url) {
-    return fetch(url, {
+  function getJSON(url, options) {
+    options = options || {};
+    var request = {
       method: "GET",
       headers: { Accept: "application/json" },
       credentials: "same-origin",
-    }).then(function (r) {
+    };
+    if (options.signal) request.signal = options.signal;
+    return fetch(url, request).then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status + " for " + url);
       return r.json();
     });
+  }
+
+  // Dashboard reads must eventually settle even when a browser/proxy leaves a
+  // fetch pending indefinitely.  The caller may also abort the shared
+  // controller immediately when the human explicitly retries; the generation
+  // guard on that surface prevents the aborted response from repainting.
+  function withReadDeadline(promise, timeoutMs, controller, label) {
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var timer = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        if (controller) controller.abort();
+        var err = new Error(
+          (label || "Request") + " timed out after " +
+          Math.round(timeoutMs / 1000) + " seconds"
+        );
+        err.name = "TimeoutError";
+        reject(err);
+      }, timeoutMs);
+      promise.then(function (value) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      }, function (err) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+  }
+
+  function newReadController() {
+    return typeof AbortController === "function" ? new AbortController() : null;
+  }
+
+  function readOptions(controller) {
+    return controller ? { signal: controller.signal } : {};
   }
 
   // A bounded variant for job-status reads. Ordinary read models can use the
@@ -193,9 +236,9 @@
         });
     });
   }
-  function fetchQueue(chapter) {
+  function fetchQueue(chapter, options) {
     var q = chapter ? "?chapter=" + encodeURIComponent(chapter) : "";
-    return getJSON("/api/queue" + q);
+    return getJSON("/api/queue" + q, options);
   }
   // GET /api/subdeck/{issue}?skip_api=0|1 — a PURE READ. The skip_api flag is
   // a VIEW-ONLY parameter: it changes WHICH cards the backend returns (main
@@ -333,9 +376,13 @@
   // postDeclVerdict — LOCAL-ONLY. Records a per-(issue,decl) verdict in the
   // backend sidecar. It merges NOTHING, dispatches NO Aristotle, writes NO
   // ledger verdict. Safe to call on every swipe. Reject notes ride verbatim.
-  function postDeclVerdict(issue, decl, verdict, note) {
+  function postDeclVerdict(issue, decl, verdict, note, declFingerprint) {
     var body = { issue: issue, decl: decl, verdict: verdict };
     if (typeof note === "string") body.note = note; // verbatim, no rewrite
+    // Real declaration decisions are bound to the exact source + elaborated
+    // dependency context that was visible when the human clicked.  The
+    // reserved informal slot supplies an exact normalized-prose fingerprint.
+    if (declFingerprint) body.decl_fingerprint = declFingerprint;
     return postJSON("/api/decl-verdict", body);
   }
 
@@ -349,8 +396,10 @@
   // postDeclLock — LOCAL-ONLY. Toggles the opt-in HARD-FREEZE lock on a
   // declaration. A locked decl's signature is frozen at reject-ship so no
   // sibling-decl refine can change it; unlocked (soft) decls stay rewritable.
-  function postDeclLock(issue, decl, locked) {
-    return postJSON("/api/decl-lock", { issue: issue, decl: decl, locked: !!locked });
+  function postDeclLock(issue, decl, locked, declFingerprint) {
+    var body = { issue: issue, decl: decl, locked: !!locked };
+    if (declFingerprint) body.decl_fingerprint = declFingerprint;
+    return postJSON("/api/decl-lock", body);
   }
 
   // postShip — THE IRREVERSIBLE REVIEW CALL. Composes the per-issue outcome
@@ -362,11 +411,12 @@
   // API auto-approval AT SHIP (folding un-verdicted API decls into KEEP). The
   // toggle itself never POSTs; auto-approval happens ONLY here, at the
   // explicit token-bearing ship — never on the GET that assembled the view.
-  function postShip(issue, skipApi, reviewToken) {
+  function postShip(issue, skipApi, reviewToken, requestId) {
     return postJSON("/api/ship", {
       issue: issue,
       skip_api: !!skipApi,
       review_token: reviewToken || null,
+      request_id: requestId || null,
     });
   }
 
@@ -475,11 +525,20 @@
     // two-step choice.  Overrides are per issue+decl and live only in this tab.
     dependencyOverrides: {},
     subdeckRequestSeq: 0, // discards stale async GETs after issue/navigation changes
+    // Queue + parked-recovery data form one Review snapshot. A retry aborts
+    // and supersedes any pending read; the generation guard makes the older
+    // response inert even when AbortController is unavailable.
+    queueRequest: null,
+    queueAbortController: null,
+    queueRequestSeq: 0,
+    queueSnapshotKey: null,
+    queueRenderedKey: null,
+    reviewStuck: { issues: [], repo: null },
     activeTab: "review", // review | files | graph | status | issues | history
     filesChapter: "",   // "" = server default, "all" = project-wide reader
     filesData: null,
     filesQuery: "",
-    filesFilter: "all", // all | unreviewed | rejected | changed | surfaced
+    filesFilter: "all", // all | provisional | unreviewed | rejected | changed | surfaced
     filesFocus: null,
     filesResumeScroll: null,
     filesResumeName: null,
@@ -496,6 +555,7 @@
     definitionTermsRequest: null,
     definitionTermsRequestToken: null,
     definitionTermsQueued: null,
+    definitionTermsRequestSeq: 0,
     definitionRequestSeq: 0,
     // Verso is an optional, asynchronously-built semantic view of the same
     // source. Raw current source is always painted first; these fields only
@@ -517,22 +577,166 @@
     versoHoverController: null,
     reconciliation: null,
     reconciliationBusy: false,
+    // Dashboard reads use the same single-flight/stale-response discipline as
+    // Review.  Snapshot keys let an unchanged poll leave the DOM (and focus)
+    // exactly where it is.
+    issuesRequest: null,
+    issuesAbortController: null,
+    issuesRequestSeq: 0,
+    issuesSnapshotKey: null,
+    issuesStuck: { issues: [], repo: null },
+    statusDashboardRequest: null,
+    statusDashboardAbortController: null,
+    statusDashboardRequestSeq: 0,
+    statusDashboardSnapshotKey: null,
   };
   state.skipApi = readSkipApiPref();
 
+  // Keep an already-useful surface mounted while a manual retry is in flight.
+  // The small, absolutely-positioned status avoids the loader → empty → stuck
+  // sequence that used to make Review and Issues visibly flash.
+  function surfaceHasStableContent(host) {
+    if (!host) return false;
+    var kids = host.children || [];
+    for (var i = 0; i < kids.length; i++) {
+      var child = kids[i];
+      if (child.getAttribute &&
+          child.getAttribute("data-marathon-refresh-indicator") === "1") continue;
+      if (child.classList &&
+          (child.classList.contains("card-loading") ||
+           child.classList.contains("dash-loading"))) continue;
+      return true;
+    }
+    return false;
+  }
+
+  function beginSurfaceRefresh(host, loadingClass, loadingText) {
+    if (!host) return false;
+    var hadContent = surfaceHasStableContent(host);
+    host.setAttribute("aria-busy", "true");
+    if (!hadContent) {
+      var existingLoader = host.querySelector("." + loadingClass);
+      if (!existingLoader) {
+        host.innerHTML = "";
+        host.appendChild(el("div", {
+          class: loadingClass,
+          text: loadingText,
+        }));
+      }
+      return false;
+    }
+    var indicator = host.querySelector(
+      '[data-marathon-refresh-indicator="1"]'
+    );
+    if (!indicator) {
+      indicator = el("div", {
+        class: "surface-refresh-indicator",
+        "data-marathon-refresh-indicator": "1",
+        role: "status",
+        "aria-live": "polite",
+      }, [
+        el("span", { class: "surface-refresh-spinner", "aria-hidden": "true" }),
+        loadingText,
+      ]);
+      host.appendChild(indicator);
+    }
+    return true;
+  }
+
+  function endSurfaceRefresh(host) {
+    if (!host) return;
+    host.removeAttribute("aria-busy");
+    var indicator = host.querySelector(
+      '[data-marathon-refresh-indicator="1"]'
+    );
+    if (indicator) indicator.remove();
+  }
+
+  function marathonNodeKey(node) {
+    return node && node.nodeType === 1
+      ? node.getAttribute("data-status-key") : null;
+  }
+
+  // Reconcile a detached status snapshot into the mounted dashboard. Stable
+  // keyed rows retain their DOM identity, event handlers, focus, and scroll;
+  // only text/attributes/children that actually changed are updated.
+  function syncDomAttributes(current, fresh) {
+    var wanted = Object.create(null);
+    var freshAttrs = Array.prototype.slice.call(fresh.attributes || []);
+    freshAttrs.forEach(function (attr) {
+      wanted[attr.name] = true;
+      if (current.getAttribute(attr.name) !== attr.value) {
+        current.setAttribute(attr.name, attr.value);
+      }
+    });
+    Array.prototype.slice.call(current.attributes || []).forEach(function (attr) {
+      if (!wanted[attr.name]) current.removeAttribute(attr.name);
+    });
+    if (current.tagName === "INPUT") {
+      current.checked = fresh.checked;
+      current.disabled = fresh.disabled;
+    } else if (current.tagName === "BUTTON" ||
+               current.tagName === "SELECT" ||
+               current.tagName === "TEXTAREA") {
+      current.disabled = fresh.disabled;
+    }
+  }
+
+  function syncDomNode(current, fresh) {
+    if (!current || current.nodeType !== fresh.nodeType ||
+        (current.nodeType === 1 && current.tagName !== fresh.tagName)) {
+      if (current && current.parentNode) current.parentNode.replaceChild(fresh, current);
+      return fresh;
+    }
+    if (current.nodeType === 3) {
+      if (current.nodeValue !== fresh.nodeValue) current.nodeValue = fresh.nodeValue;
+      return current;
+    }
+    if (current.nodeType !== 1) return current;
+    syncDomAttributes(current, fresh);
+    syncDomChildren(current, fresh);
+    return current;
+  }
+
+  function syncDomChildren(current, fresh) {
+    var desired = Array.prototype.slice.call(fresh.childNodes || []);
+    desired.forEach(function (freshChild, index) {
+      var key = marathonNodeKey(freshChild);
+      var target = null;
+      if (key) {
+        for (var i = index; i < current.childNodes.length; i++) {
+          if (marathonNodeKey(current.childNodes[i]) === key) {
+            target = current.childNodes[i];
+            break;
+          }
+        }
+      } else {
+        target = current.childNodes[index] || null;
+      }
+      if (!target) {
+        current.insertBefore(freshChild, current.childNodes[index] || null);
+        return;
+      }
+      if (current.childNodes[index] !== target) {
+        current.insertBefore(target, current.childNodes[index] || null);
+      }
+      syncDomNode(target, freshChild);
+    });
+    while (current.childNodes.length > desired.length) {
+      current.removeChild(current.lastChild);
+    }
+  }
+
   function repaintDefinitionSurfaces() {
-    if (state.activeTab === "review" && state.subdeck &&
-        !state.rejectComposerOpen && !state.busy) {
-      // Preserve an explicitly revisited card instead of jumping back to the
-      // first unreviewed declaration merely because highlighting data arrived.
-      if (state.currentDecl) revisitDecl(state.currentDecl.name);
-      else renderSubdeckStage();
+    if (state.activeTab === "review" && state.subdeck) {
+      // Definition-index updates change only which identifiers are clickable.
+      // Patch those code nodes in place so the active card, inspector, focus,
+      // semantic-source scroll, and page position are not torn down.
+      if (state.currentDecl) {
+        refreshReviewDefinitionLinks(state.currentDecl);
+      }
     } else if (state.activeTab === "files" && state.filesData) {
-      // Never rebuild over a draft that has not been POSTed yet.
-      var openDraft = document.querySelector(
-        '#tab-files .reader-reject-editor:not([hidden]) textarea'
-      );
-      if (!openDraft) paintFilesTab();
+      refreshReaderDefinitionLinks();
     }
   }
 
@@ -559,7 +763,15 @@
       return Promise.resolve(state.definitionTerms);
     }
     if (state.definitionTermsRequest) {
-      if (force || (expectedToken && expectedToken !== state.definitionTermsRequestToken)) {
+      var queued = state.definitionTermsQueued;
+      var shouldQueue = !!queued || !!force ||
+        !!(expectedToken && expectedToken !== state.definitionTermsRequestToken);
+      if (shouldQueue) {
+        if (!queued ||
+            queued.expectedToken !== expectedToken ||
+            queued.force !== !!force) {
+          state.definitionTermsRequestSeq += 1;
+        }
         state.definitionTermsQueued = {
           expectedToken: expectedToken,
           force: !!force,
@@ -568,10 +780,16 @@
       return state.definitionTermsRequest;
     }
 
+    var generation = ++state.definitionTermsRequestSeq;
     state.definitionTermsRequestToken = expectedToken;
     var flight = fetchDefinitionTerms()
       .then(function (terms) {
-        installDefinitionTerms(terms);
+        // A newer source observation arrived while this GET was pending. Do
+        // not briefly install/repaint the superseded index; the queued read
+        // below will install the newest snapshot once.
+        if (generation === state.definitionTermsRequestSeq) {
+          installDefinitionTerms(terms);
+        }
         return terms;
       })
       .catch(function () { return null; });
@@ -600,6 +818,12 @@
 
   function readyIssues() {
     return state.queue.filter(function (c) { return c.ready; });
+  }
+
+  function provisionalIssues() {
+    return state.queue.filter(function (c) {
+      return !!c.inspectable && !!c.provisional && !c.ready;
+    });
   }
 
   // The next UNREVIEWED card in the subdeck (verdict null) — these are the
@@ -1030,6 +1254,66 @@
     }
     if (last < src.length) nodes = nodes.concat(leanPlainNodes(src.slice(last), kernel));
     return nodes;
+  }
+
+  function replaceLeanHighlight(host, src, kernel) {
+    if (!host) return;
+    var focused = document.activeElement;
+    var focusedLabel = focused && host.contains(focused) &&
+      focused.classList && focused.classList.contains("lh-ref")
+      ? focused.textContent : null;
+    while (host.firstChild) host.removeChild(host.firstChild);
+    leanHighlight(src || "", kernel || []).forEach(function (node) {
+      host.appendChild(node);
+    });
+    if (focusedLabel) {
+      var refs = host.querySelectorAll(".lh-ref");
+      for (var i = 0; i < refs.length; i++) {
+        if (refs[i].textContent === focusedLabel) {
+          refs[i].focus();
+          break;
+        }
+      }
+    }
+  }
+
+  function refreshReviewDefinitionLinks(card) {
+    var active = stage().querySelector("#active-card");
+    if (!active || !card) return;
+    var source = active.querySelector(".source-block code.lean");
+    if (source && card.source_block) {
+      replaceLeanHighlight(source, card.source_block, card.kernel);
+    }
+    var statement = active.querySelector(".statement-pp");
+    if (statement && card.statement_pp) {
+      replaceLeanHighlight(
+        statement, prettyLeanType(card.statement_pp), card.kernel
+      );
+    }
+  }
+
+  function refreshReaderDefinitionLinks() {
+    var byName = Object.create(null);
+    readerTargets(state.filesData).forEach(function (target) {
+      byName[target.name] = target;
+    });
+    var articles = document.querySelectorAll(
+      "#tab-files .reader-decl[data-decl-name]"
+    );
+    for (var i = 0; i < articles.length; i++) {
+      var target = byName[articles[i].getAttribute("data-decl-name")];
+      if (!target) continue;
+      var source = articles[i].querySelector(".reader-source code.lean");
+      if (source && target.source_block) {
+        replaceLeanHighlight(source, target.source_block, []);
+      }
+      var statement = articles[i].querySelector(".statement-pp");
+      if (statement && target.statement_pp) {
+        replaceLeanHighlight(
+          statement, prettyLeanType(target.statement_pp), []
+        );
+      }
+    }
   }
 
   // --- Verso semantic source (progressive enhancement) --------------------
@@ -3154,14 +3438,20 @@
   // it into our subdeck copy and advances to the declarations. NEVER ships.
   function commitInformalVerdict(verdict, note) {
     var issue = state.issue;
+    var contextFingerprint = state.subdeck && state.subdeck.informal &&
+      state.subdeck.informal.context_fingerprint;
     state.busy = true;
     setActionsEnabled(false);
     animateOut(verdict);
-    postDeclVerdict(issue, INFORMAL_KEY, verdict, note)
+    postDeclVerdict(
+      issue, INFORMAL_KEY, verdict, note, contextFingerprint
+    )
       .then(function (resp) {
         state.busy = false;
         var sd = state.subdeck;
         if (sd) {
+          if (resp && resp.review_token)
+            sd.review_token = resp.review_token;
           // Trust the server's informal slot when present; else update locally.
           if (resp && resp.informal) sd.informal = resp.informal;
           else if (sd.informal) {
@@ -3181,6 +3471,11 @@
         // stray key/swipe cannot re-fire the POST while it is shown. The retry
         // re-renders the approval card (which re-sets the flag) if still pending.
         state.informalActive = false;
+        if (err && err.status === 409) {
+          flashToast("The informal text changed — reloading it before you decide again");
+          refetchSubdeck();
+          return;
+        }
         showErrorCard("Could not record the informal verdict", err, function () {
           renderSubdeckStage();
         });
@@ -3355,15 +3650,30 @@
   }
 
   // Open the subdeck for the first ready issue, or explain why none are ready.
+  // Queue + stuck are installed as one snapshot by refreshQueue(), so a drained
+  // Review paints exactly once instead of briefly showing "caught up" before a
+  // second request replaces it with parked-recovery rows.
   function openFirstReadyIssue() {
     var ready = readyIssues();
     if (!ready.length) {
       state.issue = null;
       state.subdeck = null;
       state.currentDecl = null;
+      // An unchanged manual refresh should not destroy/recreate the same card:
+      // doing so loses focus and creates a visible flash even with a fast API.
+      if (state.queueRenderedKey &&
+          state.queueRenderedKey === state.queueSnapshotKey &&
+          surfaceHasStableContent(stage())) {
+        return;
+      }
       var unresolved = state.unresolved > 0;
+      var provisional = provisionalIssues();
       var actions = [
-        { label: "Refresh", kind: "btn-primary", onClick: refreshQueue },
+        {
+          label: "Refresh",
+          kind: provisional.length ? "" : "btn-primary",
+          onClick: refreshQueue,
+        },
       ];
       if (unresolved) {
         actions.unshift({
@@ -3377,29 +3687,49 @@
           onClick: function () { switchTab("issues"); },
         });
       }
+      var stuckSnapshot = state.reviewStuck || { issues: [], repo: null };
+      var stuck = stuckSnapshot.issues || [];
+      if (stuck.length) {
+        actions.unshift({
+          label: "Open recovery (" + stuck.length + ")",
+          onClick: function () { switchTab("issues"); },
+        });
+      }
+      if (provisional.length) {
+        actions.unshift({
+          label: "Review blocked code (" + provisional.length + ")",
+          kind: "btn-primary",
+          onClick: function () {
+            var first = provisional[0];
+            state.filesChapter = first.chapter == null
+              ? "all" : String(first.chapter);
+            state.filesFilter = "provisional";
+            state.filesQuery = "";
+            state.filesFocus = null;
+            state.filesData = null;
+            switchTab("files");
+          },
+        });
+      }
       showMessageCard({
-        title: unresolved ? "No issues ready for review" : "All caught up",
-        body: queueBlockerSummary(),
+        title: unresolved
+          ? (provisional.length
+            ? "No issues ready to ship — blocked code is reviewable"
+            : "No issues ready for review")
+          : "All caught up",
+        body: queueBlockerSummary() + (provisional.length
+          ? " " + provisional.length + " dependency-blocked issue" +
+            (provisional.length === 1 ? " is" : "s are") +
+            " available for provisional, source-ordered review. Decisions are " +
+            "bound to the exact code shown and reopen automatically if it changes; " +
+            "shipping stays blocked until predecessors resolve."
+          : ""),
         actions: actions,
       });
-      // Upgrade to the attention card if rejected issues are stranded — else a
-      // reviewer with an empty queue never learns they exist. Best-effort: a
-      // fetch failure leaves the plain "all caught up" card. Guard on state.issue
-      // so we never clobber a card the user has since navigated to.
-      getJSON("/api/stuck")
-        .then(function (d) {
-          var stuck = (d && d.issues) || [];
-          // Only paint if we're STILL on the drained Review stage — the fetch
-          // is async, so the user may have opened an issue or switched tabs
-          // (and recovered from the Issues tab) meanwhile; don't render a stale
-          // card into a backgrounded stage.
-          if (stuck.length && state.issue == null && state.activeTab === "review") {
-            showStuckAttentionCard(stuck, d.repo);
-          }
-        })
-        .catch(function () {});
+      state.queueRenderedKey = state.queueSnapshotKey;
       return;
     }
+    state.queueRenderedKey = null;
     openIssue(ready[0].id);
   }
 
@@ -3416,6 +3746,7 @@
     state.definitionRequestSeq += 1;
     if (issue !== state.issue) state.apiPanelOpen = false; // fresh per issue
     state.issue = issue;
+    state.queueRenderedKey = null;
     state.showSummary = false;
     // A genuinely fresh issue: re-offer its informal-approval card (a prior
     // session's "decide later" dismissal does not carry across issues).
@@ -3625,10 +3956,15 @@
       return;
     }
     if (state.busy) return;
+    var currentCard = findDecl(name);
+    var contextFingerprint = currentCard && currentCard.context_fingerprint;
+    var reloadAfterConflict = false;
     state.busy = true;
-    postDeclLock(state.issue, name, locked)
+    postDeclLock(state.issue, name, locked, contextFingerprint)
       .then(function (resp) {
         if (resp && resp.summary && state.subdeck) state.subdeck.summary = resp.summary;
+        if (resp && resp.review_token && state.subdeck)
+          state.subdeck.review_token = resp.review_token;
         // Reflect the new lock state on the local card copy so re-renders and
         // a later ship summary agree with the backend.
         var card = findDecl(name);
@@ -3636,9 +3972,20 @@
         if (state.currentDecl && state.currentDecl.name === name)
           state.currentDecl.locked = locked;
       })
-      .catch(function () { /* toast already shown by postJSON */ })
+      .catch(function (err) {
+        if (err && err.status === 409) {
+          reloadAfterConflict = true;
+          flashToast("The declaration changed — reloading the current review");
+        } else {
+          flashToast((err && err.message) || "Could not change the declaration lock");
+        }
+      })
       .then(function () {
         state.busy = false;
+        if (reloadAfterConflict) {
+          refetchSubdeck();
+          return;
+        }
         if (state.showSummary) {
           renderSummaryCard();
         } else if (state.currentDecl && state.currentDecl.name === name) {
@@ -3718,12 +4065,15 @@
     if (!state.currentDecl) return;
     var issue = state.issue;
     var decl = state.currentDecl.name;
+    var contextFingerprint = state.currentDecl.context_fingerprint;
     state.busy = true;
     setActionsEnabled(false);
     animateOut(verdict);
-    postDeclVerdict(issue, decl, verdict, note)
+    postDeclVerdict(issue, decl, verdict, note, contextFingerprint)
       .then(function (resp) {
         state.busy = false;
+        if (resp && resp.review_token && state.subdeck)
+          state.subdeck.review_token = resp.review_token;
         // Reflect the recorded verdict + progress back into our subdeck copy.
         applyDeclResult(decl, verdict, note, resp);
         // Wide read models may already be cached from an earlier tab visit.
@@ -3740,6 +4090,11 @@
       })
       .catch(function (err) {
         state.busy = false;
+        if (err && err.status === 409) {
+          flashToast("The code changed — reloading it before you decide again");
+          refetchSubdeck();
+          return;
+        }
         showErrorCard("Could not record verdict for " + decl, err, function () {
           revisitDecl(decl);
         });
@@ -3887,14 +4242,17 @@
     var anyAristotle = anyRejected || !!missing;
     // Under skip-API these API decls (with no human reject) join KEEP on ship.
     var autoApproved = autoApprovedForShip();
+    var provisionalReview = !!(sd && sd.provisional && sd.shippable === false);
 
     stage().innerHTML = "";
     var card = el("article", { class: "card summary-card", id: "active-card" });
     card.appendChild(subdeckHeader());
     card.appendChild(
       el("h2", { class: "summary-title", text:
-        (partialReject ? "Review paused at first rejection" : "Review complete") +
-        " — confirm & ship issue #" + sd.issue })
+        provisionalReview
+          ? "Provisional review saved — issue #" + sd.issue + " is still waiting"
+          : (partialReject ? "Review paused at first rejection" : "Review complete") +
+            " — confirm & ship issue #" + sd.issue })
     );
 
     // KEEP list (verified decls — kept exactly as written). Under skip-API the
@@ -4045,36 +4403,59 @@
       );
     }
 
+    if (provisionalReview) {
+      card.appendChild(el("section", {
+        class: "reader-provisional-note summary-provisional-note",
+        role: "status",
+      }, [
+        el("strong", { text: "SAVED, NOT SHIPPED — " }),
+        sd.ship_blocked_reason ||
+          "An upstream issue must resolve before this review can ship.",
+        " Marathon will keep these exact-code decisions and reopen any declaration " +
+          "whose source or elaborated dependencies change.",
+      ]));
+    }
+
     // Ship action. Label depends on whether anything was rejected:
     //   nothing rejected -> "Mark issue verified" (merges the PR, no Aristotle)
     //   any rejected     -> "Ship to Aristotle" (dispatches with the note)
     var shipLabel = anyAristotle ? "Ship to Aristotle" : "Mark issue verified";
-    var shipBtn = el("button", {
-      class: "btn ship-btn " + (anyAristotle ? "btn-danger" : "btn-primary"),
-      type: "button",
-      id: "btn-ship",
-      onclick: function () { confirmAndShip(anyAristotle); },
-    }, [shipLabel]);
+    var shipBtn = provisionalReview ? null : el("button", {
+        class: "btn ship-btn " + (anyAristotle ? "btn-danger" : "btn-primary"),
+        type: "button",
+        id: "btn-ship",
+        onclick: function () { confirmAndShip(anyAristotle); },
+      }, [shipLabel]);
+    var summaryActions = [
+      el("button", { class: "btn", type: "button", onclick: function () {
+        // On a partial reject, continue at the first untouched card only by
+        // explicit choice; otherwise revisit the first card as before.
+        var first = partialReject ? pendingCards[0] : (sd.cards || [])[0];
+        if (first && findDecl(first.name)) revisitDecl(first.name);
+        else if (partialReject && state.skipApi) setSkipApi(false);
+      } }, [partialReject ? "Continue reviewing anyway" : "Revisit declarations"]),
+    ];
+    if (shipBtn) summaryActions.push(shipBtn);
+    if (provisionalReview) {
+      summaryActions.push(el("button", {
+        class: "btn btn-primary",
+        type: "button",
+        onclick: function () { switchTab("status"); },
+      }, ["See what is blocking it"]));
+    }
     card.appendChild(
-      el("div", { class: "summary-actions" }, [
-        el("button", { class: "btn", type: "button", onclick: function () {
-          // On a partial reject, continue at the first untouched card only by
-          // explicit choice; otherwise revisit the first card as before.
-          var first = partialReject ? pendingCards[0] : (sd.cards || [])[0];
-          if (first && findDecl(first.name)) revisitDecl(first.name);
-          else if (partialReject && state.skipApi) setSkipApi(false);
-        } }, [partialReject ? "Continue reviewing anyway" : "Revisit declarations"]),
-        shipBtn,
-      ])
+      el("div", { class: "summary-actions" }, summaryActions)
     );
     card.appendChild(
       el("p", { class: "ship-warn", text:
-        "This is the irreversible review action — " +
-        (anyAristotle
-          ? (partialReject
-              ? "it dispatches the fix now; WAIT declarations stay untouched for the next round."
-              : "it dispatches Aristotle with your fix/add notes verbatim.")
-          : "it merges the marathon PR and marks the issue verified.") })
+        provisionalReview
+          ? "No irreversible action is available while this issue is dependency-blocked."
+          : "This is the irreversible review action — " +
+            (anyAristotle
+              ? (partialReject
+                  ? "it dispatches the fix now; WAIT declarations stay untouched for the next round."
+                  : "it dispatches Aristotle with your fix/add notes verbatim.")
+              : "it merges the marathon PR and marks the issue verified.") })
     );
 
     stage().appendChild(card);
@@ -4088,7 +4469,12 @@
     var issue = state.issue;
     postMissing(issue, note)
       .then(function (resp) {
-        if (state.subdeck) state.subdeck.missing = (resp && resp.missing) || null;
+        if (state.subdeck) {
+          state.subdeck.missing = (resp && resp.missing) || null;
+          if (resp && resp.review_token) {
+            state.subdeck.review_token = resp.review_token;
+          }
+        }
         renderSummaryCard();
       })
       .catch(function (err) {
@@ -4299,12 +4685,17 @@
     }
   }
 
-  function issueShipStatusUrl(issue) {
-    return "/api/ship-status?issue=" + encodeURIComponent(issue);
+  function issueShipStatusUrl(issue, requestId) {
+    var url = "/api/ship-status?issue=" + encodeURIComponent(issue);
+    if (requestId) {
+      url += "&request_id=" + encodeURIComponent(requestId);
+    }
+    return url;
   }
 
   function shipContextsMatch(a, b) {
     if (!a || !b || a.issue !== b.issue) return false;
+    if (a.requestId && b.requestId) return a.requestId === b.requestId;
     if (a.operationId && b.operationId) return a.operationId === b.operationId;
     return a.statusUrl === b.statusUrl;
   }
@@ -4316,9 +4707,15 @@
     if (!Number.isInteger(issue) || issue <= 0 || !statusUrl) return null;
     var operationId = raw.operationId || raw.operation_id || null;
     if (operationId != null && typeof operationId !== "string") return null;
+    var requestId = raw.requestId || raw.request_id || null;
+    if (requestId != null &&
+        (typeof requestId !== "string" || !/^[0-9a-f]{32}$/.test(requestId))) {
+      return null;
+    }
     return {
       issue: issue,
       operationId: operationId,
+      requestId: requestId,
       statusUrl: statusUrl,
     };
   }
@@ -4364,8 +4761,35 @@
     return normalizeShipContext({
       issue: issue,
       operationId: job && job.operation_id,
-      statusUrl: (job && job.status_url) || issueShipStatusUrl(issue),
+      requestId: job && job.request_id,
+      statusUrl: (job && job.status_url) ||
+        issueShipStatusUrl(issue, job && job.request_id),
     });
+  }
+
+  function newShipRequestId() {
+    var bytes = new Uint8Array(16);
+    if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+      window.crypto.getRandomValues(bytes);
+    } else {
+      // This identifier is an idempotency correlation key, not a credential.
+      // The fallback keeps older embedded browsers functional while combining
+      // time and per-byte randomness to make accidental reuse negligible.
+      var seed = Date.now();
+      for (var i = 0; i < bytes.length; i++) {
+        bytes[i] = Math.floor(Math.random() * 256) ^ ((seed >>> ((i % 4) * 8)) & 255);
+      }
+    }
+    return Array.prototype.map.call(bytes, function (value) {
+      return value.toString(16).padStart(2, "0");
+    }).join("");
+  }
+
+  function definiteShipPostRejection(err) {
+    return !!(
+      err && typeof err.status === "number" &&
+      err.status >= 400 && err.status < 500
+    );
   }
 
   function confirmedShipStatusNotFound(err) {
@@ -4609,9 +5033,22 @@
       .catch(function (err) {
         if (err && err.shipPollCancelled) return;
         if (confirmedShipStatusNotFound(err) && ctx.operationId) {
-          // The exact operation disappeared or changed. Reconcile by issue
-          // before drawing any conclusion or enabling the irreversible button.
-          return reconcileAmbiguousShip(ctx.issue, err);
+          // The exact operation disappeared or changed. A current client can
+          // still reconcile through this click's request id; never fall back to
+          // an unrelated "latest job for the issue" lookup.
+          if (ctx.requestId) {
+            return reconcileAmbiguousShip(ctx.issue, ctx.requestId, err);
+          }
+          restoreShipSummary(
+            ctx.issue,
+            "Could not confirm shipping status",
+            "This older saved shipping session has no per-click identifier. "
+              + "Ship remains disabled because another review round's result "
+              + "must not be mistaken for this one.",
+            null,
+            false
+          );
+          return;
         }
         if (confirmedShipStatusNotFound(err)) {
           clearShipContext(ctx);
@@ -4641,11 +5078,12 @@
   // the job before a proxy/browser connection failed. Resolve that ambiguity
   // with the issue-only PURE GET. Only a specific backend JSON 404 proves that
   // no job exists and makes an explicit retry safe.
-  function reconcileAmbiguousShip(issue, postError) {
+  function reconcileAmbiguousShip(issue, requestId, postError) {
     var provisional = persistShipContext({
       issue: issue,
       operationId: null,
-      statusUrl: issueShipStatusUrl(issue),
+      requestId: requestId,
+      statusUrl: issueShipStatusUrl(issue, requestId),
     });
     state.busy = state.issue === issue;
     if (state.issue === issue) {
@@ -4686,7 +5124,7 @@
         "Could not confirm shipping status",
         "The status service returned an unrecognized state. Ship remains disabled "
           + "until a durable result can be confirmed.",
-        function () { reconcileAmbiguousShip(issue, postError); },
+        function () { reconcileAmbiguousShip(issue, requestId, postError); },
         false
       );
     }).catch(function (statusError) {
@@ -4714,7 +5152,7 @@
           + ". The status check also failed: "
           + ((statusError && statusError.message) || "network error")
           + ". Ship remains disabled; checking status is a pure read and will not submit again.",
-        function () { reconcileAmbiguousShip(issue, postError); },
+        function () { reconcileAmbiguousShip(issue, requestId, postError); },
         false
       );
     });
@@ -4747,6 +5185,13 @@
   // a decl-verdict, or status polling.
   function shipIssue() {
     if (state.busy || !state.issue) return;
+    if (state.subdeck && state.subdeck.shippable === false) {
+      flashToast(
+        state.subdeck.ship_blocked_reason ||
+        "This provisional review cannot ship until its dependencies resolve"
+      );
+      return;
+    }
     var issue = state.issue;
     // Capture the skip-API view state so the BACKEND realizes the API
     // auto-approval at ship (folding un-verdicted API decls into KEEP). This
@@ -4758,6 +5203,13 @@
     // human reviewed. The backend rejects a stale token instead of silently
     // shipping a newer/different subdeck.
     var reviewToken = state.subdeck && state.subdeck.review_token;
+    var requestId = newShipRequestId();
+    var provisionalContext = persistShipContext({
+      issue: issue,
+      operationId: null,
+      requestId: requestId,
+      statusUrl: issueShipStatusUrl(issue, requestId),
+    });
     state.busy = true;
     setActionsEnabled(false);
     var shipButton = document.getElementById("btn-ship");
@@ -4766,7 +5218,7 @@
       shipButton.setAttribute("aria-disabled", "true");
     }
     showShipProgressCard(issue, "starting", null, false);
-    postShip(issue, skipApi, reviewToken)
+    postShip(issue, skipApi, reviewToken, requestId)
       .then(function (resp) {
         var status = normalizedShipStatus(resp);
         if (status === "succeeded" || status === "complete" || status === "completed") {
@@ -4785,6 +5237,7 @@
           resumeShipStatusPoll({
             issue: issue,
             operationId: resp && resp.operation_id,
+            requestId: (resp && resp.request_id) || requestId,
             statusUrl: statusUrl,
           });
           return;
@@ -4799,10 +5252,25 @@
         throw new Error("ship returned an unrecognized response");
       })
       .catch(function (err) {
+        if (definiteShipPostRejection(err)) {
+          // A parsed 4xx is an authoritative refusal, not a lost response.
+          // Looking up "the latest job for this issue" here could mistake an
+          // older review round's success for this rejected click.
+          clearShipContext(provisionalContext);
+          restoreShipSummary(
+            issue,
+            "Ship was not accepted",
+            ((err && err.message) || "The server refused this review") +
+              ". Nothing was shipped.",
+            null,
+            true
+          );
+          return;
+        }
         // Never equate a lost response with a failed irreversible operation.
-        // The issue-only status GET is pure and tells us whether a durable job
-        // was accepted before the connection failed.
-        return reconcileAmbiguousShip(issue, err);
+        // The request-id-bound status GET is pure and tells us whether THIS
+        // click was durably accepted before the connection failed.
+        return reconcileAmbiguousShip(issue, requestId, err);
       });
   }
 
@@ -5041,31 +5509,117 @@
   }
 
   // === queue / chapter =====================================================
+  var QUEUE_READ_TIMEOUT_MS = 45000;
+
   function refreshQueue() {
     setActionsEnabled(false);
-    stage().innerHTML = "";
-    stage().appendChild(el("div", { class: "card card-loading", text: "loading queue…" }));
-    return fetchQueue()
-      .then(function (data) {
-        state.queue = (data.cards || []).slice();
-        state.building = data.building || 0;
-        state.viewBuilding = data.view_building || 0;
-        state.landedToday = data.landed_today || 0;
-        state.unresolved = data.unresolved || 0;
-        state.awaitingRefinement = data.awaiting_refinement || 0;
-        state.needsAttention = data.needs_attention || 0;
-        state.needsCitationMapping = data.needs_citation_mapping || 0;
-        state.awaitingAudit = data.awaiting_audit || 0;
-        state.dependencyBlocked = data.dependency_blocked || 0;
-        state.otherUnresolved = data.other_unresolved || 0;
-        applyStatus({ building: state.building, landed_today: state.landedToday });
-        // The queue is the issue PICKER: drop straight into the first ready
-        // issue's subdeck (auto-pick). No verdict/ship here — pure reads only.
-        openFirstReadyIssue();
-      })
-      .catch(function (err) {
+    var generation = ++state.queueRequestSeq;
+    var hadContent = beginSurfaceRefresh(
+      stage(), "card-loading", "refreshing queue…"
+    );
+    // An explicit retry must never sit behind a fetch that the proxy/browser
+    // left pending. Abort it when supported and immediately start a newer
+    // generation; without AbortController the generation guard still makes
+    // the older response observationally inert.
+    if (state.queueAbortController) state.queueAbortController.abort();
+    return startQueueRefresh(generation, hadContent);
+  }
+
+  function startQueueRefresh(generation, hadContent) {
+    // Parked issues are part of the drained Review state, so load them beside
+    // the queue.  /api/stuck remains best-effort: retain the last good parked
+    // snapshot if that auxiliary read alone fails.
+    var controller = newReadController();
+    var options = readOptions(controller);
+    var request = withReadDeadline(Promise.all([
+      fetchQueue(null, options),
+      getJSON("/api/stuck", options).then(function (data) {
+        return { ok: true, data: data || {} };
+      }, function () {
+        return { ok: false, data: null };
+      }),
+    ]), QUEUE_READ_TIMEOUT_MS, controller, "Queue refresh");
+    var completion = request.then(function (parts) {
+      if (generation !== state.queueRequestSeq) return null;
+      var data = parts[0] || {};
+      var stuckRead = parts[1] || { ok: false };
+      var stuckSnapshot = stuckRead.ok
+        ? {
+            issues: ((stuckRead.data && stuckRead.data.issues) || []).slice(),
+            repo: (stuckRead.data && stuckRead.data.repo) || null,
+          }
+        : state.reviewStuck;
+
+      // Install the read model atomically before a single render.
+      state.queue = (data.cards || []).slice();
+      state.building = data.building || 0;
+      state.viewBuilding = data.view_building || 0;
+      state.landedToday = data.landed_today || 0;
+      state.unresolved = data.unresolved || 0;
+      state.awaitingRefinement = data.awaiting_refinement || 0;
+      state.needsAttention = data.needs_attention || 0;
+      state.needsCitationMapping = data.needs_citation_mapping || 0;
+      state.awaitingAudit = data.awaiting_audit || 0;
+      state.dependencyBlocked = data.dependency_blocked || 0;
+      state.otherUnresolved = data.other_unresolved || 0;
+      state.reviewStuck = stuckSnapshot || { issues: [], repo: null };
+      state.queueSnapshotKey = JSON.stringify([
+        data,
+        state.reviewStuck,
+      ]);
+      applyStatus({ building: state.building, landed_today: state.landedToday });
+
+      // The queue is the issue PICKER: drop straight into the first ready
+      // issue's subdeck (auto-pick). If the human opened another issue while
+      // this read was pending, update caches only and preserve that newer view.
+      if (state.issue == null) openFirstReadyIssue();
+      return parts;
+    }, function (err) {
+      if (generation !== state.queueRequestSeq) return null;
+      if (hadContent || surfaceHasStableContent(stage())) {
+        endSurfaceRefresh(stage());
+        if (state.activeTab === "review") {
+          flashToast("Could not refresh the queue: " +
+            ((err && err.message) || "network error"));
+        }
+      } else {
         showErrorCard("Could not load the queue", err, refreshQueue);
-      });
+      }
+      return null;
+    }).then(function (result) {
+      var current = state.queueRequest === completion;
+      if (current) {
+        state.queueRequest = null;
+        if (state.queueAbortController === controller) {
+          state.queueAbortController = null;
+        }
+      }
+      if (generation !== state.queueRequestSeq) return result;
+      endSurfaceRefresh(stage());
+      return result;
+    }, function (err) {
+      var current = state.queueRequest === completion;
+      if (current) {
+        state.queueRequest = null;
+        if (state.queueAbortController === controller) {
+          state.queueAbortController = null;
+        }
+      }
+      if (generation !== state.queueRequestSeq) return null;
+      endSurfaceRefresh(stage());
+      if (hadContent || surfaceHasStableContent(stage())) {
+        if (state.activeTab === "review") {
+          flashToast("Could not refresh the queue: " +
+            ((err && err.message) || "rendering error"));
+        }
+      } else {
+        showErrorCard("Could not load the queue", err, refreshQueue);
+      }
+      return null;
+    });
+    state.queueRequest = completion;
+    state.queueAbortController = controller;
+    return completion;
   }
 
   // === action bar enable/disable ==========================================
@@ -5280,7 +5834,7 @@
     // Stop any prior tab's auto-refresh.
     if (dashTimer) { clearInterval(dashTimer); dashTimer = null; }
     if (name === "status") {
-      renderStatusTab();
+      renderStatusTab(true);
       dashTimer = setInterval(renderStatusTab, DASH_POLL_MS);
     } else if (name === "files") {
       renderFilesTab();
@@ -5308,6 +5862,7 @@
 
   function readerTargetMatches(target, query, filter) {
     filter = filter || "all";
+    if (filter === "provisional" && !target.provisional) return false;
     if (filter === "unreviewed" && target.verdict) return false;
     if (filter === "rejected" && target.verdict !== "rejected") return false;
     if (filter === "changed" &&
@@ -5331,13 +5886,22 @@
 
   function readerVerdict(target, verdict, note, button) {
     if (state.filesBusy) return;
+    if (verdict !== "defer" && target.inspectable === false) {
+      flashToast(
+        target.inspection_blocked_reason ||
+        "This declaration needs current machine-audit evidence before review"
+      );
+      return;
+    }
     if (verdict !== "defer" && (target.blocked_by || []).length) {
       flashToast("Waiting on " + target.blocked_by.join(", ") + " — defer or repair it first");
       return;
     }
     state.filesBusy = true;
     if (button) button.disabled = true;
-    postDeclVerdict(target.issue, target.name, verdict, note)
+    postDeclVerdict(
+      target.issue, target.name, verdict, note, target.context_fingerprint
+    )
       .then(function () {
         state.filesBusy = false;
         state.graphData = null;
@@ -5350,6 +5914,12 @@
       .catch(function (err) {
         state.filesBusy = false;
         if (button) button.disabled = false;
+        if (err && err.status === 409) {
+          state.filesData = null;
+          flashToast("The code changed — reloading the source-ordered review");
+          renderFilesTab();
+          return;
+        }
         flashToast((err && err.message) || "Could not record declaration verdict");
       });
   }
@@ -5423,9 +5993,14 @@
 
   function renderReaderTarget(target) {
     var blocked = (target.blocked_by || []).length > 0;
+    var unavailable = target.inspectable === false;
+    var decisionBlocked = blocked || unavailable;
+    var provisional = !!target.provisional;
     var article = el("article", {
       class: "reader-decl reader-status-" + (target.verdict || "unreviewed") +
-        (blocked ? " reader-blocked" : ""),
+        (blocked ? " reader-blocked" : "") +
+        (unavailable ? " reader-unavailable" : "") +
+        (provisional ? " reader-provisional" : ""),
       "data-decl-name": target.name,
     });
     var issueLink = target.permalink
@@ -5443,9 +6018,30 @@
       ]),
       el("div", { class: "reader-badges" }, [
         statusBadge(target.verdict || "unreviewed"),
+        provisional
+          ? el("span", { class: "provisional-badge", text: "provisional" })
+          : null,
         tierBadge(target.tier, target.qualifiers),
       ]),
     ]));
+    if (unavailable) {
+      article.appendChild(el("div", { class: "reader-wait" }, [
+        el("strong", { text: "NOT READY FOR REVIEW — " }),
+        target.inspection_blocked_reason ||
+          "Current machine-audit evidence is not available for this declaration.",
+      ]));
+    }
+    if (provisional) {
+      article.appendChild(el("div", { class: "reader-provisional-note" }, [
+        el("strong", { text: "PROVISIONAL REVIEW — " }),
+        "Issue #" + target.issue + " is safe to inspect but cannot ship yet. " +
+          (target.ship_blocked_reason
+            ? target.ship_blocked_reason + ". "
+            : "An upstream issue must resolve first. ") +
+          "Your decision is saved against this exact source and elaborated " +
+          "dependency context; Marathon reopens it automatically if either changes.",
+      ]));
+    }
     article.appendChild(el("div", { class: "reader-context" }, [
       issueLink,
       el("span", { text: target.issue_title || "" }),
@@ -5492,19 +6088,44 @@
     var keep = el("button", {
       class: "btn reader-keep",
       type: "button",
-      disabled: blocked ? "disabled" : null,
-      title: blocked ? "Fix the rejected predecessor first" : "Keep this declaration (local only)",
-    }, [target.verdict === "verified" ? "✓ Kept" : "Keep"]);
+      disabled: decisionBlocked ? "disabled" : null,
+      title: blocked ? "Fix the rejected predecessor first" :
+        (unavailable
+          ? (target.inspection_blocked_reason ||
+            "Current machine-audit evidence is required before review")
+          :
+        (provisional
+          ? "Keep provisionally; shipping remains blocked until predecessors resolve"
+          : "Keep this declaration (local only)")),
+    }, [target.verdict === "verified"
+      ? (provisional ? "✓ Kept provisionally" : "✓ Kept")
+      : (provisional ? "Provisional keep" : "Keep")]);
     var reject = el("button", {
       class: "btn reader-fix",
       type: "button",
-      disabled: blocked ? "disabled" : null,
-      title: blocked ? "Fix the rejected predecessor first" : "Write a FIX note beside the source",
-    }, [target.verdict === "rejected" ? "✗ Edit FIX" : "Fix…"]);
+      disabled: decisionBlocked ? "disabled" : null,
+      title: blocked ? "Fix the rejected predecessor first" :
+        (unavailable
+          ? (target.inspection_blocked_reason ||
+            "Current machine-audit evidence is required before review")
+          :
+        (provisional
+          ? "Record a provisional FIX note; shipping remains blocked"
+          : "Write a FIX note beside the source")),
+    }, [target.verdict === "rejected"
+      ? (provisional ? "✗ Edit provisional FIX" : "✗ Edit FIX")
+      : (provisional ? "Provisional fix…" : "Fix…")]);
     var defer = el("button", { class: "btn", type: "button" }, [
       target.verdict === "deferred" ? "↺ Deferred" : "Defer",
     ]);
-    var focused = el("button", { class: "btn btn-tiny", type: "button" }, ["Focused review"]);
+    var focused = el("button", {
+      class: "btn btn-tiny",
+      type: "button",
+      disabled: unavailable ? "disabled" : null,
+      title: unavailable
+        ? "Focused review opens after current machine-audit evidence is available"
+        : "Open this issue in one-declaration-at-a-time review",
+    }, ["Focused review"]);
     var reviewDetails = el("button", {
       class: "btn btn-tiny source-review-details",
       type: "button",
@@ -5543,7 +6164,12 @@
     )) return;
     state.filesBusy = true;
     var items = targets.map(function (target) {
-      return { issue: target.issue, decl: target.name, verdict: verdict };
+      return {
+        issue: target.issue,
+        decl: target.name,
+        verdict: verdict,
+        decl_fingerprint: target.context_fingerprint,
+      };
     });
     postBatchDeclVerdicts(items)
       .then(function (response) {
@@ -5554,6 +6180,12 @@
       })
       .catch(function (err) {
         state.filesBusy = false;
+        if (err && err.status === 409) {
+          state.filesData = null;
+          flashToast("The code changed — reloading before applying the batch");
+          renderFilesTab();
+          return;
+        }
         flashToast((err && err.message) || "Batch review failed");
       });
   }
@@ -5599,6 +6231,7 @@
       class: "reader-select", "aria-label": "Declaration status filter",
     }, [
       el("option", { value: "all", text: "All targets" }),
+      el("option", { value: "provisional", text: "Provisional" }),
       el("option", { value: "unreviewed", text: "Unreviewed" }),
       el("option", { value: "rejected", text: "Rejected" }),
       el("option", { value: "changed", text: "Changed" }),
@@ -5618,7 +6251,10 @@
       el("div", {}, [
         el("h2", { text: data.chapter == null ? "Project file review" : "Chapter " + data.chapter + " file review" }),
         el("p", { class: "reader-help", text:
-          "Read declarations in source order, keep notes beside the code, and batch only deliberate local verdicts." }),
+          "Read declarations in source order and keep notes beside the code. " +
+          "Dependency-blocked declarations are clearly marked provisional: " +
+          "their decisions are tied to the exact code and reopen after relevant changes; " +
+          "they cannot ship until their issue is ready." }),
       ]),
       el("div", { class: "reader-toolbar" }, [chapterSelect, targetFilter, search, refresh]),
     ]));
@@ -6812,7 +7448,7 @@
       var want = input.checked;
       input.disabled = true;
       postJSON("/api/prover-toggle", { enabled: want })
-        .then(function () { renderStatusTab(); })
+        .then(function () { renderStatusTab(true); })
         .catch(function (e) {
           input.checked = !want;
           input.disabled = false;
@@ -6844,7 +7480,7 @@
     if (state.conductorStartBusy) return;
     state.conductorStartBusy = true;
     state.conductorStartError = "";
-    renderStatusTab();
+    renderStatusTab(true);
     postJSON("/api/conductor-start", {})
       .then(function () { return pollConductorUntilLive(16); })
       .then(function (d) {
@@ -6854,12 +7490,12 @@
         state.conductorStartBusy = false;
         state.conductorStartError = "";
         flashToast("Orchestrator restarted");
-        renderStatusTab();
+        renderStatusTab(true);
       })
       .catch(function (e) {
         state.conductorStartBusy = false;
         state.conductorStartError = (e && e.message) ? e.message : String(e);
-        renderStatusTab();
+        renderStatusTab(true);
       });
   }
 
@@ -6883,20 +7519,99 @@
     ]);
   }
 
-  function renderStatusTab() {
+  var STATUS_READ_TIMEOUT_MS = 15000;
+
+  function clearStatusRefreshError(host) {
+    if (!host) return;
+    host.removeAttribute("data-status-stale");
+    var warning = host.querySelector(".status-refresh-error");
+    if (warning) warning.remove();
+  }
+
+  function showStatusRefreshError(host, err) {
+    if (!host) return;
+    var message = (err && err.message) || String(err || "network error");
+    if (state.statusDashboardSnapshotKey && surfaceHasStableContent(host)) {
+      host.setAttribute("data-status-stale", "true");
+      var warning = host.querySelector(".status-refresh-error");
+      if (!warning) {
+        warning = el("div", {
+          class: "status-refresh-error",
+          "data-status-key": "status-refresh-error",
+          role: "status",
+          "aria-live": "polite",
+        });
+        host.appendChild(warning);
+      }
+      warning.textContent =
+        "Status refresh failed — showing the last known state: " + message;
+      return;
+    }
+    dashError("dash-status", err);
+  }
+
+  function statusRowKey(kind, values) {
+    return kind + ":" + JSON.stringify(values || []);
+  }
+
+  function renderStatusTab(force) {
     if (state.activeTab !== "status") return; // a stale poll after a switch
-    getJSON("/api/conductor-status").then(function (d) {
-      if (state.activeTab !== "status") return;
-      var host = dashHost("dash-status");
-      if (!host) return;
-      host.innerHTML = "";
+    // The five-second timer must not overlap a slow conductor read. Calls made
+    // while one is live share its completion. Explicit mutation/navigation
+    // refreshes supersede the old read so a pre-mutation response cannot repaint.
+    if (state.statusDashboardRequest && !force) {
+      return state.statusDashboardRequest;
+    }
+    var host = dashHost("dash-status");
+    if (!host) return;
+    var generation = ++state.statusDashboardRequestSeq;
+    beginSurfaceRefresh(host, "dash-loading", "refreshing status…");
+    if (state.statusDashboardAbortController) {
+      state.statusDashboardAbortController.abort();
+    }
+    var controller = newReadController();
+    var request = withReadDeadline(
+      getJSON("/api/conductor-status", readOptions(controller)),
+      STATUS_READ_TIMEOUT_MS,
+      controller,
+      "Status refresh"
+    );
+    var completion = request.then(function (d) {
+      if (generation !== state.statusDashboardRequestSeq ||
+          state.activeTab !== "status") return null;
       var up = !!d.alive;
       if (up) state.conductorStartError = "";
+      // updated_ts is a heartbeat. If it is the only field that moved, update
+      // that one text node and keep the rest of the dashboard (including focus
+      // and scroll position) mounted.
+      var stableStatus = {};
+      Object.keys(d || {}).forEach(function (key) {
+        if (key !== "updated_ts") stableStatus[key] = d[key];
+      });
+      var snapshotKey = JSON.stringify([
+        stableStatus,
+        state.conductorStartBusy,
+        state.conductorStartError,
+      ]);
+      if (snapshotKey === state.statusDashboardSnapshotKey &&
+          surfaceHasStableContent(host)) {
+        var heartbeat = host.querySelector(".cond-updated");
+        if (heartbeat) {
+          heartbeat.textContent = d.updated_ts
+            ? ("updated " + fmtTs(d.updated_ts)) : "";
+        }
+        clearStatusRefreshError(host);
+        return d;
+      }
+      var nextHost = document.createElement("div");
       // DEGRADED beats "running": a conductor with a broken dispatch env
       // (e.g. no Aristotle key) is alive but can't refine — a green chip
       // here hid exactly that during the 2026-07-07 incident.
       var degraded = up && d.degraded;
-      host.appendChild(el("div", { class: "cond-banner" + (degraded ? " cond-degraded" : "") }, [
+      nextHost.appendChild(el("div", {
+        class: "cond-banner" + (degraded ? " cond-degraded" : ""),
+        "data-status-key": "conductor",
+      }, [
         el("span", { class: "cond-dot " + (degraded ? "degraded" : (up ? "up" : "down")) }),
         el("div", { class: "cond-summary" }, [
           el("div", { class: "cond-title",
@@ -6914,17 +7629,24 @@
           el("div", {}, ["pid ", el("span", { class: "mono",
             text: d.pid == null ? "—" : String(d.pid) })]),
           el("div", { text: "concurrency " + (d.concurrency == null ? "—" : d.concurrency) }),
-          el("div", { text: d.updated_ts ? ("updated " + fmtTs(d.updated_ts)) : "" }),
+          el("div", { class: "cond-updated",
+            text: d.updated_ts ? ("updated " + fmtTs(d.updated_ts)) : "" }),
           proverToggle(d),
         ]),
       ]));
-      host.appendChild(el("div", { class: "stat-row dash-section" }, [
+      nextHost.appendChild(el("div", {
+        class: "stat-row dash-section",
+        "data-status-key": "stats",
+      }, [
         statChip(d.running || 0, "running"),
         statChip((d.queued || []).length, "queued"),
         statChip((d.jobs || []).length, "jobs tracked"),
         statChip((d.landings || []).length, "recent landings"),
       ]));
-      var jobsSec = el("section", { class: "dash-section" },
+      var jobsSec = el("section", {
+        class: "dash-section",
+        "data-status-key": "jobs",
+      },
         [el("div", { class: "dash-h", text: "Aristotle jobs" })]);
       if (!(d.jobs || []).length)
         jobsSec.appendChild(el("div", { class: "dash-empty", text: "no jobs — the queue is drained" }));
@@ -6963,6 +7685,9 @@
         kids.push(el("span", { class: "job-open", text: "details ›" }));
         var row = el("div", {
           class: "job-row job-row-click",
+          "data-status-key": statusRowKey("job", [
+            j.issue_num, j.started_ts, j.pid, j.branch,
+          ]),
           title: "Open this run's ratings + prompts",
           onclick: (function (issue) {
             return function () { if (issue != null) openRunDetail(issue); };
@@ -6970,26 +7695,35 @@
         }, kids);
         jobsSec.appendChild(row);
       });
-      host.appendChild(jobsSec);
+      nextHost.appendChild(jobsSec);
       // Queued (rejected, not yet a running job) — the "I shipped a reject,
       // where is it?" gap. Single-flight + same-chapter means a reject waits
       // behind a running same-chapter job; show it here with the reason.
       var queued = d.queued || [];
-      var qSec = el("section", { class: "dash-section" },
+      var qSec = el("section", {
+        class: "dash-section",
+        "data-status-key": "queued",
+      },
         [el("div", { class: "dash-h", text: "Queued (waiting to dispatch)" })]);
       if (!queued.length) {
         qSec.appendChild(el("div", { class: "dash-empty", text: "nothing queued" }));
       }
       queued.forEach(function (it) {
-        qSec.appendChild(el("div", { class: "job-row queued-row" }, [
+        qSec.appendChild(el("div", {
+          class: "job-row queued-row",
+          "data-status-key": statusRowKey("queued", [it.issue_num]),
+        }, [
           el("span", { class: "job-issue", text: "#" + (it.issue_num == null ? "?" : it.issue_num) }),
           el("span", { class: "job-chip", text: "c" + (it.chapter == null ? "?" : it.chapter) }),
           el("span", { class: "sb sb-queued", text: "queued" }),
           el("span", { class: "job-wait", text: it.reason || "queued" }),
         ]));
       });
-      host.appendChild(qSec);
-      var landSec = el("section", { class: "dash-section" },
+      nextHost.appendChild(qSec);
+      var landSec = el("section", {
+        class: "dash-section",
+        "data-status-key": "landings",
+      },
         [el("div", { class: "dash-h", text: "Recent landings" })]);
       if (!(d.landings || []).length)
         landSec.appendChild(el("div", { class: "dash-empty", text: "none yet" }));
@@ -7006,10 +7740,49 @@
           kids.push(el("span", { class: "job-aristotle mono",
                                  text: String(l.sha_landed).slice(0, 7) }));
         kids.push(el("span", { class: "job-when", text: fmtTs(l.ts) }));
-        landSec.appendChild(el("div", { class: "land-row" }, kids));
+        landSec.appendChild(el("div", {
+          class: "land-row",
+          "data-status-key": statusRowKey("landing", [l.issue, l.pr, l.ts]),
+        }, kids));
       });
-      host.appendChild(landSec);
-    }).catch(function (e) { dashError("dash-status", e); });
+      nextHost.appendChild(landSec);
+      syncDomChildren(host, nextHost);
+      state.statusDashboardSnapshotKey = snapshotKey;
+      clearStatusRefreshError(host);
+      return d;
+    }, function (e) {
+      if (generation === state.statusDashboardRequestSeq &&
+          state.activeTab === "status") {
+        showStatusRefreshError(host, e);
+      }
+      return null;
+    }).then(function (result) {
+      if (state.statusDashboardRequest === completion) {
+        state.statusDashboardRequest = null;
+        if (state.statusDashboardAbortController === controller) {
+          state.statusDashboardAbortController = null;
+        }
+      }
+      if (generation === state.statusDashboardRequestSeq) {
+        endSurfaceRefresh(host);
+      }
+      return result;
+    }, function (e) {
+      if (state.statusDashboardRequest === completion) {
+        state.statusDashboardRequest = null;
+        if (state.statusDashboardAbortController === controller) {
+          state.statusDashboardAbortController = null;
+        }
+      }
+      if (generation === state.statusDashboardRequestSeq) {
+        endSurfaceRefresh(host);
+        if (state.activeTab === "status") showStatusRefreshError(host, e);
+      }
+      return null;
+    });
+    state.statusDashboardRequest = completion;
+    state.statusDashboardAbortController = controller;
+    return completion;
   }
 
   // openRunDetail — the click-into-a-run panel (Status tab → a job): its live
@@ -7144,7 +7917,14 @@
     var statusId = "recovery-status-" + seq;
     var completed = false;
     var busy = false;
+    var refreshedAfterCompletion = false;
     var radios = [];
+
+    function refreshOriginOnce() {
+      if (refreshedAfterCompletion) return;
+      refreshedAfterCompletion = true;
+      if (typeof after === "function") after();
+    }
 
     var title = el("h2", {
       class: "modal-title recovery-title",
@@ -7379,7 +8159,7 @@
           // surface when the durable request is accepted.
           if (!document.contains(panel)) {
             flashToast(status.textContent);
-            if (typeof after === "function") after();
+            refreshOriginOnce();
           }
         })
         .catch(function (err) {
@@ -7402,90 +8182,171 @@
     });
 
     openModal(panel, function () {
-      if (completed && typeof after === "function") after();
+      if (completed) refreshOriginOnce();
     }, trigger);
   }
 
   // Parked rejections are not in the swipe queue, so this best-effort section
   // keeps them reachable without the CLI. Every row opens the shared recovery
   // chooser; no recovery action fires from the row itself.
-  // Best-effort: a fetch failure never breaks the Issues tab.
-  function renderStuckSection(host, repo) {
-    getJSON("/api/stuck").then(function (d) {
-      if (state.activeTab !== "issues") return;
-      var stuck = (d && d.issues) || [];
-      if (!stuck.length) return;
-      var rows = stuck.map(function (it) {
-        var kids = [
-          ghLink(repo, "issues", it.num, "#" + it.num, "issue-id"),
-          statusBadge(it.status),
-          el("span", { class: "issue-title", title: it.note_preview || "",
-                       text: it.fix_pr != null ? stuckRowText(it)
-                           : (it.note_preview || "(no stored note)") }),
-        ];
-        if (it.fix_pr != null)
-          kids.push(ghLink(repo, "pull", it.fix_pr, "PR #" + it.fix_pr, "issue-tier"));
-        if (it.attempts) kids.push(el("span", { class: "issue-tier",
-                                                text: it.attempts + " tries" }));
-        kids.push(recoveryButton(it, repo, renderIssuesTab));
-        return el("div", { class: "issue-row stuck-row" }, kids);
-      });
-      var section = el("section", { class: "chap-block stuck-block" }, [
-        el("div", { class: "chap-title" }, [
-          "Parked — choose recovery",
-          el("span", { class: "chap-count", text: stuck.length + " parked" }),
-        ]),
-      ].concat(rows));
-      host.insertBefore(section, host.firstChild);
-    }).catch(function () { /* best-effort surface */ });
+  // Best-effort parked-recovery data is fetched alongside the overview and
+  // handed here synchronously. That makes the Issues tab one atomic paint and
+  // prevents late stuck reads from inserting duplicate sections.
+  function renderStuckSection(host, repo, stuckSnapshot) {
+    var stuck = (stuckSnapshot && stuckSnapshot.issues) || [];
+    if (!stuck.length) return;
+    var rows = stuck.map(function (it) {
+      var kids = [
+        ghLink(repo, "issues", it.num, "#" + it.num, "issue-id"),
+        statusBadge(it.status),
+        el("span", { class: "issue-title", title: it.note_preview || "",
+                     text: it.fix_pr != null ? stuckRowText(it)
+                         : (it.note_preview || "(no stored note)") }),
+      ];
+      if (it.fix_pr != null)
+        kids.push(ghLink(repo, "pull", it.fix_pr, "PR #" + it.fix_pr, "issue-tier"));
+      if (it.attempts) kids.push(el("span", { class: "issue-tier",
+                                              text: it.attempts + " tries" }));
+      kids.push(recoveryButton(it, repo, renderIssuesTab));
+      return el("div", { class: "issue-row stuck-row" }, kids);
+    });
+    var section = el("section", { class: "chap-block stuck-block" }, [
+      el("div", { class: "chap-title" }, [
+        "Parked — choose recovery",
+        el("span", { class: "chap-count", text: stuck.length + " parked" }),
+      ]),
+    ].concat(rows));
+    host.insertBefore(section, host.firstChild);
   }
 
+  var ISSUES_READ_TIMEOUT_MS = 30000;
+
   function renderIssuesTab() {
+    if (state.activeTab !== "issues") return;
     var host = dashHost("dash-issues");
     if (!host) return;
-    host.innerHTML = "";
-    host.appendChild(el("div", { class: "dash-loading", text: "loading issues…" }));
-    getJSON("/api/issues-overview").then(function (d) {
-      if (state.activeTab !== "issues") return;
-      host.innerHTML = "";
-      var counts = d.counts || {};
-      var order = ["building", "ready", "verified", "rejected", "stalled", "blocked", "pending"];
-      var chips = order.filter(function (s) { return counts[s]; })
-        .map(function (s) { return statChip(counts[s], s); });
-      if (chips.length) host.appendChild(el("div", { class: "stat-row dash-section" }, chips));
-      var any = false;
-      (d.chapters || []).forEach(function (ch) {
-        if (!(ch.issues || []).length) return;
-        any = true;
-        var block = el("section", { class: "chap-block" }, [
-          el("div", { class: "chap-title" }, [
-            "Chapter " + ch.chapter,
-            el("span", { class: "chap-count", text: ch.issues.length + " issues" }),
-          ]),
-        ]);
-        ch.issues.forEach(function (it) {
-          var kids = [
-            ghLink(d.repo, "issues", it.id, "#" + it.id, "issue-id"),
-            statusBadge(it.status),
-            el("span", { class: "issue-title", title: it.title || "", text: it.title || "(untitled)" }),
-          ];
-          if (it.blocked_reason) kids.push(el("span", {
-            class: "issue-blocker",
-            title: it.blocked_reason,
-            text: it.blocked_reason,
-          }));
-          if (it.tier) kids.push(el("span", { class: "issue-tier", text: it.tier }));
-          var row = el("div", { class: "issue-row" + (it.ready ? " is-ready" : "") }, kids);
-          if (it.ready) row.addEventListener("click", function () {
-            switchTab("review"); openIssue(it.id);
+    var generation = ++state.issuesRequestSeq;
+    var hadContent = beginSurfaceRefresh(
+      host, "dash-loading", "refreshing issues…"
+    );
+    if (state.issuesAbortController) state.issuesAbortController.abort();
+
+    function startIssuesRefresh(requestGeneration, preservedContent) {
+      var controller = newReadController();
+      var options = readOptions(controller);
+      var request = withReadDeadline(Promise.all([
+        getJSON("/api/issues-overview", options),
+        getJSON("/api/stuck", options).then(function (data) {
+          return { ok: true, data: data || {} };
+        }, function () {
+          return { ok: false, data: null };
+        }),
+      ]), ISSUES_READ_TIMEOUT_MS, controller, "Issues refresh");
+      var completion = request.then(function (parts) {
+        if (requestGeneration !== state.issuesRequestSeq ||
+            state.activeTab !== "issues") return null;
+        var d = parts[0] || {};
+        var stuckRead = parts[1] || { ok: false };
+        var stuckSnapshot = stuckRead.ok
+          ? {
+              issues: ((stuckRead.data && stuckRead.data.issues) || []).slice(),
+              repo: (stuckRead.data && stuckRead.data.repo) || d.repo || null,
+            }
+          : state.issuesStuck;
+        var snapshotKey = JSON.stringify([d, stuckSnapshot]);
+        state.issuesStuck = stuckSnapshot || { issues: [], repo: null };
+        if (snapshotKey === state.issuesSnapshotKey &&
+            surfaceHasStableContent(host)) {
+          return parts;
+        }
+        state.issuesSnapshotKey = snapshotKey;
+        host.innerHTML = "";
+        var counts = d.counts || {};
+        var order = ["building", "ready", "verified", "rejected", "stalled", "blocked", "pending"];
+        var chips = order.filter(function (s) { return counts[s]; })
+          .map(function (s) { return statChip(counts[s], s); });
+        if (chips.length) host.appendChild(el("div", { class: "stat-row dash-section" }, chips));
+        var any = false;
+        (d.chapters || []).forEach(function (ch) {
+          if (!(ch.issues || []).length) return;
+          any = true;
+          var block = el("section", { class: "chap-block" }, [
+            el("div", { class: "chap-title" }, [
+              "Chapter " + ch.chapter,
+              el("span", { class: "chap-count", text: ch.issues.length + " issues" }),
+            ]),
+          ]);
+          ch.issues.forEach(function (it) {
+            var kids = [
+              ghLink(d.repo, "issues", it.id, "#" + it.id, "issue-id"),
+              statusBadge(it.status),
+              el("span", { class: "issue-title", title: it.title || "", text: it.title || "(untitled)" }),
+            ];
+            if (it.blocked_reason) kids.push(el("span", {
+              class: "issue-blocker",
+              title: it.blocked_reason,
+              text: it.blocked_reason,
+            }));
+            if (it.tier) kids.push(el("span", { class: "issue-tier", text: it.tier }));
+            var row = el("div", { class: "issue-row" + (it.ready ? " is-ready" : "") }, kids);
+            if (it.ready) row.addEventListener("click", function () {
+              switchTab("review"); openIssue(it.id);
+            });
+            block.appendChild(row);
           });
-          block.appendChild(row);
+          host.appendChild(block);
         });
-        host.appendChild(block);
+        if (!any) host.appendChild(el("div", { class: "dash-empty", text: "no registered issues" }));
+        renderStuckSection(host, d.repo || state.issuesStuck.repo, state.issuesStuck);
+        return parts;
+      }, function (err) {
+        if (requestGeneration !== state.issuesRequestSeq ||
+            state.activeTab !== "issues") return null;
+        if (preservedContent || surfaceHasStableContent(host)) {
+          endSurfaceRefresh(host);
+          flashToast("Could not refresh issues: " +
+            ((err && err.message) || "network error"));
+        } else {
+          dashError("dash-issues", err);
+        }
+        return null;
+      }).then(function (result) {
+        var current = state.issuesRequest === completion;
+        if (current) {
+          state.issuesRequest = null;
+          if (state.issuesAbortController === controller) {
+            state.issuesAbortController = null;
+          }
+        }
+        if (requestGeneration !== state.issuesRequestSeq) return result;
+        endSurfaceRefresh(host);
+        return result;
+      }, function (err) {
+        var current = state.issuesRequest === completion;
+        if (current) {
+          state.issuesRequest = null;
+          if (state.issuesAbortController === controller) {
+            state.issuesAbortController = null;
+          }
+        }
+        if (requestGeneration !== state.issuesRequestSeq) return null;
+        endSurfaceRefresh(host);
+        if (preservedContent || surfaceHasStableContent(host)) {
+          if (state.activeTab === "issues") {
+            flashToast("Could not refresh issues: " +
+              ((err && err.message) || "rendering error"));
+          }
+        } else if (state.activeTab === "issues") {
+          dashError("dash-issues", err);
+        }
+        return null;
       });
-      if (!any) host.appendChild(el("div", { class: "dash-empty", text: "no registered issues" }));
-      renderStuckSection(host, d.repo);
-    }).catch(function (e) { dashError("dash-issues", e); });
+      state.issuesRequest = completion;
+      state.issuesAbortController = controller;
+      return completion;
+    }
+
+    return startIssuesRefresh(generation, hadContent);
   }
 
   // --- History tab: issue-status changes + merged PRs ---
