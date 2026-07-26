@@ -868,6 +868,25 @@ def test_worktree_parent_inside_repo_refused(cfg, monkeypatch):
     assert "inside the repo" in str(exc.value)
 
 
+def test_unsafe_startup_cache_prime_degrades_dispatch(e2e, monkeypatch):
+    monkeypatch.setattr(
+        conductor,
+        "_mathlib_already_built",
+        lambda _worktree: False,
+    )
+    monkeypatch.setattr(
+        conductor,
+        "_prime_mathlib_cache",
+        lambda _worktree: conductor._CACHE_PRIME_UNSAFE,
+    )
+
+    assert run_once(e2e) == 0
+
+    snapshot = conductor.load_jobs_snapshot(e2e.cfg.repo_dir)
+    assert "cache preparation" in snapshot["degraded"]
+    assert e2e.popen.spawned == []
+
+
 def test_prune_fails_closed_when_leftover_publication_state_is_unreadable(
     cfg, subprocess_calls, tmp_path
 ):

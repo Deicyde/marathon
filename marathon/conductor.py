@@ -2046,8 +2046,10 @@ def prune_worktrees(repo_dir: Path, runs_parent: Path) -> None:
 
 # How long to let `lake exe cache get` run when priming a worktree's Mathlib
 # oleans. A cold worktree's first run includes a dependency CLONE + cache-exe
-# build before the olean decompress, so this is generous.
+# build before the olean decompress, so this is generous. Operators with slower
+# cold checkouts can tune it without a redeploy via the env var below.
 CACHE_GET_TIMEOUT_SECONDS = 1200
+CACHE_GET_TIMEOUT_ENV_VAR = "MARATHON_CACHE_GET_TIMEOUT_SECONDS"
 
 # Mathlib's top-level olean — a PRESENCE PROXY for "this checkout has Mathlib
 # built", used to skip a redundant `cache get` decompress. It is a presence
@@ -2058,6 +2060,11 @@ CACHE_GET_TIMEOUT_SECONDS = 1200
 _MATHLIB_BUILT_MARKER = Path(
     ".lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean"
 )
+_LAKE_PACKAGES_RELPATH = Path(".lake/packages")
+_INTERRUPTED_PACKAGES_RELPATH = Path(
+    ".lake/marathon-interrupted-packages"
+)
+_CACHE_PRIME_UNSAFE = object()
 
 
 def _mathlib_already_built(worktree: Path) -> bool:
@@ -2073,9 +2080,168 @@ def _mathlib_already_built(worktree: Path) -> bool:
         return False
 
 
+def _cache_get_timeout_seconds() -> float:
+    """Return the cache-prime timeout, accepting a positive env override."""
+    raw = os.environ.get(CACHE_GET_TIMEOUT_ENV_VAR)
+    if raw is None:
+        return float(CACHE_GET_TIMEOUT_SECONDS)
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(CACHE_GET_TIMEOUT_SECONDS)
+    return (
+        value
+        if 0 < value < float("inf")
+        else float(CACHE_GET_TIMEOUT_SECONDS)
+    )
+
+
+def _quarantine_interrupted_lake_dependency(
+    worktree: Path, dependency: Path
+) -> Optional[Path]:
+    """Atomically move one generated dependency out of Lake's active path.
+
+    The move stays under the worktree's ``.lake`` directory, hence on the same
+    filesystem, and uses an exclusively-created container so it never
+    overwrites an earlier quarantine.  Return the preserved dependency path, or
+    ``None`` without mutating the active path when quarantine cannot be made.
+    """
+    quarantine_root = worktree / _INTERRUPTED_PACKAGES_RELPATH
+    try:
+        if quarantine_root.is_symlink():
+            return None
+        quarantine_root.mkdir(parents=True, exist_ok=True)
+        for _ in range(16):
+            container = (
+                quarantine_root
+                / f"{dependency.name}-{secrets.token_hex(8)}"
+            )
+            try:
+                container.mkdir()
+            except FileExistsError:
+                continue
+            target = container / dependency.name
+            try:
+                dependency.rename(target)
+            except OSError:
+                try:
+                    container.rmdir()
+                except OSError:
+                    pass
+                return None
+            return target
+    except OSError:
+        return None
+    return None
+
+
+def _quarantine_interrupted_lake_dependencies(worktree: Path) -> bool:
+    """Quarantine generated dependency checkouts left mid-Git operation.
+
+    Killing ``lake exe cache get`` while Lake is cloning a dependency can leave
+    e.g. ``.lake/packages/mathlib/.git/index.lock`` plus a partially populated
+    working tree.  Merely removing the lock is unsafe: the following fallback
+    build can then consume an incomplete checkout.  Atomically move the whole
+    generated dependency out of Lake's active package path so Lake can
+    materialize it cleanly while every byte remains available for diagnosis.
+
+    Safety is deliberately narrow: inspect only direct, non-symlink children of
+    ``.lake/packages`` whose real ``.git`` directory contains a root-level Git
+    lock.  Never move the project worktree, ``.lake/build`` output, symlinks, or
+    an unlocked dependency (which may contain intentional local edits).
+
+    Return ``False`` if a lock-marked dependency could not be quarantined.  The
+    caller must then defer instead of allowing a fallback build to consume the
+    known-poisoned checkout.  This function never raises.
+    """
+    lake_root = worktree / ".lake"
+    packages = worktree / _LAKE_PACKAGES_RELPATH
+    try:
+        # A job-local .lake directory is part of the ownership boundary. If
+        # it points elsewhere, even an ordinary-looking packages child may be
+        # shared or user-owned, so moving anything below it is unsafe.
+        if lake_root.is_symlink():
+            print(
+                "    unsafe: refusing to quarantine through symlinked Lake "
+                f"root: {lake_root}",
+                flush=True,
+            )
+            return False
+        if packages.is_symlink() or not packages.is_dir():
+            return True
+        dependencies = list(packages.iterdir())
+    except OSError as e:
+        print(
+            "    unsafe: could not inspect Lake dependency root "
+            f"{packages} ({type(e).__name__}: {e})",
+            flush=True,
+        )
+        return False
+
+    for dependency in dependencies:
+        try:
+            if dependency.is_symlink() or not dependency.is_dir():
+                continue
+            git_dir = dependency / ".git"
+            if git_dir.is_symlink() or not git_dir.is_dir():
+                continue
+            interrupted = any(
+                child.name.endswith(".lock")
+                and not child.is_symlink()
+                and child.is_file()
+                for child in git_dir.iterdir()
+            )
+            if not interrupted:
+                continue
+            quarantined = _quarantine_interrupted_lake_dependency(
+                worktree, dependency
+            )
+            if quarantined is None:
+                print(
+                    "    unsafe: could not quarantine interrupted Lake "
+                    f"dependency checkout: {dependency}",
+                    flush=True,
+                )
+                return False
+            print(
+                "    quarantined interrupted Lake dependency checkout: "
+                f"{dependency} -> {quarantined}",
+                flush=True,
+            )
+        except OSError as e:
+            print(
+                "    unsafe: could not inspect interrupted Lake dependency "
+                f"{dependency} ({type(e).__name__}: {e})",
+                flush=True,
+            )
+            return False
+    return True
+
+
+def _kill_and_reap_cache_get(proc: subprocess.Popen) -> bool:
+    """Stop the cache-get subtree and confirm its parent has exited."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.communicate(timeout=15)
+    except Exception:  # noqa: BLE001 — reaping must not raise
+        try:
+            return proc.poll() is not None
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        return proc.poll() is not None
+    except Exception:  # noqa: BLE001
+        return proc.returncode is not None
+
+
 def _prime_mathlib_cache(
-    worktree: Path, *, timeout: float = CACHE_GET_TIMEOUT_SECONDS
-) -> bool:
+    worktree: Path,
+    *,
+    timeout: Optional[float] = None,
+):
     """Best-effort: seed ``worktree``'s Mathlib oleans via ``lake exe cache get``
     so the refine's ``lake build`` SKIPS the multi-HOUR Mathlib source compile.
 
@@ -2090,20 +2256,30 @@ def _prime_mathlib_cache(
     inherited; with a warm store the decompress is an OFFLINE read into the
     worktree's OWN ``.lake``, so concurrent worktrees don't race.
 
-    FAIL-SAFE: returns True only on a clean cache-get; False on EVERYTHING else
+    This primitive never moves existing checkout state, so it is safe for the
+    operator's live checkout. Marathon-owned job worktrees use
+    :func:`_prime_job_mathlib_cache`, which wraps this command with guarded
+    pre/post quarantine.
+
+    FAIL-SAFE: returns True only on a clean cache-get; False on fallback
     (skip flag set, no ``lake`` on PATH or in ``~/.elan/bin``, non-zero exit,
-    timeout, any exception) and NEVER raises — a prime failure must never abort
-    a dispatch (the refine then just does its normal, slower build). On a
-    timeout the ENTIRE cache-get subtree (lake + its lean/leanc/curl workers) is
-    killed via its process group, so no orphaned compiler/downloader is left
-    racing the refine's build in the same worktree. No-op when
-    ``MARATHON_SKIP_CACHE_GET`` is set."""
+    timeout, any exception), and ``_CACHE_PRIME_UNSAFE`` if a failed child
+    cannot be confirmed stopped. It NEVER raises. On a timeout the ENTIRE
+    cache-get subtree (lake + its lean/leanc/curl workers) is killed via its
+    process group, so no orphaned compiler/downloader is left racing the
+    refine's build in the same worktree. No-op when
+    ``MARATHON_SKIP_CACHE_GET`` is set.  The timeout defaults to
+    :data:`CACHE_GET_TIMEOUT_SECONDS` and can be overridden with
+    ``MARATHON_CACHE_GET_TIMEOUT_SECONDS``."""
 
     if os.environ.get("MARATHON_SKIP_CACHE_GET"):
         return False
     lake = find_lake_executable()
     if lake is None:
         return False
+    effective_timeout = (
+        _cache_get_timeout_seconds() if timeout is None else timeout
+    )
     try:
         # Own process group (start_new_session) so a timeout can kill the WHOLE
         # subtree, not just the lake parent — subprocess.run's timeout would
@@ -2124,23 +2300,33 @@ def _prime_mathlib_cache(
         )
         return False
     try:
-        _out, err = proc.communicate(timeout=timeout)
+        _out, err = proc.communicate(timeout=effective_timeout)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except OSError:
-            pass
-        try:
-            proc.communicate(timeout=15)
-        except Exception:  # noqa: BLE001 — reaping must not raise
-            pass
+        if not _kill_and_reap_cache_get(proc):
+            print(
+                "    cache get timed out and its process could not be "
+                f"confirmed stopped; refusing worktree fallback: {worktree}",
+                flush=True,
+            )
+            return _CACHE_PRIME_UNSAFE
         print(
-            f"    cache get timed out after {int(timeout)}s (subtree killed); "
+            f"    cache get timed out after {effective_timeout:g}s "
+            "(subtree killed); "
             f"will build Mathlib normally: {worktree}",
             flush=True,
         )
         return False
     except Exception as e:  # noqa: BLE001 — a prime must NEVER abort a dispatch
+        # communicate can fail while the child remains live. Never move a
+        # dependency checkout out from under that process: stop and reap the
+        # whole subtree first, exactly as on a timeout.
+        if not _kill_and_reap_cache_get(proc):
+            print(
+                "    cache get pipe failed and its process could not be "
+                f"confirmed stopped; refusing worktree fallback: {worktree}",
+                flush=True,
+            )
+            return _CACHE_PRIME_UNSAFE
         print(
             f"    cache get errored ({type(e).__name__}); will build Mathlib "
             f"normally: {worktree}",
@@ -2158,6 +2344,33 @@ def _prime_mathlib_cache(
         return False
     print(f"    primed Mathlib oleans (lake exe cache get): {worktree}", flush=True)
     return True
+
+
+def _prime_job_mathlib_cache(
+    worktree: Path, *, timeout: Optional[float] = None
+):
+    """Prime a Marathon-owned worktree without exposing a poisoned fallback.
+
+    Quarantine before the command repairs state retained from an older killed
+    prime. Quarantine afterward catches a lock left by this command. The
+    command itself always kills/reaps its subtree before returning on timeout
+    or pipe failure, so the post-pass never moves files under a live child.
+
+    Return ``_CACHE_PRIME_UNSAFE`` when quarantine fails; dispatch callers must
+    defer. Otherwise preserve the primitive's True/False result.
+    """
+    if not _quarantine_interrupted_lake_dependencies(worktree):
+        return _CACHE_PRIME_UNSAFE
+    result = (
+        _prime_mathlib_cache(worktree)
+        if timeout is None
+        else _prime_mathlib_cache(worktree, timeout=timeout)
+    )
+    if result is _CACHE_PRIME_UNSAFE:
+        return _CACHE_PRIME_UNSAFE
+    if not _quarantine_interrupted_lake_dependencies(worktree):
+        return _CACHE_PRIME_UNSAFE
+    return result
 
 
 def _ensure_prover_branch(repo_dir: Path, prover_branch: str) -> None:
@@ -3247,7 +3460,15 @@ def _dispatch_job(
             publication_resume is None
             and not _mathlib_already_built(worktree)
         ):
-            _prime_mathlib_cache(worktree)
+            prime_result = _prime_job_mathlib_cache(worktree)
+            if prime_result is _CACHE_PRIME_UNSAFE:
+                kept_worktrees[kept_key] = str(worktree)
+                print(
+                    f"--- deferring #{issue_num}: interrupted Lake dependency "
+                    "could not be quarantined safely ---",
+                    flush=True,
+                )
+                return None
     else:
         worktree = runs_parent / f"wt-i{issue_num}-{ts}"
         runs_parent.mkdir(parents=True, exist_ok=True)
@@ -3334,9 +3555,18 @@ def _dispatch_job(
             )
             return None
         # Seed the fresh worktree's Mathlib oleans so the refine's `lake build`
-        # skips the from-scratch Mathlib compile. Best-effort — a failure just
-        # means a slower (normal) build; it never blocks the dispatch.
-        _prime_mathlib_cache(worktree)
+        # skips the from-scratch Mathlib compile. An ordinary failure falls
+        # back to a normal build; a known-poisoned checkout that cannot be
+        # quarantined defers rather than launching a doomed worker.
+        prime_result = _prime_job_mathlib_cache(worktree)
+        if prime_result is _CACHE_PRIME_UNSAFE:
+            kept_worktrees[kept_key] = str(worktree)
+            print(
+                f"--- deferring #{issue_num}: interrupted Lake dependency "
+                "could not be quarantined safely ---",
+                flush=True,
+            )
+            return None
 
     # Reuse BOTH halves of a failed attempt.  Reusing only the worktree keeps
     # extracted code but throws away the project/task ids needed for
@@ -5357,7 +5587,19 @@ def run_conductor(
         # store is already warm, and we must NOT run `cache get` into the
         # operator's live checkout and race a build they may have running there.
         if not _mathlib_already_built(cfg.repo_dir):
-            _prime_mathlib_cache(cfg.repo_dir)
+            main_prime_result = _prime_mathlib_cache(cfg.repo_dir)
+            if main_prime_result is _CACHE_PRIME_UNSAFE:
+                cache_error = (
+                    "Mathlib cache preparation could not confirm its child "
+                    "process stopped — dispatch is disabled until the "
+                    "orchestrator is restarted"
+                )
+                dispatch_env_error = (
+                    f"{dispatch_env_error}; {cache_error}"
+                    if dispatch_env_error
+                    else cache_error
+                )
+                print(f"⚠️  DEGRADED: {cache_error}", flush=True)
 
         while True:
             ticks += 1
