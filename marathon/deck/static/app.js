@@ -6160,7 +6160,8 @@
     if (!window.confirm(
       verb + " " + targets.length + " visible unreviewed declaration" +
       (targets.length === 1 ? "" : "s") + "?\n\n" +
-      "This records local review state only. It does not SHIP any issue."
+      "This records local review state only. It does not SHIP any issue.\n" +
+      "KEEP/FIX still require individual declaration decisions."
     )) return;
     state.filesBusy = true;
     var items = targets.map(function (target) {
@@ -6247,6 +6248,17 @@
       state.filesData = null;
       renderFilesTab();
     });
+    var visible = readerVisibleTargets(data);
+    var deferrable = visible.filter(function (target) { return !target.verdict; });
+    var deferAll = el("button", {
+      class: "btn",
+      type: "button",
+      disabled: deferrable.length ? null : "disabled",
+      "aria-label": "Defer " + deferrable.length +
+        " visible unreviewed declarations — local only; does not ship",
+      title: "Records DEFER locally; never ships. KEEP/FIX remain per declaration.",
+    }, ["Defer visible (" + deferrable.length + ")"]);
+    deferAll.addEventListener("click", function () { readerBatch("defer", deferrable); });
     host.appendChild(el("div", { class: "reader-header" }, [
       el("div", {}, [
         el("h2", { text: data.chapter == null ? "Project file review" : "Chapter " + data.chapter + " file review" }),
@@ -6256,7 +6268,9 @@
           "their decisions are tied to the exact code and reopen after relevant changes; " +
           "they cannot ship until their issue is ready." }),
       ]),
-      el("div", { class: "reader-toolbar" }, [chapterSelect, targetFilter, search, refresh]),
+      el("div", { class: "reader-toolbar" }, [
+        chapterSelect, targetFilter, search, refresh, deferAll,
+      ]),
     ]));
 
     var progress = data.progress || {};
@@ -6266,19 +6280,6 @@
       statChip(progress.verified || 0, "kept"),
       statChip(progress.rejected || 0, "fix"),
       statChip((data.files || []).length, "files"),
-    ]));
-
-    var visible = readerVisibleTargets(data);
-    var deferrable = visible.filter(function (target) { return !target.verdict; });
-    var deferAll = el("button", {
-      class: "btn", type: "button",
-      disabled: deferrable.length ? null : "disabled",
-    }, ["Defer visible unreviewed (" + deferrable.length + ")"]);
-    deferAll.addEventListener("click", function () { readerBatch("defer", deferrable); });
-    host.appendChild(el("div", { class: "reader-batch" }, [
-      el("span", { class: "reader-batch-note", text:
-        "Batch DEFER is a non-decision and never ships. KEEP/FIX remain explicit per declaration." }),
-      deferAll,
     ]));
 
     var files = (data.files || []).map(function (file) {

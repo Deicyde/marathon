@@ -2624,7 +2624,21 @@ def test_files_reader_is_source_contextual_and_batch_is_local(app_js: str):
     assert "/api/review-source" in code
     assert "Keep visible unreviewed" not in code
     assert "readerBatch(\"verify\"" not in code
-    assert "Defer visible unreviewed" in code
+    assert "Defer visible (" in code
+    assert "local only; does not ship" in code
+    assert "KEEP/FIX still require individual declaration decisions." in code
+
+
+def test_files_batch_defer_lives_in_toolbar_not_sticky_banner(
+    app_js: str, style_css: str,
+):
+    code = _strip_block_comments(app_js)
+    paint = _fn_body(code, "function paintFilesTab")
+    assert "chapterSelect, targetFilter, search, refresh, deferAll" in paint
+    assert "readerBatch(\"defer\", deferrable)" in paint
+    assert "reader-batch" not in paint
+    assert ".reader-batch" not in style_css
+    assert ".reader-batch-note" not in style_css
 
 
 def test_files_reader_guards_rejected_predecessors(app_js: str):
@@ -2866,7 +2880,7 @@ def test_project_graph_supports_pan_zoom_and_changed_impact(app_js: str):
 def test_wide_review_styles_exist(style_css: str):
     for cls in (
         ".reader-file", ".reader-decl", ".reader-reject-editor",
-        ".reader-batch", ".reader-full-file", ".graph-viewport",
+        ".reader-full-file", ".graph-viewport",
         ".project-graph", ".graph-node",
         ".graph-impact-changed", ".graph-impact-downstream",
         ".graph-edge-cyclic", ".graph-edge-topology-stale",
