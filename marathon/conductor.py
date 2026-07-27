@@ -76,7 +76,9 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -2065,6 +2067,243 @@ _INTERRUPTED_PACKAGES_RELPATH = Path(
     ".lake/marathon-interrupted-packages"
 )
 _CACHE_PRIME_UNSAFE = object()
+_PROJECT_BUILD_RELPATH = Path(".lake/build")
+_PROJECT_BUILD_SEED_PREFIX = ".marathon-project-build-seed-"
+_PROJECT_BUILD_SEED_MIN_FREE_BYTES = 5 * 1024**3
+
+
+def _project_build_tree_snapshot(
+    build_dir: Path,
+) -> Optional[tuple[tuple[str, int, int, int, int], ...]]:
+    """Metadata snapshot used to reject a concurrently changing build tree."""
+    entries: list[tuple[str, int, int, int, int]] = []
+    for path in sorted(
+        (build_dir, *build_dir.rglob("*")),
+        key=lambda item: item.as_posix(),
+    ):
+        info = path.lstat()
+        if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            return None
+        entries.append(
+            (
+                path.relative_to(build_dir).as_posix(),
+                info.st_mode,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ino,
+            )
+        )
+    return tuple(entries)
+
+
+def _project_build_manifest(
+    snapshot: tuple[tuple[str, int, int, int, int], ...],
+) -> tuple[tuple[str, int, int, int], ...]:
+    """Comparable path/type/size/mtime view; copied files have new inodes."""
+    return tuple(
+        (name, mode, size, mtime)
+        for name, mode, size, mtime, _inode in snapshot
+    )
+
+
+def _project_seed_source_dirty(source_repo: Path) -> bool:
+    """Fail closed when operator edits could make the live cache ambiguous."""
+    if not (source_repo / ".git").exists():
+        return False
+    try:
+        status_result = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                "*.lean",
+                "lakefile.lean",
+                "lakefile.toml",
+                "lake-manifest.json",
+                "lean-toolchain",
+            ],
+            cwd=str(source_repo),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return status_result.returncode != 0 or bool(
+        (status_result.stdout or "").strip()
+    )
+
+
+def _remove_owned_seed_path(path: Path) -> None:
+    """Best-effort cleanup restricted to one exclusively owned seed path."""
+    try:
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _copy_project_build_tree(source: Path, staged: Path) -> None:
+    """Copy one build tree, preferring copy-on-write where the host supports it.
+
+    macOS ``cp -c`` uses ``clonefile(2)``: the destination has independent file
+    identity while unchanged blocks remain copy-on-write.  This is unlike a
+    hardlink and therefore cannot let a job rewrite the operator's artifacts.
+    A non-APFS filesystem (or another platform) falls back to ordinary private
+    copies.
+    """
+    if sys.platform == "darwin":
+        try:
+            cloned = subprocess.run(
+                ["/bin/cp", "-cR", "-p", str(source), str(staged)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            cloned = None
+        if cloned is not None and cloned.returncode == 0:
+            return
+        _remove_owned_seed_path(staged)
+    shutil.copytree(
+        source,
+        staged,
+        copy_function=shutil.copy2,
+        symlinks=True,
+    )
+
+
+def _seed_project_build_outputs(
+    source_repo: Path, worktree: Path
+) -> bool:
+    """Copy the live checkout's generated project outputs into a fresh job.
+
+    ``git worktree add`` intentionally does not carry ignored ``.lake``
+    outputs.  Mathlib's cache restores dependency oleans, but without this
+    local seed Lake still has to rebuild every unchanged project module before
+    checking the PR's target.  A private copy of ``<repo>/.lake/build`` gives
+    Lake those candidate outputs; their trace/input hashes remain authoritative,
+    so Lake rebuilds anything whose source or dependency changed on the PR.
+
+    Correctness and isolation take priority over copy speed: artifacts are
+    copied byte-for-byte rather than hard-linked, because Lake may replace or
+    rewrite outputs in the job and must never mutate the operator's checkout.
+    The copy is staged under the job's own ``.lake`` and renamed into place
+    only after it completes.  Existing destination state and symlinked Lake
+    roots are never touched.  Missing/unreadable caches and copy failures are
+    ordinary fail-soft misses; the subsequent Lake build remains sufficient.
+    """
+    source_lake = source_repo / ".lake"
+    source_build = source_repo / _PROJECT_BUILD_RELPATH
+    destination_lake = worktree / ".lake"
+    destination_build = worktree / _PROJECT_BUILD_RELPATH
+    container: Optional[Path] = None
+    staged: Optional[Path] = None
+
+    try:
+        # This helper is for a distinct, Marathon-owned job worktree.  Refuse
+        # aliases and symlinked ownership boundaries rather than risking a
+        # write into the operator's live checkout or a shared Lake directory.
+        if source_repo.resolve() == worktree.resolve():
+            return False
+        if (
+            source_lake.is_symlink()
+            or source_build.is_symlink()
+            or not source_build.is_dir()
+            or _project_seed_source_dirty(source_repo)
+            or worktree.is_symlink()
+            or not worktree.is_dir()
+            or destination_lake.is_symlink()
+            or destination_build.is_symlink()
+            or destination_build.exists()
+        ):
+            return False
+        # A preserved link could point back into the live checkout, where a
+        # later Lake write through it would violate the isolation guarantee.
+        # The snapshot also lets us reject a source build that changes during
+        # the copy, avoiding a mismatched olean/trace pair.
+        source_snapshot = _project_build_tree_snapshot(source_build)
+        if source_snapshot is None:
+            return False
+        source_bytes = sum(
+            size
+            for _name, mode, size, _mtime, _inode in source_snapshot
+            if stat.S_ISREG(mode)
+        )
+        free_bytes = shutil.disk_usage(worktree).free
+        if free_bytes - source_bytes < _PROJECT_BUILD_SEED_MIN_FREE_BYTES:
+            print(
+                "    project build seed skipped (insufficient disk reserve): "
+                f"{worktree}",
+                flush=True,
+            )
+            return False
+
+        destination_lake.mkdir(parents=True, exist_ok=True)
+        # Re-check after mkdir in case a pre-existing non-directory or a
+        # concurrent owner made the destination unusable.
+        if destination_lake.is_symlink() or not destination_lake.is_dir():
+            return False
+
+        for _ in range(16):
+            candidate = (
+                destination_lake
+                / f"{_PROJECT_BUILD_SEED_PREFIX}{secrets.token_hex(8)}"
+            )
+            try:
+                candidate.mkdir()
+            except FileExistsError:
+                continue
+            else:
+                container = candidate
+                staged = candidate / "build"
+                break
+        if staged is None:
+            return False
+
+        _copy_project_build_tree(source_build, staged)
+        staged_snapshot = _project_build_tree_snapshot(staged)
+        if (
+            staged_snapshot is None
+            or _project_build_manifest(staged_snapshot)
+            != _project_build_manifest(source_snapshot)
+            or _project_build_tree_snapshot(source_build) != source_snapshot
+        ):
+            _remove_owned_seed_path(container)
+            print(
+                "    project build seed skipped (copy was not a stable, "
+                f"link-free snapshot): {worktree}",
+                flush=True,
+            )
+            return False
+        if destination_build.exists() or destination_build.is_symlink():
+            _remove_owned_seed_path(container)
+            return False
+        staged.rename(destination_build)
+        container.rmdir()
+    except Exception as e:  # noqa: BLE001 — a seed miss must never block a job
+        if container is not None:
+            _remove_owned_seed_path(container)
+        print(
+            "    project build seed skipped "
+            f"({type(e).__name__}: {e}): {worktree}",
+            flush=True,
+        )
+        return False
+
+    print(
+        f"    seeded project build outputs from {source_build}: {worktree}",
+        flush=True,
+    )
+    return True
 
 
 def _mathlib_already_built(worktree: Path) -> bool:
@@ -3554,6 +3793,12 @@ def _dispatch_job(
                 f"{msg} ---", flush=True,
             )
             return None
+        # A git worktree has source but none of the ignored project oleans.
+        # Copy the live checkout's generated project build into this private
+        # fresh worktree before priming Mathlib. Lake's trace hashes validate
+        # the seed and rebuild the PR's changed modules; a failed/missing seed
+        # merely retains the ordinary from-scratch project-build path.
+        _seed_project_build_outputs(cfg.repo_dir, worktree)
         # Seed the fresh worktree's Mathlib oleans so the refine's `lake build`
         # skips the from-scratch Mathlib compile. An ordinary failure falls
         # back to a normal build; a known-poisoned checkout that cannot be

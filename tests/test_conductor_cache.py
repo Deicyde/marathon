@@ -47,6 +47,251 @@ def _put_on_path(monkeypatch, bindir: Path) -> None:
     monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ.get("PATH", ""))
 
 
+def test_project_build_seed_copies_private_outputs(tmp_path):
+    source_repo = tmp_path / "repo"
+    source_build = source_repo / conductor._PROJECT_BUILD_RELPATH
+    artifact = source_build / "lib/lean/Demo/Prerequisite.olean"
+    trace = source_build / "lib/lean/Demo/Prerequisite.trace"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("source olean")
+    trace.write_text('{"inputs": []}')
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    assert conductor._seed_project_build_outputs(source_repo, worktree) is True
+
+    copied = worktree / conductor._PROJECT_BUILD_RELPATH
+    copied_artifact = copied / "lib/lean/Demo/Prerequisite.olean"
+    assert copied_artifact.read_text() == "source olean"
+    assert (copied / "lib/lean/Demo/Prerequisite.trace").read_text() == (
+        '{"inputs": []}'
+    )
+    # The job receives private bytes, never a hardlink Lake could mutate back
+    # into the operator's checkout.
+    copied_artifact.write_text("job rebuilt olean")
+    assert artifact.read_text() == "source olean"
+    artifact.write_text("operator rebuilt olean")
+    assert copied_artifact.read_text() == "job rebuilt olean"
+    assert not list(
+        (worktree / ".lake").glob(
+            f"{conductor._PROJECT_BUILD_SEED_PREFIX}*"
+        )
+    )
+
+
+def test_project_build_seed_never_overwrites_existing_job_build(tmp_path):
+    source_repo = tmp_path / "repo"
+    source_artifact = (
+        source_repo / conductor._PROJECT_BUILD_RELPATH / "source.olean"
+    )
+    source_artifact.parent.mkdir(parents=True)
+    source_artifact.write_text("source")
+    worktree = tmp_path / "worktree"
+    destination_artifact = (
+        worktree / conductor._PROJECT_BUILD_RELPATH / "existing.olean"
+    )
+    destination_artifact.parent.mkdir(parents=True)
+    destination_artifact.write_text("existing job output")
+
+    assert conductor._seed_project_build_outputs(source_repo, worktree) is False
+
+    assert destination_artifact.read_text() == "existing job output"
+    assert not (destination_artifact.parent / "source.olean").exists()
+    assert source_artifact.read_text() == "source"
+
+
+def test_project_build_seed_failure_is_clean_and_fail_soft(
+    tmp_path, monkeypatch,
+):
+    source_repo = tmp_path / "repo"
+    source_artifact = (
+        source_repo / conductor._PROJECT_BUILD_RELPATH / "keep.olean"
+    )
+    source_artifact.parent.mkdir(parents=True)
+    source_artifact.write_text("operator cache")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    def interrupted_copy(_source, staged):
+        staged.mkdir(parents=True)
+        (staged / "partial").write_text("incomplete")
+        raise OSError("disk became full")
+
+    monkeypatch.setattr(
+        conductor, "_copy_project_build_tree", interrupted_copy
+    )
+
+    assert conductor._seed_project_build_outputs(source_repo, worktree) is False
+
+    assert source_artifact.read_text() == "operator cache"
+    assert not (worktree / conductor._PROJECT_BUILD_RELPATH).exists()
+    assert not list(
+        (worktree / ".lake").glob(
+            f"{conductor._PROJECT_BUILD_SEED_PREFIX}*"
+        )
+    )
+
+
+def test_project_build_seed_discards_concurrently_changed_source(
+    tmp_path, monkeypatch,
+):
+    source_repo = tmp_path / "repo"
+    source_artifact = (
+        source_repo / conductor._PROJECT_BUILD_RELPATH / "Demo.olean"
+    )
+    source_artifact.parent.mkdir(parents=True)
+    source_artifact.write_text("old")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    real_copytree = conductor.shutil.copytree
+
+    def copy_then_rebuild(source, staged):
+        result = real_copytree(
+            source,
+            staged,
+            copy_function=conductor.shutil.copy2,
+            symlinks=True,
+        )
+        source_artifact.write_text("new, concurrently rebuilt output")
+        return result
+
+    monkeypatch.setattr(
+        conductor, "_copy_project_build_tree", copy_then_rebuild
+    )
+
+    assert conductor._seed_project_build_outputs(source_repo, worktree) is False
+
+    assert source_artifact.read_text() == "new, concurrently rebuilt output"
+    assert not (worktree / conductor._PROJECT_BUILD_RELPATH).exists()
+    assert not list(
+        (worktree / ".lake").glob(
+            f"{conductor._PROJECT_BUILD_SEED_PREFIX}*"
+        )
+    )
+
+
+def test_project_build_seed_rejects_link_introduced_during_copy(
+    tmp_path, monkeypatch,
+):
+    source_repo = tmp_path / "repo"
+    source_artifact = (
+        source_repo / conductor._PROJECT_BUILD_RELPATH / "Demo.olean"
+    )
+    source_artifact.parent.mkdir(parents=True)
+    source_artifact.write_text("stable")
+    operator_file = tmp_path / "operator-owned"
+    operator_file.write_text("do not follow")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    def copy_with_raced_link(_source, staged):
+        staged.mkdir(parents=True)
+        (staged / "Demo.olean").write_text("stable")
+        (staged / "raced-link").symlink_to(operator_file)
+
+    monkeypatch.setattr(
+        conductor, "_copy_project_build_tree", copy_with_raced_link
+    )
+
+    assert conductor._seed_project_build_outputs(source_repo, worktree) is False
+
+    assert operator_file.read_text() == "do not follow"
+    assert not (worktree / conductor._PROJECT_BUILD_RELPATH).exists()
+    assert not list(
+        (worktree / ".lake").glob(
+            f"{conductor._PROJECT_BUILD_SEED_PREFIX}*"
+        )
+    )
+
+
+def test_project_build_seed_preserves_disk_reserve(tmp_path, monkeypatch):
+    source_repo = tmp_path / "repo"
+    source_artifact = (
+        source_repo / conductor._PROJECT_BUILD_RELPATH / "Demo.olean"
+    )
+    source_artifact.parent.mkdir(parents=True)
+    source_artifact.write_text("compiled")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.setattr(
+        conductor.shutil,
+        "disk_usage",
+        lambda _path: type(
+            "Usage",
+            (),
+            {
+                "free": conductor._PROJECT_BUILD_SEED_MIN_FREE_BYTES,
+            },
+        )(),
+    )
+
+    assert conductor._seed_project_build_outputs(source_repo, worktree) is False
+
+    assert source_artifact.read_text() == "compiled"
+    assert not (worktree / conductor._PROJECT_BUILD_RELPATH).exists()
+
+
+def test_project_build_seed_skips_dirty_lean_source(tmp_path, monkeypatch):
+    source_repo = tmp_path / "repo"
+    (source_repo / ".git").mkdir(parents=True)
+    source_artifact = (
+        source_repo / conductor._PROJECT_BUILD_RELPATH / "Demo.olean"
+    )
+    source_artifact.parent.mkdir(parents=True)
+    source_artifact.write_text("compiled")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.setattr(
+        conductor.subprocess,
+        "run",
+        lambda *_args, **_kwargs: type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": " M Demo.lean\n"},
+        )(),
+    )
+
+    assert conductor._seed_project_build_outputs(source_repo, worktree) is False
+
+    assert source_artifact.read_text() == "compiled"
+    assert not (worktree / conductor._PROJECT_BUILD_RELPATH).exists()
+
+
+def test_project_build_seed_refuses_shared_symlinked_lake_root(tmp_path):
+    source_repo = tmp_path / "repo"
+    source_artifact = (
+        source_repo / conductor._PROJECT_BUILD_RELPATH / "source.olean"
+    )
+    source_artifact.parent.mkdir(parents=True)
+    source_artifact.write_text("source")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    shared_lake = tmp_path / "shared-lake"
+    shared_lake.mkdir()
+    (worktree / ".lake").symlink_to(shared_lake, target_is_directory=True)
+
+    assert conductor._seed_project_build_outputs(source_repo, worktree) is False
+
+    assert list(shared_lake.iterdir()) == []
+    assert source_artifact.read_text() == "source"
+
+
+def test_project_build_seed_refuses_link_back_to_live_checkout(tmp_path):
+    source_repo = tmp_path / "repo"
+    source_build = source_repo / conductor._PROJECT_BUILD_RELPATH
+    source_build.mkdir(parents=True)
+    live_artifact = tmp_path / "operator-artifact.olean"
+    live_artifact.write_text("must remain private")
+    (source_build / "linked.olean").symlink_to(live_artifact)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    assert conductor._seed_project_build_outputs(source_repo, worktree) is False
+
+    assert live_artifact.read_text() == "must remain private"
+    assert not (worktree / conductor._PROJECT_BUILD_RELPATH).exists()
+
+
 def test_prime_runs_cache_get_in_worktree_with_inherited_env(tmp_path, monkeypatch):
     bindir = tmp_path / "bin"
     record = tmp_path / "rec.txt"
@@ -499,6 +744,12 @@ def test_reuse_branch_primes_only_when_not_built(tmp_path, monkeypatch):
     wt = tmp_path / "kept-wt"
     wt.mkdir()
     primed: list[str] = []
+    seeded: list[str] = []
+    monkeypatch.setattr(
+        conductor,
+        "_seed_project_build_outputs",
+        lambda _source, worktree: seeded.append(str(worktree)) or True,
+    )
     monkeypatch.setattr(conductor, "_prime_mathlib_cache",
                         lambda w, **k: primed.append(str(w)) or False)
     monkeypatch.setattr(
@@ -512,6 +763,7 @@ def test_reuse_branch_primes_only_when_not_built(tmp_path, monkeypatch):
     # not built → prime runs on the reused worktree
     conductor._dispatch_job(cfg, 22, 14, tmp_path / "runs", {22: str(wt)})
     assert primed == [str(wt)]
+    assert seeded == []
 
     # built-marker present → prime skipped on the next retry
     marker = wt / conductor._MATHLIB_BUILT_MARKER
@@ -520,6 +772,56 @@ def test_reuse_branch_primes_only_when_not_built(tmp_path, monkeypatch):
     primed.clear()
     conductor._dispatch_job(cfg, 22, 14, tmp_path / "runs", {22: str(wt)})
     assert primed == []
+    assert seeded == []
+
+
+def test_fresh_dispatch_seeds_project_before_priming_mathlib(
+    tmp_path, monkeypatch,
+):
+    from types import SimpleNamespace
+    from tests.test_conductor import make_cfg
+
+    cfg = make_cfg(tmp_path)
+    runs = tmp_path / "runs"
+    events: list[tuple[str, Path, Path | None]] = []
+    monkeypatch.setattr(
+        conductor,
+        "_refine_branch_for_dispatch",
+        lambda *_a, **_kw: "marathon/refine-c14-i22",
+    )
+
+    def fake_git(_repo, *args):
+        if args[:2] == ("worktree", "add"):
+            # Normal refine add ends with WORKTREE START_POINT.
+            Path(args[-2]).mkdir(parents=True)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(conductor, "_git", fake_git)
+    monkeypatch.setattr(
+        conductor,
+        "_seed_project_build_outputs",
+        lambda source, worktree: (
+            events.append(("project", source, worktree)) or True
+        ),
+    )
+    monkeypatch.setattr(
+        conductor,
+        "_prime_job_mathlib_cache",
+        lambda worktree: (
+            events.append(("mathlib", worktree, None)) or True
+        ),
+    )
+    monkeypatch.setattr(
+        conductor, "_write_worktree_pid_marker", lambda *_a, **_kw: False
+    )
+
+    assert conductor._dispatch_job(cfg, 22, 14, runs, {}) is None
+
+    assert len(events) == 2
+    assert events[0][0] == "project"
+    assert events[0][1] == cfg.repo_dir
+    assert events[0][2] == events[1][1]
+    assert events[1][0] == "mathlib"
 
 
 def test_reuse_branch_defers_when_cache_poison_cannot_be_quarantined(
