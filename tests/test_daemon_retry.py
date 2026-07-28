@@ -141,14 +141,24 @@ def test_attempts_omitted_from_json_when_zero(cfg):
 
 def test_clean_exit_records_iteration_no_backoff(cfg):
     record_rejection(cfg, ISSUE, "notes")
+    branch = f"marathon/refine-c15-i{ISSUE}"
+    commit = "a" * 40
     backoff = daemon._handle_refine_exit(
-        cfg, ISSUE, 0, max_attempts=3, interrupted=False
+        cfg,
+        ISSUE,
+        0,
+        max_attempts=3,
+        interrupted=False,
+        iteration_branch=branch,
+        iteration_commit_sha=commit,
     )
     assert backoff == 0
     entry = load_state(cfg).issues[ISSUE]
     assert entry.status == "rejected"
     assert entry.last_iteration_ts is not None  # consumed: human verdict next
     assert entry.attempts == 0
+    assert entry.iteration_branch == branch
+    assert entry.iteration_commit_sha == commit
     assert not entry.needs_iteration()
 
 

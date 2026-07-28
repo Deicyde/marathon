@@ -18,6 +18,7 @@ import re
 import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -123,12 +124,32 @@ def _job_phase(
 # ---------------------------------------------------------------------------
 
 
-def conductor_status(cfg: "ReviewConfig") -> dict:
+def _timestamp_age_seconds(value: object) -> Optional[float]:
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+        now = (
+            datetime.now(stamp.tzinfo)
+            if stamp.tzinfo is not None
+            else datetime.now()
+        )
+        return max(0.0, (now - stamp).total_seconds())
+    except ValueError:
+        return None
+
+
+def conductor_status(
+    cfg: "ReviewConfig", *, include_landings: bool = True
+) -> dict:
     """The global orchestrator's live status: is a conductor alive (lock pid),
     its concurrency + last snapshot time, the per-job table (running/finished),
     and the recent landings. Pure read; everything degrades to empty."""
     from marathon.conductor import (
+        CONDUCTOR_HEARTBEAT_STALE_SECONDS,
+        CONDUCTOR_PROGRESS_STALE_SECONDS,
         conductor_lock_path,
+        load_conductor_heartbeat,
         load_jobs_snapshot,
         snapshot_job_is_live,
     )
@@ -164,8 +185,53 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
         snap = None
     snap = snap or {}
 
+    heartbeat: dict = {}
+    try:
+        heartbeat = load_conductor_heartbeat(Path(cfg.repo_dir)) or {}
+    except Exception:  # noqa: BLE001 — readiness remains fail-closed
+        heartbeat = {}
+    heartbeat_ts = heartbeat.get("updated_ts")
+    heartbeat_age_seconds = _timestamp_age_seconds(heartbeat_ts)
+    heartbeat_stale = (
+        heartbeat_age_seconds is None
+        or heartbeat_age_seconds > CONDUCTOR_HEARTBEAT_STALE_SECONDS
+    )
+    snapshot_ts = snap.get("updated_ts")
+    snapshot_age_seconds = _timestamp_age_seconds(snapshot_ts)
+    legacy_snapshot_fresh = bool(
+        alive
+        and not heartbeat
+        and snap.get("conductor_pid") is None
+        and snapshot_age_seconds is not None
+        and snapshot_age_seconds <= (daemon.POLL_INTERVAL_SECONDS * 2 + 15)
+    )
+    snapshot_current = bool(
+        pid is not None and snap.get("conductor_pid") == pid
+    )
+    ready = bool(
+        legacy_snapshot_fresh
+        or (
+            alive
+            and snapshot_current
+            and heartbeat.get("pid") == pid
+            and heartbeat.get("ready") is True
+            and not heartbeat_stale
+        )
+    )
+    # Jobs remain diagnostic independently of which conductor owns the lock.
+    # During restart, the new conductor publishes its PID-bound snapshot only
+    # after adopting live detached workers from this older one.  Hiding those
+    # rows in that small window would make recovery_running false and could
+    # enable a duplicate billed recovery.  snapshot_job_is_live() below keeps
+    # stale/PID-reused rows fail-closed; only operational claims such as
+    # concurrency, degradation, and prover state are PID-bound.
+    jobs_snap = snap
+    runtime_snap = (
+        snap if snapshot_current or legacy_snapshot_fresh else {}
+    )
+
     jobs: list[dict] = []
-    for raw in snap.get("jobs", []):
+    for raw in jobs_snap.get("jobs", []):
         status = raw.get("status")
         jpid = raw.get("pid")
         # Mirror `conductor status`: a "running" job whose pid is dead is shown
@@ -219,7 +285,7 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
     # The prover toggle's state: the conductor publishes its EFFECTIVE proving
     # state into the snapshot each tick; fall back to the deck-written control
     # file (a conductor that predates this field, or none yet running).
-    prover_enabled = snap.get("prover_enabled")
+    prover_enabled = runtime_snap.get("prover_enabled")
     if prover_enabled is None:
         try:
             from marathon.conductor import read_prover_control
@@ -229,19 +295,30 @@ def conductor_status(cfg: "ReviewConfig") -> dict:
 
     return {
         "alive": alive,
+        "ready": ready,
         "pid": pid,
         "repo": getattr(cfg, "github_repo", None),
-        "concurrency": snap.get("concurrency"),
-        "updated_ts": snap.get("updated_ts"),
+        "concurrency": runtime_snap.get("concurrency"),
+        "updated_ts": jobs_snap.get("updated_ts"),
+        "heartbeat_ts": heartbeat_ts,
+        "heartbeat_age_seconds": heartbeat_age_seconds,
+        "heartbeat_stale": heartbeat_stale,
+        "legacy_ready": legacy_snapshot_fresh,
+        "progress_age_seconds": snapshot_age_seconds,
+        "progress_stale": bool(
+            ready
+            and snapshot_age_seconds is not None
+            and snapshot_age_seconds > CONDUCTOR_PROGRESS_STALE_SECONDS
+        ),
         "running": sum(1 for j in jobs if j["status"] == "running"),
         "prover_enabled": prover_enabled,
         # A dispatch-disabling environment problem the conductor published
         # (e.g. no Aristotle key) — the deck must NOT render a green
         # "conductor running" chip over a conductor that can't dispatch.
-        "degraded": snap.get("degraded"),
+        "degraded": runtime_snap.get("degraded"),
         "jobs": jobs,
-        "queued": _pending_queue(cfg, jobs, snap.get("concurrency")),
-        "landings": _recent_landings(cfg, limit=8),
+        "queued": _pending_queue(cfg, jobs, runtime_snap.get("concurrency")),
+        "landings": _recent_landings(cfg, limit=8) if include_landings else [],
     }
 
 
@@ -802,7 +879,7 @@ def _orphan_note_previews(cfg) -> "dict[int, str]":
     return out
 
 
-def stuck_issues(cfg) -> "list[dict]":
+def stuck_issues(cfg, *, conductor: Optional[dict] = None) -> "list[dict]":
     """Issues parked OUTSIDE both the review feed and the refine queue — the
     conductor won't retry them and they're not in the swipe queue, so a human
     can't reach them without the CLI. The STUCK set:
@@ -901,7 +978,7 @@ def stuck_issues(cfg) -> "list[dict]":
                 for row_key, info_key in mapping.items():
                     if info_key in info:
                         row[row_key] = info[info_key]
-    conductor = conductor_status(cfg)
+    conductor = conductor if conductor is not None else conductor_status(cfg)
     running_recoveries = {
         job.get("issue_num")
         for job in conductor.get("jobs", [])
@@ -909,7 +986,9 @@ def stuck_issues(cfg) -> "list[dict]":
     }
     for row in out:
         row.update(_local_recovery_progress(cfg, row))
-        row["conductor_online"] = bool(conductor.get("alive"))
+        row["conductor_online"] = bool(
+            conductor.get("ready", conductor.get("alive"))
+        )
         row["recovery_running"] = row["num"] in running_recoveries
         row["host_conductor_disabled"] = bool(
             os.environ.get("MARATHON_NO_HOST_CONDUCTOR")

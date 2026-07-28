@@ -43,12 +43,22 @@ def test_conductor_status_alive_with_jobs(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "marathon.conductor.load_jobs_snapshot",
         lambda repo_dir: {
-            "updated_ts": "2026-06-19T01:00:00", "concurrency": 2,
+            "updated_ts": "2026-06-19T01:00:00",
+            "conductor_pid": 4242,
+            "concurrency": 2,
             "jobs": [
                 {"issue_num": 93, "chapter": 12, "status": "running", "pid": 4242,
                  "project_id": "p1", "aristotle_status": "EDITING_FILE"},
                 {"issue_num": 91, "chapter": 12, "status": "succeeded", "pid": None},
             ],
+        },
+    )
+    monkeypatch.setattr(
+        "marathon.conductor.load_conductor_heartbeat",
+        lambda repo_dir: {
+            "pid": 4242,
+            "ready": True,
+            "updated_ts": "2099-01-01T00:00:00+00:00",
         },
     )
     monkeypatch.setattr("marathon.review.daemon.process_alive", lambda pid: True)
@@ -58,7 +68,7 @@ def test_conductor_status_alive_with_jobs(tmp_path, monkeypatch):
 
     d = dash.conductor_status(_cfg(tmp_path))
 
-    assert d["alive"] is True and d["pid"] == 4242
+    assert d["alive"] is True and d["ready"] is True and d["pid"] == 4242
     assert d["concurrency"] == 2
     assert d["running"] == 1
     assert {j["issue_num"] for j in d["jobs"]} == {93, 91}
@@ -127,10 +137,124 @@ def test_conductor_status_no_snapshot_degrades(tmp_path, monkeypatch):
                         lambda cfg: tmp_path / "absent.lock")
     monkeypatch.setattr("marathon.conductor.load_jobs_snapshot", lambda repo_dir: None)
     d = dash.conductor_status(_cfg(tmp_path))
-    assert d == {"alive": False, "pid": None, "repo": "o/r", "concurrency": None,
-                 "updated_ts": None, "running": 0, "prover_enabled": None,
-                 "degraded": None,
-                 "jobs": [], "queued": [], "landings": []}
+    assert d == {
+        "alive": False,
+        "ready": False,
+        "pid": None,
+        "repo": "o/r",
+        "concurrency": None,
+        "updated_ts": None,
+        "heartbeat_ts": None,
+        "heartbeat_age_seconds": None,
+        "heartbeat_stale": True,
+        "legacy_ready": False,
+        "progress_age_seconds": None,
+        "progress_stale": False,
+        "running": 0,
+        "prover_enabled": None,
+        "degraded": None,
+        "jobs": [],
+        "queued": [],
+        "landings": [],
+    }
+
+
+def test_conductor_status_live_pid_with_stale_heartbeat_is_not_ready(
+    tmp_path, monkeypatch,
+):
+    lock = tmp_path / "conductor.lock"
+    lock.write_text("4242")
+    monkeypatch.setattr("marathon.conductor.conductor_lock_path", lambda cfg: lock)
+    monkeypatch.setattr(
+        "marathon.conductor.load_jobs_snapshot",
+        lambda repo_dir: {"conductor_pid": 4242, "jobs": []},
+    )
+    monkeypatch.setattr(
+        "marathon.conductor.load_conductor_heartbeat",
+        lambda repo_dir: {
+            "pid": 4242,
+            "ready": True,
+            "updated_ts": "2020-01-01T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr("marathon.review.daemon.process_alive", lambda pid: True)
+
+    status = dash.conductor_status(_cfg(tmp_path))
+
+    assert status["alive"] is True
+    assert status["ready"] is False
+    assert status["heartbeat_stale"] is True
+
+
+def test_conductor_status_accepts_fresh_legacy_snapshot_during_rolling_upgrade(
+    tmp_path, monkeypatch,
+):
+    lock = tmp_path / "conductor.lock"
+    lock.write_text("4242")
+    monkeypatch.setattr("marathon.conductor.conductor_lock_path", lambda cfg: lock)
+    monkeypatch.setattr(
+        "marathon.conductor.load_jobs_snapshot",
+        lambda repo_dir: {
+            "updated_ts": "2099-01-01T00:00:00+00:00",
+            "concurrency": 1,
+            "jobs": [],
+        },
+    )
+    monkeypatch.setattr(
+        "marathon.conductor.load_conductor_heartbeat",
+        lambda repo_dir: None,
+    )
+    monkeypatch.setattr("marathon.review.daemon.process_alive", lambda pid: True)
+
+    status = dash.conductor_status(_cfg(tmp_path))
+
+    assert status["alive"] is True
+    assert status["ready"] is True
+    assert status["legacy_ready"] is True
+    assert status["concurrency"] == 1
+
+
+def test_conductor_status_never_pairs_fresh_heartbeat_with_old_snapshot(
+    tmp_path, monkeypatch,
+):
+    lock = tmp_path / "conductor.lock"
+    lock.write_text("4242")
+    monkeypatch.setattr("marathon.conductor.conductor_lock_path", lambda cfg: lock)
+    monkeypatch.setattr(
+        "marathon.conductor.load_jobs_snapshot",
+        lambda repo_dir: {
+            "conductor_pid": 3131,
+            "degraded": "old process had no key",
+            "concurrency": 4,
+            "jobs": [{
+                "issue_num": 171,
+                "status": "running",
+                "pid": 3131,
+                "process_group_id": 3131,
+            }],
+        },
+    )
+    monkeypatch.setattr(
+        "marathon.conductor.load_conductor_heartbeat",
+        lambda repo_dir: {
+            "pid": 4242,
+            "ready": True,
+            "updated_ts": "2099-01-01T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr("marathon.review.daemon.process_alive", lambda pid: True)
+    monkeypatch.setattr(
+        "marathon.conductor.snapshot_job_is_live", lambda raw: True
+    )
+
+    status = dash.conductor_status(_cfg(tmp_path))
+
+    assert status["alive"] is True
+    assert status["ready"] is False
+    assert status["degraded"] is None
+    assert status["concurrency"] is None
+    assert status["jobs"][0]["issue_num"] == 171
+    assert status["jobs"][0]["status"] == "running"
 
 
 # --- issues_overview -------------------------------------------------------
@@ -281,7 +405,7 @@ def test_conductor_status_adds_progress_and_iteration(tmp_path, monkeypatch):
     monkeypatch.setattr("marathon.conductor.conductor_lock_path", lambda cfg: lock)
     monkeypatch.setattr(
         "marathon.conductor.load_jobs_snapshot",
-        lambda repo_dir: {"jobs": [
+        lambda repo_dir: {"conductor_pid": 4242, "jobs": [
             {"issue_num": 93, "chapter": 12, "status": "running", "pid": 4242,
              "workdir": str(wd)},
         ]},
@@ -339,7 +463,7 @@ def test_conductor_status_shows_queued_pending_rejections(tmp_path, monkeypatch)
     monkeypatch.setattr("marathon.conductor.conductor_lock_path", lambda cfg: lock)
     monkeypatch.setattr(
         "marathon.conductor.load_jobs_snapshot",
-        lambda repo_dir: {"concurrency": 1, "jobs": [
+        lambda repo_dir: {"conductor_pid": 4242, "concurrency": 1, "jobs": [
             {"issue_num": 95, "chapter": 12, "status": "running", "pid": 4242}]},
     )
     monkeypatch.setattr("marathon.review.daemon.process_alive", lambda pid: True)
@@ -395,7 +519,7 @@ def test_conductor_status_job_carries_phase(tmp_path, monkeypatch):
     lock = tmp_path / "conductor.lock"; lock.write_text("4242")
     monkeypatch.setattr("marathon.conductor.conductor_lock_path", lambda cfg: lock)
     monkeypatch.setattr("marathon.conductor.load_jobs_snapshot",
-        lambda repo_dir: {"jobs": [
+        lambda repo_dir: {"conductor_pid": 4242, "jobs": [
             {"issue_num": 95, "chapter": 12, "status": "running", "pid": 4242,
              "aristotle_status": "COMPLETE", "workdir": str(wd)}]})
     monkeypatch.setattr("marathon.review.daemon.process_alive", lambda pid: True)

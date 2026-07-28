@@ -198,6 +198,8 @@ def _run_queue_refresh_race(app_js: str) -> dict:
         _fn_body(code, "function withReadDeadline"),
         _fn_body(code, "function newReadController"),
         _fn_body(code, "function readOptions"),
+        _fn_body(code, "function conductorIsReady"),
+        _fn_body(code, "function reviewConductorSnapshotKey"),
         _fn_body(code, "function refreshQueue"),
         _fn_body(code, "function startQueueRefresh"),
     ))
@@ -220,6 +222,7 @@ var state = {
   unresolved: 0, awaitingRefinement: 0, needsAttention: 0,
   needsCitationMapping: 0, awaitingAudit: 0, dependencyBlocked: 0,
   otherUnresolved: 0, reviewStuck: { issues: [], repo: null },
+  reviewConductor: null, conductorStartBusy: false, conductorStartError: "",
   queueRequest: null, queueAbortController: null,
   queueRequestSeq: 0, queueSnapshotKey: null,
   issue: null, activeTab: "review"
@@ -253,8 +256,8 @@ function fetchQueue(chapter, options) {
   return abortableRead(options, queueReads);
 }
 function getJSON(url, options) {
-  if (url !== "/api/stuck") throw new Error("unexpected URL " + url);
-  return abortableRead(options, stuckReads);
+  if (url === "/api/stuck") return abortableRead(options, stuckReads);
+  throw new Error("unexpected URL " + url);
 }
 (async function () {
   var first = refreshQueue();
@@ -266,7 +269,11 @@ function getJSON(url, options) {
     cards: [{ id: 2, ready: false, marker: "new" }],
     unresolved: 1
   });
-  stuckReads[1].resolve({ issues: [], repo: "new/repo" });
+  stuckReads[1].resolve({
+    issues: [],
+    repo: "new/repo",
+    conductor: { alive: false, restart_allowed: true }
+  });
   await Promise.all([first, second]);
   process.stdout.write(JSON.stringify({
     queueReads: queueReads.length,
@@ -274,6 +281,7 @@ function getJSON(url, options) {
     renders: renders,
     installedMarker: state.queue[0] && state.queue[0].marker,
     stuckCount: state.reviewStuck.issues.length,
+    conductorAlive: state.reviewConductor && state.reviewConductor.alive,
     requestCleared: state.queueRequest === null,
     ended: ended,
     abortedReads: abortedReads
@@ -487,6 +495,7 @@ def _run_status_refresh_race(app_js: str) -> dict:
         _fn_body(code, "function withReadDeadline"),
         _fn_body(code, "function newReadController"),
         _fn_body(code, "function readOptions"),
+        _fn_body(code, "function conductorIsReady"),
         _fn_body(code, "function renderStatusTab"),
     ))
     script = "var STATUS_READ_TIMEOUT_MS = 100;\n" + helpers + r"""
@@ -2407,6 +2416,8 @@ def test_review_retry_supersedes_hung_read_and_paints_atomic_snapshot(
     assert "QUEUE_READ_TIMEOUT_MS" in start
     assert "fetchQueue(null, options)" in start
     assert 'getJSON("/api/stuck", options)' in start
+    assert 'getJSON("/api/conductor-status", options)' not in start
+    assert "stuckRead.data.conductor" in start
     assert "generation !== state.queueRequestSeq" in start
     assert "state.queueRequest = completion" in start
 
@@ -2417,6 +2428,41 @@ def test_review_retry_supersedes_hung_read_and_paints_atomic_snapshot(
     assert "state.queueRenderedKey === state.queueSnapshotKey" in drained
 
 
+def test_empty_review_card_surfaces_orchestrator_health_and_restart(
+    app_js: str,
+):
+    """A stopped conductor is an actionable blocker, not hidden in Status."""
+    code = _strip_block_comments(app_js)
+    drained = _fn_body(code, "function openFirstReadyIssue")
+    readiness = _fn_body(code, "function conductorIsReady")
+
+    assert "ready == null" in readiness
+    assert "alive" in readiness
+    assert "state.reviewConductor" in drained
+    assert "conductorIsReady" in drained
+    assert "conductor.restart_allowed" in drained
+    assert "!conductor.alive" in drained
+    assert "Restart orchestrator" in drained
+    assert "startConductorFromStatus" in drained
+    assert "queued repairs and merges " in drained
+    assert "cannot advance" in drained
+    assert "conductor.degraded" in drained
+    assert "Open orchestrator status" in drained
+
+
+def test_empty_review_snapshot_key_ignores_heartbeat_churn(app_js: str):
+    code = _strip_block_comments(app_js)
+    keyer = _fn_body(code, "function reviewConductorSnapshotKey")
+    refresh = _fn_body(code, "function startQueueRefresh")
+
+    assert "heartbeat_ts" not in keyer
+    assert "heartbeat_age_seconds" not in keyer
+    assert "progress_age_seconds" not in keyer
+    assert "conductorIsReady" in keyer
+    assert "progress_stale" in keyer
+    assert "reviewConductorSnapshotKey(state.reviewConductor)" in refresh
+
+
 def test_review_refresh_race_installs_only_newest_snapshot(app_js: str):
     result = _run_queue_refresh_race(app_js)
     assert result == {
@@ -2425,6 +2471,7 @@ def test_review_refresh_race_installs_only_newest_snapshot(app_js: str):
         "renders": 1,
         "installedMarker": "new",
         "stuckCount": 0,
+        "conductorAlive": False,
         "requestCleared": True,
         "ended": 1,
         "abortedReads": 2,
@@ -2485,6 +2532,9 @@ def test_status_poll_keeps_unchanged_dom_mounted(app_js: str):
     assert "state.statusDashboardRequest && !force" in body
     assert body.count("generation === state.statusDashboardRequestSeq") >= 3
     assert 'key !== "updated_ts"' in body
+    assert 'key !== "heartbeat_ts"' in body
+    assert 'key !== "heartbeat_age_seconds"' in body
+    assert 'key !== "progress_age_seconds"' in body
     assert "snapshotKey === state.statusDashboardSnapshotKey" in body
     assert 'querySelector(".cond-updated")' in body
     assert "syncDomChildren(host, nextHost)" in body
@@ -2523,6 +2573,7 @@ def test_status_mutations_force_a_new_generation(app_js: str):
     toggle = _fn_body(code, "function proverToggle")
     assert "renderStatusTab(true)" in switch
     assert restart.count("renderStatusTab(true)") == 3
+    assert restart.count("refreshQueue()") == 3
     assert "renderStatusTab(true)" in toggle
 
 
@@ -2592,7 +2643,7 @@ def test_conductor_restart_waits_for_confirmed_liveness(app_js: str):
     assert pollers, "restart should poll the status endpoint after launch"
     poller = pollers[0]
     assert "getJSON(" in poller
-    assert ".alive" in poller
+    assert "conductorIsReady" in poller
     assert re.search(r"attempt|tries|remaining", poller, flags=re.IGNORECASE)
 
 

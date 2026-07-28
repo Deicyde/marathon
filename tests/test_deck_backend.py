@@ -711,6 +711,64 @@ def test_queue_blocker_counts_are_view_scoped_and_mutually_exclusive(
     ) == queue.unresolved
 
 
+def test_completed_rejection_is_attention_not_awaiting_refinement(
+    tmp_path, monkeypatch,
+):
+    """A clean iteration is no longer in the conductor's dispatch queue."""
+    cfg = make_cfg(tmp_path)
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="def", value_pp="fun x => x"),
+        _decl("Demo.Chapter14.Bar", cone=["Demo.Chapter14.Foo"]),
+        _decl("Demo.Chapter14.Baz", kind="def", value_pp="0"),
+    ]))
+    meta = _bodies_for({22: "Foo", 23: "Bar", 24: "Baz"})
+    meta[22]["labels"] = {cfg.labels.rejected}
+    patch_bulk(monkeypatch, meta)
+
+    from marathon.review.state import record_iteration, record_rejection
+
+    rejected = record_rejection(cfg, 22, "Please refine Foo")
+    record_iteration(
+        cfg,
+        22,
+        expected_verdict_ts=rejected.verdict_ts,
+        iteration_branch="marathon/refine-c14-i22",
+        iteration_commit_sha="a" * 40,
+    )
+
+    queue = cards.build_queue(cfg, chapter=14)
+    card = next(item for item in queue.cards if item.id == 22)
+    assert queue.awaiting_refinement == 0
+    assert queue.needs_attention == 1
+    assert "waiting for PR merge or recovery" in (card.blocked_reason or "")
+
+
+def test_github_rejected_label_does_not_mask_local_stall(
+    tmp_path, monkeypatch,
+):
+    """GitHub stores the verdict; local state stores whether work is parked."""
+    cfg = make_cfg(tmp_path)
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="def", value_pp="fun x => x"),
+        _decl("Demo.Chapter14.Bar", cone=["Demo.Chapter14.Foo"]),
+        _decl("Demo.Chapter14.Baz", kind="def", value_pp="0"),
+    ]))
+    meta = _bodies_for({22: "Foo", 23: "Bar", 24: "Baz"})
+    meta[22]["labels"] = {cfg.labels.rejected}
+    patch_bulk(monkeypatch, meta)
+
+    from marathon.review.state import record_rejection, record_stall
+
+    rejected = record_rejection(cfg, 22, "Please refine Foo")
+    record_stall(cfg, 22, expected_verdict_ts=rejected.verdict_ts)
+
+    queue = cards.build_queue(cfg, chapter=14)
+    card = next(item for item in queue.cards if item.id == 22)
+    assert queue.awaiting_refinement == 0
+    assert queue.needs_attention == 1
+    assert "parked" in (card.blocked_reason or "")
+
+
 def test_queue_skips_surfacing_when_validated_snapshot_is_empty(
     tmp_path, monkeypatch,
 ):

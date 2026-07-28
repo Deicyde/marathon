@@ -534,6 +534,9 @@
     queueSnapshotKey: null,
     queueRenderedKey: null,
     reviewStuck: { issues: [], repo: null },
+    // The same conductor snapshot shown in Status, loaded atomically with the
+    // queue so an empty Review card can explain (and repair) a stopped host.
+    reviewConductor: null,
     activeTab: "review", // review | files | graph | status | issues | history
     filesChapter: "",   // "" = server default, "all" = project-wide reader
     filesData: null,
@@ -3631,7 +3634,7 @@
       );
     }
     if (state.needsAttention > 0) {
-      parts.push(state.needsAttention + " need recovery attention");
+      parts.push(state.needsAttention + " parked and need attention");
     }
     if (state.needsCitationMapping > 0) {
       parts.push(state.needsCitationMapping + " need declaration mapping");
@@ -3647,6 +3650,28 @@
     }
     return (parts.length ? parts.join("; ") :
       state.unresolved + " unresolved issue(s) are currently blocked") + ".";
+  }
+
+  // Newer servers distinguish a live PID from a conductor that has completed
+  // startup and is publishing fresh heartbeats. Preserve rolling-deploy
+  // compatibility with older servers that expose only `alive`.
+  function conductorIsReady(d) {
+    if (!d) return false;
+    return d.ready == null ? !!d.alive : !!d.ready;
+  }
+
+  function reviewConductorSnapshotKey(d) {
+    if (!d) return null;
+    // Review renders only these health/capability fields. Excluding heartbeat
+    // timestamps, job progress, and landings lets an unchanged manual refresh
+    // preserve the mounted empty card instead of visibly repainting it.
+    return [
+      !!d.alive,
+      conductorIsReady(d),
+      d.degraded || null,
+      !!d.progress_stale,
+      !!d.restart_allowed,
+    ];
   }
 
   // Open the subdeck for the first ready issue, or explain why none are ready.
@@ -3695,6 +3720,27 @@
           onClick: function () { switchTab("issues"); },
         });
       }
+      var conductor = state.reviewConductor;
+      var conductorReady = conductorIsReady(conductor);
+      var conductorProblem = conductor &&
+        (!conductorReady || !!conductor.degraded || !!conductor.progress_stale);
+      if (conductorProblem) {
+        // A stale heartbeat with a still-live PID needs diagnosis; the start
+        // endpoint deliberately will not replace a process that owns the lock.
+        // Offer Restart only for a genuinely stopped/crashed conductor.
+        if (!conductor.alive && conductor.restart_allowed) {
+          actions.unshift({
+            label: state.conductorStartBusy
+              ? "Restarting orchestrator…" : "Restart orchestrator",
+            onClick: startConductorFromStatus,
+          });
+        } else {
+          actions.unshift({
+            label: "Open orchestrator status",
+            onClick: function () { switchTab("status"); },
+          });
+        }
+      }
       if (provisional.length) {
         actions.unshift({
           label: "Review blocked code (" + provisional.length + ")",
@@ -3717,7 +3763,22 @@
             ? "No issues ready to ship — blocked code is reviewable"
             : "No issues ready for review")
           : "All caught up",
-        body: queueBlockerSummary() + (provisional.length
+        body: queueBlockerSummary() + (conductorProblem
+          ? (!conductorReady
+            ? (!conductor.alive
+              ? " The orchestrator is stopped, so queued repairs and merges " +
+                "cannot advance." +
+                (state.conductorStartError
+                  ? " Restart failed: " + state.conductorStartError
+                  : "")
+              : " The orchestrator process exists but has no fresh ready " +
+                "heartbeat; open Status to diagnose it.")
+            : conductor.degraded
+              ? " The orchestrator is running but cannot dispatch: " +
+                String(conductor.degraded) + "."
+              : " The orchestrator process is responsive, but its main loop " +
+                "has not completed a tick recently; open Status to diagnose it.")
+          : "") + (provisional.length
           ? " " + provisional.length + " dependency-blocked issue" +
             (provisional.length === 1 ? " is" : "s are") +
             " available for provisional, source-ordered review. Decisions are " +
@@ -5526,9 +5587,9 @@
   }
 
   function startQueueRefresh(generation, hadContent) {
-    // Parked issues are part of the drained Review state, so load them beside
-    // the queue.  /api/stuck remains best-effort: retain the last good parked
-    // snapshot if that auxiliary read alone fails.
+    // Parked issues and lightweight conductor health share /api/stuck, so
+    // Review adds no second expensive Status read to its latency-sensitive
+    // queue request. The auxiliary read remains best-effort.
     var controller = newReadController();
     var options = readOptions(controller);
     var request = withReadDeadline(Promise.all([
@@ -5549,6 +5610,9 @@
             repo: (stuckRead.data && stuckRead.data.repo) || null,
           }
         : state.reviewStuck;
+      var conductorSnapshot = stuckRead.ok
+        ? (stuckRead.data && stuckRead.data.conductor)
+        : state.reviewConductor;
 
       // Install the read model atomically before a single render.
       state.queue = (data.cards || []).slice();
@@ -5563,9 +5627,13 @@
       state.dependencyBlocked = data.dependency_blocked || 0;
       state.otherUnresolved = data.other_unresolved || 0;
       state.reviewStuck = stuckSnapshot || { issues: [], repo: null };
+      state.reviewConductor = conductorSnapshot || null;
       state.queueSnapshotKey = JSON.stringify([
         data,
         state.reviewStuck,
+        reviewConductorSnapshotKey(state.reviewConductor),
+        state.conductorStartBusy,
+        state.conductorStartError,
       ]);
       applyStatus({ building: state.building, landed_today: state.landedToday });
 
@@ -7470,7 +7538,7 @@
   // bounded number of PURE status reads before declaring the recovery failed.
   function pollConductorUntilLive(attempts) {
     return getJSON("/api/conductor-status").then(function (d) {
-      if (d.alive || attempts <= 1) return d;
+      if (conductorIsReady(d) || attempts <= 1) return d;
       return new Promise(function (resolve) {
         setTimeout(resolve, 500);
       }).then(function () { return pollConductorUntilLive(attempts - 1); });
@@ -7482,21 +7550,26 @@
     state.conductorStartBusy = true;
     state.conductorStartError = "";
     renderStatusTab(true);
+    if (state.activeTab === "review") refreshQueue();
     postJSON("/api/conductor-start", {})
       .then(function () { return pollConductorUntilLive(16); })
       .then(function (d) {
-        if (!d.alive) {
-          throw new Error("the launch was accepted, but no live conductor appeared");
+        if (!conductorIsReady(d)) {
+          throw new Error(
+            "the launch was accepted, but no healthy conductor appeared"
+          );
         }
         state.conductorStartBusy = false;
         state.conductorStartError = "";
         flashToast("Orchestrator restarted");
         renderStatusTab(true);
+        if (state.activeTab === "review") refreshQueue();
       })
       .catch(function (e) {
         state.conductorStartBusy = false;
         state.conductorStartError = (e && e.message) ? e.message : String(e);
         renderStatusTab(true);
+        if (state.activeTab === "review") refreshQueue();
       });
   }
 
@@ -7580,14 +7653,18 @@
     var completion = request.then(function (d) {
       if (generation !== state.statusDashboardRequestSeq ||
           state.activeTab !== "status") return null;
-      var up = !!d.alive;
+      var up = conductorIsReady(d);
       if (up) state.conductorStartError = "";
-      // updated_ts is a heartbeat. If it is the only field that moved, update
-      // that one text node and keep the rest of the dashboard (including focus
-      // and scroll position) mounted.
+      // Heartbeat-only movement updates one text node and keeps the rest of
+      // the dashboard (including focus and scroll position) mounted.
       var stableStatus = {};
       Object.keys(d || {}).forEach(function (key) {
-        if (key !== "updated_ts") stableStatus[key] = d[key];
+        if (key !== "updated_ts" &&
+            key !== "heartbeat_ts" &&
+            key !== "heartbeat_age_seconds" &&
+            key !== "progress_age_seconds") {
+          stableStatus[key] = d[key];
+        }
       });
       var snapshotKey = JSON.stringify([
         stableStatus,
@@ -7598,8 +7675,9 @@
           surfaceHasStableContent(host)) {
         var heartbeat = host.querySelector(".cond-updated");
         if (heartbeat) {
-          heartbeat.textContent = d.updated_ts
-            ? ("updated " + fmtTs(d.updated_ts)) : "";
+          var heartbeatTs = d.heartbeat_ts || d.updated_ts;
+          heartbeat.textContent = heartbeatTs
+            ? ("updated " + fmtTs(heartbeatTs)) : "";
         }
         clearStatusRefreshError(host);
         return d;
@@ -7608,19 +7686,29 @@
       // DEGRADED beats "running": a conductor with a broken dispatch env
       // (e.g. no Aristotle key) is alive but can't refine — a green chip
       // here hid exactly that during the 2026-07-07 incident.
-      var degraded = up && d.degraded;
+      var degraded = !!d.alive && !!d.degraded;
+      var progressStale = up && !!d.progress_stale;
+      var warned = degraded || progressStale;
+      var heartbeatTs = d.heartbeat_ts || d.updated_ts;
       nextHost.appendChild(el("div", {
-        class: "cond-banner" + (degraded ? " cond-degraded" : ""),
+        class: "cond-banner" + (warned ? " cond-degraded" : ""),
         "data-status-key": "conductor",
       }, [
-        el("span", { class: "cond-dot " + (degraded ? "degraded" : (up ? "up" : "down")) }),
+        el("span", { class: "cond-dot " + (warned ? "degraded" : (up ? "up" : "down")) }),
         el("div", { class: "cond-summary" }, [
           el("div", { class: "cond-title",
             text: degraded ? "conductor DEGRADED — not dispatching"
-                : up ? "conductor running" : "conductor stopped" }),
+                : progressStale ? "conductor running — progress is stale"
+                : up ? "conductor running"
+                : d.alive ? "conductor unresponsive or starting"
+                : "conductor stopped" }),
           el("div", { class: "dash-empty",
             text: degraded ? String(d.degraded)
+                : progressStale
+                  ? "process heartbeat is live, but the main loop has not completed a tick recently"
                 : up ? "dispatches refines + auto-merges PRs across all chapters"
+                     : d.alive
+                       ? "process is live but has no fresh ready heartbeat — inspect its log"
                      : d.restart_allowed
                        ? "no live orchestrator — restart it here to resume queued work"
                        : "no live orchestrator — host restart control is disabled" }),
@@ -7631,7 +7719,7 @@
             text: d.pid == null ? "—" : String(d.pid) })]),
           el("div", { text: "concurrency " + (d.concurrency == null ? "—" : d.concurrency) }),
           el("div", { class: "cond-updated",
-            text: d.updated_ts ? ("updated " + fmtTs(d.updated_ts)) : "" }),
+            text: heartbeatTs ? ("updated " + fmtTs(heartbeatTs)) : "" }),
           proverToggle(d),
         ]),
       ]));

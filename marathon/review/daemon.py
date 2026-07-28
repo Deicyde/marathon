@@ -329,6 +329,7 @@ def _handle_refine_exit(
     expected_verdict_ts: Optional[str] = None,
     expected_recovery_id: Optional[str] = None,
     pending_pr_branch: Optional[str] = None,
+    iteration_branch: Optional[str] = None,
     iteration_commit_sha: Optional[str] = None,
 ) -> int:
     """Apply the post-refine state transition for ``issue_num``; return
@@ -369,6 +370,7 @@ def _handle_refine_exit(
             expected_verdict_ts=expected_verdict_ts,
             expected_recovery_id=expected_recovery_id,
             pending_pr_branch=pending_pr_branch,
+            iteration_branch=iteration_branch,
             iteration_commit_sha=iteration_commit_sha,
         )
         return 0

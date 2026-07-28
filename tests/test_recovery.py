@@ -171,6 +171,66 @@ def _install_origin(repo: Path, tmp_path: Path, branch: str) -> Path:
     return bare
 
 
+def _advance_remote_main_cleanly(bare: Path, tmp_path: Path) -> str:
+    upstream = tmp_path / "upstream"
+    cloned = subprocess.run(
+        [
+            "git",
+            "clone",
+            "--quiet",
+            "--branch",
+            "main",
+            str(bare),
+            str(upstream),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert cloned.returncode == 0, cloned.stderr
+    _git(upstream, "config", "user.email", "test@example.com")
+    _git(upstream, "config", "user.name", "Test User")
+    advanced = upstream / "Demo" / "Chapter15" / "RemoteAdvance.lean"
+    advanced.write_text("theorem remoteAdvance : True := by trivial\n")
+    _git(upstream, "add", "Demo/Chapter15/RemoteAdvance.lean")
+    _git(upstream, "commit", "-m", "advance remote main during recovery")
+    base = _git(upstream, "rev-parse", "HEAD")
+    _git(upstream, "push", "origin", "main")
+    return base
+
+
+def _advance_remote_pr_branch(
+    bare: Path,
+    tmp_path: Path,
+    branch: str,
+) -> str:
+    intruder = tmp_path / "intruder"
+    cloned = subprocess.run(
+        [
+            "git",
+            "clone",
+            "--quiet",
+            "--branch",
+            branch,
+            str(bare),
+            str(intruder),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert cloned.returncode == 0, cloned.stderr
+    _git(intruder, "config", "user.email", "test@example.com")
+    _git(intruder, "config", "user.name", "Test User")
+    changed = intruder / "Demo" / "Chapter15" / "CompetingWriter.lean"
+    changed.write_text("theorem competingWriter : True := by trivial\n")
+    _git(intruder, "add", "Demo/Chapter15/CompetingWriter.lean")
+    _git(intruder, "commit", "-m", "competing PR branch writer")
+    head = _git(intruder, "rev-parse", "HEAD")
+    _git(intruder, "push", "origin", branch)
+    return head
+
+
 def test_retry_build_attests_exact_sha_and_reuses_target_planner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -390,21 +450,21 @@ def test_retry_build_posts_failure_for_red_build(
 def test_update_continue_green_fast_path_merges_builds_and_pushes_exact_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo, _base, original_head, branch = _fixture_repo(tmp_path)
+    repo, stale_rest_base, original_head, branch = _fixture_repo(tmp_path)
     current_base = _advance_main_cleanly(repo, branch)
     bare = _install_origin(repo, tmp_path, branch)
     workdir = tmp_path / "work"
 
     github = _FakeGitHub(
         [
-            _pr_payload(base=current_base, head=original_head, branch=branch),
-            _pr_payload(base=current_base, head=original_head, branch=branch),
-            _pr_payload(base=current_base, head=original_head, branch=branch),
-            _pr_payload(base=current_base, head=original_head, branch=branch),
+            _pr_payload(base=stale_rest_base, head=original_head, branch=branch),
+            _pr_payload(base=stale_rest_base, head=original_head, branch=branch),
+            _pr_payload(base=stale_rest_base, head=original_head, branch=branch),
+            _pr_payload(base=stale_rest_base, head=original_head, branch=branch),
             # GitHub can briefly expose the old head after a successful push.
-            _pr_payload(base=current_base, head=original_head, branch=branch),
+            _pr_payload(base=stale_rest_base, head=original_head, branch=branch),
             lambda: _pr_payload(
-                base=current_base,
+                base=stale_rest_base,
                 head=_git(repo, "rev-parse", "HEAD"),
                 branch=branch,
             ),
@@ -459,8 +519,244 @@ def test_update_continue_green_fast_path_merges_builds_and_pushes_exact_lease(
     assert github.statuses[0]["context"] == TRUSTED_BUILD_CONTEXT
     marker = json.loads((workdir / UPDATE_RECOVERY_MARKER_FILENAME).read_text())
     assert marker["phase"] == UPDATE_RECOVERY_PHASE_PUBLISHED
+    assert marker["base_sha"] == current_base
     assert marker["current_local_head"] == updated_head
     assert sleeps == [0.25]
+
+
+def test_update_continue_rolls_forward_when_base_moves_during_green_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _base, original_head, branch = _fixture_repo(tmp_path)
+    initial_base = _advance_main_cleanly(repo, branch)
+    bare = _install_origin(repo, tmp_path, branch)
+    workdir = tmp_path / "work"
+    moved: dict[str, str] = {}
+
+    def live_pr() -> dict:
+        return _pr_payload(
+            # GitHub's pull payload may retain an old base SHA. The branch ref
+            # itself is the publication boundary.
+            base=initial_base,
+            head=_git(
+                bare,
+                "rev-parse",
+                f"refs/heads/{branch}",
+            ),
+            branch=branch,
+        )
+
+    github = _FakeGitHub([live_pr for _ in range(16)])
+    builds: list[list[str] | None] = []
+
+    def build(
+        _repo: Path, _timeout: int, targets: list[str] | None = None
+    ) -> BuildResult:
+        builds.append(targets)
+        if len(builds) == 1:
+            moved["base"] = _advance_remote_main_cleanly(bare, tmp_path)
+        return BuildResult(ok=True, duration_seconds=float(len(builds)))
+
+    monkeypatch.setattr(recovery_mod, "gh", github)
+    monkeypatch.setattr(recovery_mod, "run_lake_build", build)
+    monkeypatch.setattr(
+        recovery_mod,
+        "_run_fallback",
+        lambda *a, **k: pytest.fail("a moving base must rebuild, not use Aristotle"),
+    )
+
+    result = update_continue(
+        _update_config(repo, original_head, branch, workdir)
+    )
+
+    marker = json.loads((workdir / UPDATE_RECOVERY_MARKER_FILENAME).read_text())
+    assert result.ok is True
+    assert result.fast_path is True
+    assert builds == [["Demo.Chapter15.A"], ["Demo.Chapter15.A"]]
+    assert marker["phase"] == UPDATE_RECOVERY_PHASE_PUBLISHED
+    assert marker["base_sha"] == moved["base"]
+    assert marker["build_duration_seconds"] == 2.0
+    assert subprocess.run(
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            moved["base"],
+            result.head_sha,
+        ],
+        cwd=repo,
+        check=False,
+    ).returncode == 0
+    assert [status["state"] for status in github.statuses] == ["success"]
+
+
+def test_update_continue_rechecks_and_rolls_base_moved_during_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _base, original_head, branch = _fixture_repo(tmp_path)
+    initial_base = _advance_main_cleanly(repo, branch)
+    bare = _install_origin(repo, tmp_path, branch)
+    workdir = tmp_path / "work"
+
+    def live_pr() -> dict:
+        return _pr_payload(
+            base=initial_base,
+            head=_git(bare, "rev-parse", f"refs/heads/{branch}"),
+            branch=branch,
+        )
+
+    github = _FakeGitHub([live_pr for _ in range(16)])
+    real_push = recovery_mod._push_updated_head
+    moved: dict[str, str] = {}
+
+    def push_then_move_base(*args: object, **kwargs: object) -> None:
+        real_push(*args, **kwargs)
+        if not moved:
+            moved["base"] = _advance_remote_main_cleanly(bare, tmp_path)
+
+    builds = 0
+
+    def build(*_args: object, **_kwargs: object) -> BuildResult:
+        nonlocal builds
+        builds += 1
+        return BuildResult(ok=True, duration_seconds=float(builds))
+
+    monkeypatch.setattr(recovery_mod, "gh", github)
+    monkeypatch.setattr(recovery_mod, "_push_updated_head", push_then_move_base)
+    monkeypatch.setattr(recovery_mod, "run_lake_build", build)
+    monkeypatch.setattr(
+        recovery_mod,
+        "_run_fallback",
+        lambda *a, **k: pytest.fail("publication race must rebuild, not refine"),
+    )
+
+    result = update_continue(
+        _update_config(repo, original_head, branch, workdir)
+    )
+
+    marker = json.loads((workdir / UPDATE_RECOVERY_MARKER_FILENAME).read_text())
+    assert result.ok is True
+    assert builds == 2
+    assert marker["phase"] == UPDATE_RECOVERY_PHASE_PUBLISHED
+    assert marker["base_sha"] == moved["base"]
+    assert subprocess.run(
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            moved["base"],
+            result.head_sha,
+        ],
+        cwd=repo,
+        check=False,
+    ).returncode == 0
+    assert [status["state"] for status in github.statuses] == ["success"]
+
+
+def test_update_continue_aborts_if_pr_head_moves_during_publication_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _base, original_head, branch = _fixture_repo(tmp_path)
+    initial_base = _advance_main_cleanly(repo, branch)
+    bare = _install_origin(repo, tmp_path, branch)
+    workdir = tmp_path / "work"
+
+    def live_pr() -> dict:
+        return _pr_payload(
+            base=initial_base,
+            head=_git(bare, "rev-parse", f"refs/heads/{branch}"),
+            branch=branch,
+        )
+
+    github = _FakeGitHub([live_pr for _ in range(10)])
+    real_await = recovery_mod._await_published_revision
+    competing: dict[str, str] = {}
+
+    def await_then_move_head(
+        *args: object,
+        **kwargs: object,
+    ) -> recovery_mod.PullRequestRevision:
+        published = real_await(*args, **kwargs)
+        competing["head"] = _advance_remote_pr_branch(
+            bare, tmp_path, branch
+        )
+        return published
+
+    monkeypatch.setattr(recovery_mod, "gh", github)
+    monkeypatch.setattr(
+        recovery_mod,
+        "_await_published_revision",
+        await_then_move_head,
+    )
+    monkeypatch.setattr(
+        recovery_mod,
+        "run_lake_build",
+        lambda *a, **k: BuildResult(ok=True, duration_seconds=1.0),
+    )
+
+    with pytest.raises(
+        RecoveryError,
+        match="moved to unexpected head .* after publication",
+    ):
+        update_continue(
+            _update_config(repo, original_head, branch, workdir)
+        )
+
+    marker = json.loads((workdir / UPDATE_RECOVERY_MARKER_FILENAME).read_text())
+    assert marker["phase"] == UPDATE_RECOVERY_PHASE_PUSHING
+    assert _git(bare, "rev-parse", f"refs/heads/{branch}") == competing["head"]
+    assert github.statuses == []
+
+
+def test_update_continue_rolls_forward_before_red_build_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _base, original_head, branch = _fixture_repo(tmp_path)
+    initial_base = _advance_main_cleanly(repo, branch)
+    bare = _install_origin(repo, tmp_path, branch)
+    workdir = tmp_path / "work"
+    moved: dict[str, str] = {}
+
+    def live_pr() -> dict:
+        return _pr_payload(
+            base=initial_base,
+            head=_git(bare, "rev-parse", f"refs/heads/{branch}"),
+            branch=branch,
+        )
+
+    github = _FakeGitHub([live_pr for _ in range(16)])
+    builds = 0
+
+    def build(*_args: object, **_kwargs: object) -> BuildResult:
+        nonlocal builds
+        builds += 1
+        if builds == 1:
+            moved["base"] = _advance_remote_main_cleanly(bare, tmp_path)
+            return BuildResult(ok=False, log_tail="stale-base failure")
+        return BuildResult(ok=True, duration_seconds=2.0)
+
+    monkeypatch.setattr(recovery_mod, "gh", github)
+    monkeypatch.setattr(recovery_mod, "run_lake_build", build)
+    monkeypatch.setattr(
+        recovery_mod,
+        "_run_fallback",
+        lambda *a, **k: pytest.fail(
+            "Aristotle must not run until the live base is rebuilt"
+        ),
+    )
+
+    result = update_continue(
+        _update_config(repo, original_head, branch, workdir)
+    )
+
+    marker = json.loads((workdir / UPDATE_RECOVERY_MARKER_FILENAME).read_text())
+    assert result.ok is True
+    assert result.fast_path is True
+    assert result.fallback_invoked is False
+    assert builds == 2
+    assert marker["phase"] == UPDATE_RECOVERY_PHASE_PUBLISHED
+    assert marker["base_sha"] == moved["base"]
+    assert [status["state"] for status in github.statuses] == ["success"]
 
 
 def test_update_continue_joins_diverged_dirty_checkpoint_without_aristotle(
@@ -567,6 +863,7 @@ def test_update_continue_resumes_if_killed_after_joining_diverged_checkpoint(
 ) -> None:
     repo, initial_base, original_head, branch = _fixture_repo(tmp_path)
     current_base = _advance_main_cleanly(repo, branch)
+    _install_origin(repo, tmp_path, branch)
     _git(repo, "reset", "--hard", initial_base)
     local = repo / "Demo" / "Chapter15" / "InterruptedLocal.lean"
     local.write_text("theorem interruptedLocal : True := by trivial\n")
@@ -678,6 +975,7 @@ def test_update_continue_conflict_preserves_dirty_checkpoint_and_session(
     _git(repo, "commit", "-m", "conflicting main edit")
     current_base = _git(repo, "rev-parse", "HEAD")
     _git(repo, "checkout", branch)
+    _install_origin(repo, tmp_path, branch)
     local_file = repo / "Demo" / "Chapter15" / "LocalCheckpoint.lean"
     local_file.write_text("theorem localCheckpoint : True := by trivial\n")
 
@@ -763,6 +1061,7 @@ def test_update_continue_red_build_preserves_old_session_for_fallback(
 ) -> None:
     repo, _base, original_head, branch = _fixture_repo(tmp_path)
     current_base = _advance_main_cleanly(repo, branch)
+    _install_origin(repo, tmp_path, branch)
     workdir = tmp_path / "work"
     workdir.mkdir()
     save_refine_state(
@@ -822,6 +1121,7 @@ def test_update_continue_aborts_if_pr_head_moves_before_exact_lease_push(
 ) -> None:
     repo, _base, original_head, branch = _fixture_repo(tmp_path)
     current_base = _advance_main_cleanly(repo, branch)
+    _install_origin(repo, tmp_path, branch)
     github = _FakeGitHub(
         [
             _pr_payload(base=current_base, head=original_head, branch=branch),
@@ -851,33 +1151,56 @@ def test_update_continue_aborts_if_pr_head_moves_before_exact_lease_push(
     assert github.statuses == []
 
 
-def test_update_continue_aborts_if_remote_base_moves_before_push(
+def test_update_continue_aborts_if_remote_base_is_force_rewritten_before_push(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo, _base, original_head, branch = _fixture_repo(tmp_path)
     current_base = _advance_main_cleanly(repo, branch)
-    old_pr = _pr_payload(base=current_base, head=original_head, branch=branch)
-    github = _FakeGitHub([old_pr, old_pr, old_pr, old_pr])
+    bare = _install_origin(repo, tmp_path, branch)
+
+    def live_pr() -> dict:
+        return _pr_payload(
+            base=current_base,
+            head=_git(bare, "rev-parse", f"refs/heads/{branch}"),
+            branch=branch,
+        )
+
+    github = _FakeGitHub([live_pr for _ in range(8)])
     pushed = False
 
     def fake_push(*args: object, **kwargs: object) -> None:
         nonlocal pushed
         pushed = True
 
+    def green_build(*_args: object, **_kwargs: object) -> BuildResult:
+        upstream = tmp_path / "rewriter"
+        cloned = subprocess.run(
+            [
+                "git",
+                "clone",
+                "--quiet",
+                "--branch",
+                "main",
+                str(bare),
+                str(upstream),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert cloned.returncode == 0, cloned.stderr
+        _git(upstream, "config", "user.email", "test@example.com")
+        _git(upstream, "config", "user.name", "Test User")
+        tree = _git(upstream, "rev-parse", "HEAD^{tree}")
+        rewritten = _git(upstream, "commit-tree", tree, "-m", "rewrite main")
+        _git(upstream, "push", "--force", "origin", f"{rewritten}:main")
+        return BuildResult(ok=True)
+
     monkeypatch.setattr(recovery_mod, "gh", github)
-    monkeypatch.setattr(
-        recovery_mod,
-        "run_lake_build",
-        lambda *args, **kwargs: BuildResult(ok=True),
-    )
-    monkeypatch.setattr(
-        recovery_mod,
-        "_remote_branch_head",
-        lambda _repo, name: original_head if name == branch else "b" * 40,
-    )
+    monkeypatch.setattr(recovery_mod, "run_lake_build", green_build)
     monkeypatch.setattr(recovery_mod, "_push_updated_head", fake_push)
 
-    with pytest.raises(RecoveryError, match="remote base branch main moved"):
+    with pytest.raises(RecoveryError, match="remote base branch main was rewritten"):
         update_continue(
             _update_config(repo, original_head, branch, tmp_path / "work")
         )
@@ -1086,6 +1409,7 @@ def test_update_continue_staged_conflicts_resume_as_mandatory_fallback(
     _git(repo, "commit", "-m", "conflicting main edit")
     current_base = _git(repo, "rev-parse", "HEAD")
     _git(repo, "checkout", branch)
+    _install_origin(repo, tmp_path, branch)
 
     workdir = tmp_path / "work"
     config = _update_config(repo, original_head, branch, workdir)
@@ -1213,6 +1537,7 @@ def test_update_continue_recovers_fallback_commit_before_phase_update(
 ) -> None:
     repo, _base, original_head, branch = _fixture_repo(tmp_path)
     current_base = _advance_main_cleanly(repo, branch)
+    _install_origin(repo, tmp_path, branch)
     workdir = tmp_path / "work"
     config = _update_config(repo, original_head, branch, workdir)
     old_pr = _pr_payload(base=current_base, head=original_head, branch=branch)
@@ -1356,6 +1681,96 @@ def test_update_continue_resumes_after_push_without_pushing_twice_and_published_
     assert repeated.ok is True
     assert repeated.head_sha == updated_head
     assert "already published" in repeated.message
+
+
+def test_update_continue_rolls_forward_if_base_moves_after_push_before_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _base, original_head, branch = _fixture_repo(tmp_path)
+    initial_base = _advance_main_cleanly(repo, branch)
+    bare = _install_origin(repo, tmp_path, branch)
+    workdir = tmp_path / "work"
+    config = _update_config(
+        repo,
+        original_head,
+        branch,
+        workdir,
+        operation_id="operation-post-push-base-move",
+    )
+    old_pr = _pr_payload(base=initial_base, head=original_head, branch=branch)
+
+    with monkeypatch.context() as crash:
+        crash.setattr(
+            recovery_mod,
+            "gh",
+            _FakeGitHub([old_pr, old_pr, old_pr, old_pr]),
+        )
+        crash.setattr(
+            recovery_mod,
+            "run_lake_build",
+            lambda *a, **k: BuildResult(ok=True, duration_seconds=1.0),
+        )
+        crash.setattr(
+            recovery_mod,
+            "_await_published_revision",
+            lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError("simulated death after push")
+            ),
+        )
+        with pytest.raises(RuntimeError, match="after push"):
+            update_continue(config)
+
+    first_published = _git(
+        bare, "rev-parse", f"refs/heads/{branch}"
+    )
+    advanced_base = _advance_remote_main_cleanly(bare, tmp_path)
+
+    def live_pr() -> dict:
+        return _pr_payload(
+            base=initial_base,
+            head=_git(bare, "rev-parse", f"refs/heads/{branch}"),
+            branch=branch,
+        )
+
+    github = _FakeGitHub([live_pr for _ in range(10)])
+    builds = 0
+
+    def rebuilt(*_args: object, **_kwargs: object) -> BuildResult:
+        nonlocal builds
+        builds += 1
+        return BuildResult(ok=True, duration_seconds=2.0)
+
+    with monkeypatch.context() as resume:
+        resume.setattr(recovery_mod, "gh", github)
+        resume.setattr(recovery_mod, "run_lake_build", rebuilt)
+        resume.setattr(
+            recovery_mod,
+            "_run_fallback",
+            lambda *a, **k: pytest.fail("fast-forward base must not use Aristotle"),
+        )
+        result = update_continue(config)
+
+    marker = json.loads(
+        (workdir / UPDATE_RECOVERY_MARKER_FILENAME).read_text()
+    )
+    assert result.ok is True
+    assert result.head_sha != first_published
+    assert builds == 1
+    assert marker["phase"] == UPDATE_RECOVERY_PHASE_PUBLISHED
+    assert marker["expected_remote_head"] == first_published
+    assert marker["base_sha"] == advanced_base
+    assert subprocess.run(
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            advanced_base,
+            result.head_sha,
+        ],
+        cwd=repo,
+        check=False,
+    ).returncode == 0
+    assert [status["state"] for status in github.statuses] == ["success"]
 
 
 def test_update_continue_cli_accepts_operation_id() -> None:

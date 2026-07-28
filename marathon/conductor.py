@@ -131,6 +131,7 @@ from marathon.state import (
 # Snapshot + lock locations (repo-relative).
 SNAPSHOT_SCHEMA_VERSION = 1
 JOBS_SNAPSHOT_RELPATH = Path(".marathon/conductor/jobs.json")
+CONDUCTOR_HEARTBEAT_RELPATH = Path(".marathon/conductor/heartbeat.json")
 CONDUCTOR_LOCK_FILENAME = "conductor.lock"
 START_OVER_RECOVERY_MARKER_FILENAME = "marathon-start-over-recovery.json"
 START_OVER_RECOVERY_SCHEMA_VERSION = 1
@@ -190,6 +191,15 @@ METADATA_BASE_BRANCH = WORKTREE_START_POINT.rsplit("/", 1)[-1]
 # Loop cadence: short ticks while jobs are running (reap promptly, keep
 # the snapshot fresh); the daemon's drained-queue interval otherwise.
 TICK_SECONDS = 10
+# The jobs snapshot is written only at the end of a tick. A separate tiny
+# heartbeat stays fresh even while a slow GitHub or audit operation is running,
+# so the deck never mistakes yesterday's snapshot for a ready conductor.
+CONDUCTOR_HEARTBEAT_INTERVAL_SECONDS = 5
+CONDUCTOR_HEARTBEAT_STALE_SECONDS = 30
+# A separate main-loop progress age is diagnostic only: audits and builds can
+# legitimately make one tick long, so it must not kill the process or cancel a
+# worker. The UI can nevertheless stop claiming that queued work is advancing.
+CONDUCTOR_PROGRESS_STALE_SECONDS = 15 * 60
 # A dispatch deferred by the worktree double-dispatch guard is retried
 # after this long (the conflicting checkout is usually another live
 # job or a leftover the operator must --prune; hammering won't help).
@@ -4979,6 +4989,11 @@ def _reap_finished(
             expected_verdict_ts=job.expected_verdict_ts,
             expected_recovery_id=job.expected_recovery_id,
             pending_pr_branch=(job.branch if rc == 0 and reconcile else None),
+            # Branch/SHA ownership is durable completion evidence, not an
+            # optional reconciliation side effect.  In particular, an exact
+            # retry-build reaped under ``--no-reconcile`` must still be
+            # mergeable by a later normal conductor.
+            iteration_branch=(job.branch if rc == 0 else None),
             iteration_commit_sha=(_job_head_sha(job) if rc == 0 else None),
         )
         if backoff:
@@ -5131,6 +5146,96 @@ def jobs_snapshot_path(repo_dir: Path) -> Path:
     return Path(repo_dir) / JOBS_SNAPSHOT_RELPATH
 
 
+def conductor_heartbeat_path(repo_dir: Path) -> Path:
+    return Path(repo_dir) / CONDUCTOR_HEARTBEAT_RELPATH
+
+
+def load_conductor_heartbeat(repo_dir: Path) -> Optional[dict]:
+    """Return the conductor readiness heartbeat, or ``None`` if unavailable."""
+    try:
+        data = json.loads(conductor_heartbeat_path(repo_dir).read_text())
+    except (OSError, ValueError, AttributeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+class _ConductorHeartbeat:
+    """Independent readiness heartbeat for the long-running conductor.
+
+    Its first synchronous write is also a startup permission preflight. A host
+    process that cannot write the consumer repo fails before the deck reports
+    it ready, instead of pairing a live PID with an old jobs snapshot.
+    """
+
+    def __init__(self, repo_dir: Path):
+        self.repo_dir = Path(repo_dir)
+        self.pid = os.getpid()
+        self.ready = False
+        self._stop = threading.Event()
+        self._write_lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+
+    def _write(self) -> None:
+        # mark_ready() can coincide with the background tick. Serialize the
+        # shared atomic temp path so one writer cannot replace it out from
+        # underneath the other.
+        with self._write_lock:
+            path = conductor_heartbeat_path(self.repo_dir)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            gitignore = path.parent / ".gitignore"
+            if not gitignore.is_file():
+                gitignore.write_text("*\n")
+            payload = {
+                "schema_version": 1,
+                "pid": self.pid,
+                "ready": self.ready,
+                "updated_ts": now_iso(),
+            }
+            tmp = path.with_name(f".{path.name}.{self.pid}.tmp")
+            tmp.write_text(json.dumps(payload, indent=2) + "\n")
+            tmp.replace(path)
+
+    def start(self) -> None:
+        # Synchronous by design: inability to publish runtime state is a hard
+        # startup failure, not a warning hidden behind a green PID.
+        self._write()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="marathon-conductor-heartbeat",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def mark_ready(self) -> None:
+        self.ready = True
+        self._write()
+
+    def _run(self) -> None:
+        while not self._stop.wait(CONDUCTOR_HEARTBEAT_INTERVAL_SECONDS):
+            try:
+                self._write()
+            except OSError as exc:
+                # The last timestamp ages out and the deck turns unhealthy.
+                # The main loop retains ownership of running jobs and surfaces
+                # its own write failure without cancelling an Aristotle run.
+                print(
+                    f"  warning: conductor heartbeat write failed ({exc})",
+                    flush=True,
+                )
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        path = conductor_heartbeat_path(self.repo_dir)
+        try:
+            current = load_conductor_heartbeat(self.repo_dir)
+            if current and current.get("pid") == self.pid:
+                path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 #: The deck's web toggle for proving — a control file the conductor polls each
 #: tick. Lives in the self-ignoring .marathon/conductor/ runtime dir so it never
 #: leaks into an Aristotle bundle or dirties `git status`.
@@ -5242,6 +5347,7 @@ def write_jobs_snapshot(
     repo_dir: Path, jobs: list[ConductorJob], concurrency: int,
     prover_enabled: Optional[bool] = None,
     degraded: Optional[str] = None,
+    conductor_pid: Optional[int] = None,
 ) -> None:
     """Atomic-ish write (tmp + rename, like review.state.save_state) so
     ``marathon conductor status`` never reads a torn snapshot. ``prover_enabled``
@@ -5265,6 +5371,7 @@ def write_jobs_snapshot(
     payload = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "updated_ts": now_iso(),
+        "conductor_pid": conductor_pid,
         "concurrency": concurrency,
         "prover_enabled": prover_enabled,
         "degraded": degraded,
@@ -5704,6 +5811,18 @@ def run_conductor(
         )
         return 0
 
+    heartbeat = _ConductorHeartbeat(cfg.repo_dir)
+    try:
+        heartbeat.start()
+    except OSError as exc:
+        release_conductor_lock(cfg)
+        print(
+            "conductor startup failed: cannot write its runtime heartbeat "
+            f"under {conductor_heartbeat_path(cfg.repo_dir).parent}: {exc}",
+            flush=True,
+        )
+        return 2
+
     signal.signal(signal.SIGTERM, _handle_stop_signal)
     signal.signal(signal.SIGINT, _handle_stop_signal)
 
@@ -5814,6 +5933,28 @@ def run_conductor(
     last_tracker_sync = float("-inf")  # tracker safety-net cadence (~once/2min)
     last_merge_reconcile = float("-inf")  # merged-but-rejected re-review heal (~once/min)
     last_reopen_check = float("-inf")  # stale-verified re-open cadence (~once/2min)
+
+    # Bind the jobs snapshot to this process before publishing readiness. This
+    # prevents a fresh heartbeat from making a previous conductor's jobs or
+    # degraded environment look current during the first slow tick.
+    try:
+        write_jobs_snapshot(
+            cfg.repo_dir,
+            jobs,
+            n,
+            prover_enabled=proving_default,
+            degraded=dispatch_env_error,
+            conductor_pid=os.getpid(),
+        )
+        heartbeat.mark_ready()
+    except OSError as exc:
+        heartbeat.stop()
+        release_conductor_lock(cfg)
+        print(
+            f"conductor startup failed while publishing readiness: {exc}",
+            flush=True,
+        )
+        return 2
 
     try:
         if prune:
@@ -6092,7 +6233,8 @@ def run_conductor(
 
             write_jobs_snapshot(cfg.repo_dir, jobs, n,
                                 prover_enabled=prover_enabled_now,
-                                degraded=dispatch_env_error)
+                                degraded=dispatch_env_error,
+                                conductor_pid=os.getpid())
 
             if _STOP_REQUESTED:
                 if not running:
@@ -6131,12 +6273,21 @@ def run_conductor(
                 TICK_SECONDS if (running or picks) else daemon.POLL_INTERVAL_SECONDS
             )
     finally:
-        write_jobs_snapshot(cfg.repo_dir, jobs, n, degraded=dispatch_env_error)
-        release_conductor_lock(cfg)
-        print(
-            f"\n=== conductor done {datetime.now().isoformat()} "
-            f"({dispatch_count} dispatch(es)) ===",
-            flush=True,
-        )
+        try:
+            write_jobs_snapshot(
+                cfg.repo_dir,
+                jobs,
+                n,
+                degraded=dispatch_env_error,
+                conductor_pid=os.getpid(),
+            )
+        finally:
+            heartbeat.stop()
+            release_conductor_lock(cfg)
+            print(
+                f"\n=== conductor done {datetime.now().isoformat()} "
+                f"({dispatch_count} dispatch(es)) ===",
+                flush=True,
+            )
 
     return 0

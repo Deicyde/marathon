@@ -27,6 +27,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -1010,6 +1011,49 @@ def test_orphan_report_failure_warns_and_continues(cfg, monkeypatch, capsys):
 
 
 # --- jobs.json snapshot -------------------------------------------------------------
+
+
+def test_conductor_heartbeat_publishes_readiness_and_cleans_up(cfg):
+    heartbeat = conductor._ConductorHeartbeat(cfg.repo_dir)
+
+    heartbeat.start()
+    starting = conductor.load_conductor_heartbeat(cfg.repo_dir)
+    assert starting is not None
+    assert starting["pid"] == heartbeat.pid
+    assert starting["ready"] is False
+
+    heartbeat.mark_ready()
+    ready = conductor.load_conductor_heartbeat(cfg.repo_dir)
+    assert ready is not None
+    assert ready["pid"] == heartbeat.pid
+    assert ready["ready"] is True
+    assert ready["updated_ts"]
+
+    heartbeat.stop()
+    assert conductor.load_conductor_heartbeat(cfg.repo_dir) is None
+
+
+def test_conductor_heartbeat_serializes_concurrent_writers(cfg):
+    heartbeat = conductor._ConductorHeartbeat(cfg.repo_dir)
+    heartbeat.start()
+    errors = []
+
+    def publish_ready():
+        try:
+            heartbeat.mark_ready()
+        except Exception as exc:  # noqa: BLE001 — captured for the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=publish_ready) for _ in range(40)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    ready = conductor.load_conductor_heartbeat(cfg.repo_dir)
+    heartbeat.stop()
+    assert errors == []
+    assert ready is not None and ready["ready"] is True
 
 
 def test_jobs_snapshot_round_trips(cfg):

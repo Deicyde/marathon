@@ -1168,6 +1168,12 @@ def test_reap_finished_passes_expected_recovery_id_to_daemon(
     assert captured["issue"] == ISSUE
     assert captured["expected_recovery_id"] == RECOVERY_ID
     assert captured["expected_verdict_ts"] == job.expected_verdict_ts
+    # ``--no-reconcile`` disables the PR-presence follow-up, not immutable
+    # branch ownership.  A later normal conductor still needs this identity to
+    # merge the successful exact-SHA recovery.
+    assert captured["pending_pr_branch"] is None
+    assert captured["iteration_branch"] == BRANCH
+    assert captured["iteration_commit_sha"] == HEAD
 
 
 def test_failed_retry_build_does_not_claim_stall_after_recovery_cas_loses(

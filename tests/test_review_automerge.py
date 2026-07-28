@@ -465,6 +465,65 @@ def test_automerge_refuses_refine_pr_owned_by_older_verdict(monkeypatch, tmp_pat
     assert "stale/unowned" in result.reason
 
 
+def test_automerge_heals_branchless_exact_sha_retry_completion(
+    monkeypatch, tmp_path
+):
+    """A legacy no-reconcile reap kept the SHA but lost the branch.
+
+    The PR head + issue-bearing branch make that completed verdict generation
+    unambiguous, so automerge may land it and clear the parked rejection.
+    """
+    from tests.test_conductor import make_cfg
+
+    cfg = make_cfg(tmp_path)
+    head = "marathon/refine-c15-i166"
+    pr = _pr(110, head=head, build="OK")
+    rejected = review_state.record_rejection(cfg, 166, "delete the helper")
+    review_state.record_iteration(
+        cfg,
+        166,
+        expected_verdict_ts=rejected.verdict_ts,
+        iteration_commit_sha=pr["headRefOid"],
+    )
+    poisoned = review_state.load_state(cfg).issues[166]
+    assert poisoned.iteration_branch is None
+    assert poisoned.last_iteration_ts is not None
+    calls = _install_gh(monkeypatch, [pr])
+
+    [result] = am.automerge(cfg)
+
+    assert calls["merged"] == [110]
+    assert result.action == "merged"
+    assert 166 not in review_state.load_state(cfg).issues
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_automerge_branchless_self_heal_requires_exact_completed_iteration(
+    monkeypatch, tmp_path, completed
+):
+    from tests.test_conductor import make_cfg
+
+    cfg = make_cfg(tmp_path)
+    head = "marathon/refine-c15-i166"
+    pr = _pr(110, head=head, build="OK")
+    rejected = review_state.record_rejection(cfg, 166, "current verdict")
+    if completed:
+        # A completed iteration at a different SHA is an older/unrelated head.
+        review_state.record_iteration(
+            cfg,
+            166,
+            expected_verdict_ts=rejected.verdict_ts,
+            iteration_commit_sha="different-head",
+        )
+    calls = _install_gh(monkeypatch, [pr])
+
+    [result] = am.automerge(cfg)
+
+    assert calls["merged"] == []
+    assert result.action == "skipped"
+    assert "stale/unowned" in result.reason
+
+
 def test_automerge_holds_old_pr_while_start_over_recovery_is_active(
     monkeypatch, tmp_path
 ):

@@ -73,6 +73,7 @@ UPDATE_RECOVERY_PHASES = frozenset({
     UPDATE_RECOVERY_PHASE_PUSHING,
     UPDATE_RECOVERY_PHASE_PUBLISHED,
 })
+MAX_UPDATE_BASE_ROLLFORWARDS = 8
 _FULL_GIT_OID_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
@@ -934,6 +935,14 @@ def _load_update_recovery_marker(marker: Path) -> dict:
             str(payload["original_expected_head"]),
             label="marker original expected head",
         )
+        payload["expected_remote_head"] = _normalise_full_oid(
+            str(
+                payload.get(
+                    "expected_remote_head", payload["original_expected_head"]
+                )
+            ),
+            label="marker expected remote head",
+        )
         payload["base_sha"] = _normalise_full_oid(
             str(payload["base_sha"]), label="marker base SHA"
         )
@@ -1011,6 +1020,8 @@ def _new_update_recovery_marker(
     pr: PullRequestRevision,
     target: Path,
     adopted_local_head: str,
+    *,
+    base_sha: Optional[str] = None,
 ) -> dict:
     stamp = now_iso()
     return {
@@ -1023,9 +1034,12 @@ def _new_update_recovery_marker(
         "pr": config.pr_number,
         "branch": pr.head_branch,
         "original_expected_head": pr.head_sha,
+        "expected_remote_head": pr.head_sha,
         "adopted_local_head": adopted_local_head,
         "base_branch": pr.base_branch,
-        "base_sha": pr.base_sha,
+        "base_sha": _normalise_full_oid(
+            base_sha or pr.base_sha, label="recovery base SHA"
+        ),
         "current_local_head": adopted_local_head,
         "target_path": str(target),
         "had_conflicts": False,
@@ -1044,10 +1058,14 @@ def _transition_update_recovery_marker(
     allowed = {
         UPDATE_RECOVERY_PHASE_STARTING: {UPDATE_RECOVERY_PHASE_MERGED},
         UPDATE_RECOVERY_PHASE_MERGED: {
+            UPDATE_RECOVERY_PHASE_STARTING,
             UPDATE_RECOVERY_PHASE_FALLBACK_PREPARED,
             UPDATE_RECOVERY_PHASE_PUSHING,
         },
-        UPDATE_RECOVERY_PHASE_PUSHING: {UPDATE_RECOVERY_PHASE_PUBLISHED},
+        UPDATE_RECOVERY_PHASE_PUSHING: {
+            UPDATE_RECOVERY_PHASE_STARTING,
+            UPDATE_RECOVERY_PHASE_PUBLISHED,
+        },
     }
     current_phase = marker["phase"]
     if phase not in allowed.get(current_phase, set()):
@@ -1179,7 +1197,7 @@ def _run_prepared_fallback(
     local_head: str,
     reason: str,
     build: Optional[BuildResult],
-) -> UpdateContinueResult:
+) -> Optional[UpdateContinueResult]:
     local_head = _commit_fallback_checkpoint(
         config.repo_dir.expanduser().resolve(),
         expected_head=local_head,
@@ -1193,8 +1211,49 @@ def _run_prepared_fallback(
         config,
         current_pr,
         expected_head_sha=pr.head_sha,
-        expected_base_sha=pr.base_sha,
     )
+    remote_base = _remote_branch_head(
+        config.repo_dir.expanduser().resolve(), marker["base_branch"]
+    )
+    remote_head = _remote_branch_head(
+        config.repo_dir.expanduser().resolve(), marker["branch"]
+    )
+    expected_remote = marker["expected_remote_head"]
+    if remote_head != expected_remote:
+        raise RecoveryError(
+            f"remote branch {marker['branch']} moved to unexpected head "
+            f"{remote_head}; expected {expected_remote}; refusing to spend an "
+            "Aristotle continuation"
+        )
+    if remote_base != marker["base_sha"]:
+        repo_dir = config.repo_dir.expanduser().resolve()
+        _ensure_commit_available(repo_dir, remote_base, marker["base_branch"])
+        if not _is_ancestor(repo_dir, marker["base_sha"], remote_base):
+            raise RecoveryError(
+                f"remote base branch {marker['base_branch']} was rewritten "
+                f"from {marker['base_sha']} to {remote_base}; refusing to "
+                "combine unrelated base histories"
+            )
+        previous_base = marker["base_sha"]
+        _transition_update_recovery_marker(
+            marker_path,
+            marker,
+            UPDATE_RECOVERY_PHASE_STARTING,
+            current_local_head=local_head,
+            base_sha=remote_base,
+            expected_remote_head=remote_head,
+            build_duration_seconds=None,
+            reason=(
+                f"base advanced from {previous_base} to {remote_base}; "
+                "rebuilding before fallback"
+            ),
+        )
+        print(
+            f"update-continue: {marker['base_branch']} advanced to "
+            f"{remote_base[:12]}; rebuilding before spending Aristotle",
+            flush=True,
+        )
+        return None
     fallback, _marker = _prepare_fresh_update_fallback(
         config,
         marker_path=marker_path,
@@ -1312,7 +1371,6 @@ def _await_published_revision(
     *,
     original_head: str,
     published_head: str,
-    base_sha: str,
 ) -> PullRequestRevision:
     """Wait briefly for GitHub's PR metadata to expose a successful push."""
     last_error: Optional[RecoveryError] = None
@@ -1329,7 +1387,6 @@ def _await_published_revision(
                 config,
                 candidate,
                 expected_head_sha=candidate.head_sha,
-                expected_base_sha=base_sha,
             )
             if candidate.head_sha == published_head:
                 return candidate
@@ -1547,11 +1604,14 @@ def _read_marker_pr(
     allowed_heads: set[str],
 ) -> PullRequestRevision:
     pr = _read_pr_revision(config.github_repo, config.pr_number)
+    # GitHub's pull payload can retain the base SHA from an earlier mergeability
+    # calculation even after the named base ref advances.  Head identity and
+    # both branch names still come from the PR; the exact base publication
+    # boundary is read directly from origin by the phase finishers.
     _validate_live_pr(
         config,
         pr,
         expected_head_sha=pr.head_sha,
-        expected_base_sha=marker["base_sha"],
     )
     if pr.head_branch != marker["branch"]:
         raise RecoveryError(
@@ -1578,17 +1638,19 @@ def _resume_starting_phase(
     marker: dict,
 ) -> tuple[dict, PullRequestRevision, Path]:
     original = marker["original_expected_head"]
+    selected_remote = marker.get("expected_remote_head", original)
     adopted = marker.get("adopted_local_head", original)
     base_sha = marker["base_sha"]
-    pr = _read_marker_pr(config, marker, allowed_heads={original})
+    pr = _read_marker_pr(config, marker, allowed_heads={selected_remote})
     target, local_head = _validate_named_update_worktree(config, marker)
     repo_dir = config.repo_dir.expanduser().resolve()
     _ensure_commit_available(repo_dir, original, marker["branch"])
+    _ensure_commit_available(repo_dir, selected_remote, marker["branch"])
     _ensure_commit_available(repo_dir, base_sha, marker["base_branch"])
     had_conflicts = bool(marker.get("had_conflicts"))
 
     merge_head = _merge_head(repo_dir)
-    if merge_head == original:
+    if merge_head == selected_remote:
         # A previous worker died while joining a diverged local checkpoint to
         # the exact selected PR head. HEAD is still the pre-merge local commit;
         # finish only this expected merge and durably record the joined head
@@ -1600,7 +1662,7 @@ def _resume_starting_phase(
             )
         local_head, adoption_conflicts = _finish_interrupted_merge(
             repo_dir,
-            base_sha=original,
+            base_sha=selected_remote,
             pr_number=config.pr_number,
             conflict_subject=_adoption_conflict_subject(config.pr_number),
         )
@@ -1615,7 +1677,7 @@ def _resume_starting_phase(
     elif merge_head not in (None, base_sha):
         raise RecoveryError(
             f"in-progress merge targets {merge_head}, expected selected PR "
-            f"head {original} or current base {base_sha}"
+            f"head {selected_remote} or current base {base_sha}"
         )
 
     if merge_head is None:
@@ -1627,16 +1689,16 @@ def _resume_starting_phase(
             )
 
         contains_adopted = _is_ancestor(repo_dir, adopted, local_head)
-        contains_original = _is_ancestor(repo_dir, original, local_head)
+        contains_selected = _is_ancestor(repo_dir, selected_remote, local_head)
         if not contains_adopted:
             raise RecoveryError(
                 f"local HEAD {local_head} no longer contains the adopted "
                 f"checkpoint {adopted}"
             )
-        if not contains_original:
+        if not contains_selected:
             local_head, adoption_conflicts = _merge_base_checkpoint(
                 repo_dir,
-                base_sha=original,
+                base_sha=selected_remote,
                 pr_number=config.pr_number,
                 conflict_subject=_adoption_conflict_subject(config.pr_number),
                 ancestor_label="selected PR head",
@@ -1668,7 +1730,7 @@ def _resume_starting_phase(
     # If MERGE_HEAD names the base, adoption was already complete when the
     # prior worker began that merge. Validate both histories before finishing.
     if not _is_ancestor(repo_dir, adopted, local_head) or not _is_ancestor(
-        repo_dir, original, local_head
+        repo_dir, selected_remote, local_head
     ):
         raise RecoveryError(
             "base update would discard the selected PR head or adopted local "
@@ -1805,7 +1867,7 @@ def _resume_merged_phase(
     pr = _read_marker_pr(
         config,
         marker,
-        allowed_heads={marker["original_expected_head"]},
+        allowed_heads={marker["expected_remote_head"]},
     )
     return marker, pr, target
 
@@ -1837,14 +1899,14 @@ def _finish_pushing_phase(
     marker: dict,
     *,
     build: Optional[BuildResult],
-) -> UpdateContinueResult:
+) -> Optional[UpdateContinueResult]:
     _validate_resumed_local_head(config, marker)
-    original = marker["original_expected_head"]
+    lease_head = marker["expected_remote_head"]
     published_head = marker["current_local_head"]
     _read_marker_pr(
         config,
         marker,
-        allowed_heads={original, published_head},
+        allowed_heads={lease_head, published_head},
     )
     remote_head = _remote_branch_head(
         config.repo_dir.expanduser().resolve(), marker["branch"]
@@ -1852,30 +1914,96 @@ def _finish_pushing_phase(
     remote_base = _remote_branch_head(
         config.repo_dir.expanduser().resolve(), marker["base_branch"]
     )
-    if remote_base != marker["base_sha"]:
+    if remote_head not in {lease_head, published_head}:
         raise RecoveryError(
-            f"remote base branch {marker['base_branch']} moved to {remote_base}; "
-            f"expected exact recovery base {marker['base_sha']}"
+            f"remote branch {marker['branch']} moved to unexpected head "
+            f"{remote_head}; expected {lease_head} or {published_head}"
         )
-    if remote_head == original:
+    if remote_base != marker["base_sha"]:
+        repo_dir = config.repo_dir.expanduser().resolve()
+        _ensure_commit_available(repo_dir, remote_base, marker["base_branch"])
+        if not _is_ancestor(repo_dir, marker["base_sha"], remote_base):
+            raise RecoveryError(
+                f"remote base branch {marker['base_branch']} was rewritten "
+                f"from {marker['base_sha']} to {remote_base}; refusing to "
+                "combine unrelated base histories"
+            )
+        previous_base = marker["base_sha"]
+        marker = _transition_update_recovery_marker(
+            marker_path,
+            marker,
+            UPDATE_RECOVERY_PHASE_STARTING,
+            base_sha=remote_base,
+            expected_remote_head=remote_head,
+            build_duration_seconds=None,
+            reason=(
+                f"base advanced from {previous_base} to {remote_base}; "
+                "rebuilding before publication"
+            ),
+        )
+        print(
+            f"update-continue: {marker['base_branch']} advanced to "
+            f"{remote_base[:12]}; merging and rebuilding before publication",
+            flush=True,
+        )
+        return None
+    if remote_head == lease_head:
         _push_updated_head(
             config.repo_dir.expanduser().resolve(),
             branch=marker["branch"],
-            expected_remote_head=original,
+            expected_remote_head=lease_head,
             new_head=published_head,
-        )
-    elif remote_head != published_head:
-        raise RecoveryError(
-            f"remote branch {marker['branch']} moved to unexpected head "
-            f"{remote_head}; expected {original} or {published_head}"
         )
 
     published = _await_published_revision(
         config,
-        original_head=original,
+        original_head=lease_head,
         published_head=published_head,
-        base_sha=marker["base_sha"],
     )
+    # GitHub acknowledging the pushed PR head is not an atomic snapshot with
+    # the two remote refs. Re-read both after that acknowledgement so a base
+    # commit landing during the push/API wait cannot receive a stale success
+    # status or terminal journal marker.
+    confirmed_head = _remote_branch_head(
+        config.repo_dir.expanduser().resolve(), marker["branch"]
+    )
+    if confirmed_head != published_head:
+        raise RecoveryError(
+            f"remote branch {marker['branch']} moved to unexpected head "
+            f"{confirmed_head} after publication; expected {published_head}"
+        )
+    confirmed_base = _remote_branch_head(
+        config.repo_dir.expanduser().resolve(), marker["base_branch"]
+    )
+    if confirmed_base != marker["base_sha"]:
+        repo_dir = config.repo_dir.expanduser().resolve()
+        _ensure_commit_available(repo_dir, confirmed_base, marker["base_branch"])
+        if not _is_ancestor(repo_dir, marker["base_sha"], confirmed_base):
+            raise RecoveryError(
+                f"remote base branch {marker['base_branch']} was rewritten "
+                f"from {marker['base_sha']} to {confirmed_base}; refusing to "
+                "combine unrelated base histories"
+            )
+        previous_base = marker["base_sha"]
+        marker = _transition_update_recovery_marker(
+            marker_path,
+            marker,
+            UPDATE_RECOVERY_PHASE_STARTING,
+            base_sha=confirmed_base,
+            expected_remote_head=published_head,
+            build_duration_seconds=None,
+            reason=(
+                f"base advanced from {previous_base} to {confirmed_base} "
+                "during publication; rebuilding before success"
+            ),
+        )
+        print(
+            f"update-continue: {marker['base_branch']} advanced to "
+            f"{confirmed_base[:12]} during publication; merging and "
+            "rebuilding before success",
+            flush=True,
+        )
+        return None
     duration_seconds = marker.get("build_duration_seconds")
     duration = (
         f" in {float(duration_seconds):.1f}s"
@@ -1912,7 +2040,9 @@ def _finish_pushing_phase(
     )
 
 
-def update_continue(config: UpdateContinueConfig) -> UpdateContinueResult:
+def _update_continue_once(
+    config: UpdateContinueConfig,
+) -> Optional[UpdateContinueResult]:
     """Crash-safe base update of an existing PR, continuing only when needed."""
     _normalise_full_oid(config.expected_head_sha, label="expected head SHA")
     if config.pr_number <= 0:
@@ -1950,7 +2080,17 @@ def update_continue(config: UpdateContinueConfig) -> UpdateContinueResult:
         _validate_live_pr(config, pr)
         _ensure_commit_available(repo_dir, pr.head_sha, pr.head_branch)
         target, adopted_local_head = _validate_update_checkout(config, pr)
-        _ensure_commit_available(repo_dir, pr.base_sha, pr.base_branch)
+        # Bind the first durable marker to the branch refs themselves. In
+        # particular, do not seed it from PullRequestRevision.base_sha: GitHub
+        # may keep that value frozen while origin/main has already advanced.
+        remote_head = _remote_branch_head(repo_dir, pr.head_branch)
+        if remote_head != pr.head_sha:
+            raise RecoveryError(
+                f"remote branch {pr.head_branch} moved to {remote_head}; "
+                f"expected exact PR head {pr.head_sha}"
+            )
+        remote_base = _remote_branch_head(repo_dir, pr.base_branch)
+        _ensure_commit_available(repo_dir, remote_base, pr.base_branch)
         if workdir.exists() and not workdir.is_dir():
             raise RecoveryError(f"--workdir exists but is not a directory: {workdir}")
         try:
@@ -1962,6 +2102,7 @@ def update_continue(config: UpdateContinueConfig) -> UpdateContinueResult:
             pr,
             target,
             adopted_local_head,
+            base_sha=remote_base,
         )
         _atomic_create_update_recovery_marker(marker_path, marker)
 
@@ -2024,7 +2165,7 @@ def update_continue(config: UpdateContinueConfig) -> UpdateContinueResult:
 
     targets = plan_retry_build_targets(
         repo_dir,
-        base_sha=pr.base_sha,
+        base_sha=marker["base_sha"],
         head_sha=updated_head,
         target_path=target,
     )
@@ -2073,7 +2214,7 @@ def update_continue(config: UpdateContinueConfig) -> UpdateContinueResult:
     _read_marker_pr(
         config,
         marker,
-        allowed_heads={marker["original_expected_head"]},
+        allowed_heads={marker["expected_remote_head"]},
     )
     marker = _transition_update_recovery_marker(
         marker_path,
@@ -2086,6 +2227,26 @@ def update_continue(config: UpdateContinueConfig) -> UpdateContinueResult:
         marker_path,
         marker,
         build=build,
+    )
+
+
+def update_continue(config: UpdateContinueConfig) -> UpdateContinueResult:
+    """Crash-safe base update that follows a fast-forwarding live base.
+
+    A long build can overlap commits landing on the PR's base branch.  In that
+    case the durable marker rolls forward, merges the new exact base, and
+    rebuilds before publication.  The bounded loop prevents a continuously
+    moving base from creating unbounded in-process work; its latest marker
+    remains safe to resume on the next conductor attempt.
+    """
+    for _attempt in range(MAX_UPDATE_BASE_ROLLFORWARDS + 1):
+        result = _update_continue_once(config)
+        if result is not None:
+            return result
+    raise RecoveryError(
+        f"remote base branch kept advancing during "
+        f"{MAX_UPDATE_BASE_ROLLFORWARDS} consecutive rebuilds; retry the "
+        "preserved recovery checkpoint"
     )
 
 

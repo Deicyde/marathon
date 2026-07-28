@@ -443,6 +443,7 @@ class _DeckContext:
     tiers_by_decl: dict  # {decl_name: TierResult}
     issue_meta: dict  # {issue_num: {title, body, labels, ...}} (may be {})
     verdict_status: dict  # {issue_num: status str}  ('verified'/'rejected'/...)
+    issue_states: dict  # {issue_num: IssueState} local operational lifecycle
     repo_dir: object = None  # Path — for reading failed modules' source
     # Bare decl names defined in modules the last audit recorded as FAILING to
     # build. An issue citing one references code that does not compile → its own
@@ -499,12 +500,19 @@ def _load_context(
             issue_meta.update(fetch_issues_rest_bulk(missing, cfg.github_repo))
         except Exception:  # noqa: BLE001 - metadata is optional deck context
             pass
-    verdict_status = _verdict_status(cfg, issue_meta)
+    try:
+        from marathon.review.state import load_state
+
+        issue_states = load_state(cfg).issues
+    except Exception:  # noqa: BLE001 — missing state degrades to attention
+        issue_states = {}
+    verdict_status = _verdict_status(cfg, issue_meta, issue_states)
     return _DeckContext(
         snapshot=snapshot,
         tiers_by_decl=tiers_by_decl,
         issue_meta=issue_meta,
         verdict_status=verdict_status,
+        issue_states=issue_states,
         repo_dir=cfg.repo_dir,
         broken_module_decls=_failed_module_decls(cfg.repo_dir, snapshot),
         issue_chapter={
@@ -580,28 +588,33 @@ def _tiers_by_decl(cfg: "ReviewConfig", snapshot) -> dict:
         return {}
 
 
-def _verdict_status(cfg: "ReviewConfig", issue_meta: Optional[dict] = None) -> dict:
+def _verdict_status(
+    cfg: "ReviewConfig",
+    issue_meta: Optional[dict] = None,
+    issue_states: Optional[dict] = None,
+) -> dict:
     """``{issue_num: status}`` for the readiness gate.
 
-    Layered, later wins:
+    Layered, with GitHub authoritative for the human verdict and local state
+    authoritative for the rejected-vs-stalled operational lifecycle:
 
     1. the deck's own DEFER markers (deck-local; touch neither Aristotle nor
        GitHub — see :mod:`marathon.deck.verdicts`);
     2. the committed local review state (``state.json`` — operational truth
        like ``'stalled'``, plus any locally-recorded verdicts);
     3. **the GitHub labels** (``review:verified`` / ``review:rejected``),
-       which are AUTHORITATIVE for human verdicts (the Phase-1 sync policy)
-       and so are applied last — a card verified on GitHub drops out of the
-       swipe queue even when the local ``state.json`` never recorded it
+       which are AUTHORITATIVE for human verdicts (the Phase-1 sync policy).
+       A card verified on GitHub drops out of the swipe queue even when the
+       local ``state.json`` never recorded it
        (the documented state.json-lags-labels drift; recon §2). The labels
        come from ``issue_meta`` the queue already fetched, so this costs no
-       extra GitHub call.
+       extra GitHub call. A rejected label does not demote a local ``stalled``
+       state back into the conductor's dispatchable queue.
 
     A missing/corrupt source on any layer is an empty contribution, never an
     error."""
     from marathon.deck.verdicts import deferred_issue_nums
     from marathon.review.review import _status_from_labels
-    from marathon.review.state import load_state
 
     out: dict[int, str] = {}
     try:
@@ -609,20 +622,28 @@ def _verdict_status(cfg: "ReviewConfig", issue_meta: Optional[dict] = None) -> d
             out[num] = "deferred"
     except Exception:  # noqa: BLE001 — no defers → no overlay
         pass
-    try:
-        state = load_state(cfg)
-        for num, st in state.issues.items():
-            out[num] = st.status
-    except Exception:  # noqa: BLE001 — degrade to "no local verdicts"
-        pass
-    # GitHub labels win for human verdicts (verified/rejected). 'inflight' and
-    # unlabelled issues do not override a more specific local state.
+    if issue_states is None:
+        try:
+            from marathon.review.state import load_state
+
+            issue_states = load_state(cfg).issues
+        except Exception:  # noqa: BLE001 — degrade to "no local verdicts"
+            issue_states = {}
+    for num, st in issue_states.items():
+        out[num] = st.status
+    # GitHub labels win for human verdicts (verified/rejected), but a rejected
+    # label must not erase the local *operational* distinction between
+    # ``rejected`` (dispatchable) and ``stalled`` (parked).  The label only
+    # says what the human decided; state.json says whether the conductor can
+    # still act on that decision.
     for num, meta in (issue_meta or {}).items():
         labels = meta.get("labels")
         if not labels:
             continue
         gh_status = _status_from_labels(cfg, set(labels))
-        if gh_status in ("verified", "rejected"):
+        if gh_status == "verified":
+            out[num] = gh_status
+        elif gh_status == "rejected" and out.get(num) != "stalled":
             out[num] = gh_status
     return out
 
@@ -903,7 +924,16 @@ def _base_review_eligibility(
     if status == "verified":
         return False, "already verified"
     if status == "rejected":
-        return False, "rejected — in the refine queue"
+        local = ctx.issue_states.get(num)
+        if local is not None and local.needs_iteration():
+            return False, "rejected — queued for refinement"
+        if local is None:
+            return False, (
+                "rejected — local refinement state is missing; recovery needed"
+            )
+        return False, (
+            "rejected — refinement finished; waiting for PR merge or recovery"
+        )
     if status == "stalled":
         return False, ("rejected — refinement parked (open Recover… on the "
                        "⚠ needs-attention card / Issues tab)")
@@ -1147,14 +1177,26 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
     ]
     unresolved_ids = {card.id for card in unresolved_cards}
     active_ids = unresolved_ids & live_issue_ids
+    # Human verdict labels and conductor lifecycle are deliberately separate.
+    # A ``review:rejected`` label can describe all of these:
+    #   * a fresh rejection the conductor will dispatch;
+    #   * a clean iteration whose PR now awaits merge/review;
+    #   * a stalled or orphaned rejection that needs recovery.
+    # Only the first is truthfully "awaiting refinement".  Derive that lane
+    # from the same needs_iteration() predicate the conductor uses; fail closed
+    # into attention when local operational state is absent/unreadable.
+    rejected_ids = {
+        card.id for card in unresolved_cards
+        if ctx.verdict_status.get(card.id) in {"rejected", "stalled"}
+    }
     refinement_ids = {
-        card.id for card in unresolved_cards
-        if ctx.verdict_status.get(card.id) == "rejected"
+        issue_id for issue_id in rejected_ids
+        if (
+            ctx.issue_states.get(issue_id) is not None
+            and ctx.issue_states[issue_id].needs_iteration()
+        )
     } - active_ids
-    attention_ids = {
-        card.id for card in unresolved_cards
-        if ctx.verdict_status.get(card.id) == "stalled"
-    } - active_ids
+    attention_ids = rejected_ids - refinement_ids - active_ids
     mapping_ids = {
         card.id for card in unresolved_cards
         if _issue_needs_citation_mapping(ctx, card.id)

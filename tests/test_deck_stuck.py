@@ -55,6 +55,24 @@ def test_stuck_issues_empty_when_nothing_parked(tmp_path):
     assert stuck_issues(cfg) == []
 
 
+def test_stuck_recovery_uses_conductor_readiness_not_pid_liveness(
+    tmp_path, monkeypatch,
+):
+    from marathon.deck import dashboard as dash_mod
+
+    cfg = make_cfg(tmp_path)
+    record_rejection(cfg, 10, "fix it")
+    record_stall(cfg, 10)
+    monkeypatch.setattr(
+        dash_mod,
+        "conductor_status",
+        lambda cfg: {"alive": True, "ready": False, "jobs": []},
+    )
+
+    row = stuck_issues(cfg)[0]
+    assert row["conductor_online"] is False
+
+
 def test_stuck_issues_note_preview_truncated(tmp_path):
     cfg = make_cfg(tmp_path)
     record_rejection(cfg, 10, "x" * 500)

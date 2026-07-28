@@ -569,10 +569,28 @@ def _owned_refine_verdict(
 
     issue = int(m.group(1))
     current = load_state(cfg).issues.get(issue)
+    # A short-lived conductor bug recorded successful exact-SHA retry builds
+    # with ``iteration_commit_sha`` but no ``iteration_branch`` whenever they
+    # were reaped under ``--no-reconcile``.  Those rows are otherwise terminal:
+    # they no longer need an iteration, yet the ownership gate cannot merge
+    # their already-green PR.  Recover only the unambiguous legacy shape.  The
+    # refine branch itself names this issue (matched above), the current PR head
+    # must equal the CAS-recorded iteration SHA below, and a completed iteration
+    # for this verdict must exist.  A wrong SHA, fresh rejection, or active
+    # recovery remains fail-closed.
+    legacy_branchless_owner = bool(
+        current is not None
+        and current.iteration_branch is None
+        and current.last_iteration_ts is not None
+        and not current.needs_iteration()
+    )
     if (
         current is None
         or current.status != "rejected"
-        or current.iteration_branch != head
+        or (
+            current.iteration_branch != head
+            and not legacy_branchless_owner
+        )
         or not pr_head_sha
         or current.iteration_commit_sha != pr_head_sha
         or (

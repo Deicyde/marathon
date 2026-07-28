@@ -2320,10 +2320,30 @@ class DeckHandler(BaseHTTPRequestHandler):
         carries its stored rejection note so the deck can offer a one-click
         re-queue. Empty in demo mode."""
         if self._demo:
-            return self._send_json({"issues": [], "repo": None})
-        from marathon.deck.dashboard import stuck_issues
-        self._send_json({"issues": stuck_issues(self.cfg),
-                         "repo": self.cfg.github_repo})
+            return self._send_json({
+                "issues": [],
+                "repo": None,
+                "conductor": {
+                    "alive": False,
+                    "ready": False,
+                    "degraded": None,
+                    "restart_allowed": False,
+                },
+            })
+        from marathon.deck.dashboard import conductor_status, stuck_issues
+
+        # Reuse one local-only runtime read for both recovery rows and Review's
+        # empty-state health card. Excluding landings avoids a redundant GitHub
+        # call on the queue's latency-sensitive path.
+        conductor = conductor_status(self.cfg, include_landings=False)
+        conductor["restart_allowed"] = bool(
+            getattr(self.server, "allow_host_conductor_control", False)
+        )
+        self._send_json({
+            "issues": stuck_issues(self.cfg, conductor=conductor),
+            "repo": self.cfg.github_repo,
+            "conductor": conductor,
+        })
 
     def _api_recovery(self) -> None:
         """Queue one explicit, PR-preserving recovery operation."""
@@ -2572,7 +2592,8 @@ class DeckHandler(BaseHTTPRequestHandler):
             launch_error = str(exc)
         from marathon.deck.dashboard import conductor_status
 
-        online = bool(conductor_status(self.cfg).get("alive"))
+        conductor = conductor_status(self.cfg)
+        online = bool(conductor.get("ready", conductor.get("alive")))
         waiting = not online
         message = (
             f"Recovery queued for #{issue_num}; waiting for an external conductor"
