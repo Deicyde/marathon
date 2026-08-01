@@ -41,14 +41,33 @@ def test_degraded_round_trips_through_snapshot(tmp_path):
     assert conductor.load_jobs_snapshot(tmp_path)["degraded"] is None
 
 
-def test_conductor_status_passes_degraded_through(tmp_path):
+def test_conductor_status_passes_degraded_through(tmp_path, monkeypatch):
     from marathon.deck.dashboard import conductor_status
 
     from tests.test_conductor import make_cfg
 
     cfg = make_cfg(tmp_path)
+    lock = tmp_path / "conductor.lock"
+    lock.write_text("4242")
+    monkeypatch.setattr(conductor, "conductor_lock_path", lambda _cfg: lock)
+    monkeypatch.setattr(
+        conductor,
+        "load_conductor_heartbeat",
+        lambda _repo: {
+            "pid": 4242,
+            "ready": True,
+            "updated_ts": "2099-01-01T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        "marathon.review.daemon.process_alive", lambda _pid: True
+    )
     conductor.write_jobs_snapshot(
-        cfg.repo_dir, [], 1, degraded="ARISTOTLE_API_KEY is not set — ..."
+        cfg.repo_dir,
+        [],
+        1,
+        degraded="ARISTOTLE_API_KEY is not set — ...",
+        conductor_pid=4242,
     )
     status = conductor_status(cfg)
     assert status["degraded"].startswith("ARISTOTLE_API_KEY")

@@ -1,7 +1,12 @@
 import json
+import os
 import re
+import signal
 import subprocess
+import sys
 import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -14,6 +19,11 @@ from marathon.deck.verso import (
     effective_artifact_token,
     safe_artifact_path,
     verso_tag_from_toolchain,
+)
+from marathon.lake_build_lock import (
+    LakeBuildLockTimeout,
+    lake_build_lock,
+    lake_build_lock_path,
 )
 
 
@@ -399,6 +409,158 @@ def test_builds_nested_overlay_and_semantic_manifest(tmp_path):
     assert manager.resolve_artifact("Demo/Main/").name == "index.html"
     assert manager.resolve_artifact("code.css").read_text().startswith(".const")
     assert not (manager.root / "artifacts" / artifact_token / "literate").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX inherited flock")
+def test_build_holds_repo_scoped_lake_lock_for_every_command(tmp_path):
+    repo = _project(tmp_path)
+    observed_fds: list[int] = []
+
+    class LockCheckingRunner(FakeVersoRunner):
+        def __call__(self, command, **kwargs):
+            (lock_fd,) = kwargs["pass_fds"]
+            assert os.fstat(lock_fd).st_ino == os.stat(
+                lake_build_lock_path(repo)
+            ).st_ino
+            with lake_build_lock(repo, blocking=False) as contender:
+                assert contender is None
+            observed_fds.append(lock_fd)
+            return super().__call__(command, **kwargs)
+
+    manager = VersoArtifactManager(
+        repo,
+        runner=LockCheckingRunner(),
+        source_token_fn=lambda _repo: TOKEN_A,
+    )
+    manager.trigger()
+
+    assert manager.wait(2)
+    assert manager.status(trigger=False)["state"] == "ready"
+    assert len(observed_fds) == 3  # update, literate build, HTML render
+    assert len(set(observed_fds)) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX inherited flock")
+def test_lock_timeout_retries_unchanged_token_when_contention_clears(
+    tmp_path, monkeypatch
+):
+    repo = _project(tmp_path)
+    runner = FakeVersoRunner()
+    timed_out = threading.Event()
+
+    @contextmanager
+    def observed_lock(repo_dir, **kwargs):
+        try:
+            with lake_build_lock(repo_dir, **kwargs) as lock_fd:
+                yield lock_fd
+        except LakeBuildLockTimeout:
+            timed_out.set()
+            raise
+
+    monkeypatch.setattr(verso, "lake_build_lock", observed_lock)
+    monkeypatch.setattr(verso, "_BUILD_TIMEOUT_SECONDS", 0.02)
+
+    with lake_build_lock(repo):
+        manager = VersoArtifactManager(
+            repo,
+            runner=runner,
+            source_token_fn=lambda _repo: TOKEN_A,
+        )
+        assert manager.trigger()["state"] == "building"
+        assert timed_out.wait(1)
+        status = manager.status(trigger=False)
+        assert status["state"] == "building"
+        assert status["error"] is None
+        assert manager._failed_token is None
+        assert runner.commands == []
+
+    assert manager.wait(2)
+    assert manager.status(trigger=False)["state"] == "ready"
+    assert manager._failed_token is None
+    assert [command[1] for command in runner.commands] == [
+        "update",
+        "build",
+        "exe",
+    ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX inherited flock")
+def test_shutdown_cancels_build_waiting_for_shared_lock(tmp_path, monkeypatch):
+    repo = _project(tmp_path)
+    runner = FakeVersoRunner()
+    waiting = threading.Event()
+
+    @contextmanager
+    def observed_lock(repo_dir, **kwargs):
+        if kwargs.get("blocking"):
+            waiting.set()
+        with lake_build_lock(repo_dir, **kwargs) as lock_fd:
+            yield lock_fd
+
+    monkeypatch.setattr(verso, "lake_build_lock", observed_lock)
+
+    with lake_build_lock(repo):
+        manager = VersoArtifactManager(
+            repo,
+            runner=runner,
+            source_token_fn=lambda _repo: TOKEN_A,
+        )
+        manager.trigger()
+        assert waiting.wait(1)
+        started = time.monotonic()
+        manager.shutdown(wait=True)
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 1
+    assert manager.wait(0.1)
+    assert runner.commands == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups")
+def test_timeout_kills_grandchild_before_shared_lock_is_released(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    pid_file = tmp_path / "grandchild.pid"
+    manager = object.__new__(VersoArtifactManager)
+    manager._check_lake = True
+    manager._process_env = os.environ.copy()
+    manager.root = tmp_path
+    child_pid = 0
+
+    try:
+        with lake_build_lock(repo) as lock_fd:
+            assert lock_fd is not None
+            parent_code = f"""
+import pathlib
+import subprocess
+import sys
+import time
+
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(60)"],
+    pass_fds=({lock_fd},),
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))
+time.sleep(60)
+"""
+            with pytest.raises(verso.VersoBuildError, match="timed out"):
+                manager._run_command(
+                    [sys.executable, "-c", parent_code],
+                    0.5,
+                    lock_fd=lock_fd,
+                )
+
+        child_pid = int(pid_file.read_text())
+        with lake_build_lock(repo, blocking=False) as next_owner:
+            assert next_owner is not None
+    finally:
+        if child_pid:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_artifact_build_restores_math_without_mutating_incremental_cache(tmp_path):

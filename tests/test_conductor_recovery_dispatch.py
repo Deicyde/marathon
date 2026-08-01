@@ -9,12 +9,14 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import marathon.conductor as conductor
+import marathon.recovery as recovery_mod
 import marathon.review.daemon as daemon
 from marathon.recovery import (
     UPDATE_RECOVERY_MARKER_FILENAME,
@@ -398,6 +400,272 @@ def test_update_continue_marker_retry_runs_prepared_plain_refine(
     assert child[:4] == [sys.executable, "-m", "marathon", "refine"]
     assert "marathon.recovery" not in child
     assert _arg(child, "--auto-pr-expected-remote-oid") == HEAD
+
+
+def test_update_continue_adopts_terminal_fallback_from_prior_operation(
+    tmp_path, dispatch_harness
+):
+    """A new explicit click inherits, but never relabels, dead local work."""
+    cfg = make_cfg(tmp_path)
+    queued = _queue_recovery(cfg, review_state.RECOVERY_UPDATE_CONTINUE)
+    runs = tmp_path / "runs"
+    worktree = runs / "wt-i31-terminal-fallback"
+    workdir = runs / "wd-i31-terminal-fallback"
+    target = worktree / "Demo/Chapter15"
+    target.mkdir(parents=True)
+    workdir.mkdir(parents=True)
+    irreplaceable = target / "Unpublished.lean"
+    irreplaceable.write_text("-- prior recovery work must survive\n")
+    old_operation = "superseded-recovery-operation"
+    old_marker = {
+        "schema_version": UPDATE_RECOVERY_SCHEMA_VERSION,
+        "phase": "fallback_prepared",
+        "operation_id": old_operation,
+        "github_repo": cfg.github_repo,
+        "pr": 277,
+        "branch": BRANCH,
+        "original_expected_head": HEAD,
+        # Older schema-v2 writers emitted null here; fallback_prepared has not
+        # pushed, so the original selected head remains the exact lease.
+        "expected_remote_head": None,
+        "adopted_local_head": HEAD,
+        "base_branch": BASE,
+        "base_sha": "c" * 40,
+        "current_local_head": "b" * 40,
+        "target_path": str(target.resolve()),
+    }
+    marker_path = workdir / UPDATE_RECOVERY_MARKER_FILENAME
+    marker_path.write_text(json.dumps(old_marker) + "\n")
+    save_refine_state(
+        workdir / conductor.REFINE_STATE_FILENAME,
+        RefineState(
+            target_folder=str(target),
+            project_id="project-existing",
+            agent_task_id="task-existing",
+            status="RETRIES_EXHAUSTED",
+            review_verdict_ts=queued.verdict_ts,
+        ),
+    )
+    dispatch_harness.registered = worktree
+    dispatch_harness.local_branch_head = "b" * 40
+    dispatch_harness.worktree_head = "b" * 40
+
+    job = _dispatch(cfg, runs, {})
+
+    assert job.worktree == str(worktree)
+    assert job.workdir == str(workdir)
+    assert irreplaceable.read_text() == "-- prior recovery work must survive\n"
+    assert not marker_path.exists()
+    retired = list(workdir.glob(f"{UPDATE_RECOVERY_MARKER_FILENAME}.retired-*"))
+    assert len(retired) == 1
+    assert json.loads(retired[0].read_text()) == old_marker
+    checkpoint = load_refine_state(
+        workdir / conductor.REFINE_STATE_FILENAME
+    )
+    assert checkpoint is not None
+    assert checkpoint.project_id == "project-existing"
+    assert checkpoint.agent_task_id == "task-existing"
+    child = dispatch_harness.spawned[0].cmd
+    assert child[:4] == [
+        sys.executable, "-m", "marathon.recovery", "update-continue"
+    ]
+    assert _arg(child, "--operation-id") == RECOVERY_ID
+    assert dispatch_harness.fetches == [(BRANCH, HEAD)]
+    assert not any(
+        args[:2] == ("worktree", "add")
+        for _repo, args in dispatch_harness.git_calls
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_case",
+    ["in_flight", "pending_publication", "wrong_pr", "moved_head", "same_operation"],
+)
+def test_update_continue_stale_marker_adoption_fails_closed(
+    tmp_path, dispatch_harness, unsafe_case
+):
+    cfg = make_cfg(tmp_path)
+    runs = tmp_path / "runs"
+    worktree = runs / "wt-i31-unsafe-fallback"
+    workdir = runs / "wd-i31-unsafe-fallback"
+    target = worktree / "Demo/Chapter15"
+    target.mkdir(parents=True)
+    workdir.mkdir(parents=True)
+    marker = {
+        "schema_version": UPDATE_RECOVERY_SCHEMA_VERSION,
+        "phase": "fallback_prepared",
+        "operation_id": (
+            RECOVERY_ID if unsafe_case == "same_operation" else "old-operation"
+        ),
+        "github_repo": cfg.github_repo,
+        "pr": 999 if unsafe_case == "wrong_pr" else 277,
+        "branch": BRANCH,
+        "original_expected_head": HEAD,
+        "expected_remote_head": None,
+        "base_branch": BASE,
+        "base_sha": "c" * 40,
+        "current_local_head": "b" * 40,
+        "target_path": str(target.resolve()),
+    }
+    marker_path = workdir / UPDATE_RECOVERY_MARKER_FILENAME
+    marker_path.write_text(json.dumps(marker) + "\n")
+    save_refine_state(
+        workdir / conductor.REFINE_STATE_FILENAME,
+        RefineState(
+            target_folder=str(target),
+            status="IN_PROGRESS" if unsafe_case == "in_flight" else "RETRIES_EXHAUSTED",
+            pending_publication=(
+                {"kind": "pr", "commit_sha": "d" * 40}
+                if unsafe_case == "pending_publication"
+                else None
+            ),
+        ),
+    )
+    dispatch_harness.registered = worktree
+    dispatch_harness.local_branch_head = "b" * 40
+    dispatch_harness.worktree_head = (
+        "d" * 40 if unsafe_case == "moved_head" else "b" * 40
+    )
+
+    adopted = conductor._update_recovery_adoption_checkout(
+        cfg.repo_dir,
+        runs,
+        ISSUE,
+        BRANCH,
+        {},
+        expected_operation_id=RECOVERY_ID,
+        expected_repo=cfg.github_repo,
+        expected_pr=277,
+        expected_head=HEAD,
+        expected_base=BASE,
+        target_relpath="Demo/Chapter15",
+    )
+
+    assert adopted is None
+    assert json.loads(marker_path.read_text()) == marker
+    assert list(workdir.glob(f"{UPDATE_RECOVERY_MARKER_FILENAME}.retired-*")) == []
+
+
+def test_update_continue_marker_rotation_is_compare_and_swap(
+    tmp_path, dispatch_harness
+):
+    cfg = make_cfg(tmp_path)
+    runs = tmp_path / "runs"
+    worktree = runs / "wt-i31-marker-cas"
+    workdir = runs / "wd-i31-marker-cas"
+    target = worktree / "Demo/Chapter15"
+    target.mkdir(parents=True)
+    workdir.mkdir(parents=True)
+    marker = {
+        "schema_version": UPDATE_RECOVERY_SCHEMA_VERSION,
+        "phase": "fallback_prepared",
+        "operation_id": "old-operation",
+        "github_repo": cfg.github_repo,
+        "pr": 277,
+        "branch": BRANCH,
+        "original_expected_head": HEAD,
+        "expected_remote_head": None,
+        "base_branch": BASE,
+        "base_sha": "c" * 40,
+        "current_local_head": "b" * 40,
+        "target_path": str(target.resolve()),
+    }
+    marker_path = workdir / UPDATE_RECOVERY_MARKER_FILENAME
+    marker_path.write_text(json.dumps(marker) + "\n")
+    changed = dict(marker, reason="changed after candidate selection")
+    marker_path.write_text(json.dumps(changed) + "\n")
+
+    assert not conductor._retire_terminal_update_marker(
+        marker_path,
+        marker,
+        replacement_operation_id=RECOVERY_ID,
+    )
+    assert json.loads(marker_path.read_text()) == changed
+    assert list(workdir.glob(f"{UPDATE_RECOVERY_MARKER_FILENAME}.retired-*")) == []
+
+
+def test_update_marker_writer_cannot_replace_between_archive_and_unlink(
+    tmp_path, monkeypatch
+):
+    """Retirement and recovery transitions share one workdir lock."""
+    marker_path = tmp_path / UPDATE_RECOVERY_MARKER_FILENAME
+    marker = {
+        "schema_version": UPDATE_RECOVERY_SCHEMA_VERSION,
+        "phase": "fallback_prepared",
+        "operation_id": "old-operation",
+        "github_repo": "example/Demo",
+        "pr": 277,
+        "branch": BRANCH,
+        "original_expected_head": HEAD,
+        "expected_remote_head": HEAD,
+        "adopted_local_head": HEAD,
+        "base_branch": BASE,
+        "base_sha": "c" * 40,
+        "current_local_head": "b" * 40,
+        "target_path": str(tmp_path / "target"),
+    }
+    marker_path.write_text(json.dumps(marker) + "\n")
+    archive_fsync_reached = threading.Event()
+    release_retirement = threading.Event()
+    writer_entered = threading.Event()
+    writer_finished = threading.Event()
+    retirement_result: list[bool] = []
+    writer_errors: list[BaseException] = []
+    real_fsync = conductor.os.fsync
+
+    def pause_after_archive_link(fd):
+        if (
+            threading.current_thread().name == "marker-retirement"
+            and not archive_fsync_reached.is_set()
+        ):
+            archive_fsync_reached.set()
+            assert release_retirement.wait(5)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(conductor.os, "fsync", pause_after_archive_link)
+
+    def retire():
+        retirement_result.append(
+            conductor._retire_terminal_update_marker(
+                marker_path,
+                marker,
+                replacement_operation_id=RECOVERY_ID,
+            )
+        )
+
+    def write_newer_transition():
+        writer_entered.set()
+        try:
+            recovery_mod._replace_update_recovery_marker_fields(
+                marker_path,
+                marker,
+                reason="newer worker transition",
+            )
+        except BaseException as exc:  # captured for deterministic thread assertions
+            writer_errors.append(exc)
+        finally:
+            writer_finished.set()
+
+    retirement = threading.Thread(target=retire, name="marker-retirement")
+    retirement.start()
+    assert archive_fsync_reached.wait(5)
+    assert marker_path.exists()
+    assert len(list(tmp_path.glob(f"{UPDATE_RECOVERY_MARKER_FILENAME}.retired-*"))) == 1
+
+    writer = threading.Thread(target=write_newer_transition, name="marker-writer")
+    writer.start()
+    assert writer_entered.wait(5)
+    assert not writer_finished.wait(0.1)
+
+    release_retirement.set()
+    retirement.join(5)
+    writer.join(5)
+    assert not retirement.is_alive()
+    assert not writer.is_alive()
+    assert retirement_result == [True]
+    assert len(writer_errors) == 1
+    assert isinstance(writer_errors[0], recovery_mod.RecoveryError)
+    assert not marker_path.exists()
 
 
 @pytest.mark.parametrize(

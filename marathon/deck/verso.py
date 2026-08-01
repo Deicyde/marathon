@@ -17,13 +17,14 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import threading
 import time
 import tomllib
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from html import escape as _html_escape
 from html.parser import HTMLParser
@@ -32,6 +33,13 @@ from typing import Any, Callable, Iterator, Optional
 from urllib.parse import unquote
 
 from marathon.deck.definitions import definition_source_token
+from marathon.lake_build_lock import (
+    LakeBuildLockCancelled,
+    LakeBuildLockTimeout,
+    LakeBuildLockUnavailable,
+    lake_build_lock,
+    lake_build_lock_supported,
+)
 
 try:  # POSIX advisory locks
     import fcntl as _fcntl
@@ -44,7 +52,6 @@ _STATE_FILE = "state.json"
 _MANIFEST_FILE = "manifest.json"
 _METADATA_FILE = "metadata.json"
 _DEPENDENCY_SIGNATURE_FILE = "dependency-signature"
-_BUILD_LOCK_FILE = "build.lock"
 _TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
 _TOOLCHAIN_VERSION_RE = re.compile(r"(?:^|:)v(\d+\.\d+\.\d+)(?:\s*)$")
 _LEAN_NAME_RE = r"[A-Za-z_][A-Za-z0-9_'.]*"
@@ -73,6 +80,77 @@ class _VersoSourceChanged(RuntimeError):
     def __init__(self, source_token: str) -> None:
         super().__init__("Lean source changed during the Verso build")
         self.source_token = source_token
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Terminate a timed-out Lake launcher and every compiler descendant."""
+
+    killed_group = False
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            killed_group = True
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    elif os.name == "nt":  # pragma: no cover - Verso is disabled on Windows
+        try:
+            killed = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            killed_group = killed.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if not killed_group:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _run_process_group(
+    command: list[str],
+    *,
+    cwd: str,
+    timeout: int | float,
+    env: dict[str, str],
+    lock_fd: int,
+) -> subprocess.CompletedProcess:
+    """Run a real Verso command with timeout-safe process-tree cleanup."""
+
+    kwargs: dict[str, Any] = {
+        "cwd": cwd,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "env": env,
+    }
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+        kwargs["pass_fds"] = (lock_fd,)
+    elif os.name == "nt":  # pragma: no cover - Verso is disabled on Windows
+        kwargs["creationflags"] = getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    proc = subprocess.Popen(command, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        stdout, stderr = proc.communicate()
+        raise subprocess.TimeoutExpired(
+            cmd=command,
+            timeout=timeout,
+            output=stdout,
+            stderr=stderr,
+        )
+    return subprocess.CompletedProcess(
+        command, proc.returncode, stdout=stdout, stderr=stderr
+    )
 
 
 @dataclass(frozen=True)
@@ -592,7 +670,9 @@ class VersoArtifactManager:
         self._project: Optional[VersoProject] = None
         self._project_signature: Optional[str] = None
         self._unavailable: Optional[str] = None
-        self._locking_unavailable = _fcntl is None
+        self._locking_unavailable = (
+            _fcntl is None or not lake_build_lock_supported()
+        )
 
         if self._locking_unavailable:
             self._unavailable = (
@@ -712,42 +792,34 @@ class VersoArtifactManager:
             return project
 
     @contextmanager
-    def _build_lock(self, *, blocking: bool) -> Iterator[Optional[int]]:
-        """Serialize the shared overlay across deck processes.
+    def _build_lock(
+        self, *, blocking: bool, timeout: float | None = None
+    ) -> Iterator[Optional[int]]:
+        """Serialize every Lake build that shares the reviewed repository.
 
         The descriptor is passed into every Lake subprocess.  If the Python
         deck is killed during a relaunch, the still-running Lake process keeps
-        the flock until it exits, preventing the replacement deck from racing
-        its literate outputs.
+        the flock until it exits.  Keeping this lock beside the reviewed
+        repository's ``.lake/build`` also prevents the machine audit from
+        compiling the same modules concurrently with Verso.
         """
-
-        self.root.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.root / _BUILD_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
-        acquired = False
-        try:
-            if _fcntl is None:  # defensive if capability changes after init
-                raise VersoUnavailable(
-                    "POSIX flock is required for crash-safe Verso builds"
-                )
-            flags = _fcntl.LOCK_EX | (0 if blocking else _fcntl.LOCK_NB)
+        with ExitStack() as stack:
             try:
-                _fcntl.flock(fd, flags)
-            except BlockingIOError:
+                lock_fd = stack.enter_context(
+                    lake_build_lock(
+                        self.repo_dir,
+                        blocking=blocking,
+                        timeout=timeout,
+                        cancelled=self._stop.is_set if blocking else None,
+                    )
+                )
+            except LakeBuildLockCancelled:
+                # shutdown(wait=True) must not wait behind a long audit.
                 yield None
                 return
-            acquired = True
-            yield fd
-        finally:
-            if acquired:
-                try:
-                    if _fcntl is not None:
-                        _fcntl.flock(fd, _fcntl.LOCK_UN)
-                except OSError:
-                    pass
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            except LakeBuildLockUnavailable as exc:
+                raise VersoUnavailable(str(exc)) from exc
+            yield lock_fd
 
     def _cleanup_abandoned_work(self) -> None:
         """Remove staging directories left by a terminated deck process."""
@@ -1005,6 +1077,13 @@ class VersoArtifactManager:
                 # failure.  The same single worker immediately catches up.
                 with self._lock:
                     self._pending_token = exc.source_token
+            except LakeBuildLockTimeout:
+                # The audit (or a previous deck process's surviving Lake
+                # child) still owns the shared build tree.  This is queueing,
+                # not a source failure: retain the in-flight token and retry
+                # automatically instead of making status polling report a
+                # sticky error that requires a manual retry.
+                continue
             except Exception as exc:  # state must survive every build failure
                 message = str(exc).strip() or type(exc).__name__
                 with self._lock:
@@ -1154,7 +1233,7 @@ class VersoArtifactManager:
         return needs_update, signature
 
     def _run_command(
-        self, command: list[str], timeout: int, *, lock_fd: int
+        self, command: list[str], timeout: int | float, *, lock_fd: int
     ) -> None:
         kwargs: dict[str, Any] = {
             "cwd": str(self.root),
@@ -1170,7 +1249,16 @@ class VersoArtifactManager:
             "pass_fds": (lock_fd,),
         }
         try:
-            result = self._runner(command, **kwargs)
+            if self._check_lake:
+                result = _run_process_group(
+                    command,
+                    cwd=str(self.root),
+                    timeout=timeout,
+                    env=kwargs["env"],
+                    lock_fd=lock_fd,
+                )
+            else:
+                result = self._runner(command, **kwargs)
         except subprocess.TimeoutExpired as exc:
             raise VersoBuildError(
                 f"`{' '.join(command[:3])}` timed out after {timeout} seconds"
@@ -1227,8 +1315,11 @@ class VersoArtifactManager:
                     pass
 
     def _build(self, token: str) -> None:
-        with self._build_lock(blocking=True) as lock_fd:
-            assert lock_fd is not None
+        with self._build_lock(
+            blocking=True, timeout=_BUILD_TIMEOUT_SECONDS
+        ) as lock_fd:
+            if lock_fd is None:
+                return
             if self._stop.is_set():
                 return
             self._cleanup_abandoned_work_unlocked()

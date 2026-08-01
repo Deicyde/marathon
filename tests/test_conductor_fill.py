@@ -2,6 +2,10 @@
 Excludes in-flight, backed-off, attempt-capped, and open-PR (pending-merge) issues."""
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -87,6 +91,7 @@ def test_auto_audit_gates_on_throttle_and_head_move(tmp_path, monkeypatch):
                         lambda *a, **k: calls.append(list(a[0])))
     monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda r: False)
     monkeypatch.setattr(cond, "_persisted_audit_revision", lambda cfg: None)
+    monkeypatch.setattr(cond, "_live_legacy_auto_audit_pids", lambda *a: [])
     monkeypatch.setattr(refresh_mod, "head_sha", lambda r: "newhead123")
     I = cond.AUTO_AUDIT_MIN_INTERVAL_SECONDS
 
@@ -138,6 +143,7 @@ def test_auto_audit_advances_only_after_persisted_success(tmp_path, monkeypatch)
         cond, "_persisted_audit_revision", lambda cfg: persisted["revision"]
     )
     monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda r: False)
+    monkeypatch.setattr(cond, "_live_legacy_auto_audit_pids", lambda *a: [])
     monkeypatch.setattr(refresh_mod, "head_sha", lambda r: "newhead")
     monkeypatch.setattr(
         cond.subprocess, "Popen", lambda *a, **k: calls.append(a)
@@ -169,6 +175,7 @@ def test_auto_audit_failure_keeps_cursor_and_retries(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(cond, "_persisted_audit_revision", lambda cfg: "old")
     monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda r: False)
+    monkeypatch.setattr(cond, "_live_legacy_auto_audit_pids", lambda *a: [])
     monkeypatch.setattr(refresh_mod, "head_sha", lambda r: "new")
     monkeypatch.setattr(
         cond.subprocess, "Popen", lambda *a, **k: calls.append(a)
@@ -184,6 +191,139 @@ def test_auto_audit_failure_keeps_cursor_and_retries(tmp_path, monkeypatch):
         cfg, head, when, _now_fn=lambda: when + interval + 1
     )
     assert head == "old" and len(calls) == 2
+
+
+@pytest.mark.skipif(os.name == "nt", reason="auto-audit lease uses POSIX flock")
+def test_auto_audit_busy_guard_is_restart_safe_and_does_not_move_throttle(
+    tmp_path, monkeypatch
+):
+    """A child inherited lease survives its launcher's fd close.  A replacement
+    conductor cannot launch beside it; normal exit releases the kernel state
+    even though the stable guard file and its stale metadata remain."""
+    guard, status = cond._try_acquire_auto_audit_guard(tmp_path)
+    assert status == "acquired" and guard is not None
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        pass_fds=(guard.fileno(),),
+        start_new_session=True,
+    )
+    guard.close()  # simulate the conductor exiting immediately after spawn
+    try:
+        replacement, status = cond._try_acquire_auto_audit_guard(tmp_path)
+        assert replacement is None and status == "busy"
+
+        import marathon.deck.refresh as refresh_mod
+
+        cfg = SimpleNamespace(
+            repo_dir=tmp_path,
+            target_path_template="GA/LeeSM/Chapter{chapter}",
+        )
+        calls = []
+        monkeypatch.setattr(cond, "_persisted_audit_revision", lambda cfg: "old")
+        monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda repo: False)
+        monkeypatch.setattr(refresh_mod, "head_sha", lambda repo: "new")
+        monkeypatch.setattr(cond.subprocess, "Popen", lambda *a, **k: calls.append(a))
+        head, when = cond._maybe_auto_audit(
+            cfg, "old", 123.0, _now_fn=lambda: 1e12
+        )
+        assert (head, when) == ("old", 123.0)
+        assert calls == []
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
+
+    recovered, status = cond._try_acquire_auto_audit_guard(tmp_path)
+    assert status == "acquired" and recovered is not None
+    recovered.close()
+
+
+def test_auto_audit_adopts_exact_live_legacy_process(tmp_path, monkeypatch):
+    """The first upgraded conductor waits for an old pre-flock audit rather
+    than creating a duplicate.  Waiting does not consume the retry throttle."""
+    import marathon.deck.refresh as refresh_mod
+
+    cfg = SimpleNamespace(
+        repo_dir=tmp_path,
+        target_path_template="GA/LeeSM/Chapter{chapter}",
+    )
+    calls = []
+    monkeypatch.setattr(cond, "_persisted_audit_revision", lambda cfg: "old")
+    monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda repo: False)
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda repo: "new")
+    monkeypatch.setattr(cond, "_live_legacy_auto_audit_pids", lambda *a: [4242])
+    monkeypatch.setattr(cond.subprocess, "Popen", lambda *a, **k: calls.append(a))
+
+    head, when = cond._maybe_auto_audit(
+        cfg, "old", 123.0, _now_fn=lambda: 1e12
+    )
+    assert (head, when) == ("old", 123.0)
+    assert calls == []
+
+
+def test_live_legacy_auto_audit_scan_requires_exact_identity(tmp_path, monkeypatch):
+    repo = tmp_path.resolve()
+    command = (
+        f"/usr/bin/python3 -m marathon audit run --target GA/LeeSM "
+        f"--repo-dir {repo}"
+    )
+    monkeypatch.setattr(
+        cond.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                f"101 S {command}\n"                    # exact live worker
+                f"102 Z {command}\n"                    # completed zombie
+                f"103 S {command}Elsewhere\n"           # wrong repo
+                f"104 S /usr/bin/python3 -m marathon fill --repo-dir {repo}\n"
+            ),
+        ),
+    )
+    assert cond._live_legacy_auto_audit_pids(repo, "GA/LeeSM") == [101]
+
+
+def test_auto_audit_child_inherits_guard_and_records_diagnostics(
+    tmp_path, monkeypatch
+):
+    import marathon.deck.refresh as refresh_mod
+
+    cfg = SimpleNamespace(
+        repo_dir=tmp_path,
+        target_path_template="GA/LeeSM/Chapter{chapter}",
+    )
+    captured = {}
+
+    class FakePopen:
+        pid = 9876
+
+        def __init__(self, command, **kwargs):
+            captured["command"] = list(command)
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(cond, "_persisted_audit_revision", lambda cfg: "old")
+    monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda repo: False)
+    monkeypatch.setattr(cond, "_live_legacy_auto_audit_pids", lambda *a: [])
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda repo: "new")
+    monkeypatch.setattr(cond.subprocess, "Popen", FakePopen)
+
+    head, when = cond._maybe_auto_audit(
+        cfg, "old", 0.0, _now_fn=lambda: 1e12
+    )
+    assert head == "old" and when == 1e12
+    inherited = captured["kwargs"]["pass_fds"]
+    assert len(inherited) == 1 and isinstance(inherited[0], int)
+
+    marker = cond.auto_audit_guard_path(tmp_path)
+    payload = json.loads(marker.read_text())
+    assert payload["status"] == "running"
+    assert payload["pid"] == 9876
+    assert payload["head"] == "new"
+
+    # The fake child inherited nothing, so stale diagnostic contents alone do
+    # not block the next launch.
+    recovered, status = cond._try_acquire_auto_audit_guard(tmp_path)
+    assert status == "acquired" and recovered is not None
+    recovered.close()
 
 
 def test_persisted_audit_revision_requires_complete_same_revision_coverage(

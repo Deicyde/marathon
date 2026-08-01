@@ -22,6 +22,7 @@ import pytest
 from marathon.audit import engine
 from marathon.audit.lean_template import DEFAULT_TRUSTED_PREFIXES
 from marathon.audit.records import AuditSnapshot, DeclAudit, fingerprint
+from marathon.lake_build_lock import lake_build_lock, lake_build_lock_path
 
 TESTS_DIR = Path(__file__).resolve().parent
 FIXTURE_DIR = TESTS_DIR / "fixtures" / "audit_fixture"
@@ -88,7 +89,9 @@ def fake_lake(monkeypatch):
         # logic itself is covered by TestPartitionBuildable / TestSkipBroken.
         monkeypatch.setattr(
             engine, "partition_buildable",
-            lambda lake, repo, modules, timeout: (list(modules), []),
+            lambda lake, repo, modules, timeout, lock_fd=None: (
+                list(modules), []
+            ),
         )
         calls: list[tuple[list, dict]] = []
 
@@ -112,6 +115,24 @@ def fake_lake(monkeypatch):
 
 
 class TestProcessGroupRunner:
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX inherited flock")
+    def test_child_inherits_shared_build_lock_descriptor(self, tmp_path):
+        with lake_build_lock(tmp_path) as lock_fd:
+            assert lock_fd is not None
+            proc = engine._run_process_group(
+                [
+                    sys.executable,
+                    "-c",
+                    f"import os; os.fstat({lock_fd}); print('inherited')",
+                ],
+                cwd=str(tmp_path),
+                timeout=5,
+                lock_fd=lock_fd,
+            )
+
+        assert proc.returncode == 0
+        assert proc.stdout.strip() == "inherited"
+
     @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups")
     def test_timeout_kills_descendant_process_group(self, tmp_path):
         """The launcher and its child die together; no 60s sleep survives."""
@@ -157,6 +178,94 @@ class TestProcessGroupRunner:
 
 
 class TestGoldenEndToEnd:
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX inherited flock")
+    def test_build_and_audit_share_one_repo_lock(self, monkeypatch):
+        monkeypatch.setattr(engine, "_find_lake", lambda: "/fake/lake")
+        monkeypatch.setattr(
+            engine, "source_state", lambda repo: ("a" * 40, True)
+        )
+        observed: list[tuple[str, int]] = []
+
+        def assert_held(phase: str, lock_fd: int) -> None:
+            lock_stat = os.stat(lake_build_lock_path(FIXTURE_DIR))
+            assert os.fstat(lock_fd).st_ino == lock_stat.st_ino
+            with lake_build_lock(FIXTURE_DIR, blocking=False) as contender:
+                assert contender is None
+            observed.append((phase, lock_fd))
+
+        def fake_partition(
+            lake, repo, modules, timeout, *, lock_fd=None
+        ):
+            assert lock_fd is not None
+            assert_held("build", lock_fd)
+            return list(modules), []
+
+        def fake_run(cmd, **kwargs):
+            assert kwargs["lock_fd"] is not None
+            assert_held("audit", kwargs["lock_fd"])
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=GOLDEN_TEXT, stderr=""
+            )
+
+        monkeypatch.setattr(engine, "partition_buildable", fake_partition)
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        snap = engine.run_audit(FIXTURE_DIR, "AuditFixture", timeout=5)
+
+        assert snap.failures == []
+        assert [phase for phase, _fd in observed] == ["build", "audit"]
+        assert observed[0][1] == observed[1][1]
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX inherited flock")
+    def test_lock_wait_is_bounded_by_audit_command_timeout(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(engine, "_find_lake", lambda: "/fake/lake")
+        monkeypatch.setattr(
+            engine, "source_state", lambda repo: ("a" * 40, True)
+        )
+        partition_called = False
+
+        def unexpected_partition(*args, **kwargs):
+            nonlocal partition_called
+            partition_called = True
+            raise AssertionError("audit must not build without the shared lock")
+
+        monkeypatch.setattr(
+            engine, "partition_buildable", unexpected_partition
+        )
+        started = time.monotonic()
+        with lake_build_lock(FIXTURE_DIR):
+            snap = engine.run_audit(
+                FIXTURE_DIR, "AuditFixture", timeout=0.15
+            )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1
+        assert partition_called is False
+        assert any(
+            "timed out" in failure and "another Lake build" in failure
+            for failure in snap.failures
+        )
+
+    def test_unsupported_posix_lock_keeps_prior_unlocked_audit(
+        self, fake_lake, monkeypatch
+    ):
+        calls = fake_lake()
+        monkeypatch.setattr(
+            engine, "lake_build_lock_supported", lambda: False
+        )
+
+        def unexpected_lock(*args, **kwargs):
+            raise AssertionError("unsupported platforms must not open flock")
+
+        monkeypatch.setattr(engine, "lake_build_lock", unexpected_lock)
+        snap = engine.run_audit(FIXTURE_DIR, "AuditFixture", timeout=5)
+
+        assert snap.failures == []
+        assert len(calls) == 1
+        assert calls[0][1]["lock_fd"] is None
+
     def test_snapshot_counts_and_context(self, fake_lake):
         fake_lake()
         snap = engine.run_audit(FIXTURE_DIR, "AuditFixture", timeout=5)
@@ -560,19 +669,40 @@ class TestPartitionBuildable:
         assert calls == [["Q.A", "Q.B"]]
 
     def test_broken_module_split_out(self, monkeypatch):
-        good = {"P.Good1", "P.Good2"}
-        mods = ["P.Good1", "P.Good2", "P.Broken"]
+        good = {"P.Good1", "P.Good2", "P.Good3"}
+        mods = ["P.Good1", "P.Good2", "P.Good3", "P.Broken"]
         calls = self._fake_lake_by_exit(monkeypatch, good)
         buildable, broken = engine.partition_buildable(
             "/fake/lake", Path("/repo"), mods, 5
         )
-        assert buildable == ["P.Good1", "P.Good2"]
+        assert buildable == ["P.Good1", "P.Good2", "P.Good3"]
         assert broken == ["P.Broken"]
-        # Batch failed → per-module fallback probed each module.
+        # Batch failed → recursively isolate the broken leaf. The healthy
+        # first half is accepted as one batch instead of probing both modules.
+        assert calls == [
+            mods,
+            ["P.Good1", "P.Good2"],
+            ["P.Good3", "P.Broken"],
+            ["P.Good3"],
+            ["P.Broken"],
+        ]
+
+    def test_multiple_broken_modules_are_still_classified_exactly(
+        self, monkeypatch
+    ):
+        good = {"P.A", "P.C", "P.D", "P.F"}
+        mods = ["P.A", "P.B", "P.C", "P.D", "P.E", "P.F"]
+        calls = self._fake_lake_by_exit(monkeypatch, good)
+
+        buildable, broken = engine.partition_buildable(
+            "/fake/lake", Path("/repo"), mods, 5
+        )
+
+        assert buildable == ["P.A", "P.C", "P.D", "P.F"]
+        assert broken == ["P.B", "P.E"]
         assert calls[0] == mods
-        assert set(map(tuple, calls[1:])) == {
-            ("P.Good1",), ("P.Good2",), ("P.Broken",)
-        }
+        assert ["P.B"] in calls
+        assert ["P.E"] in calls
 
     def test_lake_build_ok_reads_exit_code(self, monkeypatch):
         monkeypatch.setattr(
@@ -608,7 +738,9 @@ class TestSkipBrokenIntegration:
         )
         monkeypatch.setattr(
             engine, "partition_buildable",
-            lambda lake, repo, modules, timeout: ([], list(modules)),
+            lambda lake, repo, modules, timeout, lock_fd=None: (
+                [], list(modules)
+            ),
         )
         ran: list = []
 
@@ -629,7 +761,7 @@ class TestSkipBrokenIntegration:
         monkeypatch.setattr(engine, "_find_lake", lambda: "/fake/lake")
         monkeypatch.setattr(
             engine, "partition_buildable",
-            lambda lake, repo, modules, timeout: (
+            lambda lake, repo, modules, timeout, lock_fd=None: (
                 [m for m in modules if "Deception" not in m],
                 [m for m in modules if "Deception" in m],
             ),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -39,6 +40,34 @@ def _git(repo: Path, *args: str) -> str:
     )
     assert proc.returncode == 0, proc.stderr
     return proc.stdout.strip()
+
+
+def test_update_marker_writer_lock_is_reentrant(tmp_path):
+    """A transition helper may compose under the same per-workdir lock."""
+    marker_path = tmp_path / UPDATE_RECOVERY_MARKER_FILENAME
+    marker_path.write_text("{}\n")
+    finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def nested_writer():
+        try:
+            with recovery_mod._update_recovery_marker_lock(marker_path):
+                recovery_mod._atomic_replace_update_recovery_marker(
+                    marker_path, {"writer": "nested"}
+                )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=nested_writer)
+    worker.start()
+    worker.join(5)
+
+    assert finished.is_set()
+    assert not worker.is_alive()
+    assert errors == []
+    assert json.loads(marker_path.read_text()) == {"writer": "nested"}
 
 
 def _fixture_repo(tmp_path: Path) -> tuple[Path, str, str, str]:

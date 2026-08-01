@@ -67,6 +67,12 @@ from marathon.audit.lean_template import (
 )
 from marathon.audit.records import AuditSnapshot, DeclAudit, STATUSES
 from marathon.formalization import module_from_file_path
+from marathon.lake_build_lock import (
+    LakeBuildLockUnavailable,
+    LakeBuildLockTimeout,
+    lake_build_lock,
+    lake_build_lock_supported,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +92,7 @@ DIFF_KEYS = (
 )
 
 _LINE_PREFIXES = (SENTINEL + "|", META_SENTINEL + "|", DONE_SENTINEL + "|")
+
 
 # Git pathspecs whose dirty state makes a HEAD-bound audit dishonest.  Build
 # artefacts and Marathon runtime files are intentionally excluded; Lean source,
@@ -139,7 +146,11 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
 
 
 def _run_process_group(
-    command: list[str], *, cwd: str, timeout: int | float
+    command: list[str],
+    *,
+    cwd: str,
+    timeout: int | float,
+    lock_fd: int | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a captured text command with a timeout-safe descendant boundary."""
     kwargs: dict = {
@@ -150,6 +161,10 @@ def _run_process_group(
     }
     if os.name == "posix":
         kwargs["start_new_session"] = True
+        if lock_fd is not None:
+            # Keep the shared build lock alive if this Python process is
+            # terminated while its Lake/Lean descendants are still running.
+            kwargs["pass_fds"] = (lock_fd,)
     elif os.name == "nt":  # pragma: no cover - exercised on Windows
         kwargs["creationflags"] = getattr(
             subprocess, "CREATE_NEW_PROCESS_GROUP", 0
@@ -187,7 +202,12 @@ def _find_lake() -> str | None:
 
 
 def _lake_build_ok(
-    lake: str, repo: Path, targets: list[str], timeout: int
+    lake: str,
+    repo: Path,
+    targets: list[str],
+    timeout: int | float,
+    *,
+    lock_fd: int | None = None,
 ) -> bool:
     """``lake build <targets>`` in *repo*; True iff it exits 0. Never raises.
 
@@ -205,15 +225,24 @@ def _lake_build_ok(
             [lake, "build", *targets],
             cwd=str(repo),
             timeout=timeout,
+            lock_fd=lock_fd,
         )
         return proc.returncode == 0
-    except (subprocess.TimeoutExpired, OSError) as exc:
+    except subprocess.TimeoutExpired as exc:
+        logger.debug("lake build %s: %s", targets, exc)
+        return False
+    except OSError as exc:
         logger.debug("lake build %s: %s", targets, exc)
         return False
 
 
 def partition_buildable(
-    lake: str, repo: Path, modules: list[str], timeout: int
+    lake: str,
+    repo: Path,
+    modules: list[str],
+    timeout: int | float,
+    *,
+    lock_fd: int | None = None,
 ) -> tuple[list[str], list[str]]:
     """Build *modules* and split them into ``(buildable, broken)``.
 
@@ -226,8 +255,8 @@ def partition_buildable(
 
     The healthy case is one batched ``lake build``: if it exits 0 every
     module built and there is nothing to exclude. Only when the batch fails
-    is each module rebuilt individually to find the culprit(s) — lake's
-    per-module exit code is authoritative (see :func:`_lake_build_ok`).
+    is it recursively split until the culprit singleton(s) are found — Lake's
+    per-module exit code remains authoritative (see :func:`_lake_build_ok`).
     Broken modules are returned separately so the caller records them as
     honest failures and drops them from the audit import set.
 
@@ -235,15 +264,39 @@ def partition_buildable(
     imports a broken one cannot itself build, so it too lands in ``broken``
     — which is exactly why the surviving audit script never loads a stale
     or inconsistent olean."""
-    if _lake_build_ok(lake, repo, modules, timeout):
-        return sorted(modules), []
+    if not modules:
+        return [], []
+
     buildable: list[str] = []
     broken: list[str] = []
-    for m in modules:
-        if _lake_build_ok(lake, repo, [m], timeout):
-            buildable.append(m)
-        else:
-            broken.append(m)
+
+    def classify(batch: list[str]) -> None:
+        """Isolate failures without rebuilding every healthy target alone.
+
+        A failed batch says only that at least one member (or one of its
+        imports) is broken.  Recursively bisecting that batch preserves the
+        exact singleton classification while reducing the common one-broken-
+        module fallback from O(n) Lake startups to O(log n).  Successful
+        halves also warm all of their Lake traces in one process.
+        """
+
+        if _lake_build_ok(
+            lake,
+            repo,
+            batch,
+            timeout,
+            lock_fd=lock_fd,
+        ):
+            buildable.extend(batch)
+            return
+        if len(batch) == 1:
+            broken.extend(batch)
+            return
+        midpoint = len(batch) // 2
+        classify(batch[:midpoint])
+        classify(batch[midpoint:])
+
+    classify(list(modules))
     return sorted(buildable), sorted(broken)
 
 
@@ -603,7 +656,10 @@ def _now_iso() -> str:
 
 
 def run_audit(
-    repo_dir: str | Path, target_folder: str | Path, *, timeout: int = 900
+    repo_dir: str | Path,
+    target_folder: str | Path,
+    *,
+    timeout: int | float = 900,
 ) -> AuditSnapshot:
     """Audit every declaration of the target folder's modules.
 
@@ -667,51 +723,102 @@ def run_audit(
              "audit evidence undetermined"],
         )
 
-    # Build-targets-first + skip-broken: compile every module before the
-    # single all-imports audit script runs, and drop any module that fails
-    # to build. Without this, one uncompilable module (a broken orphan)
-    # fails the whole `lake env lean` audit → an empty snapshot → every
-    # decl reads as "no audit evidence" (the StokesTheorem blocker).
-    buildable, broken = partition_buildable(lake, repo, modules, timeout)
-    for m in broken:
-        failures.append(
-            f"module {m} failed to build; excluded from audit "
-            "(its declarations are absent from this snapshot)"
-        )
-    modules = buildable
-    if not modules:
-        return snapshot(
-            [],
-            ["no modules built successfully — audit evidence undetermined"],
-        )
-    try:
-        script = render_audit_script(modules, trusted)
-    except ValueError as exc:  # belt-and-braces: inputs are pre-filtered
-        return snapshot([], [f"could not render audit script: {exc}"])
-
     run_failures: list[str] = []
     stdout = ""
     proc: subprocess.CompletedProcess | None = None
-    with tempfile.TemporaryDirectory(prefix="marathon-audit-") as td:
-        script_path = Path(td) / "marathon_audit.lean"
-        script_path.write_text(script)
-        try:
-            proc = _run_process_group(
-                [lake, "env", "lean", str(script_path)],
-                cwd=str(repo),
+    try:
+        # Verso's dependency package and this audit both publish into the
+        # reviewed repository's `.lake/build`.  Hold one repo-scoped lock for
+        # the build partition and the importing audit process so a concurrent
+        # request waits, then reuses the first process's Lake traces. On a
+        # platform without inherited POSIX flock, Verso is disabled, so retain
+        # audit's historical unlocked runner instead of suppressing evidence.
+        build_guard = (
+            lake_build_lock(
+                repo,
+                blocking=True,
+                # Waiting on Verso must be bounded, but it must not consume
+                # the independent timeout of every subsequent Lake command.
+                # Historically --timeout meant the `lake env lean` command's
+                # budget; making it one end-to-end deadline causes large,
+                # valid projects to lose all audit evidence after 15 minutes.
                 timeout=timeout,
             )
-        except subprocess.TimeoutExpired as exc:
-            partial = exc.stdout
-            if isinstance(partial, bytes):
-                partial = partial.decode("utf-8", errors="replace")
-            stdout = partial or ""
-            run_failures.append(
-                f"audit script timed out after {timeout}s — evidence "
-                "undetermined for everything not seen"
+            if lake_build_lock_supported()
+            else contextlib.nullcontext(None)
+        )
+        with build_guard as lock_fd:
+
+            # Build-targets-first + skip-broken: compile every module before
+            # the single all-imports audit script runs, and drop any module
+            # that fails to build. Without this, one uncompilable module (a
+            # broken orphan) fails the whole `lake env lean` audit → an empty
+            # snapshot → every decl reads as "no audit evidence".
+            buildable, broken = partition_buildable(
+                lake,
+                repo,
+                modules,
+                timeout,
+                lock_fd=lock_fd,
             )
-        except OSError as exc:
-            return snapshot([], [f"failed to run `lake env lean`: {exc}"])
+            for m in broken:
+                failures.append(
+                    f"module {m} failed to build; excluded from audit "
+                    "(its declarations are absent from this snapshot)"
+                )
+            modules = buildable
+            if not modules:
+                return snapshot(
+                    [],
+                    [
+                        "no modules built successfully — audit evidence "
+                        "undetermined"
+                    ],
+                )
+            try:
+                script = render_audit_script(modules, trusted)
+            except ValueError as exc:  # inputs are already pre-filtered
+                return snapshot([], [f"could not render audit script: {exc}"])
+
+            with tempfile.TemporaryDirectory(prefix="marathon-audit-") as td:
+                script_path = Path(td) / "marathon_audit.lean"
+                script_path.write_text(script)
+                try:
+                    proc = _run_process_group(
+                        [lake, "env", "lean", str(script_path)],
+                        cwd=str(repo),
+                        timeout=timeout,
+                        lock_fd=lock_fd,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    partial = exc.stdout
+                    if isinstance(partial, bytes):
+                        partial = partial.decode("utf-8", errors="replace")
+                    stdout = partial or ""
+                    run_failures.append(
+                        f"audit script timed out after {timeout}s — evidence "
+                        "undetermined for everything not seen"
+                    )
+                except OSError as exc:
+                    return snapshot(
+                        [], [f"failed to run `lake env lean`: {exc}"]
+                    )
+    except LakeBuildLockTimeout:
+        return snapshot(
+            [],
+            [
+                f"audit timed out after {timeout}s waiting for another Lake "
+                "build to finish — audit evidence undetermined"
+            ],
+        )
+    except LakeBuildLockUnavailable as exc:
+        return snapshot(
+            [],
+            [
+                f"could not coordinate the shared Lake build: {exc} — "
+                "audit evidence undetermined"
+            ],
+        )
     if proc is not None:
         stdout = proc.stdout or ""
         if proc.returncode != 0:

@@ -76,6 +76,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import stat
@@ -96,11 +97,13 @@ from marathon.post_pipeline import (
     find_lake_executable,
 )
 from marathon.recovery import (
+    RecoveryError,
     UPDATE_RECOVERY_MARKER_FILENAME,
     UPDATE_RECOVERY_PHASE_FALLBACK_PREPARED,
     UPDATE_RECOVERY_PHASE_PUBLISHED,
     UPDATE_RECOVERY_PHASES,
     UPDATE_RECOVERY_SCHEMA_VERSION,
+    _update_recovery_marker_lock,
 )
 from marathon.refine import (
     EXIT_AUTO_PR_BRANCH_ABORT,
@@ -749,6 +752,178 @@ def _update_recovery_resume_checkout(
     return None
 
 
+_TERMINAL_UPDATE_FALLBACK_STATUSES = frozenset({
+    "ASK_FAILED",
+    "CANCELED",
+    "COMPLETE",
+    "COMPLETE_WITH_ERRORS",
+    "DOWNLOAD_FAILED",
+    "FAILED",
+    "OUT_OF_BUDGET",
+    "OUTPUT_FOLDER_MISSING",
+    "POLL_FAILED",
+    "POST_PIPELINE_BUILD_FAILED",
+    "POST_PIPELINE_PR_BLOCKED",
+    "RETRIES_EXHAUSTED",
+    "SUBMIT_FAILED",
+})
+
+
+def _adoptable_terminal_update_marker(
+    marker_path: Path,
+    checkpoint: Optional[RefineState],
+    *,
+    expected_operation_id: str,
+    expected_repo: str,
+    expected_pr: int,
+    expected_branch: str,
+    expected_head: str,
+    expected_base: str,
+    expected_target: Path,
+    current_head: str,
+) -> Optional[dict]:
+    """Recognise one superseded, terminal fallback without relabelling it.
+
+    ``fallback_prepared`` is the hand-off point from the update wrapper to a
+    plain refine worker.  Once that worker has exited terminally, its operation
+    journal no longer represents live work, but the named worktree may contain
+    valuable uncommitted output.  A later explicit recovery may inherit that
+    tree only when every durable identity still names the same PR revision and
+    the refine checkpoint proves there is no publication left to finish.
+    """
+    try:
+        marker = json.loads(marker_path.read_text())
+        marker_target = Path(marker.get("target_path")).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(marker, dict) or checkpoint is None:
+        return None
+
+    def _full_oid(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) in {40, 64}
+            and all(char in "0123456789abcdefABCDEF" for char in value)
+        )
+
+    old_operation = marker.get("operation_id")
+    original_head = marker.get("original_expected_head")
+    raw_selected_head = marker.get("expected_remote_head")
+    # Early schema-v2 writers persisted JSON null for this additive field.
+    # At fallback_prepared no push has happened, so null has the same narrow
+    # meaning as the loader's legacy default: the originally selected head.
+    selected_head = (
+        original_head if raw_selected_head is None else raw_selected_head
+    )
+    marker_local_head = marker.get("current_local_head")
+    identity_ok = (
+        marker.get("schema_version") == UPDATE_RECOVERY_SCHEMA_VERSION
+        and marker.get("phase") == UPDATE_RECOVERY_PHASE_FALLBACK_PREPARED
+        and isinstance(old_operation, str)
+        and bool(old_operation.strip())
+        and old_operation != expected_operation_id
+        and marker.get("github_repo") == expected_repo
+        and not isinstance(marker.get("pr"), bool)
+        and marker.get("pr") == expected_pr
+        and marker.get("branch") == expected_branch
+        and original_head == expected_head
+        and selected_head == expected_head
+        and marker.get("base_branch") == expected_base
+        and marker_target == expected_target.resolve()
+        and _full_oid(marker.get("base_sha"))
+        and _full_oid(marker_local_head)
+        and marker_local_head == current_head
+        and checkpoint.status in _TERMINAL_UPDATE_FALLBACK_STATUSES
+        and checkpoint.pending_publication is None
+    )
+    return marker if identity_ok else None
+
+
+def _retire_terminal_update_marker(
+    marker_path: Path,
+    marker: dict,
+    *,
+    replacement_operation_id: str,
+) -> bool:
+    """Atomically archive an exact stale journal before a new wrapper starts.
+
+    The hard link is a durable, byte-for-byte preservation of the old journal.
+    We unlink the active name only while it still names that same inode.  A
+    crash before unlink leaves the old operation resumable; a crash afterwards
+    leaves the worktree marker-free and therefore adoptable on the next tick.
+    """
+    old_operation = str(marker.get("operation_id") or "")
+    old_token = hashlib.sha256(old_operation.encode("utf-8")).hexdigest()[:12]
+    new_token = hashlib.sha256(
+        replacement_operation_id.encode("utf-8")
+    ).hexdigest()[:12]
+    try:
+        with _update_recovery_marker_lock(marker_path):
+            raw = marker_path.read_bytes()
+            if json.loads(raw) != marker:
+                return False
+            marker_stat = marker_path.stat(follow_symlinks=False)
+            if not stat.S_ISREG(marker_stat.st_mode):
+                return False
+            content_token = hashlib.sha256(raw).hexdigest()[:12]
+            retired_path = marker_path.with_name(
+                f"{marker_path.name}.retired-{old_token}-{content_token}-for-{new_token}"
+            )
+            try:
+                os.link(marker_path, retired_path, follow_symlinks=False)
+            except FileExistsError:
+                pass
+            retired_stat = retired_path.stat(follow_symlinks=False)
+            current_stat = marker_path.stat(follow_symlinks=False)
+            same_inode = (
+                retired_stat.st_dev == current_stat.st_dev
+                and retired_stat.st_ino == current_stat.st_ino
+                and marker_stat.st_dev == current_stat.st_dev
+                and marker_stat.st_ino == current_stat.st_ino
+            )
+            if (
+                not same_inode
+                or not stat.S_ISREG(retired_stat.st_mode)
+                or marker_path.read_bytes() != raw
+                or retired_path.read_bytes() != raw
+            ):
+                return False
+
+            # Persist the archive directory entry before removing the active
+            # name.  A power loss at any later point therefore leaves at least
+            # one durable copy of the superseded operation journal.
+            directory_fd = os.open(marker_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            marker_path.unlink()
+            directory_fd = os.open(marker_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except (
+        OSError,
+        RecoveryError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        print(
+            f"--- recovery deferred: could not retire stale update journal "
+            f"{marker_path} ({exc}) ---",
+            flush=True,
+        )
+        return False
+    print(
+        f"--- recovery: archived terminal update journal from operation "
+        f"{old_operation!r} before starting {replacement_operation_id!r} ---",
+        flush=True,
+    )
+    return True
+
+
 def _update_recovery_adoption_checkout(
     repo_dir: Path,
     runs_parent: Path,
@@ -756,15 +931,24 @@ def _update_recovery_adoption_checkout(
     branch: str,
     kept_worktrees: dict[int, str],
     *,
+    expected_operation_id: str,
+    expected_repo: str,
+    expected_pr: int,
+    expected_head: str,
+    expected_base: str,
     target_relpath: str,
-) -> Optional[tuple[Path, Path]]:
+) -> Optional[tuple[Path, Path, Optional[dict]]]:
     """Find a dead exact-branch checkpoint for a fresh update operation.
 
     Unlike an update *resume*, this checkout has no operation journal yet. Its
     ownership evidence is the selected PR's exact named branch plus the
     conductor issue/worktree pairing. The recovery worker will checkpoint all
     files and create the operation-bound journal before merging or publishing.
-    A journal or publication recipe from any other operation fails closed.
+    A journal or publication recipe from any other operation fails closed,
+    except for a terminal ``fallback_prepared`` journal whose complete PR
+    identity and unchanged local HEAD can be archived before the new wrapper
+    starts.  The returned optional marker is not retired here: the caller first
+    verifies the selected remote head and preserves the local branch ref.
     """
     candidates: list[tuple[str, Optional[str]]] = [
         (kept_worktrees.get(issue_num) or "", None)
@@ -818,10 +1002,6 @@ def _update_recovery_adoption_checkout(
                 continue
         except OSError:
             continue
-        # An existing operation journal must be handled only by its exact
-        # identity-aware resume path above; never relabel it as a new click.
-        if (workdir / UPDATE_RECOVERY_MARKER_FILENAME).exists():
-            continue
         try:
             checkpoint = load_refine_state(workdir / REFINE_STATE_FILENAME)
         except Exception:  # noqa: BLE001 - malformed state remains untouched
@@ -849,7 +1029,24 @@ def _update_recovery_adoption_checkout(
             and merge_head.returncode != 0
             and (worktree / target_relpath).is_dir()
         ):
-            return worktree, workdir
+            marker_path = workdir / UPDATE_RECOVERY_MARKER_FILENAME
+            stale_marker: Optional[dict] = None
+            if marker_path.exists():
+                stale_marker = _adoptable_terminal_update_marker(
+                    marker_path,
+                    checkpoint,
+                    expected_operation_id=expected_operation_id,
+                    expected_repo=expected_repo,
+                    expected_pr=expected_pr,
+                    expected_branch=branch,
+                    expected_head=expected_head,
+                    expected_base=expected_base,
+                    expected_target=(worktree / target_relpath),
+                    current_head=(current_head.stdout or "").strip(),
+                )
+                if stale_marker is None:
+                    continue
+            return worktree, workdir, stale_marker
     return None
 
 
@@ -3345,7 +3542,7 @@ def _dispatch_job(
     rejection_note: Optional[str] = None
     auto_pr_expected_remote_oid: Optional[str] = None
     update_resume: Optional[tuple[Path, Path, str]] = None
-    update_adoption: Optional[tuple[Path, Path]] = None
+    update_adoption: Optional[tuple[Path, Path, Optional[dict]]] = None
     start_over_resume: Optional[tuple[Path, Path]] = None
     publication_resume: Optional[tuple[Path, Path, str]] = None
     if not fill and not repair:
@@ -3527,6 +3724,11 @@ def _dispatch_job(
                     issue_num,
                     branch,
                     kept_worktrees,
+                    expected_operation_id=expected_recovery_id,
+                    expected_repo=cfg.github_repo,
+                    expected_pr=recovery_pr,
+                    expected_head=recovery_head_sha,
+                    expected_base=recovery_base or "main",
                     target_relpath=_target_relpath(cfg, chapter),
                 )
         start_point = WORKTREE_START_POINT
@@ -3650,7 +3852,19 @@ def _dispatch_job(
             flush=True,
         )
     if recovery_mode == RECOVERY_UPDATE_CONTINUE and update_adoption is not None:
-        adoption_worktree, adoption_workdir = update_adoption
+        adoption_worktree, adoption_workdir, stale_update_marker = update_adoption
+        if stale_update_marker is not None and not _retire_terminal_update_marker(
+            adoption_workdir / UPDATE_RECOVERY_MARKER_FILENAME,
+            stale_update_marker,
+            replacement_operation_id=expected_recovery_id or "",
+        ):
+            kept_worktrees[kept_key] = str(adoption_worktree)
+            print(
+                f"--- deferring #{issue_num}: terminal update journal changed "
+                "before it could be archived ---",
+                flush=True,
+            )
+            return None
         reuse = str(adoption_worktree)
         selected_recovery_workdir = adoption_workdir
         print(
@@ -5445,6 +5659,164 @@ def print_status(repo_dir: Path) -> int:
 #: Minimum spacing between auto re-audits — an audit is a full (incremental)
 #: build, so this bounds the cost while keeping the snapshot near-fresh.
 AUTO_AUDIT_MIN_INTERVAL_SECONDS = 900.0
+# Stable inode whose inherited POSIX flock is the auto-audit single-flight
+# lease.  The file itself intentionally survives process/machine restarts; only
+# the kernel lock is authoritative, so stale diagnostic contents never block a
+# later audit after its child exits or the host reboots.
+AUTO_AUDIT_GUARD_RELPATH = Path(".marathon/conductor/auto-audit.guard")
+AUTO_AUDIT_GUARD_SCHEMA_VERSION = 1
+
+
+def auto_audit_guard_path(repo_dir: str | Path) -> Path:
+    return Path(repo_dir) / AUTO_AUDIT_GUARD_RELPATH
+
+
+def _try_acquire_auto_audit_guard(
+    repo_dir: str | Path,
+) -> tuple[Optional[object], str]:
+    """Acquire the restart-safe auto-audit lease without waiting.
+
+    ``flock`` belongs to the open file description inherited by the audit
+    child.  The conductor closes only its duplicate after ``Popen``; the lease
+    therefore remains held until that exact child exits, even if the conductor
+    is killed and relaunched.  A stale file or PID is harmless because kernel
+    lock state, not file contents, decides ownership.
+
+    Returns ``(handle, "acquired")``, ``(None, "busy")``, or
+    ``(None, "unsupported"/"error: ...")``.  Callers must close an acquired
+    handle without explicitly unlocking it after a successful spawn.
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows fails closed
+        return None, "unsupported"
+
+    path = auto_audit_guard_path(repo_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        gitignore = path.parent / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text("*\n")
+        handle = open(path, "a+b")
+    except OSError as exc:
+        return None, f"error: {exc}"
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None, "busy"
+    except OSError as exc:
+        handle.close()
+        return None, f"error: {exc}"
+    return handle, "acquired"
+
+
+def _write_auto_audit_guard_metadata(handle: object, payload: dict) -> None:
+    """Best-effort diagnostics on the stable lock inode.
+
+    This metadata is never treated as a lease: it may legitimately outlive its
+    process.  Keeping it on the locked inode makes a production incident easy
+    to inspect without creating a stale-marker failure mode.
+    """
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(
+            (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode()
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+
+
+def _command_option(tokens: list[str], name: str) -> Optional[str]:
+    """Return one command option in either ``--x value`` or ``--x=value`` form."""
+    for index, token in enumerate(tokens):
+        if token == name and index + 1 < len(tokens):
+            return tokens[index + 1]
+        prefix = name + "="
+        if token.startswith(prefix):
+            return token[len(prefix):]
+    return None
+
+
+def _is_exact_auto_audit_command(
+    command: str, *, repo_dir: str | Path, target: str,
+) -> bool:
+    """Whether a process command is this repo's exact Marathon audit worker."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    module_index = next(
+        (
+            index
+            for index in range(1, len(tokens) - 3)
+            if tokens[index:index + 4] == ["-m", "marathon", "audit", "run"]
+        ),
+        None,
+    )
+    if module_index is None or "python" not in Path(
+        tokens[module_index - 1]
+    ).name.lower():
+        return False
+    command_repo = _command_option(tokens, "--repo-dir")
+    command_target = _command_option(tokens, "--target")
+    if command_repo is None or command_target is None:
+        return False
+    try:
+        expected_repo = Path(repo_dir).expanduser().resolve(strict=False)
+        actual_repo = Path(command_repo).expanduser().resolve(strict=False)
+        expected_target = (expected_repo / target).resolve(strict=False)
+        actual_target = (actual_repo / command_target).resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
+    return actual_repo == expected_repo and actual_target == expected_target
+
+
+def _live_legacy_auto_audit_pids(
+    repo_dir: str | Path, target: str,
+) -> Optional[list[int]]:
+    """Exact live auto-audits launched before the inherited-lock protocol.
+
+    This migration guard prevents the first upgraded conductor from launching
+    beside a still-running legacy child.  Zombies are deliberately ignored:
+    they no longer execute or own descendants, and a detached child's inherited
+    flock is the durable identity for every launch made by the new protocol.
+    ``None`` means process identity could not be inspected and therefore makes
+    launch fail closed.
+    """
+    if os.name == "nt":  # pragma: no cover - no inherited ``pass_fds`` lease
+        return None
+    try:
+        cp = subprocess.run(
+            ["ps", "-axo", "pid=,state=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if cp.returncode != 0:
+        return None
+    matches: list[int] = []
+    for line in (cp.stdout or "").splitlines():
+        fields = line.strip().split(maxsplit=2)
+        if len(fields) != 3:
+            continue
+        try:
+            pid = int(fields[0])
+        except ValueError:
+            continue
+        state, command = fields[1], fields[2]
+        if state.upper().startswith("Z"):
+            continue
+        if _is_exact_auto_audit_command(
+            command, repo_dir=repo_dir, target=target
+        ):
+            matches.append(pid)
+    return matches
 
 
 def _audit_target_folder(cfg: ReviewConfig) -> Optional[str]:
@@ -5525,7 +5897,10 @@ def _maybe_auto_audit(
     keeps the snapshot honest so a downstream break surfaces immediately.
 
     Non-blocking: spawns a detached ``marathon audit run`` (the snapshot updates
-    when it finishes; the tick continues). Throttled by
+    when it finishes; the tick continues).  The child inherits a flock on a
+    stable repo-scoped inode, so a conductor restart cannot launch a duplicate
+    while the first audit is still alive.  Legacy pre-lock audit processes are
+    adopted by exact command/repo/target identity until they exit. Throttled by
     :data:`AUTO_AUDIT_MIN_INTERVAL_SECONDS`, and skipped while the operator has
     uncommitted Lean work. Best-effort — never raises."""
     now = _now_fn()
@@ -5547,15 +5922,70 @@ def _maybe_auto_audit(
     target = _audit_target_folder(cfg)
     if target is None:
         return last_head, now
+    guard, guard_status = _try_acquire_auto_audit_guard(cfg.repo_dir)
+    if guard_status == "busy":
+        # A child from this or a previous conductor still owns the inherited
+        # lease.  Do not advance the retry clock: once it exits, the very next
+        # tick may observe its snapshot or retry a failed run.
+        return last_head, last_time
+    if guard is None:
+        # Without an inheritable kernel lease, a detached launch cannot be
+        # restart-safe. Fail closed and throttle the warning/cost.
+        print(
+            f"  audit: auto-refresh skipped (single-flight guard "
+            f"{guard_status})",
+            flush=True,
+        )
+        return last_head, now
     try:
+        legacy_pids = _live_legacy_auto_audit_pids(cfg.repo_dir, target)
+        if legacy_pids is None:
+            print(
+                "  audit: auto-refresh deferred (could not verify existing "
+                "audit process identity)",
+                flush=True,
+            )
+            return last_head, last_time
+        if legacy_pids:
+            print(
+                "  audit: existing pre-single-flight audit still running "
+                f"(pid{'s' if len(legacy_pids) != 1 else ''} "
+                f"{', '.join(str(pid) for pid in legacy_pids)}); "
+                "waiting for its persisted result",
+                flush=True,
+            )
+            return last_head, last_time
+
         log_path = jobs_snapshot_path(cfg.repo_dir).parent / "auto-audit.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            sys.executable, "-m", "marathon", "audit", "run",
+            "--target", target, "--repo-dir", str(cfg.repo_dir),
+        ]
+        metadata = {
+            "schema_version": AUTO_AUDIT_GUARD_SCHEMA_VERSION,
+            "status": "launching",
+            "launcher_pid": os.getpid(),
+            "pid": None,
+            "head": cur,
+            "target": target,
+            "repo_dir": str(Path(cfg.repo_dir).resolve(strict=False)),
+            "launched_at": now_iso(),
+            "command": command,
+        }
+        _write_auto_audit_guard_metadata(guard, metadata)
         with open(log_path, "ab") as fh:
-            subprocess.Popen(
-                [sys.executable, "-m", "marathon", "audit", "run",
-                 "--target", target, "--repo-dir", str(cfg.repo_dir)],
+            proc = subprocess.Popen(
+                command,
                 stdout=fh, stderr=fh, cwd=str(cfg.repo_dir), start_new_session=True,
+                # The audit process never reads this descriptor. Merely keeping
+                # it open preserves the exact kernel lease across conductor
+                # restarts; close-on-exec remains enabled for every other fd.
+                pass_fds=(guard.fileno(),),
             )
+        metadata["status"] = "running"
+        metadata["pid"] = getattr(proc, "pid", None)
+        _write_auto_audit_guard_metadata(guard, metadata)
         print(f"  audit: main moved to {cur[:8]} — auto-refreshing the snapshot "
               f"(target {target}) so a downstream break surfaces", flush=True)
         # Launch is not success.  The next tick advances ``last_head`` only
@@ -5565,6 +5995,15 @@ def _maybe_auto_audit(
     except Exception as e:  # noqa: BLE001 — a refresh failure must not crash a tick
         print(f"  audit: auto-refresh skipped ({e})", flush=True)
         return last_head, now
+    finally:
+        # Do NOT LOCK_UN here.  ``pass_fds`` gave the child a duplicate of the
+        # same open file description; closing only the parent's copy leaves the
+        # lease held until that exact audit process exits.  If Popen failed,
+        # this close simply releases the launch reservation.
+        try:
+            guard.close()
+        except (AttributeError, OSError):
+            pass
 
 
 def _maybe_reconcile_signatures(

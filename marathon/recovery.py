@@ -36,10 +36,22 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
+
+try:  # POSIX advisory locks (Linux/macOS).
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised on non-POSIX hosts
+    _fcntl = None
+
+try:  # Windows advisory byte-range locks.
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - exercised on non-Windows hosts
+    _msvcrt = None
 
 from marathon.post_pipeline import (
     BuildResult,
@@ -60,6 +72,7 @@ from marathon.state import (
 EXIT_BUILD_FAILED = 1
 EXIT_RECOVERY_ABORTED = 2
 UPDATE_RECOVERY_MARKER_FILENAME = "marathon-update-recovery-prepared.json"
+UPDATE_RECOVERY_MARKER_LOCK_FILENAME = "marathon-update-recovery-prepared.lock"
 UPDATE_RECOVERY_SCHEMA_VERSION = 2
 UPDATE_RECOVERY_PHASE_STARTING = "starting"
 UPDATE_RECOVERY_PHASE_MERGED = "merged"
@@ -79,6 +92,86 @@ _FULL_GIT_OID_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 class RecoveryError(RuntimeError):
     """A safe preflight/publication abort, rather than a failed Lake build."""
+
+
+class _UpdateMarkerLockState:
+    """One path's thread-reentrant lock plus its outermost OS lock."""
+
+    def __init__(self) -> None:
+        self.rlock = threading.RLock()
+        self.depth = 0
+        self.handle = None
+
+
+_UPDATE_MARKER_LOCKS_GUARD = threading.Lock()
+_UPDATE_MARKER_LOCKS: dict[str, _UpdateMarkerLockState] = {}
+
+
+def _update_marker_lock_state(path: Path) -> _UpdateMarkerLockState:
+    key = str(path.resolve())
+    with _UPDATE_MARKER_LOCKS_GUARD:
+        return _UPDATE_MARKER_LOCKS.setdefault(key, _UpdateMarkerLockState())
+
+
+def _lock_update_marker_file(handle) -> None:
+    if _fcntl is not None:
+        _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX)
+        return
+    if _msvcrt is not None:  # pragma: no cover - Windows-only branch
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        _msvcrt.locking(handle.fileno(), _msvcrt.LK_LOCK, 1)
+        return
+    raise RecoveryError(
+        "update recovery journals require an operating-system file lock"
+    )
+
+
+def _unlock_update_marker_file(handle) -> None:
+    if _fcntl is not None:
+        _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+        return
+    if _msvcrt is not None:  # pragma: no cover - Windows-only branch
+        handle.seek(0)
+        _msvcrt.locking(handle.fileno(), _msvcrt.LK_UNLCK, 1)
+
+
+@contextmanager
+def _update_recovery_marker_lock(marker: Path):
+    """Serialize every update-journal mutation across threads and processes.
+
+    The stable sibling lock file is never replaced.  Nested helpers share the
+    outer descriptor, avoiding the self-deadlock caused by opening and flocking
+    the same inode twice in one thread.
+    """
+    lock_path = marker.with_name(UPDATE_RECOVERY_MARKER_LOCK_FILENAME)
+    state = _update_marker_lock_state(lock_path)
+    with state.rlock:
+        if state.depth == 0:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            state.handle = lock_path.open("a+b")
+            try:
+                _lock_update_marker_file(state.handle)
+            except BaseException:
+                state.handle.close()
+                state.handle = None
+                raise
+        state.depth += 1
+        try:
+            yield
+        finally:
+            state.depth -= 1
+            if state.depth == 0:
+                handle = state.handle
+                state.handle = None
+                assert handle is not None
+                try:
+                    _unlock_update_marker_file(handle)
+                finally:
+                    handle.close()
 
 
 @dataclass(frozen=True)
@@ -870,6 +963,13 @@ def _write_marker_temp(marker: Path, payload: dict) -> Path:
 
 
 def _atomic_create_update_recovery_marker(marker: Path, payload: dict) -> None:
+    with _update_recovery_marker_lock(marker):
+        _atomic_create_update_recovery_marker_unlocked(marker, payload)
+
+
+def _atomic_create_update_recovery_marker_unlocked(
+    marker: Path, payload: dict
+) -> None:
     """Publish the initial marker without ever replacing another operation.
 
     A fully-written temp file is hard-linked into place.  The link is an atomic
@@ -901,6 +1001,13 @@ def _atomic_create_update_recovery_marker(marker: Path, payload: dict) -> None:
 
 
 def _atomic_replace_update_recovery_marker(marker: Path, payload: dict) -> None:
+    with _update_recovery_marker_lock(marker):
+        _atomic_replace_update_recovery_marker_unlocked(marker, payload)
+
+
+def _atomic_replace_update_recovery_marker_unlocked(
+    marker: Path, payload: dict
+) -> None:
     tmp = _write_marker_temp(marker, payload)
     try:
         os.replace(tmp, marker)
@@ -1090,16 +1197,17 @@ def _replace_update_recovery_marker_fields(
     **updates: object,
 ) -> dict:
     """CAS-like atomic replacement for a marker phase or checkpoint field."""
-    on_disk = _load_update_recovery_marker(marker_path)
-    if on_disk != marker:
-        raise RecoveryError(
-            f"update recovery marker changed concurrently at {marker_path}"
-        )
-    payload = dict(marker)
-    payload.update(updates)
-    payload["updated_at"] = now_iso()
-    _atomic_replace_update_recovery_marker(marker_path, payload)
-    return payload
+    with _update_recovery_marker_lock(marker_path):
+        on_disk = _load_update_recovery_marker(marker_path)
+        if on_disk != marker:
+            raise RecoveryError(
+                f"update recovery marker changed concurrently at {marker_path}"
+            )
+        payload = dict(marker)
+        payload.update(updates)
+        payload["updated_at"] = now_iso()
+        _atomic_replace_update_recovery_marker_unlocked(marker_path, payload)
+        return payload
 
 
 def _prepare_fresh_update_fallback(
