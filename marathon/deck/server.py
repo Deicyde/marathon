@@ -540,10 +540,11 @@ class DeckServer(ThreadingHTTPServer):
         self._project_graph_generation = 0
 
         # Verso elaboration is deliberately isolated behind its artifact
-        # manager.  Constructing the manager does no build work; only
-        # GET /api/verso-status asks it to start its background single-flight
-        # builder.  Queue/card routes never consult it.  Explicit ``None`` is
-        # used by demo mode and focused server tests.
+        # manager. Constructing the manager does no build work; ``serve``
+        # prewarms its background single-flight builder before the first review
+        # visit, and GET /api/verso-status remains a fail-safe trigger. Queue
+        # and card routes never wait on it. Explicit ``None`` is used by demo
+        # mode and focused server tests.
         self._verso_close_lock = Lock()
         self._verso_closed = False
         self._verso_unavailable_reason: Optional[str] = None
@@ -568,6 +569,22 @@ class DeckServer(ThreadingHTTPServer):
             )
         self.verso_manager = verso_manager
         super().__init__(server_address, DeckHandler)
+
+    def prewarm_verso(self) -> Optional[dict]:
+        """Ask the semantic artifact manager to catch up, without blocking.
+
+        ``VersoArtifactManager.trigger`` only starts or joins its daemon worker.
+        Keeping this tiny boundary fail-soft means a missing toolchain can never
+        prevent the raw-source review deck from starting or syncing.
+        """
+
+        manager = self.verso_manager
+        if manager is None or self._verso_closed:
+            return None
+        try:
+            return manager.trigger()
+        except Exception:  # noqa: BLE001 — raw source remains authoritative
+            return None
 
     def server_close(self) -> None:
         """Close the HTTP socket and the server-owned artifact manager.
@@ -3306,6 +3323,10 @@ def serve(
             "  host orchestrator control: ENABLED — authenticated users may\n"
             "  explicitly start the conductor with this host's credentials."
         )
+    # Start semantic documentation before a reviewer opens the first card.
+    # This is nonblocking and single-flight; the review server is already bound
+    # and raw source remains immediately available throughout the build.
+    server.prewarm_verso()
     # A fronted (shared) deck without --no-host-conductor is an attribution
     # footgun: a collaborator's REJECT spawns/feeds the HOST's conductor, so the
     # PR merge that lands their refine + the Aristotle spend are billed to the
@@ -3326,7 +3347,12 @@ def serve(
         print(f"  repo sync: fast-forward pull every {pull_every}s "
               f"(keeps the hosted deck's source current)"
               + (f"; audit from {audit_from}" if audit_from else ""))
-        start_repo_sync(cfg.repo_dir, pull_every, audit_from=audit_from)
+        start_repo_sync(
+            cfg.repo_dir,
+            pull_every,
+            audit_from=audit_from,
+            on_change=server.prewarm_verso,
+        )
     print("  press Ctrl-C to stop.")
     print("=" * 70)
 

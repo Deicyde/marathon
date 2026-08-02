@@ -2,6 +2,7 @@
 fail-soft, audit-age note. All git calls are monkeypatched."""
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import marathon.deck.sync as sync
@@ -218,6 +219,48 @@ def test_audit_age_note_reports_age(tmp_path):
 def test_start_repo_sync_noop_when_disabled(tmp_path):
     assert sync.start_repo_sync(tmp_path, 0) is None
     assert sync.start_repo_sync(tmp_path, -5) is None
+
+
+def test_repo_sync_notifies_derived_artifacts_after_source_advance(
+    monkeypatch, tmp_path,
+):
+    changed = threading.Event()
+    slept = threading.Event()
+    halt = threading.Event()
+    monkeypatch.setattr(sync, "pull_once", lambda _repo: "updated abc1234 → def5678")
+
+    def one_long_sleep(_interval):
+        slept.set()
+        halt.wait()
+
+    monkeypatch.setattr(sync.time, "sleep", one_long_sleep)
+    thread = sync.start_repo_sync(
+        tmp_path, 60, log=lambda _line: None, on_change=changed.set
+    )
+    assert thread is not None
+    assert changed.wait(1)
+    assert slept.wait(1)
+
+
+def test_repo_sync_survives_a_failing_change_callback(monkeypatch, tmp_path):
+    slept = threading.Event()
+    hold = threading.Event()
+    monkeypatch.setattr(sync, "pull_once", lambda _repo: "updated abc1234 → def5678")
+
+    def broken_callback():
+        raise RuntimeError("semantic prewarm failed")
+
+    def observe_sleep(_interval):
+        slept.set()
+        hold.wait()
+
+    monkeypatch.setattr(sync.time, "sleep", observe_sleep)
+    thread = sync.start_repo_sync(
+        tmp_path, 60, log=lambda _line: None, on_change=broken_callback
+    )
+    assert thread is not None
+    # Reaching sleep proves the callback exception stayed inside the live loop.
+    assert slept.wait(1)
 
 
 def test_refresh_audit_from_local_path(tmp_path):

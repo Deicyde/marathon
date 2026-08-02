@@ -195,12 +195,6 @@ html, body {
 .verso-retry:disabled { cursor: wait; opacity: 0.65; }
 .verso-semantic-source { overflow: auto; background: #0b0e14; }
 .verso-semantic-source[hidden] { display: none; }
-.verso-semantic-source[data-verso-stale="1"]::before {
-  content: "Stale semantic snapshot — audit the current raw source above";
-  display: block; position: sticky; top: 0; z-index: 2; padding: 0.38rem 0.58rem;
-  border-bottom: 1px solid #f0883e88; background: #2a1b14; color: #f0883e;
-  font-size: 0.72rem; font-weight: 700;
-}
 .verso-semantic-decl { max-height: 38rem; }
 .verso-semantic-module { max-height: 70vh; }
 .verso-semantic-source code.hl.lean.block,

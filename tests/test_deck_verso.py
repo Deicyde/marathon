@@ -18,6 +18,7 @@ from marathon.deck.verso import (
     discover_verso_project,
     effective_artifact_token,
     safe_artifact_path,
+    verso_source_token,
     verso_tag_from_toolchain,
 )
 from marathon.lake_build_lock import (
@@ -125,6 +126,38 @@ def test_lake_environment_adds_elan_for_minimal_gui_service_path(tmp_path):
     ]
     assert verso.shutil.which("lake", path=env["PATH"]) == str(lake)
     assert verso._lake_environment(env, home=home)["PATH"] == env["PATH"]
+
+
+def test_semantic_source_identity_uses_content_not_head_or_mtime(tmp_path):
+    repo = _project(tmp_path)
+    source = repo / "Demo.lean"
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "source"], cwd=repo, check=True)
+    first = verso_source_token(repo)
+
+    stat = source.stat()
+    os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+    assert verso_source_token(repo) == first
+
+    (repo / "README.md").write_text("metadata only\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "metadata"], cwd=repo, check=True)
+    assert verso_source_token(repo) == first
+
+    source.write_text("def Demo.answer : Nat := 43\n")
+    assert verso_source_token(repo) != first
+
+
+def test_semantic_source_identity_includes_file_inventory(tmp_path):
+    repo = _project(tmp_path)
+    first = verso_source_token(repo)
+    extra = repo / "Demo" / "Extra.lean"
+    extra.parent.mkdir()
+    extra.write_text("def Demo.Extra.answer : Nat := 42\n")
+    assert verso_source_token(repo) != first
 
 
 def test_staged_literate_math_is_scoped_restored_and_escaped(tmp_path):
@@ -561,6 +594,44 @@ time.sleep(60)
                 os.kill(child_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def test_failed_build_diagnostic_keeps_command_exit_cause_and_tail(tmp_path):
+    repo = _project(tmp_path)
+    first = "FIRST: compiler crashed while elaborating Demo.answer"
+    last = "LAST: final worker warning"
+
+    def failed(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command, 139, stdout="", stderr=first + "\n" + ("x" * 8000) + "\n" + last
+        )
+
+    manager = VersoArtifactManager(
+        repo, runner=failed, source_token_fn=lambda _repo: TOKEN_A
+    )
+    with lake_build_lock(repo) as lock_fd:
+        with pytest.raises(verso.VersoBuildError) as caught:
+            manager._run_command(
+                ["lake", "build", "@DemoPackage/+Demo:literate"],
+                1,
+                lock_fd=lock_fd,
+            )
+
+    message = str(caught.value)
+    assert "lake build @DemoPackage/+Demo:literate" in message
+    assert "exited 139" in message
+    assert first in message
+    assert "output clipped" in message
+    assert last in message
+    assert len(message) <= verso._MAX_ERROR_CHARS
+
+
+def test_non_lake_diagnostic_never_echoes_payload_argument():
+    message = verso._process_failure_message(
+        ["python", "-c", "SECRET_PAYLOAD"], 1, "safe failure"
+    )
+    assert "python" in message
+    assert "SECRET_PAYLOAD" not in message
 
 
 def test_artifact_build_restores_math_without_mutating_incremental_cache(tmp_path):

@@ -162,7 +162,19 @@ def test_status_triggers_background_build_without_delaying_queue(
 
     class _Queue:
         def to_json(self):
-            return {"cards": [], "building": [], "landed_today": []}
+            return {
+                "cards": [],
+                "building": 0,
+                "landed_today": 0,
+                "view_building": 0,
+                "unresolved": 0,
+                "awaiting_refinement": 0,
+                "needs_attention": 0,
+                "needs_citation_mapping": 0,
+                "awaiting_audit": 0,
+                "dependency_blocked": 0,
+                "other_unresolved": 0,
+            }
 
     monkeypatch.setattr(cards, "build_queue", lambda _cfg, _chapter: _Queue())
 
@@ -195,6 +207,21 @@ def test_status_triggers_background_build_without_delaying_queue(
         assert queue_code == 200
         assert json.loads(queue_raw)["cards"] == []
         assert manager.status_calls == [True]
+
+
+def test_server_verso_prewarm_is_nonblocking_single_flight_boundary(tmp_path):
+    manager = _FakeVersoManager(tmp_path / "artifact")
+    server = deck_server.make_server(
+        _cfg(tmp_path), port=0, default_chapter=14, verso_manager=manager
+    )
+    try:
+        started = time.monotonic()
+        status = server.prewarm_verso()
+        assert time.monotonic() - started < 1
+        assert status["state"] == "building"
+        assert manager.trigger_calls == [False]
+    finally:
+        server.server_close()
 
 
 def test_manifest_returns_last_good_artifact_without_starting_a_build(tmp_path):

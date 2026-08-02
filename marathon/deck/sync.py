@@ -305,25 +305,40 @@ def start_repo_sync(
     *,
     audit_from: Optional[str] = None,
     log: Callable[[str], None] = print,
+    on_change: Optional[Callable[[], object]] = None,
 ) -> Optional[threading.Thread]:
     """Start a daemon thread that fast-forwards ``repo_dir`` every ``interval``
     seconds (pulling once immediately), keeping a hosted deck's working tree
     current. When ``audit_from`` is set, ALSO refresh the (gitignored) audit
-    snapshot from that path/URL each cycle. A no-op returning ``None`` when
-    ``interval <= 0`` (the default — a local single-user deck manages its own
-    checkout)."""
+    snapshot from that path/URL each cycle. ``on_change`` is called after a
+    successful source advance, allowing derived background artifacts to prewarm
+    without delaying the sync loop. A no-op returning ``None`` when ``interval
+    <= 0`` (the default — a local single-user deck manages its own checkout)."""
     if interval is None or interval <= 0:
         return None
+
+    def _notify_change() -> None:
+        if on_change is None:
+            return
+        try:
+            on_change()
+        except Exception:  # derived-artifact prewarming is strictly best-effort
+            pass
 
     def _loop() -> None:
         while True:
             try:
                 msg = pull_once(repo_dir)
+                source_changed = msg.startswith(
+                    ("updated ", "recovered wedged checkout ")
+                )
                 if audit_from:
                     msg += " · " + refresh_audit(repo_dir, audit_from)
                 else:
                     msg += audit_age_note(repo_dir)
                 log(f"  [sync] {msg}")
+                if source_changed:
+                    _notify_change()
             except Exception:  # noqa: BLE001 — the sync thread must never die
                 pass
             time.sleep(interval)

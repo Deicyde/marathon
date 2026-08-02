@@ -18,6 +18,7 @@ import json
 import os
 import re
 import signal
+import shlex
 import shutil
 import subprocess
 import threading
@@ -32,7 +33,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator, Optional
 from urllib.parse import unquote
 
-from marathon.deck.definitions import definition_source_token
 from marathon.lake_build_lock import (
     LakeBuildLockCancelled,
     LakeBuildLockTimeout,
@@ -61,7 +61,7 @@ _RENDER_TIMEOUT_SECONDS = 60 * 15
 _LEAN_BUILD_THREADS = "2"
 _MODULE_TARGET_BATCH_SIZE = 100
 _ARTIFACT_RETENTION = 5  # current site plus four recent pinned-tab generations
-_ARTIFACT_PIPELINE_VERSION = "marathon-verso-v2"
+_ARTIFACT_PIPELINE_VERSION = "marathon-verso-v3"
 _MATH_SENTINEL_PREFIX = "__MARATHON_VERSO_MATH_"
 _MATH_SENTINEL_RE = re.compile(
     rf"<code>({_MATH_SENTINEL_PREFIX}[0-9a-f]{{32}}_[ID]_[0-9]+__)</code>"
@@ -80,6 +80,41 @@ class _VersoSourceChanged(RuntimeError):
     def __init__(self, source_token: str) -> None:
         super().__init__("Lean source changed during the Verso build")
         self.source_token = source_token
+
+
+def verso_source_token(repo_dir: Path) -> str:
+    """Hash the actual Lean source bytes used by semantic documentation.
+
+    The definition index uses a deliberately cheap HEAD/size/mtime token for
+    browser-cache invalidation.  Verso artifacts are much more expensive: a
+    checkout, stash round-trip, or metadata-only commit must not make an
+    unchanged project look semantically stale and start another full build.
+    Content plus repository-relative path is the durable identity here;
+    Lake/toolchain files are bound separately by ``_dependency_signature``.
+    """
+
+    from marathon.deck.cards import _tracked_lean_files
+
+    root = Path(repo_dir).resolve()
+    digest = hashlib.sha256()
+    for path in _tracked_lean_files(root):
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(root)
+            relative = resolved.relative_to(root).as_posix()
+            if not resolved.is_file():
+                continue
+            digest.update(relative.encode("utf-8") + b"\0")
+            with resolved.open("rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+            digest.update(b"\0")
+        except (OSError, ValueError):
+            # Match the current-source index's fail-soft containment policy.
+            # A disappearing file changes the next completed fingerprint and
+            # the pre/post-build identity check prevents a mixed publication.
+            continue
+    return digest.hexdigest()
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -110,6 +145,45 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
             proc.kill()
         except OSError:
             pass
+
+
+def _safe_command_label(command: list[str]) -> str:
+    """Describe an internal command without copying arbitrary payload args."""
+
+    if not command:
+        return "command"
+    executable = Path(command[0]).name or "command"
+    # Production calls are Lake invocations with project/module names only.
+    # Tests also exercise the runner with ``python -c``; never echo that source
+    # (or a future arbitrary payload) into a durable browser-visible error.
+    if executable != "lake":
+        return executable
+    visible = command[:8]
+    label = shlex.join(visible)
+    if len(command) > len(visible):
+        label += f" … (+{len(command) - len(visible)} args)"
+    return label
+
+
+def _bounded_diagnostic(text: str, *, limit: int = _MAX_ERROR_CHARS) -> str:
+    """Keep the cause at the head and final diagnostics within one bound."""
+
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    marker = "\n… output clipped …\n"
+    head = min(1200, max(1, (limit - len(marker)) // 2))
+    tail = max(1, limit - len(marker) - head)
+    return value[:head] + marker + value[-tail:]
+
+
+def _process_failure_message(
+    command: list[str], returncode: int, output: str
+) -> str:
+    header = f"`{_safe_command_label(command)}` exited {returncode}"
+    detail = str(output or "no subprocess output").strip()
+    budget = max(1, _MAX_ERROR_CHARS - len(header) - 2)
+    return header + ":\n" + _bounded_diagnostic(detail, limit=budget)
 
 
 def _run_process_group(
@@ -658,7 +732,7 @@ class VersoArtifactManager:
         self._check_lake = runner is None
         self._runner: Runner = runner or subprocess.run
         self._process_env = _lake_environment()
-        self._source_token_fn = source_token_fn or definition_source_token
+        self._source_token_fn = source_token_fn or verso_source_token
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -1088,7 +1162,7 @@ class VersoArtifactManager:
                 message = str(exc).strip() or type(exc).__name__
                 with self._lock:
                     self._failed_token = token
-                    self._last_error = message[-_MAX_ERROR_CHARS:]
+                    self._last_error = _bounded_diagnostic(message)
                     try:
                         self._write_state()
                     except OSError:
@@ -1261,15 +1335,17 @@ class VersoArtifactManager:
                 result = self._runner(command, **kwargs)
         except subprocess.TimeoutExpired as exc:
             raise VersoBuildError(
-                f"`{' '.join(command[:3])}` timed out after {timeout} seconds"
+                f"`{_safe_command_label(command)}` timed out after {timeout} seconds"
             ) from exc
         except OSError as exc:
-            raise VersoBuildError(f"could not run `{command[0]}`: {exc}") from exc
+            raise VersoBuildError(
+                f"could not run `{_safe_command_label(command)}`: {exc}"
+            ) from exc
         if result.returncode == 0:
             return
         detail = (result.stderr or result.stdout or "no subprocess output").strip()
         raise VersoBuildError(
-            f"`{' '.join(command)}` exited {result.returncode}: {detail[-_MAX_ERROR_CHARS:]}"
+            _process_failure_message(command, result.returncode, detail)
         )
 
     def _prune_literate(

@@ -1781,13 +1781,13 @@
     var label = "Verso loading";
     var cls = "verso-status-loading";
     if (status.stale && status.available && (stateName === "error" || status.error)) {
-      label = "Verso stale · rebuild error";
+      label = "Verso rebuild failed · current source shown";
       cls = "verso-status-error";
     } else if (status.stale && status.available && rebuilding) {
-      label = "Verso stale · rebuilding";
+      label = "Verso rebuilding · current source shown";
       cls = "verso-status-stale";
     } else if (status.stale && status.available) {
-      label = "Verso stale";
+      label = "Verso update pending · current source shown";
       cls = "verso-status-stale";
     } else if (stateName === "building" || stateName === "queued") {
       label = "Verso building · raw source shown";
@@ -2291,6 +2291,15 @@
     var raw = shell.querySelector(".verso-raw-fallback");
     var stale = !!(status && status.stale);
     if (semantic) semantic.setAttribute("data-verso-stale", stale ? "1" : "0");
+    if (stale && semantic && semantic.childNodes.length) {
+      // Stale generated markup is not merely covered by the current source:
+      // remove it, its focus targets, and hover context from the review DOM.
+      // A ready poll mounts a newly fetched, token-matched fragment later.
+      resetVersoInteractions(semantic);
+      while (semantic.firstChild) semantic.removeChild(semantic.firstChild);
+      semantic.removeAttribute("data-verso-artifact");
+      semantic.setAttribute("hidden", "hidden");
+    }
     if (!raw) return;
     var selectedArtifact = state.versoManifest && state.versoManifest.artifact_token;
     var semanticArtifact = semantic && semantic.getAttribute("data-verso-artifact");
@@ -2300,15 +2309,21 @@
     var hasSemantic = !!(semantic && semantic.childNodes.length);
     // A ready status can arrive before its page fragment. Never let a fragment
     // from the previous generation replace the current raw source during that
-    // fetch (or remain visible if the fetch ultimately fails).
-    if (hasSemantic && artifactMatches && status && status.available) {
+    // fetch (or remain visible if the fetch ultimately fails). In particular,
+    // a last-good manifest is useful for direct, token-pinned links but is not
+    // review evidence for the current source: mounting it beside the raw block
+    // showed the declaration twice and invited reviewers to read the wrong one.
+    var semanticIsCurrent = !!(
+      hasSemantic && artifactMatches && status && status.available &&
+      !status.stale
+    );
+    if (semanticIsCurrent) {
       semantic.removeAttribute("hidden");
     } else if (hasSemantic) {
       semantic.setAttribute("hidden", "hidden");
     }
     var semanticReady = !!(
-      hasSemantic && artifactMatches && status && status.available &&
-      !semantic.hasAttribute("hidden")
+      semanticIsCurrent && !semantic.hasAttribute("hidden")
     );
     if (versoNeedsStatusChrome(status) || !semanticReady) raw.removeAttribute("hidden");
     else raw.setAttribute("hidden", "hidden");
@@ -2319,6 +2334,10 @@
     shell, clean, status, docs, pageRelative, artifactBase, artifactToken
   ) {
     var semantic = shell.querySelector(".verso-semantic-source");
+    // Keep the semantic layer inert while replacing it. This makes the swap
+    // from raw source to one coherent, token-matched fragment atomic even when
+    // a previously mounted artifact was visible.
+    semantic.setAttribute("hidden", "hidden");
     resetVersoInteractions(semantic);
     // renderVersoMath marks a mount after processing so repeat calls cannot
     // re-enter KaTeX's generated DOM. Fresh semantic content gets a fresh
@@ -2334,7 +2353,6 @@
       catch (e) { /* raw TeX remains visible as the fail-safe */ }
     }
     semantic.setAttribute("data-verso-artifact", artifactToken || "");
-    semantic.removeAttribute("hidden");
     updateVersoFreshness(shell, status);
     activateVersoHovers(
       semantic, docs, pageRelative, artifactBase,
@@ -2348,7 +2366,7 @@
       if (generation !== shell._marathonVersoGeneration) return;
       var status = metadata.status || {};
       updateVersoBadge(shell, status, "declaration");
-      if (!status.available || !metadata.manifest) return;
+      if (!status.available || status.stale || !metadata.manifest) return;
       var entry = versoConstantEntry(name);
       if (!entry || !entry.url) {
         updateVersoBadge(shell, {
@@ -2389,7 +2407,7 @@
       if (generation !== shell._marathonVersoGeneration) return;
       var status = metadata.status || {};
       updateVersoBadge(shell, status, "module");
-      if (!status.available || !metadata.manifest) return;
+      if (!status.available || status.stale || !metadata.manifest) return;
       var entry = versoModuleEntry(path);
       if (!entry || !entry.url) {
         updateVersoBadge(shell, {

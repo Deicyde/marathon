@@ -188,6 +188,84 @@ def _run_ship_status_transport(app_js: str) -> dict:
     return json.loads(proc.stdout)
 
 
+def _run_verso_freshness_transition(app_js: str) -> dict:
+    """Execute stale→fresh source visibility against a tiny DOM-shaped stub."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for Verso freshness semantic test")
+    code = _strip_block_comments(app_js)
+    helpers = "\n".join((
+        _fn_body(code, "function versoNeedsStatusChrome"),
+        _fn_body(code, "function updateVersoStatusChrome"),
+        _fn_body(code, "function resetVersoInteractions"),
+        _fn_body(code, "function updateVersoFreshness"),
+    ))
+    script = helpers + r"""
+function stub(attributes, children) {
+    return {
+    attributes: Object.assign({}, attributes || {}),
+    childNodes: children || [],
+    getAttribute: function (name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name)
+        ? this.attributes[name] : null;
+    },
+    setAttribute: function (name, value) { this.attributes[name] = String(value); },
+    removeAttribute: function (name) { delete this.attributes[name]; },
+    hasAttribute: function (name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name);
+    },
+    querySelectorAll: function () { return []; },
+    removeChild: function (child) {
+      var index = this.childNodes.indexOf(child);
+      if (index >= 0) this.childNodes.splice(index, 1);
+      return child;
+    },
+    get firstChild() { return this.childNodes.length ? this.childNodes[0] : null; }
+  };
+}
+var semantic = stub({"data-verso-artifact": "old"}, [{}]);
+var raw = stub({}, [{}]);
+var meta = stub({}, []);
+var shell = {
+  querySelector: function (selector) {
+    if (selector === ".verso-semantic-source") return semantic;
+    if (selector === ".verso-raw-fallback") return raw;
+    if (selector === ".verso-source-meta") return meta;
+    return null;
+  }
+};
+var state = {versoManifest: {artifact_token: "old"}};
+updateVersoFreshness(shell, {
+  state: "building", available: true, stale: true, artifact_token: "old"
+});
+var stale = {
+  semanticHidden: semantic.hasAttribute("hidden"),
+  semanticChildren: semantic.childNodes.length,
+  rawHidden: raw.hasAttribute("hidden"),
+  metaHidden: meta.hasAttribute("hidden")
+};
+
+state.versoManifest = {artifact_token: "fresh"};
+semantic.setAttribute("data-verso-artifact", "fresh");
+semantic.childNodes.push({});
+updateVersoFreshness(shell, {
+  state: "ready", available: true, stale: false, artifact_token: "fresh"
+});
+var fresh = {
+  semanticHidden: semantic.hasAttribute("hidden"),
+  rawHidden: raw.hasAttribute("hidden"),
+  metaHidden: meta.hasAttribute("hidden")
+};
+process.stdout.write(JSON.stringify({stale: stale, fresh: fresh}));
+"""
+    proc = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=10,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
 def _run_queue_refresh_race(app_js: str) -> dict:
     """Execute the queue coordinator with two overlapping retries in Node."""
     node = shutil.which("node")
@@ -1582,7 +1660,7 @@ def test_verso_prose_math_is_dom_preserving_bounded_and_offline_safe(
     assert "MarathonLatex.renderVersoMath(semantic)" in paint
     assert paint.index("semantic.appendChild(clean)") < paint.index(
         "MarathonLatex.renderVersoMath(semantic)"
-    ) < paint.index('semantic.removeAttribute("hidden")')
+    ) < paint.index("updateVersoFreshness(shell, status)")
     assert paint.index(
         'semantic.removeAttribute("data-marathon-verso-math-rendered")'
     ) < paint.index("semantic.removeChild")
@@ -1772,9 +1850,13 @@ def test_verso_fragment_ids_are_unique_and_hover_init_waits_for_docs(app_js: str
     assert paint.index("resetVersoInteractions(semantic)") < paint.index(
         "semantic.removeChild"
     )
+    assert paint.index('setAttribute("hidden", "hidden")') < paint.index(
+        "semantic.removeChild"
+    )
     assert paint.index('setAttribute("data-verso-artifact"') < paint.index(
-        'removeAttribute("hidden")'
-    ) < paint.index("updateVersoFreshness(shell, status)")
+        "updateVersoFreshness(shell, status)"
+    )
+    assert 'semantic.removeAttribute("hidden")' not in paint
 
 
 def test_verso_building_status_polls_then_upgrades_mounted_surfaces(app_js: str):
@@ -1800,7 +1882,7 @@ def test_verso_building_status_polls_then_upgrades_mounted_surfaces(app_js: str)
     assert "updateVersoFreshness" in refresh
 
 
-def test_stale_verso_never_hides_current_raw_source(app_js: str):
+def test_stale_verso_shows_only_current_raw_source(app_js: str, style_css: str):
     code = _strip_block_comments(app_js)
     shell = _fn_body(code, "function makeVersoShell")
     assert shell.index("raw,") < shell.index("semantic,")
@@ -1812,16 +1894,49 @@ def test_stale_verso_never_hides_current_raw_source(app_js: str):
     assert 'semantic.getAttribute("data-verso-artifact")' in freshness
     assert "semanticArtifact === selectedArtifact" in freshness
     assert "hasSemantic && artifactMatches && status && status.available" in freshness
+    assert "!status.stale" in freshness
+    assert "semanticIsCurrent" in freshness
     assert 'semantic.removeAttribute("hidden")' in freshness
     assert 'semantic.setAttribute("hidden", "hidden")' in freshness
-    assert freshness.index('semantic.removeAttribute("hidden")') < freshness.index(
-        'semantic.setAttribute("hidden", "hidden")'
+    assert freshness.index("if (semanticIsCurrent)") < freshness.index(
+        'semantic.removeAttribute("hidden")'
     )
     assert "versoNeedsStatusChrome(status) || !semanticReady" in freshness
     assert 'raw.removeAttribute("hidden")' in freshness
     assert 'raw.setAttribute("hidden", "hidden")' in freshness
     paint = _fn_body(code, "function paintVersoResult")
     assert "updateVersoFreshness(shell, status)" in paint
+    assert "Stale semantic snapshot" not in style_css
+
+
+def test_verso_stale_to_fresh_swap_is_atomic(app_js: str):
+    transition = _run_verso_freshness_transition(app_js)
+    assert transition["stale"] == {
+        "semanticHidden": True,
+        "semanticChildren": 0,
+        "rawHidden": False,
+        "metaHidden": False,
+    }
+    assert transition["fresh"] == {
+        "semanticHidden": False,
+        "rawHidden": True,
+        "metaHidden": True,
+    }
+
+
+def test_stale_verso_is_neither_fetched_nor_retained(app_js: str):
+    code = _strip_block_comments(app_js)
+    declaration = _fn_body(code, "function enhanceVersoDeclaration")
+    module = _fn_body(code, "function enhanceVersoModule")
+    for enhancer in (declaration, module):
+        assert "status.stale" in enhancer
+        assert enhancer.index("status.stale") < enhancer.index("fetchVerso")
+
+    freshness = _fn_body(code, "function updateVersoFreshness")
+    assert "if (stale && semantic && semantic.childNodes.length)" in freshness
+    assert "resetVersoInteractions(semantic)" in freshness
+    assert "semantic.removeChild(semantic.firstChild)" in freshness
+    assert 'semantic.removeAttribute("data-verso-artifact")' in freshness
 
 
 def test_verso_surfaces_report_only_actionable_statuses_and_keep_raw_fallback(
@@ -1829,8 +1944,9 @@ def test_verso_surfaces_report_only_actionable_statuses_and_keep_raw_fallback(
 ):
     code = _strip_block_comments(app_js)
     badge = _fn_body(code, "function versoBadge")
-    for label in ("Verso building", "Verso stale", "Verso error"):
+    for label in ("Verso building", "Verso rebuilding", "Verso error"):
         assert label in badge
+    assert "Verso stale" not in badge
     assert "Verso semantic" not in badge
     assert 'hidden: label ? null : "hidden"' in badge
     shell = _fn_body(code, "function makeVersoShell")
