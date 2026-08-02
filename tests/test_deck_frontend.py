@@ -200,10 +200,15 @@ def _run_queue_refresh_race(app_js: str) -> dict:
         _fn_body(code, "function readOptions"),
         _fn_body(code, "function conductorIsReady"),
         _fn_body(code, "function reviewConductorSnapshotKey"),
+        _fn_body(code, "function semanticQueueSnapshot"),
+        _fn_body(code, "function reviewQueueSnapshotKey"),
+        _fn_body(code, "function abortQueueReads"),
         _fn_body(code, "function refreshQueue"),
         _fn_body(code, "function startQueueRefresh"),
     ))
-    script = "var QUEUE_READ_TIMEOUT_MS = 100;\n" + helpers + r"""
+    script = (
+        "var QUEUE_READ_TIMEOUT_MS = 100;\n"
+        "var REVIEW_STUCK_READ_TIMEOUT_MS = 100;\n" + helpers + r"""
 function deferred() {
   var resolve, reject;
   var promise = new Promise(function (yes, no) {
@@ -222,9 +227,12 @@ var state = {
   unresolved: 0, awaitingRefinement: 0, needsAttention: 0,
   needsCitationMapping: 0, awaitingAudit: 0, dependencyBlocked: 0,
   otherUnresolved: 0, reviewStuck: { issues: [], repo: null },
+  reviewStuckChecked: false, reviewStuckPending: false,
   reviewConductor: null, conductorStartBusy: false, conductorStartError: "",
   queueRequest: null, queueAbortController: null,
-  queueRequestSeq: 0, queueSnapshotKey: null,
+  queueStuckRequest: null, queueStuckAbortController: null,
+  queueRequestSeq: 0, queueSnapshotKey: null, queueWarmRetryTimer: null,
+  queueFreshness: null,
   issue: null, activeTab: "review"
 };
 function stage() { return host; }
@@ -290,6 +298,520 @@ function getJSON(url, options) {
   process.stderr.write(String(err && err.stack || err));
   process.exit(1);
 });
+"""
+    )
+    proc = subprocess.run(
+        [node, "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _run_queue_warming_response(app_js: str) -> dict:
+    """Execute a cold-start 503 and verify stable automatic retry behavior."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for queue warming semantic test")
+    code = _strip_block_comments(app_js)
+    helpers = "\n".join((
+        _fn_body(code, "function withReadDeadline"),
+        _fn_body(code, "function newReadController"),
+        _fn_body(code, "function readOptions"),
+        _fn_body(code, "function abortQueueReads"),
+        _fn_body(code, "function scheduleQueueWarmRetry"),
+        _fn_body(code, "function startQueueRefresh"),
+    ))
+    script = (
+        "var QUEUE_READ_TIMEOUT_MS = 100;\n"
+        "var REVIEW_STUCK_READ_TIMEOUT_MS = 100;\n"
+        "var QUEUE_WARM_RETRY_MS = 2000;\n" + helpers + r"""
+var host = {};
+var shown = [];
+var errors = 0;
+var ended = 0;
+var stuckAborts = 0;
+var state = {
+  queue: [], building: 0, viewBuilding: 0, landedToday: 0,
+  unresolved: 0, awaitingRefinement: 0, needsAttention: 0,
+  needsCitationMapping: 0, awaitingAudit: 0, dependencyBlocked: 0,
+  otherUnresolved: 0, reviewStuck: { issues: [], repo: null },
+  reviewStuckChecked: false, reviewStuckPending: false,
+  reviewConductor: null, conductorStartBusy: false, conductorStartError: "",
+  queueRequest: null, queueAbortController: null,
+  queueStuckRequest: null, queueStuckAbortController: null,
+  queueRequestSeq: 1,
+  queueSnapshotKey: null, queueFreshness: null, queueWarmRetryTimer: null,
+  issue: null, activeTab: "review"
+};
+function stage() { return host; }
+function surfaceHasStableContent() { return false; }
+function endSurfaceRefresh() { ended += 1; }
+function showMessageCard(opts) { shown.push(opts.title); }
+function showErrorCard() { errors += 1; }
+function flashToast() { errors += 1; }
+function applyStatus() {}
+function openFirstReadyIssue() {}
+function fetchQueue() {
+  var err = new Error("preparing");
+  err.status = 503;
+  err.data = {
+    ok: false,
+    queue_snapshot: { state: "warming", refreshing: true, saved_at: null }
+  };
+  return Promise.reject(err);
+}
+function getJSON(url, options) {
+  if (url === "/api/stuck") {
+    return new Promise(function (_resolve, reject) {
+      var signal = options && options.signal;
+      if (signal) signal.addEventListener("abort", function () {
+        stuckAborts += 1;
+        reject(new Error("aborted"));
+      }, { once: true });
+    });
+  }
+  return Promise.reject(new Error("unexpected URL " + url));
+}
+(async function () {
+  await startQueueRefresh(1, false);
+  await Promise.resolve();
+  var scheduled = state.queueWarmRetryTimer != null;
+  if (state.queueWarmRetryTimer) clearTimeout(state.queueWarmRetryTimer);
+  state.queueWarmRetryTimer = null;
+  process.stdout.write(JSON.stringify({
+    shown: shown,
+    errors: errors,
+    scheduled: scheduled,
+    freshness: state.queueFreshness && state.queueFreshness.state,
+    requestCleared: state.queueRequest === null,
+    stuckCleared: state.queueStuckRequest === null,
+    stuckAborts: stuckAborts,
+    ended: ended
+  }));
+})().catch(function (err) {
+  process.stderr.write(String(err && err.stack || err));
+  process.exit(1);
+});
+"""
+    )
+    proc = subprocess.run(
+        [node, "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _run_queue_without_waiting_for_stuck(app_js: str) -> dict:
+    """Resolve the primary queue while the auxiliary stuck read remains open."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for independent queue read test")
+    code = _strip_block_comments(app_js)
+    helpers = "\n".join((
+        _fn_body(code, "function withReadDeadline"),
+        _fn_body(code, "function newReadController"),
+        _fn_body(code, "function readOptions"),
+        _fn_body(code, "function conductorIsReady"),
+        _fn_body(code, "function reviewConductorSnapshotKey"),
+        _fn_body(code, "function semanticQueueSnapshot"),
+        _fn_body(code, "function reviewQueueSnapshotKey"),
+        _fn_body(code, "function startQueueRefresh"),
+    ))
+    script = (
+        "var QUEUE_READ_TIMEOUT_MS = 1000;\n"
+        "var REVIEW_STUCK_READ_TIMEOUT_MS = 1000;\n" + helpers + r"""
+function deferred() {
+  var resolve, reject;
+  var promise = new Promise(function (yes, no) {
+    resolve = yes; reject = no;
+  });
+  return { promise: promise, resolve: resolve, reject: reject };
+}
+var queueRead = deferred();
+var stuckRead = deferred();
+var renders = 0;
+var ended = 0;
+var host = {};
+var state = {
+  queue: [], building: 0, viewBuilding: 0, landedToday: 0,
+  unresolved: 0, awaitingRefinement: 0, needsAttention: 0,
+  needsCitationMapping: 0, awaitingAudit: 0, dependencyBlocked: 0,
+  otherUnresolved: 0, queueFreshness: null, queueWarmRetryTimer: null,
+  queueRequest: null, queueAbortController: null,
+  queueStuckRequest: null, queueStuckAbortController: null,
+  queueRequestSeq: 1, queueSnapshotKey: null,
+  reviewStuck: { issues: [], repo: null },
+  reviewStuckChecked: false, reviewStuckPending: false,
+  reviewConductor: null, conductorStartBusy: false, conductorStartError: "",
+  issue: null, activeTab: "review"
+};
+function stage() { return host; }
+function surfaceHasStableContent() { return true; }
+function endSurfaceRefresh() { ended += 1; }
+function applyStatus() {}
+function openFirstReadyIssue() { renders += 1; }
+function showMessageCard() {}
+function showErrorCard(_title, err) { throw err; }
+function flashToast(message) { throw new Error(message); }
+function fetchQueue() { return queueRead.promise; }
+function getJSON(url) {
+  if (url === "/api/stuck") return stuckRead.promise;
+  return Promise.reject(new Error("unexpected URL " + url));
+}
+(async function () {
+  var completion = startQueueRefresh(1, false);
+  queueRead.resolve({ cards: [], unresolved: 1, marker: "queue-ready" });
+  await completion;
+  var afterQueue = {
+    marker: state.queue.length ? state.queue[0] : "queue-ready",
+    pending: state.reviewStuckPending,
+    stuckOpen: state.queueStuckRequest != null,
+    renders: renders
+  };
+  stuckRead.resolve({
+    issues: [{ issue: 240 }],
+    repo: "example/repo",
+    conductor: { alive: true, ready: true }
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  process.stdout.write(JSON.stringify({
+    queueInstalled: state.unresolved === 1,
+    pendingAfterQueue: afterQueue.pending,
+    stuckOpenAfterQueue: afterQueue.stuckOpen,
+    rendersAfterQueue: afterQueue.renders,
+    stuckCount: state.reviewStuck.issues.length,
+    conductorAlive: state.reviewConductor && state.reviewConductor.alive,
+    pendingAfterStuck: state.reviewStuckPending,
+    rendersFinal: renders,
+    ended: ended
+  }));
+})().catch(function (err) {
+  process.stderr.write(String(err && err.stack || err));
+  process.exit(1);
+});
+"""
+    )
+    proc = subprocess.run(
+        [node, "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _run_stale_ready_queue_refresh(app_js: str) -> dict:
+    """A stale ready card must keep polling after it opens its subdeck."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for stale queue semantic test")
+    code = _strip_block_comments(app_js)
+    helpers = "\n".join((
+        _fn_body(code, "function withReadDeadline"),
+        _fn_body(code, "function newReadController"),
+        _fn_body(code, "function readOptions"),
+        _fn_body(code, "function conductorIsReady"),
+        _fn_body(code, "function reviewConductorSnapshotKey"),
+        _fn_body(code, "function semanticQueueSnapshot"),
+        _fn_body(code, "function reviewQueueSnapshotKey"),
+        _fn_body(code, "function abortQueueReads"),
+        _fn_body(code, "function scheduleQueueWarmRetry"),
+        _fn_body(code, "function startQueueRefresh"),
+    ))
+    script = (
+        "var QUEUE_READ_TIMEOUT_MS = 45000;\n"
+        "var REVIEW_STUCK_READ_TIMEOUT_MS = 5000;\n"
+        "var QUEUE_WARM_RETRY_MS = 2000;\n"
+        "var QUEUE_STALE_RETRY_MS = 6000;\n" + helpers + r"""
+var timers = [];
+function setTimeout(fn, delay) {
+  var timer = { fn: fn, delay: Number(delay), cancelled: false };
+  timers.push(timer);
+  return timer;
+}
+function clearTimeout(timer) { if (timer) timer.cancelled = true; }
+var queueReads = 0;
+var renders = 0;
+var ended = 0;
+var host = {};
+var state = {
+  queue: [], building: 0, viewBuilding: 0, landedToday: 0,
+  unresolved: 0, awaitingRefinement: 0, needsAttention: 0,
+  needsCitationMapping: 0, awaitingAudit: 0, dependencyBlocked: 0,
+  otherUnresolved: 0, queueFreshness: null, queueWarmRetryTimer: null,
+  queueRequest: null, queueAbortController: null,
+  queueStuckRequest: null, queueStuckAbortController: null,
+  queueRequestSeq: 1, queueSnapshotKey: null,
+  reviewStuck: { issues: [], repo: null },
+  reviewStuckChecked: false, reviewStuckPending: false,
+  reviewStuckUnavailable: false,
+  reviewConductor: null, conductorStartBusy: false, conductorStartError: "",
+  issue: null, activeTab: "review"
+};
+function stage() { return host; }
+function surfaceHasStableContent() { return true; }
+function endSurfaceRefresh() { ended += 1; }
+function applyStatus() {}
+function setActionsEnabled() {}
+function openFirstReadyIssue() {
+  renders += 1;
+  if (state.issue == null && state.queue.length) state.issue = state.queue[0].id;
+}
+function showMessageCard() {}
+function showErrorCard(_title, err) { throw err; }
+function flashToast(message) { throw new Error(message); }
+function fetchQueue() {
+  queueReads += 1;
+  if (queueReads === 1) {
+    return Promise.resolve({
+      cards: [{ id: 171, ready: true, marker: "stale" }],
+      unresolved: 1,
+      queue_snapshot: {
+        state: "stale", saved_at: "2026-08-01T00:00:00Z",
+        refreshing: true, retry_after_seconds: 0
+      }
+    });
+  }
+  return Promise.resolve({
+    cards: [{ id: 171, ready: true, marker: "fresh" }],
+    unresolved: 1
+  });
+}
+function getJSON(url) {
+  if (url === "/api/stuck") {
+    return Promise.resolve({
+      issues: [], repo: "example/repo",
+      conductor: { alive: true, ready: true }
+    });
+  }
+  return Promise.reject(new Error("unexpected URL " + url));
+}
+(async function () {
+  await startQueueRefresh(1, false);
+  var firstMarker = state.queue[0] && state.queue[0].marker;
+  var openedIssue = state.issue;
+  var retry = timers.find(function (timer) {
+    return !timer.cancelled && timer.delay >= QUEUE_STALE_RETRY_MS;
+  });
+  if (!retry) throw new Error("stale queue did not schedule a quiet refresh");
+  retry.cancelled = true;
+  retry.fn();
+  var retryCompletion = state.queueRequest;
+  if (!retryCompletion) throw new Error("quiet refresh did not start");
+  await retryCompletion;
+  process.stdout.write(JSON.stringify({
+    queueReads: queueReads,
+    firstMarker: firstMarker,
+    installedMarker: state.queue[0] && state.queue[0].marker,
+    openedIssue: openedIssue,
+    preservedIssue: state.issue,
+    renders: renders,
+    retryDelay: retry.delay,
+    ended: ended
+  }));
+})().catch(function (err) {
+  process.stderr.write(String(err && err.stack || err));
+  process.exit(1);
+});
+"""
+    )
+    proc = subprocess.run(
+        [node, "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _run_stuck_failure_retry(app_js: str) -> dict:
+    """Recovery failure stays explicit and retries after the read deadline."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for recovery retry semantic test")
+    code = _strip_block_comments(app_js)
+    helpers = "\n".join((
+        _fn_body(code, "function withReadDeadline"),
+        _fn_body(code, "function newReadController"),
+        _fn_body(code, "function readOptions"),
+        _fn_body(code, "function conductorIsReady"),
+        _fn_body(code, "function reviewConductorSnapshotKey"),
+        _fn_body(code, "function semanticQueueSnapshot"),
+        _fn_body(code, "function reviewQueueSnapshotKey"),
+        _fn_body(code, "function abortQueueReads"),
+        _fn_body(code, "function scheduleQueueWarmRetry"),
+        _fn_body(code, "function startQueueRefresh"),
+    ))
+    script = (
+        "var QUEUE_READ_TIMEOUT_MS = 45000;\n"
+        "var REVIEW_STUCK_READ_TIMEOUT_MS = 5000;\n"
+        "var QUEUE_WARM_RETRY_MS = 2000;\n"
+        "var QUEUE_STALE_RETRY_MS = 6000;\n" + helpers + r"""
+var timers = [];
+function setTimeout(fn, delay) {
+  var timer = { fn: fn, delay: Number(delay), cancelled: false };
+  timers.push(timer);
+  return timer;
+}
+function clearTimeout(timer) { if (timer) timer.cancelled = true; }
+var queueReads = 0;
+var stuckReads = 0;
+var renders = 0;
+var host = {};
+var state = {
+  queue: [], building: 0, viewBuilding: 0, landedToday: 0,
+  unresolved: 0, awaitingRefinement: 0, needsAttention: 0,
+  needsCitationMapping: 0, awaitingAudit: 0, dependencyBlocked: 0,
+  otherUnresolved: 0, queueFreshness: null, queueWarmRetryTimer: null,
+  queueRequest: null, queueAbortController: null,
+  queueStuckRequest: null, queueStuckAbortController: null,
+  queueRequestSeq: 1, queueSnapshotKey: null,
+  reviewStuck: { issues: [], repo: null },
+  reviewStuckChecked: false, reviewStuckPending: false,
+  reviewStuckUnavailable: false,
+  reviewConductor: null, conductorStartBusy: false, conductorStartError: "",
+  issue: null, activeTab: "review"
+};
+function stage() { return host; }
+function surfaceHasStableContent() { return true; }
+function endSurfaceRefresh() {}
+function applyStatus() {}
+function setActionsEnabled() {}
+function openFirstReadyIssue() { renders += 1; }
+function showMessageCard() {}
+function showErrorCard(_title, err) { throw err; }
+function flashToast(message) { throw new Error(message); }
+function fetchQueue() {
+  queueReads += 1;
+  return Promise.resolve({ cards: [], unresolved: 1 });
+}
+function getJSON(url) {
+  if (url !== "/api/stuck") {
+    return Promise.reject(new Error("unexpected URL " + url));
+  }
+  stuckReads += 1;
+  if (stuckReads === 1) return Promise.reject(new Error("temporary failure"));
+  return Promise.resolve({
+    issues: [], repo: "example/repo",
+    conductor: { alive: true, ready: true }
+  });
+}
+(async function () {
+  await startQueueRefresh(1, false);
+  var retry = timers.find(function (timer) {
+    return !timer.cancelled && timer.delay >= QUEUE_STALE_RETRY_MS;
+  });
+  var afterFailure = {
+    checked: state.reviewStuckChecked,
+    unavailable: state.reviewStuckUnavailable,
+    pending: state.reviewStuckPending,
+    activeRetries: timers.filter(function (timer) {
+      return !timer.cancelled && timer.delay >= QUEUE_STALE_RETRY_MS;
+    }).length
+  };
+  if (!retry) throw new Error("recovery failure did not schedule a retry");
+  retry.cancelled = true;
+  retry.fn();
+  var retryCompletion = state.queueRequest;
+  if (!retryCompletion) throw new Error("recovery retry did not start");
+  await retryCompletion;
+  await Promise.resolve();
+  process.stdout.write(JSON.stringify({
+    afterFailure: afterFailure,
+    retryDelay: retry.delay,
+    queueReads: queueReads,
+    stuckReads: stuckReads,
+    checkedAfterRetry: state.reviewStuckChecked,
+    unavailableAfterRetry: state.reviewStuckUnavailable,
+    activeRetriesAfterSuccess: timers.filter(function (timer) {
+      return !timer.cancelled && timer.delay >= QUEUE_STALE_RETRY_MS;
+    }).length,
+    renders: renders
+  }));
+})().catch(function (err) {
+  process.stderr.write(String(err && err.stack || err));
+  process.exit(1);
+});
+"""
+    )
+    proc = subprocess.run(
+        [node, "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _run_queue_telemetry_render_count(app_js: str) -> dict:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for queue key semantic test")
+    code = _strip_block_comments(app_js)
+    helpers = "\n".join((
+        _fn_body(code, "function conductorIsReady"),
+        _fn_body(code, "function reviewConductorSnapshotKey"),
+        _fn_body(code, "function semanticQueueSnapshot"),
+        _fn_body(code, "function reviewQueueSnapshotKey"),
+    ))
+    script = helpers + r"""
+var state = {
+  reviewStuck: { issues: [], repo: null },
+  reviewStuckPending: false,
+  reviewConductor: { alive: true, ready: true },
+  conductorStartBusy: false,
+  conductorStartError: ""
+};
+var renderedKey = null;
+var renders = 0;
+function install(data) {
+  var key = reviewQueueSnapshotKey(data);
+  if (key !== renderedKey) {
+    renderedKey = key;
+    renders += 1;
+  }
+  return key;
+}
+var first = install({
+  cards: [], unresolved: 2,
+  queue_snapshot: {
+    state: "stale", saved_at: "2026-08-01T00:00:00Z", refreshing: true
+  }
+});
+var telemetryOnly = install({
+  cards: [], unresolved: 2,
+  queue_snapshot: {
+    state: "stale", saved_at: "2026-08-01T00:00:00Z", refreshing: false,
+    retry_after_seconds: 9, last_refresh_error: "temporary failure"
+  }
+});
+var newer = install({
+  cards: [], unresolved: 2,
+  queue_snapshot: {
+    state: "stale", saved_at: "2026-08-01T00:01:00Z", refreshing: true
+  }
+});
+process.stdout.write(JSON.stringify({
+  telemetryKeyStable: first === telemetryOnly,
+  newerSnapshotChangesKey: telemetryOnly !== newer,
+  renders: renders
+}));
 """
     proc = subprocess.run(
         [node, "-e", script],
@@ -2408,18 +2930,20 @@ def test_review_retry_supersedes_hung_read_and_paints_atomic_snapshot(
     assert "stage().innerHTML" not in refresh
     assert "state.queueRequest" in refresh
     assert "++state.queueRequestSeq" in refresh
-    assert "queueAbortController" in refresh
-    assert ".abort()" in refresh
+    assert "abortQueueReads()" in refresh
 
-    assert "Promise.all(" in start
+    assert "Promise.all(" not in start
     assert "withReadDeadline(" in start
     assert "QUEUE_READ_TIMEOUT_MS" in start
+    assert "REVIEW_STUCK_READ_TIMEOUT_MS" in start
     assert "fetchQueue(null, options)" in start
-    assert 'getJSON("/api/stuck", options)' in start
+    assert 'getJSON("/api/stuck", stuckOptions)' in start
     assert 'getJSON("/api/conductor-status", options)' not in start
-    assert "stuckRead.data.conductor" in start
+    assert "state.reviewConductor" in start
     assert "generation !== state.queueRequestSeq" in start
     assert "state.queueRequest = completion" in start
+    assert "state.queueStuckRequest = stuckCompletion" in start
+    assert "cancelAuxiliaryStuckRead()" in start
 
     # Parked recovery is already part of the installed snapshot; the drained
     # renderer performs no late GET that could replace the card a second time.
@@ -2453,6 +2977,8 @@ def test_empty_review_card_surfaces_orchestrator_health_and_restart(
 def test_empty_review_snapshot_key_ignores_heartbeat_churn(app_js: str):
     code = _strip_block_comments(app_js)
     keyer = _fn_body(code, "function reviewConductorSnapshotKey")
+    queue_keyer = _fn_body(code, "function reviewQueueSnapshotKey")
+    semantic = _fn_body(code, "function semanticQueueSnapshot")
     refresh = _fn_body(code, "function startQueueRefresh")
 
     assert "heartbeat_ts" not in keyer
@@ -2460,7 +2986,12 @@ def test_empty_review_snapshot_key_ignores_heartbeat_churn(app_js: str):
     assert "progress_age_seconds" not in keyer
     assert "conductorIsReady" in keyer
     assert "progress_stale" in keyer
-    assert "reviewConductorSnapshotKey(state.reviewConductor)" in refresh
+    assert "reviewConductorSnapshotKey(state.reviewConductor)" in queue_keyer
+    for volatile in (
+        "refreshing", "retry_after_seconds", "last_refresh_error"
+    ):
+        assert volatile not in semantic
+    assert "reviewQueueSnapshotKey(data)" in refresh
 
 
 def test_review_refresh_race_installs_only_newest_snapshot(app_js: str):
@@ -2475,6 +3006,91 @@ def test_review_refresh_race_installs_only_newest_snapshot(app_js: str):
         "requestCleared": True,
         "ended": 1,
         "abortedReads": 2,
+    }
+
+
+def test_queue_cold_start_prepares_and_retries_without_error_card(app_js: str):
+    result = _run_queue_warming_response(app_js)
+    assert result == {
+        "shown": ["Preparing review queue"],
+        "errors": 0,
+        "scheduled": True,
+        "freshness": "warming",
+        "requestCleared": True,
+        "stuckCleared": True,
+        "stuckAborts": 1,
+        "ended": 1,
+    }
+
+
+def test_queue_renders_before_auxiliary_stuck_read_finishes(app_js: str):
+    assert _run_queue_without_waiting_for_stuck(app_js) == {
+        "queueInstalled": True,
+        "pendingAfterQueue": True,
+        "stuckOpenAfterQueue": True,
+        "rendersAfterQueue": 1,
+        "stuckCount": 1,
+        "conductorAlive": True,
+        "pendingAfterStuck": False,
+        "rendersFinal": 2,
+        "ended": 1,
+    }
+
+
+def test_stale_ready_queue_refreshes_without_closing_open_issue(app_js: str):
+    assert _run_stale_ready_queue_refresh(app_js) == {
+        "queueReads": 2,
+        "firstMarker": "stale",
+        "installedMarker": "fresh",
+        "openedIssue": 171,
+        "preservedIssue": 171,
+        "renders": 1,
+        "retryDelay": 6000,
+        "ended": 2,
+    }
+
+
+def test_recovery_failure_is_unavailable_then_retried(app_js: str):
+    assert _run_stuck_failure_retry(app_js) == {
+        "afterFailure": {
+            "checked": False,
+            "unavailable": True,
+            "pending": False,
+            "activeRetries": 1,
+        },
+        "retryDelay": 6000,
+        "queueReads": 2,
+        "stuckReads": 2,
+        "checkedAfterRetry": True,
+        "unavailableAfterRetry": False,
+        "activeRetriesAfterSuccess": 0,
+        "renders": 2,
+    }
+
+
+def test_recovery_read_deadline_and_retry_are_separate(app_js: str):
+    code = _strip_block_comments(app_js)
+    scheduler = _fn_body(code, "function scheduleQueueWarmRetry")
+    start = _fn_body(code, "function startQueueRefresh")
+    drained = _fn_body(code, "function openFirstReadyIssue")
+
+    assert "var REVIEW_STUCK_READ_TIMEOUT_MS = 5000;" in code
+    assert "var QUEUE_STALE_RETRY_MS = 6000;" in code
+    assert "state.issue != null" not in scheduler
+    assert "state.issue !== null" not in scheduler
+    assert "state.reviewStuckChecked = false" in start
+    assert "state.reviewStuckUnavailable = true" in start
+    assert "QUEUE_STALE_RETRY_MS" in start
+    assert "state.reviewStuckUnavailable" in drained
+    assert "Recovery status is temporarily unavailable" in drained
+    assert '"automatically."' in drained
+
+
+def test_queue_telemetry_poll_does_not_remount_empty_review(app_js: str):
+    assert _run_queue_telemetry_render_count(app_js) == {
+        "telemetryKeyStable": True,
+        "newerSnapshotChangesKey": True,
+        "renders": 2,
     }
 
 

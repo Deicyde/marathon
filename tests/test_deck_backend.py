@@ -1008,6 +1008,25 @@ def test_unknown_verdict_refused(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _cached_queue_payload(marker: str, **extra) -> dict:
+    payload = {
+        "cards": [],
+        "building": 0,
+        "landed_today": 0,
+        "view_building": 0,
+        "unresolved": 0,
+        "awaiting_refinement": 0,
+        "needs_attention": 0,
+        "needs_citation_mapping": 0,
+        "awaiting_audit": 0,
+        "dependency_blocked": 0,
+        "other_unresolved": 0,
+        "marker": marker,
+    }
+    payload.update(extra)
+    return payload
+
+
 def test_queue_payload_coalesces_concurrent_builds_and_caches(tmp_path):
     """Several ThreadingHTTPServer readers share one expensive queue build."""
     server = deck_server.make_server(make_cfg(tmp_path), port=0)
@@ -1022,7 +1041,7 @@ def test_queue_payload_coalesces_concurrent_builds_and_caches(tmp_path):
             calls += 1
         started.set()
         assert release.wait(timeout=5)
-        return {"version": 1}
+        return _cached_queue_payload("version-1", version=1)
 
     try:
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -1031,52 +1050,339 @@ def test_queue_payload_coalesces_concurrent_builds_and_caches(tmp_path):
             ]
             assert started.wait(timeout=2)
             release.set()
-            assert [future.result(timeout=2) for future in futures] == [
-                {"version": 1}
+            assert [future.result(timeout=2)["version"] for future in futures] == [
+                1
             ] * 8
 
         # A sequential refresh inside the short TTL is also served without a
         # second GitHub/audit build.
         assert server.queue_payload(
             14, lambda: pytest.fail("unexpired queue cache must be reused")
-        ) == {"version": 1}
+        )["version"] == 1
         assert calls == 1
     finally:
         release.set()
         server.server_close()
 
 
-def test_queue_invalidation_detaches_an_old_inflight_build(tmp_path):
-    """A post-mutation GET never joins or caches a pre-mutation flight."""
+def test_queue_invalidation_serializes_superseded_and_current_builds(tmp_path):
+    """A mutation cannot publish old data or create overlapping rebuilds."""
     server = deck_server.make_server(make_cfg(tmp_path), port=0)
     old_started = Event()
     release_old = Event()
+    new_started = Event()
+    active_lock = Lock()
+    active = 0
+    peak_active = 0
 
     def build_old():
+        nonlocal active, peak_active
+        with active_lock:
+            active += 1
+            peak_active = max(peak_active, active)
         old_started.set()
         assert release_old.wait(timeout=5)
-        return {"version": "old"}
+        with active_lock:
+            active -= 1
+        return _cached_queue_payload("old", version="old")
+
+    def build_new():
+        nonlocal active, peak_active
+        with active_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        new_started.set()
+        with active_lock:
+            active -= 1
+        return _cached_queue_payload("new", version="new")
 
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
+        with ThreadPoolExecutor(max_workers=2) as pool:
             old = pool.submit(server.queue_payload, 14, build_old)
             assert old_started.wait(timeout=2)
             server.invalidate_queue_cache()
+            current = pool.submit(server.queue_payload, 14, build_new)
 
-            # This build starts immediately in the new generation; it does not
-            # wait for the stale flight that was already in progress.
-            assert server.queue_payload(
-                14, lambda: {"version": "new"}
-            ) == {"version": "new"}
+            # The old physical scan is allowed to finish but cannot publish;
+            # the queued current-generation scan starts afterward.
+            assert not new_started.wait(timeout=0.05)
             release_old.set()
-            assert old.result(timeout=2) == {"version": "old"}
+            assert new_started.wait(timeout=2)
+            assert old.result(timeout=2)["version"] == "new"
+            assert current.result(timeout=2)["version"] == "new"
 
-        # Completing the detached old flight must not overwrite the new cache.
+        assert peak_active == 1
         assert server.queue_payload(
             14, lambda: pytest.fail("old flight repopulated the queue cache")
-        ) == {"version": "new"}
+        )["version"] == "new"
     finally:
         release_old.set()
+        server.server_close()
+
+
+def test_expired_queue_returns_stale_immediately_and_single_flight(tmp_path):
+    server = deck_server.make_server(make_cfg(tmp_path), port=0)
+    release = Event()
+    started = Event()
+    calls = 0
+
+    def refresh():
+        nonlocal calls
+        calls += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return _cached_queue_payload("new")
+
+    try:
+        assert server.queue_payload(
+            14, lambda: _cached_queue_payload("old")
+        )["marker"] == "old"
+        with server._queue_lock:
+            server._queue_cache[14].expires_at = 0.0
+
+        replies = [
+            server.queue_payload(14, refresh, cold_wait_seconds=0.01)
+            for _ in range(6)
+        ]
+        assert started.wait(timeout=1)
+        assert calls == 1
+        assert [reply["marker"] for reply in replies] == ["old"] * 6
+        assert all(reply["queue_snapshot"]["state"] == "stale" for reply in replies)
+        assert all(reply["queue_snapshot"]["refreshing"] for reply in replies)
+
+        with server._queue_lock:
+            flight = server._queue_flights[14]
+        release.set()
+        assert flight.event.wait(timeout=2)
+        assert server.queue_payload(
+            14, lambda: pytest.fail("completed refresh was not cached")
+        )["marker"] == "new"
+    finally:
+        release.set()
+        server.server_close()
+
+
+def test_failed_queue_refresh_preserves_stale_and_uses_backoff(tmp_path):
+    server = deck_server.make_server(make_cfg(tmp_path), port=0)
+    release = Event()
+    started = Event()
+    calls = 0
+
+    def fail_refresh():
+        nonlocal calls
+        calls += 1
+        started.set()
+        assert release.wait(timeout=5)
+        raise RuntimeError("temporary GitHub failure")
+
+    try:
+        server.queue_payload(14, lambda: _cached_queue_payload("last-good"))
+        with server._queue_lock:
+            server._queue_cache[14].expires_at = 0.0
+
+        stale = server.queue_payload(14, fail_refresh)
+        assert stale["marker"] == "last-good"
+        assert stale["queue_snapshot"]["refreshing"] is True
+        assert started.wait(timeout=1)
+        with server._queue_lock:
+            flight = server._queue_flights[14]
+        release.set()
+        assert flight.event.wait(timeout=2)
+
+        backed_off = server.queue_payload(14, fail_refresh)
+        assert backed_off["marker"] == "last-good"
+        assert backed_off["queue_snapshot"]["refreshing"] is False
+        assert backed_off["queue_snapshot"]["retry_after_seconds"] >= 1
+        assert "temporary GitHub failure" in backed_off["queue_snapshot"][
+            "last_refresh_error"
+        ]
+        assert calls == 1
+    finally:
+        release.set()
+        server.server_close()
+
+
+def test_malformed_queue_candidate_is_never_published(tmp_path):
+    server = deck_server.make_server(make_cfg(tmp_path), port=0)
+    try:
+        with pytest.raises(TypeError, match="malformed payload"):
+            server.queue_payload(
+                14, lambda: {"cards": []}, cold_wait_seconds=1
+            )
+        with server._queue_lock:
+            assert 14 not in server._queue_cache
+            assert server._queue_retry_after[14] > monotonic()
+    finally:
+        server.server_close()
+
+
+def test_queue_cold_start_is_bounded_and_coalesced(tmp_path):
+    server = deck_server.make_server(make_cfg(tmp_path), port=0)
+    release = Event()
+    started = Event()
+    calls = 0
+
+    def slow_build():
+        nonlocal calls
+        calls += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return _cached_queue_payload("ready")
+
+    try:
+        before = monotonic()
+        with pytest.raises(deck_server.QueueRefreshPending, match="first snapshot"):
+            server.queue_payload(14, slow_build, cold_wait_seconds=0.02)
+        assert monotonic() - before < 0.5
+        assert started.wait(timeout=1)
+
+        with pytest.raises(deck_server.QueueRefreshPending, match="first snapshot"):
+            server.queue_payload(14, slow_build, cold_wait_seconds=0.02)
+        assert calls == 1
+        with server._queue_lock:
+            flight = server._queue_flights[14]
+        release.set()
+        assert flight.event.wait(timeout=2)
+        assert server.queue_payload(14, slow_build)["marker"] == "ready"
+        assert calls == 1
+    finally:
+        release.set()
+        server.server_close()
+
+
+def test_global_queue_worker_never_retains_request_actor_token(tmp_path):
+    """A shared cache never inherits either collaborator's OAuth lifetime."""
+    from marathon.review.github import _ACTOR_GH_TOKEN, actor_github_token
+
+    server = deck_server.make_server(make_cfg(tmp_path), port=0)
+    phase = 1
+    second_started = Event()
+    second_release = Event()
+    seen = []
+
+    def build():
+        seen.append(_ACTOR_GH_TOKEN.get())
+        if phase == 2:
+            second_started.set()
+            assert second_release.wait(timeout=5)
+        return _cached_queue_payload(f"phase-{phase}", phase=phase)
+
+    try:
+        with actor_github_token("alice-short-lived-token"):
+            assert server.queue_payload(14, build)["phase"] == 1
+        assert seen == [None]
+
+        phase = 2
+        with actor_github_token("bob-short-lived-token"):
+            server.invalidate_queue_cache()
+            assert second_started.wait(timeout=1)
+        with server._queue_lock:
+            flight = server._queue_flights[14]
+        second_release.set()
+        assert flight.event.wait(timeout=2)
+        assert seen == [None, None]
+        assert server.queue_payload(14, build)["phase"] == 2
+    finally:
+        second_release.set()
+        server.server_close()
+
+
+def test_server_close_bounds_wait_and_blocks_late_queue_publication(tmp_path):
+    cfg = make_cfg(tmp_path)
+    server = deck_server.make_server(cfg, port=0)
+    started = Event()
+    release = Event()
+    calls = 0
+
+    def blocked_build():
+        nonlocal calls
+        calls += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return _cached_queue_payload("must-not-publish")
+
+    try:
+        with pytest.raises(deck_server.QueueRefreshPending):
+            server.queue_payload(14, blocked_build, cold_wait_seconds=0.01)
+        assert started.wait(timeout=1)
+        # Queue a newer generation while the one physical build is blocked;
+        # closing must suppress both its result and the deferred successor.
+        server.invalidate_queue_cache()
+        with server._queue_lock:
+            worker = next(iter(server._queue_workers))
+
+        before = monotonic()
+        server.server_close()
+        assert monotonic() - before < 0.75
+
+        release.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert calls == 1
+        assert not deck_server._queue_cache_path(cfg.repo_dir, 14).exists()
+        with server._queue_lock:
+            assert server._queue_flights == {}
+            assert server._queue_workers == set()
+            assert 14 not in server._queue_cache
+    finally:
+        release.set()
+        server.server_close()
+
+
+def test_queue_last_good_survives_restart_but_never_authorizes_ship(tmp_path):
+    cfg = make_cfg(tmp_path)
+    payload = _cached_queue_payload("durable")
+    payload["cards"] = [{"id": 22, "ready": True, "shippable": True}]
+    first = deck_server.make_server(cfg, port=0)
+    try:
+        assert first.queue_payload(14, lambda: payload)["marker"] == "durable"
+        path = deck_server._queue_cache_path(cfg.repo_dir, 14)
+        deadline = monotonic() + 2
+        while not path.is_file() and monotonic() < deadline:
+            Event().wait(0.01)
+        assert path.is_file()
+        assert (path.parent / ".gitignore").read_text() == "*\n"
+    finally:
+        first.server_close()
+
+    second = deck_server.make_server(cfg, port=0)
+    release = Event()
+    started = Event()
+
+    def refresh():
+        started.set()
+        assert release.wait(timeout=5)
+        return _cached_queue_payload("fresh")
+
+    try:
+        restored = second.queue_payload(14, refresh, cold_wait_seconds=0.01)
+        assert restored["marker"] == "durable"
+        assert restored["queue_snapshot"]["state"] == "stale"
+        assert restored["queue_snapshot"]["refreshing"] is True
+        assert started.wait(timeout=1)
+        assert second.cached_issue_reviewability(cfg, 22) is None
+    finally:
+        release.set()
+        second.server_close()
+
+
+def test_corrupt_persisted_queue_is_not_presented_as_caught_up(tmp_path):
+    cfg = make_cfg(tmp_path)
+    path = deck_server._queue_cache_path(cfg.repo_dir, 14)
+    path.parent.mkdir(parents=True)
+    path.write_text('{"schema_version": 1, "chapter": 14, "payload": {}}')
+    server = deck_server.make_server(cfg, port=0)
+    release = Event()
+
+    def slow_build():
+        assert release.wait(timeout=5)
+        return _cached_queue_payload("fresh")
+
+    try:
+        with pytest.raises(deck_server.QueueRefreshPending):
+            server.queue_payload(14, slow_build, cold_wait_seconds=0.01)
+    finally:
+        release.set()
         server.server_close()
 
 
@@ -1315,10 +1621,44 @@ def test_get_queue_is_pure_no_verdict(running_server, monkeypatch):
     assert "jobs" in json.loads(sbody)
 
 
+def test_get_queue_cold_start_returns_retryable_warming_state(
+    running_server, monkeypatch,
+):
+    server, base, _token = running_server
+
+    def pending(*_args, **_kwargs):
+        raise deck_server.QueueRefreshPending("preparing first snapshot")
+
+    monkeypatch.setattr(server, "queue_payload", pending)
+    try:
+        status, raw = _get(base + "/api/queue?chapter=14")
+    except urllib.error.HTTPError as exc:
+        status, raw = exc.code, exc.read().decode("utf-8")
+    payload = json.loads(raw)
+
+    assert status == 503
+    assert payload["ok"] is False
+    assert payload["queue_snapshot"] == {
+        "state": "warming",
+        "refreshing": True,
+        "saved_at": None,
+    }
+
+
 def test_successful_queue_mutation_invalidates_cache(running_server, monkeypatch):
     """A mutation cannot leave the server-side queue snapshot cached."""
     server, base, token = running_server
-    server.queue_payload(14, lambda: {"version": 1})
+    version = 1
+    refresh_started = Event()
+    refresh_release = Event()
+
+    def build():
+        if version == 2:
+            refresh_started.set()
+            assert refresh_release.wait(timeout=5)
+        return _cached_queue_payload(f"version-{version}", version=version)
+
+    server.queue_payload(14, build)
 
     from marathon.deck import refresh as refresh_mod
 
@@ -1327,6 +1667,7 @@ def test_successful_queue_mutation_invalidates_cache(running_server, monkeypatch
         "refresh_issue_signatures",
         lambda cfg, issue: {"ok": True, "updated": True, "issue": issue},
     )
+    version = 2
     status, raw = _post(
         base + "/api/refresh-issue",
         {"issue": 22},
@@ -1334,12 +1675,16 @@ def test_successful_queue_mutation_invalidates_cache(running_server, monkeypatch
     )
     assert status == 200
     assert json.loads(raw)["ok"] is True
+    assert refresh_started.wait(timeout=1)
 
-    builds = []
-    assert server.queue_payload(
-        14, lambda: builds.append(1) or {"version": 2}
-    ) == {"version": 2}
-    assert builds == [1]
+    stale = server.queue_payload(14, build)
+    assert stale["version"] == 1
+    assert stale["queue_snapshot"]["state"] == "stale"
+    with server._queue_lock:
+        flight = server._queue_flights[14]
+    refresh_release.set()
+    assert flight.event.wait(timeout=2)
+    assert server.queue_payload(14, build)["version"] == 2
 
 
 def test_successful_graph_mutation_invalidates_cache(running_server, monkeypatch):
@@ -1460,7 +1805,15 @@ def test_queue_cache_invalidates_before_mutation_response(
 ):
     """An immediate browser refresh cannot beat post-action invalidation."""
     server, base, token = running_server
-    server.queue_payload(14, lambda: {"version": 1})
+    version = 1
+    refreshed = Event()
+
+    def build():
+        if version == 2:
+            refreshed.set()
+        return _cached_queue_payload(f"version-{version}", version=version)
+
+    server.queue_payload(14, build)
 
     from marathon.deck import refresh as refresh_mod
 
@@ -1480,6 +1833,7 @@ def test_queue_cache_invalidates_before_mutation_response(
 
     monkeypatch.setattr(server, "invalidate_queue_cache", block_after_invalidation)
     try:
+        version = 2
         with ThreadPoolExecutor(max_workers=1) as pool:
             response = pool.submit(
                 _post,
@@ -1487,11 +1841,24 @@ def test_queue_cache_invalidates_before_mutation_response(
                 {"issue": 22},
                 {deck_server.TOKEN_HEADER: token},
             )
-            assert invalidated.wait(timeout=2)
-            assert server.queue_payload(
-                14, lambda: {"version": 2}
-            ) == {"version": 2}
-            release_response.set()
+            try:
+                assert invalidated.wait(timeout=2)
+                assert refreshed.wait(timeout=2)
+                observed = server.queue_payload(14, build)
+                if observed["version"] == 1:
+                    # A request may briefly receive pre-mutation data, but it
+                    # is never mistaken for current: SWR labels it stale while
+                    # the post-mutation generation publishes in background.
+                    assert observed["queue_snapshot"]["state"] == "stale"
+                else:
+                    assert observed["version"] == 2
+                with server._queue_lock:
+                    flight = server._queue_flights.get(14)
+                if flight is not None:
+                    assert flight.event.wait(timeout=2)
+                assert server.queue_payload(14, build)["version"] == 2
+            finally:
+                release_response.set()
             status, raw = response.result(timeout=2)
     finally:
         release_response.set()
@@ -1503,14 +1870,16 @@ def test_queue_cache_invalidates_before_mutation_response(
 def test_rejected_post_does_not_invalidate_queue_cache(running_server):
     """Bad clients cannot detach a live flight or evict a completed queue."""
     server, base, _token = running_server
-    server.queue_payload(14, lambda: {"version": 1})
+    server.queue_payload(
+        14, lambda: _cached_queue_payload("version-1", version=1)
+    )
 
     status, _raw = _post(base + "/api/refresh-issue", {"issue": 22})
 
     assert status == 403
     assert server.queue_payload(
         14, lambda: pytest.fail("rejected POST evicted the queue cache")
-    ) == {"version": 1}
+    )["version"] == 1
 
 
 def test_definition_lookup_and_term_index_routes(running_server):
@@ -1559,7 +1928,15 @@ def test_reconciliation_preview_and_guarded_decision_routes(
     assert status == 200
     assert json.loads(raw)["proposed_renames"] == [proposal]
 
-    server.queue_payload(14, lambda: {"version": 1})
+    version = 1
+    refreshed = Event()
+
+    def build():
+        if version == 2:
+            refreshed.set()
+        return _cached_queue_payload(f"version-{version}", version=version)
+
+    server.queue_payload(14, build)
 
     seen = {}
     monkeypatch.setattr(
@@ -1570,6 +1947,7 @@ def test_reconciliation_preview_and_guarded_decision_routes(
             or {"ok": True, "updated": True, "renamed": [proposal]}
         ),
     )
+    version = 2
     status, raw = _post(
         base + "/api/reconcile-proposal",
         {
@@ -1585,9 +1963,8 @@ def test_reconciliation_preview_and_guarded_decision_routes(
     assert status == 200 and json.loads(raw)["updated"] is True
     assert seen["issue"] == 22
     assert seen["confirmation"]["renames"] == [proposal]
-    assert server.queue_payload(
-        14, lambda: {"version": 2}
-    ) == {"version": 2}
+    assert refreshed.wait(timeout=2)
+    assert server.queue_payload(14, build)["version"] == 2
 
     status, _raw = _post(
         base + "/api/reconcile-proposal",

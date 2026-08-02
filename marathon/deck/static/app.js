@@ -114,8 +114,20 @@
     };
     if (options.signal) request.signal = options.signal;
     return fetch(url, request).then(function (r) {
-      if (!r.ok) throw new Error("HTTP " + r.status + " for " + url);
-      return r.json();
+      return r.json().then(function (data) {
+        if (!r.ok) {
+          var err = new Error(
+            (data && (data.message || data.error)) ||
+              "HTTP " + r.status + " for " + url
+          );
+          err.status = r.status;
+          err.data = data || null;
+          throw err;
+        }
+        return data;
+      }, function () {
+        throw new Error("HTTP " + r.status + " returned invalid JSON for " + url);
+      });
     });
   }
 
@@ -525,17 +537,25 @@
     // two-step choice.  Overrides are per issue+decl and live only in this tab.
     dependencyOverrides: {},
     subdeckRequestSeq: 0, // discards stale async GETs after issue/navigation changes
-    // Queue + parked-recovery data form one Review snapshot. A retry aborts
-    // and supersedes any pending read; the generation guard makes the older
-    // response inert even when AbortController is unavailable.
+    // Queue is the primary Review snapshot; parked-recovery data enriches it
+    // independently. A retry aborts both reads, and generation guards make
+    // older responses inert even when AbortController is unavailable.
     queueRequest: null,
     queueAbortController: null,
+    queueStuckRequest: null,
+    queueStuckAbortController: null,
     queueRequestSeq: 0,
     queueSnapshotKey: null,
     queueRenderedKey: null,
+    queueFreshness: null,
+    queueWarmRetryTimer: null,
     reviewStuck: { issues: [], repo: null },
-    // The same conductor snapshot shown in Status, loaded atomically with the
-    // queue so an empty Review card can explain (and repair) a stopped host.
+    reviewStuckChecked: false,
+    reviewStuckPending: false,
+    reviewStuckUnavailable: false,
+    // The lightweight conductor snapshot bundled into /api/stuck lets an
+    // empty Review card explain (and repair) a stopped host once that
+    // independent best-effort read settles.
     reviewConductor: null,
     activeTab: "review", // review | files | graph | status | issues | history
     filesChapter: "",   // "" = server default, "all" = project-wide reader
@@ -3674,10 +3694,39 @@
     ];
   }
 
+  function semanticQueueSnapshot(data) {
+    var semantic = {};
+    Object.keys(data || {}).forEach(function (key) {
+      if (key !== "queue_snapshot") semantic[key] = data[key];
+    });
+    var freshness = data && data.queue_snapshot;
+    if (freshness) {
+      // These two fields affect the visible stale/cold explanation. Volatile
+      // transport telemetry does not, so polling cannot remount the card.
+      semantic.queue_snapshot = {
+        state: freshness.state || null,
+        saved_at: freshness.saved_at || null,
+      };
+    }
+    return semantic;
+  }
+
+  function reviewQueueSnapshotKey(data) {
+    return JSON.stringify([
+      semanticQueueSnapshot(data),
+      state.reviewStuck,
+      state.reviewStuckPending,
+      state.reviewStuckUnavailable,
+      reviewConductorSnapshotKey(state.reviewConductor),
+      state.conductorStartBusy,
+      state.conductorStartError,
+    ]);
+  }
+
   // Open the subdeck for the first ready issue, or explain why none are ready.
-  // Queue + stuck are installed as one snapshot by refreshQueue(), so a drained
-  // Review paints exactly once instead of briefly showing "caught up" before a
-  // second request replaces it with parked-recovery rows.
+  // Queue renders without waiting for recovery status.  If that auxiliary read
+  // is still pending, the empty card says so rather than briefly claiming the
+  // project is caught up; a generation-safe completion then enriches the view.
   function openFirstReadyIssue() {
     var ready = readyIssues();
     if (!ready.length) {
@@ -3713,14 +3762,16 @@
         });
       }
       var stuckSnapshot = state.reviewStuck || { issues: [], repo: null };
-      var stuck = stuckSnapshot.issues || [];
+      var stuck = (state.reviewStuckPending || state.reviewStuckUnavailable)
+        ? [] : (stuckSnapshot.issues || []);
       if (stuck.length) {
         actions.unshift({
           label: "Open recovery (" + stuck.length + ")",
           onClick: function () { switchTab("issues"); },
         });
       }
-      var conductor = state.reviewConductor;
+      var conductor = (state.reviewStuckPending || state.reviewStuckUnavailable)
+        ? null : state.reviewConductor;
       var conductorReady = conductorIsReady(conductor);
       var conductorProblem = conductor &&
         (!conductorReady || !!conductor.degraded || !!conductor.progress_stale);
@@ -3757,12 +3808,26 @@
           },
         });
       }
+      var freshnessNote = state.queueFreshness &&
+        state.queueFreshness.state === "stale"
+          ? " This is the last saved queue while the server refreshes it; " +
+            "the page will update automatically."
+          : "";
+      var stuckPendingNote = state.reviewStuckPending
+        ? " Checking parked issues and orchestrator health in the background."
+        : "";
+      var stuckUnavailableNote = state.reviewStuckUnavailable
+        ? " Recovery status is temporarily unavailable; it will retry " +
+          "automatically."
+        : "";
       showMessageCard({
         title: unresolved
           ? (provisional.length
             ? "No issues ready to ship — blocked code is reviewable"
             : "No issues ready for review")
-          : "All caught up",
+          : (state.reviewStuckPending
+            ? "Queue loaded — checking issue status"
+            : "All caught up"),
         body: queueBlockerSummary() + (conductorProblem
           ? (!conductorReady
             ? (!conductor.alive
@@ -3784,7 +3849,7 @@
             " available for provisional, source-ordered review. Decisions are " +
             "bound to the exact code shown and reopen automatically if it changes; " +
             "shipping stays blocked until predecessors resolve."
-          : ""),
+          : "") + freshnessNote + stuckPendingNote + stuckUnavailableNote,
         actions: actions,
       });
       state.queueRenderedKey = state.queueSnapshotKey;
@@ -5571,9 +5636,47 @@
 
   // === queue / chapter =====================================================
   var QUEUE_READ_TIMEOUT_MS = 45000;
+  var REVIEW_STUCK_READ_TIMEOUT_MS = 5000;
+  var QUEUE_WARM_RETRY_MS = 2000;
+  var QUEUE_STALE_RETRY_MS = 6000;
+
+  function abortQueueReads() {
+    if (state.queueAbortController) state.queueAbortController.abort();
+    if (state.queueStuckAbortController) {
+      state.queueStuckAbortController.abort();
+    }
+  }
+
+  function scheduleQueueWarmRetry(generation, delayMs, minimumMs) {
+    if (state.queueWarmRetryTimer) {
+      clearTimeout(state.queueWarmRetryTimer);
+      state.queueWarmRetryTimer = null;
+    }
+    var delay = Math.max(
+      Number(minimumMs) || QUEUE_WARM_RETRY_MS,
+      Number(delayMs) || 0
+    );
+    state.queueWarmRetryTimer = setTimeout(function () {
+      state.queueWarmRetryTimer = null;
+      if (generation !== state.queueRequestSeq ||
+          state.activeTab !== "review") return;
+      var nextGeneration = ++state.queueRequestSeq;
+      abortQueueReads();
+      // This is a quiet observation of the server's background refresh.  Keep
+      // the mounted Review card intact; only a changed completed snapshot may
+      // repaint it, avoiding the old retry/loading flicker.
+      startQueueRefresh(
+        nextGeneration, surfaceHasStableContent(stage())
+      );
+    }, delay);
+  }
 
   function refreshQueue() {
     setActionsEnabled(false);
+    if (state.queueWarmRetryTimer) {
+      clearTimeout(state.queueWarmRetryTimer);
+      state.queueWarmRetryTimer = null;
+    }
     var generation = ++state.queueRequestSeq;
     var hadContent = beginSurfaceRefresh(
       stage(), "card-loading", "refreshing queue…"
@@ -5582,39 +5685,100 @@
     // left pending. Abort it when supported and immediately start a newer
     // generation; without AbortController the generation guard still makes
     // the older response observationally inert.
-    if (state.queueAbortController) state.queueAbortController.abort();
+    abortQueueReads();
     return startQueueRefresh(generation, hadContent);
   }
 
   function startQueueRefresh(generation, hadContent) {
-    // Parked issues and lightweight conductor health share /api/stuck, so
-    // Review adds no second expensive Status read to its latency-sensitive
-    // queue request. The auxiliary read remains best-effort.
+    // Queue data is the primary Review read. Parked/recovery status is useful
+    // context, but it must never hold a usable queue behind a slow endpoint.
+    // Run it independently with its own deadline/controller and merge it only
+    // when this generation is still current.
     var controller = newReadController();
     var options = readOptions(controller);
-    var request = withReadDeadline(Promise.all([
-      fetchQueue(null, options),
-      getJSON("/api/stuck", options).then(function (data) {
-        return { ok: true, data: data || {} };
-      }, function () {
-        return { ok: false, data: null };
-      }),
-    ]), QUEUE_READ_TIMEOUT_MS, controller, "Queue refresh");
-    var completion = request.then(function (parts) {
-      if (generation !== state.queueRequestSeq) return null;
-      var data = parts[0] || {};
-      var stuckRead = parts[1] || { ok: false };
-      var stuckSnapshot = stuckRead.ok
-        ? {
-            issues: ((stuckRead.data && stuckRead.data.issues) || []).slice(),
-            repo: (stuckRead.data && stuckRead.data.repo) || null,
-          }
-        : state.reviewStuck;
-      var conductorSnapshot = stuckRead.ok
-        ? (stuckRead.data && stuckRead.data.conductor)
-        : state.reviewConductor;
+    var stuckController = newReadController();
+    var stuckOptions = readOptions(stuckController);
+    var installedQueueData = null;
+    var stuckSettled = false;
+    var stuckCancelledByPrimary = false;
+    var stuckNeedsRetry = false;
+    var queueRenderPending = false;
 
-      // Install the read model atomically before a single render.
+    var stuckRequest = withReadDeadline(
+      getJSON("/api/stuck", stuckOptions),
+      REVIEW_STUCK_READ_TIMEOUT_MS,
+      stuckController,
+      "Recovery-status refresh"
+    ).then(function (data) {
+      return { ok: true, data: data || {} };
+    }, function () {
+      return { ok: false, data: null };
+    });
+    var stuckCompletion = stuckRequest.then(function (stuckRead) {
+      stuckSettled = true;
+      var currentStuck = state.queueStuckRequest === stuckCompletion;
+      if (currentStuck) {
+        state.queueStuckRequest = null;
+        if (state.queueStuckAbortController === stuckController) {
+          state.queueStuckAbortController = null;
+        }
+      }
+      if (stuckCancelledByPrimary || generation !== state.queueRequestSeq) {
+        return stuckRead;
+      }
+      state.reviewStuckPending = false;
+      if (stuckRead.ok) {
+        state.reviewStuckChecked = true;
+        state.reviewStuckUnavailable = false;
+        state.reviewStuck = {
+          issues: ((stuckRead.data && stuckRead.data.issues) || []).slice(),
+          repo: (stuckRead.data && stuckRead.data.repo) || null,
+        };
+        state.reviewConductor =
+          (stuckRead.data && stuckRead.data.conductor) || null;
+      } else {
+        state.reviewStuckChecked = false;
+        state.reviewStuckUnavailable = true;
+        stuckNeedsRetry = true;
+      }
+      if (installedQueueData) {
+        state.queueSnapshotKey = reviewQueueSnapshotKey(installedQueueData);
+        if (!queueRenderPending && state.issue == null) openFirstReadyIssue();
+        if (stuckNeedsRetry) {
+          scheduleQueueWarmRetry(
+            generation, QUEUE_STALE_RETRY_MS, QUEUE_STALE_RETRY_MS
+          );
+        }
+      }
+      return stuckRead;
+    });
+    state.queueStuckRequest = stuckCompletion;
+    state.queueStuckAbortController = stuckController;
+
+    function cancelAuxiliaryStuckRead() {
+      stuckCancelledByPrimary = true;
+      if (stuckController) stuckController.abort();
+      if (generation === state.queueRequestSeq) {
+        state.reviewStuckPending = false;
+      }
+    }
+
+    var request = withReadDeadline(
+      fetchQueue(null, options),
+      QUEUE_READ_TIMEOUT_MS,
+      controller,
+      "Queue refresh"
+    );
+    var completion = request.then(function (data) {
+      if (generation !== state.queueRequestSeq) return null;
+      data = data || {};
+      installedQueueData = data;
+      queueRenderPending = true;
+      state.reviewStuckPending = !state.reviewStuckChecked && !stuckSettled;
+      if (state.reviewStuckPending) state.reviewStuckUnavailable = false;
+
+      // Install and render the useful queue immediately.  The independent
+      // recovery read above may enrich an empty Review card later.
       state.queue = (data.cards || []).slice();
       state.building = data.building || 0;
       state.viewBuilding = data.view_building || 0;
@@ -5626,24 +5790,57 @@
       state.awaitingAudit = data.awaiting_audit || 0;
       state.dependencyBlocked = data.dependency_blocked || 0;
       state.otherUnresolved = data.other_unresolved || 0;
-      state.reviewStuck = stuckSnapshot || { issues: [], repo: null };
-      state.reviewConductor = conductorSnapshot || null;
-      state.queueSnapshotKey = JSON.stringify([
-        data,
-        state.reviewStuck,
-        reviewConductorSnapshotKey(state.reviewConductor),
-        state.conductorStartBusy,
-        state.conductorStartError,
-      ]);
+      state.queueFreshness = data.queue_snapshot || null;
+      state.queueSnapshotKey = reviewQueueSnapshotKey(data);
       applyStatus({ building: state.building, landed_today: state.landedToday });
 
-      // The queue is the issue PICKER: drop straight into the first ready
-      // issue's subdeck (auto-pick). If the human opened another issue while
-      // this read was pending, update caches only and preserve that newer view.
-      if (state.issue == null) openFirstReadyIssue();
-      return parts;
+      // Two microtask turns coalesce an already-completed auxiliary read
+      // without waiting on one that is actually slow.  The queue state above
+      // is installed immediately; this only avoids painting an intermediate
+      // empty card when /api/stuck finished in the same event-loop turn.
+      return Promise.resolve().then(function () {
+        return Promise.resolve();
+      }).then(function () {
+        queueRenderPending = false;
+        if (generation !== state.queueRequestSeq) return null;
+        state.queueSnapshotKey = reviewQueueSnapshotKey(data);
+        // The queue is the issue PICKER: drop straight into the first ready
+        // issue's subdeck. Preserve a newer issue opened while reads settled.
+        if (state.issue == null) openFirstReadyIssue();
+        if (state.queueFreshness && state.queueFreshness.state === "stale") {
+          scheduleQueueWarmRetry(
+            generation,
+            1000 * (state.queueFreshness.retry_after_seconds || 0),
+            QUEUE_STALE_RETRY_MS
+          );
+        } else if (stuckNeedsRetry || state.reviewStuckUnavailable) {
+          scheduleQueueWarmRetry(
+            generation, QUEUE_STALE_RETRY_MS, QUEUE_STALE_RETRY_MS
+          );
+        } else if (state.queueWarmRetryTimer) {
+          clearTimeout(state.queueWarmRetryTimer);
+          state.queueWarmRetryTimer = null;
+        }
+        return data;
+      });
     }, function (err) {
       if (generation !== state.queueRequestSeq) return null;
+      // A primary timeout/warming response must not leave an auxiliary
+      // /api/stuck fetch alive across automatic retries.
+      cancelAuxiliaryStuckRead();
+      var queueSnapshot = err && err.data && err.data.queue_snapshot;
+      if (queueSnapshot && queueSnapshot.state === "warming") {
+        state.queueFreshness = queueSnapshot;
+        if (!hadContent && !surfaceHasStableContent(stage())) {
+          showMessageCard({
+            title: "Preparing review queue",
+            body: "The server is building the first queue snapshot. This page " +
+              "will update automatically; no manual retry is needed.",
+          });
+        }
+        scheduleQueueWarmRetry(generation, QUEUE_WARM_RETRY_MS);
+        return null;
+      }
       if (hadContent || surfaceHasStableContent(stage())) {
         endSurfaceRefresh(stage());
         if (state.activeTab === "review") {
@@ -5674,6 +5871,7 @@
         }
       }
       if (generation !== state.queueRequestSeq) return null;
+      cancelAuxiliaryStuckRead();
       endSurfaceRefresh(stage());
       if (hadContent || surfaceHasStableContent(stage())) {
         if (state.activeTab === "review") {

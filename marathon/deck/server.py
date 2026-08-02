@@ -61,11 +61,14 @@ import json
 import os
 import re
 import secrets
+import threading
 import webbrowser
+from contextvars import Context
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from time import monotonic
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -162,12 +165,37 @@ MAX_INFORMAL_SOURCE_BYTES = 5 * 1024 * 1024
 INFORMAL_SOURCE_SUFFIXES = frozenset({".md", ".markdown", ".txt"})
 MAX_REVIEW_SOURCE_BYTES = 2 * 1024 * 1024
 
-# Queue assembly may include GitHub and source/audit reads.  Keep its result
-# briefly so a browser refresh (or several tabs opening together) does not
-# repeat the same work.  This is deliberately an in-process cache only; every
-# recognized POST invalidates it, and the short TTL bounds drift caused by
-# external GitHub changes.
-QUEUE_CACHE_TTL_SECONDS = 5.0
+# Queue assembly may include GitHub and source/audit reads and can take longer
+# than an HTTP proxy's request budget.  A completed result stays available as
+# the last-known-good snapshot after this freshness TTL: the next read returns
+# it immediately while one background refresh runs.  The last good snapshot is
+# also persisted under the consumer repo's ignored ``.marathon`` runtime area,
+# so restarting the deck does not turn an otherwise healthy review page into a
+# long, empty cold start.
+QUEUE_CACHE_TTL_SECONDS = 60.0
+
+# A brand-new installation has no honest snapshot to serve.  Give its first
+# background build a small bounded chance to finish; after that /api/queue
+# returns a retryable 503 instead of hanging until Cloudflare/browser timeout.
+QUEUE_COLD_START_WAIT_SECONDS = 3.0
+QUEUE_REFRESH_ERROR_BACKOFF_SECONDS = 10.0
+QUEUE_WORKER_SHUTDOWN_WAIT_SECONDS = 0.25
+
+_QUEUE_CACHE_SCHEMA_VERSION = 1
+_QUEUE_CACHE_DIRNAME = "deck-queue-cache"
+_QUEUE_CACHE_MAX_BYTES = 16 * 1024 * 1024
+_QUEUE_PAYLOAD_COUNT_KEYS = (
+    "building",
+    "landed_today",
+    "view_building",
+    "unresolved",
+    "awaiting_refinement",
+    "needs_attention",
+    "needs_citation_mapping",
+    "awaiting_audit",
+    "dependency_blocked",
+    "other_unresolved",
+)
 
 # The project graph is substantially more expensive than the queue: it spans
 # every registered chapter, reconciles current source, and projects audit
@@ -208,13 +236,39 @@ _PROJECT_GRAPH_MUTATING_POST_ROUTES = frozenset({
 
 
 class _QueueFlight:
-    """One queue build shared by concurrent readers of the same chapter."""
+    """One physical queue build shared by readers of the same chapter."""
 
-    def __init__(self, generation: int):
+    def __init__(self, generation: int, build: Callable[[], dict]):
         self.generation = generation
+        self.build = build
         self.event = Event()
         self.payload: Optional[dict] = None
         self.error: Optional[BaseException] = None
+
+
+class _QueueSnapshot:
+    """One validated last-known-good payload and its freshness metadata."""
+
+    def __init__(
+        self,
+        payload: dict,
+        *,
+        expires_at: float,
+        saved_at: str,
+        generation: int,
+    ):
+        self.payload = payload
+        self.expires_at = expires_at
+        self.saved_at = saved_at
+        self.generation = generation
+
+
+class QueueRefreshPending(RuntimeError):
+    """The bounded cold-start wait elapsed while the queue is still building."""
+
+    def __init__(self, message: str, *, refreshing: bool = True):
+        super().__init__(message)
+        self.refreshing = refreshing
 
 
 class _ProjectGraphFlight:
@@ -225,6 +279,120 @@ class _ProjectGraphFlight:
         self.event = Event()
         self.payload: Optional[dict] = None
         self.error: Optional[BaseException] = None
+
+
+def _queue_cache_path(repo_dir: Path, chapter: Optional[int]) -> Path:
+    """Return the repo-local runtime path for one queue view."""
+    name = "all" if chapter is None else f"chapter-{chapter}"
+    return (
+        Path(repo_dir) / ".marathon" / "review" / _QUEUE_CACHE_DIRNAME
+        / f"{name}.json"
+    )
+
+
+def _valid_queue_payload(payload: object) -> bool:
+    """Reject corrupt/foreign durable snapshots before presenting them.
+
+    This cache is never authoritative for shipping, but a malformed runtime
+    file must still not make the Review page claim that work is complete.
+    Validate every counter and the minimum card identity/readiness shape.
+    Unknown additive fields remain forwards-compatible.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("cards"), list):
+        return False
+    for key in _QUEUE_PAYLOAD_COUNT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return False
+    for card in payload["cards"]:
+        if not isinstance(card, dict):
+            return False
+        issue = card.get("id")
+        if isinstance(issue, bool) or not isinstance(issue, int) or issue <= 0:
+            return False
+        if not isinstance(card.get("ready"), bool):
+            return False
+    return True
+
+
+def _read_queue_snapshot(
+    repo_dir: Path, chapter: Optional[int], generation: int
+) -> Optional[_QueueSnapshot]:
+    """Load one durable last-good queue as stale, failing closed on damage."""
+    path = _queue_cache_path(repo_dir, chapter)
+    try:
+        if path.stat().st_size > _QUEUE_CACHE_MAX_BYTES:
+            return None
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    if document.get("schema_version") != _QUEUE_CACHE_SCHEMA_VERSION:
+        return None
+    stored_chapter = document.get("chapter")
+    if isinstance(stored_chapter, bool) or stored_chapter != chapter:
+        return None
+    saved_at = document.get("saved_at")
+    payload = document.get("payload")
+    if not isinstance(saved_at, str) or not saved_at or not _valid_queue_payload(payload):
+        return None
+    return _QueueSnapshot(
+        payload,
+        expires_at=0.0,  # monotonic deadlines cannot survive a process restart
+        saved_at=saved_at,
+        generation=generation - 1,  # durable snapshots are always presented stale
+    )
+
+
+def _write_queue_snapshot(
+    repo_dir: Path,
+    chapter: Optional[int],
+    payload: dict,
+    saved_at: str,
+) -> None:
+    """Durably and atomically replace one validated last-good queue."""
+    if not _valid_queue_payload(payload):
+        return
+    path = _queue_cache_path(repo_dir, chapter)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # This is droppable runtime state inside the consumer checkout.  Make the
+    # directory self-ignoring so a first deck run cannot dirty the Lean repo or
+    # accidentally include cached issue text in a future proof-worker bundle.
+    gitignore = path.parent / ".gitignore"
+    if not gitignore.is_file():
+        gitignore.write_text("*\n", encoding="utf-8")
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    document = {
+        "schema_version": _QUEUE_CACHE_SCHEMA_VERSION,
+        "chapter": chapter,
+        "saved_at": saved_at,
+        "payload": payload,
+    }
+    try:
+        encoded = json.dumps(
+            document, ensure_ascii=False, indent=2, sort_keys=True
+        ) + "\n"
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(directory_fd)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _repo_informal_source(repo_dir: Path, raw: str) -> Path:
@@ -356,9 +524,16 @@ class DeckServer(ThreadingHTTPServer):
         # stampede GitHub and the local audit store.  Builders run outside this
         # lock; only the tiny cache/flight registry is protected by it.
         self._queue_lock = Lock()
-        self._queue_cache: dict[Optional[int], tuple[float, dict]] = {}
+        self._queue_cache: dict[Optional[int], _QueueSnapshot] = {}
         self._queue_flights: dict[Optional[int], _QueueFlight] = {}
+        self._queue_builders: dict[Optional[int], Callable[[], dict]] = {}
+        self._queue_errors: dict[Optional[int], str] = {}
+        self._queue_retry_after: dict[Optional[int], float] = {}
+        self._queue_persisted_loaded: set[Optional[int]] = set()
         self._queue_generation = 0
+        self._queue_shutdown = Event()
+        self._queue_workers: set[Thread] = set()
+        self._queue_persist_lock = Lock()
         self._project_graph_lock = Lock()
         self._project_graph_cache: Optional[tuple[float, dict]] = None
         self._project_graph_flight: Optional[_ProjectGraphFlight] = None
@@ -402,6 +577,7 @@ class DeckServer(ThreadingHTTPServer):
         nonblocking: stopping the review UI must not wait for a Lake/Verso
         subprocess that was already in flight.
         """
+        self._stop_queue_workers()
         with self._verso_close_lock:
             if not self._verso_closed:
                 self._verso_closed = True
@@ -413,70 +589,277 @@ class DeckServer(ThreadingHTTPServer):
                         pass
         super().server_close()
 
-    def queue_payload(
-        self, chapter: Optional[int], build: Callable[[], dict]
-    ) -> dict:
-        """Return a fresh-enough queue payload, sharing one concurrent build.
+    def _stop_queue_workers(self) -> None:
+        """Close queue publication and briefly reap cooperative workers.
 
-        A failed build is never cached, but its exception is delivered to all
-        readers that joined that flight.  Invalidation detaches old flights so
-        a GET that starts after a mutation can build fresh immediately.
+        Queue builders may be blocked in GitHub or local source inspection, so
+        shutdown has a single total wait budget rather than joining each worker
+        indefinitely.  Workers that finish later see ``_queue_shutdown`` and
+        cannot publish, persist, or launch a successor generation.
         """
+        deadline = monotonic() + QUEUE_WORKER_SHUTDOWN_WAIT_SECONDS
         with self._queue_lock:
-            cached = self._queue_cache.get(chapter)
-            now = monotonic()
-            if cached is not None and cached[0] > now:
-                return cached[1]
-            if cached is not None:
-                self._queue_cache.pop(chapter, None)
-
-            flight = self._queue_flights.get(chapter)
-            owner = flight is None
-            if owner:
-                flight = _QueueFlight(self._queue_generation)
-                self._queue_flights[chapter] = flight
-
-        assert flight is not None
-        if not owner:
-            flight.event.wait()
-            if flight.error is not None:
-                raise flight.error
-            assert flight.payload is not None
-            return flight.payload
-
-        try:
-            payload = build()
-        except BaseException as exc:
-            with self._queue_lock:
-                flight.error = exc
-                if self._queue_flights.get(chapter) is flight:
-                    self._queue_flights.pop(chapter, None)
+            self._queue_shutdown.set()
+            self._queue_generation += 1
+            workers = tuple(self._queue_workers)
+            flights = tuple(self._queue_flights.values())
+            self._queue_flights.clear()
+            for flight in flights:
                 flight.event.set()
-            raise
+        # Drain a persistence operation that began before the shutdown signal
+        # when it fits inside the same total budget. No later writer may begin:
+        # every writer rechecks the signal while holding this gate.
+        remaining = deadline - monotonic()
+        if remaining > 0 and self._queue_persist_lock.acquire(timeout=remaining):
+            self._queue_persist_lock.release()
+        for worker in workers:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            worker.join(timeout=remaining)
 
+    def queue_payload(
+        self,
+        chapter: Optional[int],
+        build: Callable[[], dict],
+        *,
+        cold_wait_seconds: float = QUEUE_COLD_START_WAIT_SECONDS,
+    ) -> dict:
+        """Return fresh data or an immediate stale-while-refresh snapshot.
+
+        Exactly one physical build runs per chapter.  When a last-known-good
+        value exists, expiration and mutation only make it *stale*: callers get
+        that clearly-labelled snapshot immediately while a daemon worker
+        refreshes it.  With no snapshot, callers share the same worker and wait
+        only ``cold_wait_seconds`` before receiving :class:`QueueRefreshPending`.
+        """
+        try:
+            wait_budget = max(0.0, float(cold_wait_seconds))
+        except (TypeError, ValueError):
+            wait_budget = QUEUE_COLD_START_WAIT_SECONDS
+        deadline = monotonic() + wait_budget
+
+        while True:
+            with self._queue_lock:
+                # Keep the newest factory for an invalidation-triggered followup.
+                # HTTP callers bind only cfg+chapter, never the request handler.
+                self._queue_builders[chapter] = build
+                if chapter not in self._queue_persisted_loaded:
+                    persisted = _read_queue_snapshot(
+                        self.cfg.repo_dir, chapter, self._queue_generation
+                    )
+                    if persisted is not None:
+                        self._queue_cache[chapter] = persisted
+                    self._queue_persisted_loaded.add(chapter)
+
+                snapshot = self._queue_cache.get(chapter)
+                now = monotonic()
+                fresh = bool(
+                    snapshot is not None
+                    and snapshot.generation == self._queue_generation
+                    and snapshot.expires_at > now
+                )
+                if fresh:
+                    assert snapshot is not None
+                    return self._queue_response_locked(
+                        chapter, snapshot, state="fresh"
+                    )
+
+                flight = self._start_queue_refresh_locked(chapter)
+                if snapshot is not None:
+                    return self._queue_response_locked(
+                        chapter, snapshot, state="stale"
+                    )
+
+            if flight is None:
+                raise QueueRefreshPending(
+                    "Queue has no saved snapshot and its refresh could not start",
+                    refreshing=False,
+                )
+            remaining = deadline - monotonic()
+            if remaining <= 0 or not flight.event.wait(timeout=remaining):
+                raise QueueRefreshPending(
+                    "Queue is preparing its first snapshot; retry shortly"
+                )
+            # If this was the current generation, propagate an immediate build
+            # failure honestly.  A mutation can supersede a failed/finished
+            # flight; in that case loop and wait for its generation's successor.
+            with self._queue_lock:
+                current_generation = self._queue_generation
+            if flight.generation == current_generation and flight.error is not None:
+                if isinstance(flight.error, Exception):
+                    raise flight.error
+                raise RuntimeError(f"queue refresh failed: {flight.error}")
+
+    def _queue_response_locked(
+        self,
+        chapter: Optional[int],
+        snapshot: _QueueSnapshot,
+        *,
+        state: str,
+    ) -> dict:
+        """Copy one payload and attach non-authoritative freshness metadata."""
+        response = dict(snapshot.payload)
+        if state == "fresh":
+            return response
+        flight = self._queue_flights.get(chapter)
+        metadata = {
+            "state": state,
+            "refreshing": flight is not None,
+            "saved_at": snapshot.saved_at,
+        }
+        error = self._queue_errors.get(chapter)
+        if error and state != "fresh":
+            metadata["last_refresh_error"] = error
+        retry_at = self._queue_retry_after.get(chapter, 0.0)
+        if flight is None and retry_at > monotonic():
+            metadata["retry_after_seconds"] = max(
+                1, int(retry_at - monotonic() + 0.999)
+            )
+        response["queue_snapshot"] = metadata
+        return response
+
+    def _start_queue_refresh_locked(
+        self, chapter: Optional[int]
+    ) -> Optional[_QueueFlight]:
+        """Start (or join) the one physical background build for ``chapter``.
+
+        Caller holds ``_queue_lock``.  A superseded generation is deliberately
+        left running rather than detached: when it exits it schedules one build
+        for the newest generation.  Rapid mutations therefore cannot create a
+        pile-up of concurrent GitHub/source scans.
+        """
+        existing = self._queue_flights.get(chapter)
+        if existing is not None:
+            return existing
+        if self._queue_shutdown.is_set():
+            return None
+        if self._queue_retry_after.get(chapter, 0.0) > monotonic():
+            return None
+        build = self._queue_builders.get(chapter)
+        if build is None:
+            return None
+        flight = _QueueFlight(self._queue_generation, build)
+        self._queue_flights[chapter] = flight
+        # Queue snapshots are process-global and may outlive any one HTTP
+        # request.  Always run under a deliberately empty context so a shared
+        # cache neither depends on nor retains a collaborator's short-lived
+        # OAuth token from a mutating POST.
+        context = Context()
+        worker = Thread(
+            target=context.run,
+            args=(self._run_queue_refresh, chapter, flight),
+            name=f"marathon-queue-{chapter if chapter is not None else 'all'}",
+            daemon=True,
+        )
+        self._queue_workers.add(worker)
+        try:
+            worker.start()
+        except BaseException as exc:
+            flight.error = exc
+            flight.event.set()
+            self._queue_flights.pop(chapter, None)
+            self._queue_workers.discard(worker)
+            self._queue_errors[chapter] = str(exc)[:500]
+            self._queue_retry_after[chapter] = (
+                monotonic() + QUEUE_REFRESH_ERROR_BACKOFF_SECONDS
+            )
+            return None
+        return flight
+
+    def _run_queue_refresh(
+        self, chapter: Optional[int], flight: _QueueFlight
+    ) -> None:
+        """Complete one background build and publish only its own generation."""
+        payload: Optional[dict] = None
+        error: Optional[BaseException] = None
+        try:
+            candidate = flight.build()
+            if not isinstance(candidate, dict):
+                raise TypeError("queue builder returned a non-object payload")
+            if not _valid_queue_payload(candidate):
+                raise TypeError("queue builder returned a malformed payload")
+            payload = candidate
+        except BaseException as exc:  # always wake bounded cold-start readers
+            error = exc
+
+        persist: Optional[tuple[dict, str]] = None
+        retry_new_generation = False
         with self._queue_lock:
             flight.payload = payload
-            # A POST may have invalidated this build while it was running.  Its
-            # original callers may still receive their pre-mutation snapshot,
-            # but it must not repopulate the cache for later requests.
-            if flight.generation == self._queue_generation:
-                self._queue_cache[chapter] = (
-                    monotonic() + QUEUE_CACHE_TTL_SECONDS,
-                    payload,
+            flight.error = error
+            registered = self._queue_flights.get(chapter) is flight
+            current = flight.generation == self._queue_generation
+            shutting_down = self._queue_shutdown.is_set()
+            if (
+                registered and current and not shutting_down
+                and error is None and payload is not None
+            ):
+                saved_at = datetime.now(timezone.utc).isoformat().replace(
+                    "+00:00", "Z"
                 )
-            if self._queue_flights.get(chapter) is flight:
+                snapshot = _QueueSnapshot(
+                    payload,
+                    expires_at=monotonic() + QUEUE_CACHE_TTL_SECONDS,
+                    saved_at=saved_at,
+                    generation=self._queue_generation,
+                )
+                self._queue_cache[chapter] = snapshot
+                self._queue_persisted_loaded.add(chapter)
+                self._queue_errors.pop(chapter, None)
+                self._queue_retry_after.pop(chapter, None)
+                persist = (payload, saved_at)
+            elif registered and current and not shutting_down and error is not None:
+                self._queue_errors[chapter] = str(error)[:500]
+                self._queue_retry_after[chapter] = (
+                    monotonic() + QUEUE_REFRESH_ERROR_BACKOFF_SECONDS
+                )
+
+            if registered:
                 self._queue_flights.pop(chapter, None)
+                retry_new_generation = not current and not shutting_down
             flight.event.set()
-        return payload
+
+        try:
+            # Persistence is best-effort and never delays a caller: the cache
+            # is a rendering fallback, while shipping performs a fresh gate.
+            if persist is not None:
+                with self._queue_persist_lock:
+                    if not self._queue_shutdown.is_set():
+                        try:
+                            _write_queue_snapshot(
+                                self.cfg.repo_dir,
+                                chapter,
+                                persist[0],
+                                persist[1],
+                            )
+                        except Exception:
+                            pass
+
+            if retry_new_generation and not self._queue_shutdown.is_set():
+                with self._queue_lock:
+                    self._start_queue_refresh_locked(chapter)
+        finally:
+            with self._queue_lock:
+                self._queue_workers.discard(threading.current_thread())
 
     def invalidate_queue_cache(self) -> None:
-        """Make every subsequent queue GET observe a post-mutation build."""
+        """Expire last-good views and request one post-mutation refresh.
+
+        Existing snapshots remain available for rendering but are clearly
+        stale.  A running older-generation build is allowed to finish without
+        publishing and then launches exactly one successor for the newest
+        generation; this is both mutation-safe and stampede-free.
+        """
         with self._queue_lock:
+            if self._queue_shutdown.is_set():
+                return
             self._queue_generation += 1
-            self._queue_cache.clear()
-            # Do not cancel old builders: detach them.  Their existing callers
-            # still complete, while new readers start a fresh generation.
-            self._queue_flights.clear()
+            self._queue_retry_after.clear()
+            for snapshot in self._queue_cache.values():
+                snapshot.expires_at = 0.0
+            for chapter in tuple(self._queue_builders):
+                self._start_queue_refresh_locked(chapter)
 
     def cached_issue_reviewability(
         self, _cfg: "ReviewConfig", issue_num: int
@@ -495,8 +878,12 @@ class DeckServer(ThreadingHTTPServer):
             snapshots = []
             for key in (None, chapter):
                 cached = self._queue_cache.get(key)
-                if cached is not None and cached[0] > now:
-                    snapshots.append(cached[1])
+                if (
+                    cached is not None
+                    and cached.generation == self._queue_generation
+                    and cached.expires_at > now
+                ):
+                    snapshots.append(cached.payload)
         for payload in snapshots:
             for card in payload.get("cards") or []:
                 if card.get("id") != issue_num:
@@ -977,9 +1364,27 @@ class DeckHandler(BaseHTTPRequestHandler):
         from marathon.deck.cards import build_queue
 
         chapter = self._chapter_from_query(query)
-        payload = self.server.queue_payload(  # type: ignore[attr-defined]
-            chapter, lambda: build_queue(self.cfg, chapter).to_json()
-        )
+        cfg = self.cfg
+        try:
+            payload = self.server.queue_payload(  # type: ignore[attr-defined]
+                chapter,
+                lambda cfg=cfg, chapter=chapter: build_queue(
+                    cfg, chapter
+                ).to_json(),
+            )
+        except QueueRefreshPending as exc:
+            return self._send_json(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                    "queue_snapshot": {
+                        "state": "warming",
+                        "refreshing": exc.refreshing,
+                        "saved_at": None,
+                    },
+                },
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
         self._send_json(payload)
 
     def _api_card(self, raw_id: str) -> None:
