@@ -73,6 +73,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -85,7 +86,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field, fields
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
@@ -5659,16 +5660,51 @@ def print_status(repo_dir: Path) -> int:
 #: Minimum spacing between auto re-audits — an audit is a full (incremental)
 #: build, so this bounds the cost while keeping the snapshot near-fresh.
 AUTO_AUDIT_MIN_INTERVAL_SECONDS = 900.0
+#: A dead/incomplete full audit of one exact revision is expensive enough that
+#: restarting the conductor must not immediately launch it again.  This is
+#: deliberately longer than the in-process throttle: guard metadata survives a
+#: restart, while a different HEAD bypasses the cooldown entirely.
+AUTO_AUDIT_FAILED_ATTEMPT_COOLDOWN_SECONDS = 6 * 60 * 60.0
 # Stable inode whose inherited POSIX flock is the auto-audit single-flight
 # lease.  The file itself intentionally survives process/machine restarts; only
-# the kernel lock is authoritative, so stale diagnostic contents never block a
-# later audit after its child exits or the host reboots.
+# the kernel lock is authoritative for liveness.  Once that lock is free, an
+# exact recent same-HEAD attempt recorded on the inode may impose the bounded
+# failed-attempt cooldown above; stale or unvalidated contents never do.
 AUTO_AUDIT_GUARD_RELPATH = Path(".marathon/conductor/auto-audit.guard")
-AUTO_AUDIT_GUARD_SCHEMA_VERSION = 1
+AUTO_AUDIT_GUARD_SCHEMA_VERSION = 2
+AUTO_AUDIT_GUARD_MAX_BYTES = 32 * 1024
+AUTO_AUDIT_GUARD_MAX_CLOCK_SKEW_SECONDS = 5 * 60.0
+_AUTO_AUDIT_READABLE_GUARD_SCHEMAS = frozenset({1, 2})
+# The public loop state retains the last successful audit revision separately
+# from ``last_time``.  Remember which revision actually set that retry clock so
+# an unreadable guard record can neither erase the same-HEAD throttle nor make
+# a newly landed HEAD inherit the prior revision's delay.
+_AUTO_AUDIT_RECENT_TIMED_HEADS: dict[tuple[str, str], str] = {}
 
 
 def auto_audit_guard_path(repo_dir: str | Path) -> Path:
     return Path(repo_dir) / AUTO_AUDIT_GUARD_RELPATH
+
+
+def _auto_audit_identity(
+    repo_dir: str | Path, target: str,
+) -> tuple[str, str]:
+    """Canonical in-process identity for one repository audit target."""
+    return (
+        str(Path(repo_dir).expanduser().resolve(strict=False)),
+        target,
+    )
+
+
+def _auto_audit_command(
+    repo_dir: str | Path, target: str,
+) -> list[str]:
+    """The one exact argv emitted for an automatic audit."""
+    canonical_repo, _ = _auto_audit_identity(repo_dir, target)
+    return [
+        sys.executable, "-m", "marathon", "audit", "run",
+        "--target", target, "--repo-dir", canonical_repo,
+    ]
 
 
 def _try_acquire_auto_audit_guard(
@@ -5684,7 +5720,9 @@ def _try_acquire_auto_audit_guard(
 
     Returns ``(handle, "acquired")``, ``(None, "busy")``, or
     ``(None, "unsupported"/"error: ...")``.  Callers must close an acquired
-    handle without explicitly unlocking it after a successful spawn.
+    handle without explicitly unlocking it after a successful spawn.  Callers
+    may inspect bounded, validated metadata only *after* this returns an
+    acquired handle; metadata is never a substitute for the kernel lease.
     """
     try:
         import fcntl
@@ -5712,11 +5750,12 @@ def _try_acquire_auto_audit_guard(
 
 
 def _write_auto_audit_guard_metadata(handle: object, payload: dict) -> None:
-    """Best-effort diagnostics on the stable lock inode.
+    """Best-effort attempt metadata on the stable lock inode.
 
-    This metadata is never treated as a lease: it may legitimately outlive its
-    process.  Keeping it on the locked inode makes a production incident easy
-    to inspect without creating a stale-marker failure mode.
+    This metadata is never treated as a lease: it legitimately outlives its
+    process.  After the kernel proves that no child owns the inode, a strictly
+    validated exact-identity record may impose only the bounded retry cooldown;
+    it also keeps production incidents easy to inspect.
     """
     try:
         handle.seek(0)
@@ -5728,6 +5767,156 @@ def _write_auto_audit_guard_metadata(handle: object, payload: dict) -> None:
         os.fsync(handle.fileno())
     except (AttributeError, OSError, TypeError, ValueError):
         pass
+
+
+@dataclass(frozen=True)
+class _AutoAuditGuardAttempt:
+    """Validated, non-live diagnostics from one completed audit lease."""
+
+    head: str
+    attempted_at: float
+
+
+def _is_exact_auto_audit_guard_command(
+    command: object, *, repo_dir: str | Path, target: str,
+) -> bool:
+    """Validate the exact argv shape written by :func:`_maybe_auto_audit`.
+
+    The process-table scanner intentionally accepts harmless extra argv so it
+    can recognize legacy workers.  Durable guard metadata has a stricter trust
+    boundary: duplicate or unknown options must fail open rather than letting
+    an operator-edited record suppress work for six hours.
+    """
+    if (
+        not isinstance(command, list)
+        or len(command) != 9
+        or any(
+            type(token) is not str or not token or len(token) > 4096
+            for token in command
+        )
+        or sum(len(token) for token in command) > 16 * 1024
+    ):
+        return False
+    try:
+        expected = _auto_audit_command(repo_dir, target)
+    except (OSError, RuntimeError):
+        return False
+    return command == expected
+
+
+def _read_auto_audit_guard_attempt(
+    handle: object,
+    *,
+    repo_dir: str | Path,
+    target: str,
+    now: float,
+) -> Optional[_AutoAuditGuardAttempt]:
+    """Read one bounded, strictly validated attempt record from a free guard."""
+    try:
+        handle.seek(0)
+        raw = handle.read(AUTO_AUDIT_GUARD_MAX_BYTES + 1)
+    except (AttributeError, OSError, ValueError):
+        return None
+    if (
+        not isinstance(raw, (bytes, bytearray))
+        or not raw
+        or len(raw) > AUTO_AUDIT_GUARD_MAX_BYTES
+    ):
+        return None
+    try:
+        payload = json.loads(bytes(raw).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    schema = payload.get("schema_version")
+    if type(schema) is not int or schema not in _AUTO_AUDIT_READABLE_GUARD_SCHEMAS:
+        return None
+    required = {
+        "schema_version", "status", "launcher_pid", "pid", "head",
+        "target", "repo_dir", "launched_at", "command",
+    }
+    allowed = set(required)
+    if schema == 2:
+        required.add("launched_at_epoch")
+        allowed.add("launched_at_epoch")
+    if not required.issubset(payload) or not set(payload).issubset(allowed):
+        return None
+
+    status = payload.get("status")
+    launcher_pid = payload.get("launcher_pid")
+    child_pid = payload.get("pid")
+    if status not in {"launching", "running"}:
+        return None
+    if type(launcher_pid) is not int or launcher_pid <= 0:
+        return None
+    if status == "launching":
+        if child_pid is not None:
+            return None
+    elif type(child_pid) is not int or child_pid <= 0:
+        return None
+
+    try:
+        expected_repo = str(
+            Path(repo_dir).expanduser().resolve(strict=False)
+        )
+    except (OSError, RuntimeError):
+        return None
+    head = payload.get("head")
+    bounded_identity = (
+        (head, 256),
+        (payload.get("target"), 4096),
+        (payload.get("repo_dir"), 4096),
+    )
+    for actual, limit in bounded_identity:
+        if type(actual) is not str or not actual or len(actual) > limit:
+            return None
+    if payload.get("target") != target or payload.get("repo_dir") != expected_repo:
+        return None
+
+    launched_at = payload.get("launched_at")
+    if type(launched_at) is not str or not launched_at or len(launched_at) > 128:
+        return None
+    try:
+        launched_dt = datetime.fromisoformat(launched_at.replace("Z", "+00:00"))
+        if launched_dt.tzinfo is None:
+            return None
+        launched_iso_epoch = launched_dt.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+    if not _is_exact_auto_audit_guard_command(
+        payload.get("command"), repo_dir=repo_dir, target=target
+    ):
+        return None
+
+    attempted_at = launched_iso_epoch
+    if schema == 2:
+        epoch = payload.get("launched_at_epoch")
+        if (
+            isinstance(epoch, bool)
+            or not isinstance(epoch, (int, float))
+            or not math.isfinite(float(epoch))
+            or float(epoch) < 0
+        ):
+            return None
+        attempted_at = float(epoch)
+        if abs(attempted_at - launched_iso_epoch) > (
+            AUTO_AUDIT_GUARD_MAX_CLOCK_SKEW_SECONDS
+        ):
+            return None
+    if (
+        isinstance(now, bool)
+        or not isinstance(now, (int, float))
+        or not math.isfinite(float(now))
+        or float(now) < 0
+    ):
+        return None
+    now = float(now)
+    if attempted_at > now + AUTO_AUDIT_GUARD_MAX_CLOCK_SKEW_SECONDS:
+        return None
+    return _AutoAuditGuardAttempt(head=head, attempted_at=attempted_at)
 
 
 def _command_option(tokens: list[str], name: str) -> Optional[str]:
@@ -5833,12 +6022,13 @@ def _audit_target_folder(cfg: ReviewConfig) -> Optional[str]:
 
 
 def _persisted_audit_revision(cfg: ReviewConfig) -> Optional[str]:
-    """The revision durably audited for every module in the auto-audit target.
+    """The revision validated for every module in the auto-audit target.
 
     This is the conductor's restart-safe success cursor.  It is derived from
-    the atomically persisted per-module revision map, never from current HEAD
-    and never from an audit process merely having been launched.  Partial or
-    legacy snapshots return ``None``.
+    the normal fail-closed snapshot view: exact audits and older evidence whose
+    complete import closure is Git-proven byte-identical both count. It is
+    never advanced merely because an audit process launched. Partial, stale,
+    dirty, or legacy snapshots return ``None``.
     """
     target = _audit_target_folder(cfg)
     if target is None:
@@ -5849,7 +6039,7 @@ def _persisted_audit_revision(cfg: ReviewConfig) -> Optional[str]:
         modules, failures = derive_modules(Path(cfg.repo_dir), target)
         if not modules or failures:
             return None
-        snapshot = load_snapshot(cfg.repo_dir, validate_revision=False)
+        snapshot = load_snapshot(cfg.repo_dir)
         if snapshot is None:
             return None
         revisions = {
@@ -5905,8 +6095,9 @@ def _maybe_auto_audit(
     uncommitted Lean work. Best-effort — never raises."""
     now = _now_fn()
     # Poll the durable result before the throttle.  A child that completed
-    # since the previous tick advances the cursor immediately; a failed child
-    # changes nothing and is retried after the normal interval.
+    # since the previous tick advances the cursor immediately. A failed child
+    # changes nothing; in-process retries use the normal interval, while a
+    # restart observes the longer durable same-HEAD cooldown below.
     persisted = _persisted_audit_revision(cfg)
     if persisted is not None and persisted != last_head:
         last_head = persisted
@@ -5915,13 +6106,17 @@ def _maybe_auto_audit(
     cur = head_sha(cfg.repo_dir)
     if cur is None or cur == last_head:
         return last_head, last_time  # HEAD unmoved / unknown — nothing to refresh
-    if now - last_time < AUTO_AUDIT_MIN_INTERVAL_SECONDS:
-        return last_head, last_time
-    if _has_uncommitted_lean(cfg.repo_dir):
-        return last_head, now  # operator mid-edit — skip, but reset the throttle
     target = _audit_target_folder(cfg)
     if target is None:
         return last_head, now
+    try:
+        audit_identity = _auto_audit_identity(cfg.repo_dir, target)
+    except (OSError, RuntimeError):
+        return last_head, now
+
+    def remember_timed_head() -> None:
+        _AUTO_AUDIT_RECENT_TIMED_HEADS[audit_identity] = cur
+
     guard, guard_status = _try_acquire_auto_audit_guard(cfg.repo_dir)
     if guard_status == "busy":
         # A child from this or a previous conductor still owns the inherited
@@ -5931,13 +6126,61 @@ def _maybe_auto_audit(
     if guard is None:
         # Without an inheritable kernel lease, a detached launch cannot be
         # restart-safe. Fail closed and throttle the warning/cost.
+        if (
+            now - last_time < AUTO_AUDIT_MIN_INTERVAL_SECONDS
+            and _AUTO_AUDIT_RECENT_TIMED_HEADS.get(audit_identity) == cur
+        ):
+            return last_head, last_time
         print(
             f"  audit: auto-refresh skipped (single-flight guard "
             f"{guard_status})",
             flush=True,
         )
+        remember_timed_head()
         return last_head, now
     try:
+        prior_attempt = _read_auto_audit_guard_attempt(
+            guard,
+            repo_dir=cfg.repo_dir,
+            target=target,
+            now=now,
+        )
+        # The in-memory clock limits repeated work on one revision. A durable
+        # record for a *different* revision makes the distinction explicit and
+        # lets a newly-landed HEAD bypass that old revision's throttle.
+        if (
+            now - last_time < AUTO_AUDIT_MIN_INTERVAL_SECONDS
+            and (
+                _AUTO_AUDIT_RECENT_TIMED_HEADS.get(audit_identity) == cur
+                or (
+                    prior_attempt is not None
+                    and prior_attempt.head == cur
+                )
+            )
+        ):
+            return last_head, last_time
+        if _has_uncommitted_lean(cfg.repo_dir):
+            # Operator mid-edit — skip, but reset this revision's throttle.
+            remember_timed_head()
+            return last_head, now
+
+        cooldown_remaining = None
+        if prior_attempt is not None and prior_attempt.head == cur:
+            age = max(0.0, float(now) - prior_attempt.attempted_at)
+            if age < AUTO_AUDIT_FAILED_ATTEMPT_COOLDOWN_SECONDS:
+                cooldown_remaining = (
+                    AUTO_AUDIT_FAILED_ATTEMPT_COOLDOWN_SECONDS - age
+                )
+        if cooldown_remaining is not None:
+            retry_minutes = max(1, math.ceil(cooldown_remaining / 60.0))
+            print(
+                "  audit: auto-refresh deferred (this exact HEAD already had "
+                f"an incomplete attempt; retry cooldown {retry_minutes}m)",
+                flush=True,
+            )
+            remember_timed_head()
+            return last_head, now
+
         legacy_pids = _live_legacy_auto_audit_pids(cfg.repo_dir, target)
         if legacy_pids is None:
             print(
@@ -5958,10 +6201,16 @@ def _maybe_auto_audit(
 
         log_path = jobs_snapshot_path(cfg.repo_dir).parent / "auto-audit.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        command = [
-            sys.executable, "-m", "marathon", "audit", "run",
-            "--target", target, "--repo-dir", str(cfg.repo_dir),
-        ]
+        command = _auto_audit_command(cfg.repo_dir, target)
+        try:
+            launched_at = datetime.fromtimestamp(
+                now, timezone.utc
+            ).isoformat()
+        except (OSError, OverflowError, ValueError):
+            # A production wall clock is always representable. Preserve the
+            # launch if an injected/test clock is not; the contradictory v2
+            # record then fails open on a later restart.
+            launched_at = now_iso()
         metadata = {
             "schema_version": AUTO_AUDIT_GUARD_SCHEMA_VERSION,
             "status": "launching",
@@ -5970,7 +6219,8 @@ def _maybe_auto_audit(
             "head": cur,
             "target": target,
             "repo_dir": str(Path(cfg.repo_dir).resolve(strict=False)),
-            "launched_at": now_iso(),
+            "launched_at": launched_at,
+            "launched_at_epoch": now,
             "command": command,
         }
         _write_auto_audit_guard_metadata(guard, metadata)
@@ -5991,9 +6241,11 @@ def _maybe_auto_audit(
         # Launch is not success.  The next tick advances ``last_head`` only
         # after save_snapshot has atomically persisted complete per-module
         # coverage for this revision.
+        remember_timed_head()
         return last_head, now
     except Exception as e:  # noqa: BLE001 — a refresh failure must not crash a tick
         print(f"  audit: auto-refresh skipped ({e})", flush=True)
+        remember_timed_head()
         return last_head, now
     finally:
         # Do NOT LOCK_UN here.  ``pass_fds`` gave the child a duplicate of the

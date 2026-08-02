@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -29,6 +30,112 @@ FIXTURE_DIR = TESTS_DIR / "fixtures" / "audit_fixture"
 GOLDEN_TEXT = (TESTS_DIR / "golden" / "audit_fixture_output.txt").read_text()
 
 FIXTURE_MODULES = ["AuditFixture.Basic", "AuditFixture.Deception"]
+
+
+def _contract_for_modules(
+    modules: list[str], *, complete: bool = True,
+    schema: str | None = "1", lean_version: str | None = "4.28.0",
+    trusted_prefixes: tuple[str, ...] | list[str] | None = (
+        DEFAULT_TRUSTED_PREFIXES
+    ),
+) -> str:
+    """Small valid audit contract with one declaration per module."""
+
+    lines = [
+        "AUDIT_BEGIN",
+        *([] if schema is None else [f"AUDIT_META|schema|{schema}"]),
+        *(
+            []
+            if lean_version is None
+            else [f"AUDIT_META|lean_version|{lean_version}"]
+        ),
+        *(f"AUDIT_META|module|{module}" for module in modules),
+        *(
+            []
+            if trusted_prefixes is None
+            else [
+                "AUDIT_META|trusted_prefixes|"
+                + (",".join(trusted_prefixes) if trusted_prefixes else "-")
+            ]
+        ),
+        *(
+            f"AUDIT|{module}.probe|theorem|{module}|ok|TmF0|-|-|-|false|-|-"
+            for module in modules
+        ),
+    ]
+    if complete:
+        lines.append(f"AUDIT_DONE|{len(modules)}")
+    return "\n".join(lines) + "\n"
+
+
+def _script_modules(command: list[str]) -> list[str]:
+    """Read target imports back from a generated audit-script command."""
+
+    script = Path(command[3]).read_text()
+    return [
+        line.removeprefix("import ")
+        for line in script.splitlines()
+        if line.startswith("import ") and line != "import Lean"
+    ]
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: int | float) -> None:
+        self.now += float(seconds)
+
+
+def _git(repo: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    return (proc.stdout or "").strip()
+
+
+def _commit(repo: Path, message: str, *paths: str) -> str:
+    _git(repo, "add", "--", *paths)
+    _git(
+        repo,
+        "-c", "user.name=Audit Test",
+        "-c", "user.email=audit@example.invalid",
+        "commit", "-q", "-m", message,
+    )
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _audit_carry_repo(tmp_path: Path) -> tuple[Path, str]:
+    repo = tmp_path / "repo"
+    (repo / "Demo").mkdir(parents=True)
+    (repo / "Demo" / "A.lean").write_text("def a : Nat := 1\n")
+    (repo / "Demo" / "B.lean").write_text(
+        "import Demo.A\ndef b : Nat := a\n"
+    )
+    (repo / "Demo" / "Unrelated.lean").write_text(
+        "def unrelated : Nat := 1\n"
+    )
+    (repo / "lean-toolchain").write_text("leanprover/lean4:v4.28.0\n")
+    (repo / "lakefile.toml").write_text(
+        'name = "Demo"\n[[lean_lib]]\nname = "Demo"\n'
+    )
+    (repo / "lake-manifest.json").write_text('{"packages": []}\n')
+    _git(repo, "init", "-q")
+    old_revision = _commit(
+        repo,
+        "initial",
+        "Demo/A.lean",
+        "Demo/B.lean",
+        "Demo/Unrelated.lean",
+        "lean-toolchain",
+        "lakefile.toml",
+        "lake-manifest.json",
+    )
+    return repo, old_revision
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +447,650 @@ class TestGoldenEndToEnd:
         assert restored == snap
 
 
+class TestImmutableAuditSource:
+    """Clean Git audits elaborate a private start-commit checkout."""
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX shared Lake flock")
+    def test_internal_aba_mutation_cannot_change_audit_source(
+        self, tmp_path, monkeypatch
+    ):
+        repo, revision = _audit_carry_repo(tmp_path)
+        original_source = repo / "Demo" / "A.lean"
+        original_text = original_source.read_text()
+        (repo / ".lake").mkdir()
+        (repo / ".lake" / "shared-cache-sentinel").write_text("warm\n")
+
+        monkeypatch.setattr(engine, "_find_lake", lambda: "/fake/lake")
+        real_derive_modules = engine.derive_modules
+        derived_from: list[Path] = []
+        build_repos: list[Path] = []
+        evidence_repos: list[Path] = []
+
+        def tracked_derive(source_repo, target):
+            source_repo = Path(source_repo).resolve()
+            derived_from.append(source_repo)
+            assert source_repo != repo.resolve()
+            assert (source_repo / "Demo" / "A.lean").read_text() == original_text
+            return real_derive_modules(source_repo, target)
+
+        def fake_partition(
+            lake, source_repo, requested, timeout, *, lock_fd=None
+        ):
+            source_repo = Path(source_repo).resolve()
+            build_repos.append(source_repo)
+            assert source_repo != repo.resolve()
+            assert lock_fd is not None
+            assert os.fstat(lock_fd).st_ino == os.stat(
+                lake_build_lock_path(repo)
+            ).st_ino
+            with lake_build_lock(repo, blocking=False) as contender:
+                assert contender is None
+            lake_cache = source_repo / ".lake"
+            assert lake_cache.is_symlink()
+            assert lake_cache.resolve() == (repo / ".lake").resolve()
+            assert (lake_cache / "shared-cache-sentinel").read_text() == "warm\n"
+            assert (source_repo / "Demo" / "A.lean").read_text() == original_text
+            return list(requested), []
+
+        def fake_run(command, **kwargs):
+            source_repo = Path(kwargs["cwd"]).resolve()
+            evidence_repos.append(source_repo)
+            assert source_repo == build_repos[-1]
+            assert kwargs["lock_fd"] is not None
+            assert (source_repo / "Demo" / "A.lean").read_text() == original_text
+
+            # The reviewed checkout changes A→B→A entirely within the Lean
+            # subprocess boundary. Boundary sampling cannot observe this, but
+            # the command's detached worktree remains byte-for-byte A.
+            original_source.write_text("def a : Nat := 999\n")
+            assert engine.source_state(repo) == (revision, False)
+            assert (source_repo / "Demo" / "A.lean").read_text() == original_text
+            original_source.write_text(original_text)
+            assert engine.source_state(repo) == (revision, True)
+
+            requested = _script_modules(command)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=_contract_for_modules(requested),
+                stderr="",
+            )
+
+        monkeypatch.setattr(engine, "derive_modules", tracked_derive)
+        monkeypatch.setattr(engine, "partition_buildable", fake_partition)
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        first = engine.run_audit(repo, "Demo", timeout=5)
+        checkout = build_repos[0]
+        assert first.failures == []
+        assert first.repo_dir == str(repo.resolve())
+        assert first.source_revision == revision
+        assert first.module_revisions == {
+            module: revision for module in first.modules
+        }
+        assert checkout == evidence_repos[0] == derived_from[0]
+
+        # Simulate an early implementation's checkout-local cache. The next
+        # preparation migrates this private derived directory to the shared
+        # original cache instead of silently keeping a second cache.
+        checkout_lake = checkout / ".lake"
+        checkout_lake.unlink()
+        checkout_lake.mkdir()
+        (checkout_lake / "Obsolete.lean").write_text("def derived := 1\n")
+
+        second = engine.run_audit(repo, "Demo", timeout=5)
+
+        assert second.failures == []
+        assert second.source_revision == revision
+        assert build_repos == [checkout, checkout]
+        assert evidence_repos == [checkout, checkout]
+        assert derived_from == [checkout, checkout]
+        assert checkout_lake.is_symlink()
+        assert checkout_lake.resolve() == (repo / ".lake").resolve()
+        assert not (repo / ".lake" / "Obsolete.lean").exists()
+        assert original_source.read_text() == original_text
+
+    def test_clean_git_root_without_shared_lock_never_binds(
+        self, tmp_path, monkeypatch
+    ):
+        repo, _revision = _audit_carry_repo(tmp_path)
+        monkeypatch.setattr(engine, "_find_lake", lambda: "/fake/lake")
+        monkeypatch.setattr(
+            engine, "lake_build_lock_supported", lambda: False
+        )
+        monkeypatch.setattr(
+            engine,
+            "partition_buildable",
+            lambda lake, source_repo, modules, timeout, lock_fd=None: (
+                list(modules),
+                [],
+            ),
+        )
+        monkeypatch.setattr(
+            engine,
+            "_run_process_group",
+            lambda command, **kwargs: subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=_contract_for_modules(_script_modules(command)),
+                stderr="",
+            ),
+        )
+
+        snap = engine.run_audit(repo, "Demo", timeout=5)
+
+        assert snap.decls
+        assert snap.source_revision is None
+        assert snap.module_revisions == {}
+        assert any(
+            "requires the shared Lake-build lock" in failure
+            for failure in snap.failures
+        )
+
+
+class TestAuditBatchRecovery:
+    """A slow/broken import cannot erase healthy modules' audit evidence."""
+
+    @staticmethod
+    def _install(monkeypatch, modules):
+        revision = "d" * 40
+        monkeypatch.setattr(engine, "_find_lake", lambda: "/fake/lake")
+        monkeypatch.setattr(
+            engine, "derive_modules", lambda repo, target: (list(modules), [])
+        )
+        monkeypatch.setattr(
+            engine,
+            "partition_buildable",
+            lambda lake, repo, requested, timeout, lock_fd=None: (
+                list(requested),
+                [],
+            ),
+        )
+        monkeypatch.setattr(
+            engine, "source_state", lambda repo: (revision, True)
+        )
+        return revision
+
+    def test_aggregate_timeout_bisects_and_recovers_every_module(
+        self, tmp_path, monkeypatch
+    ):
+        modules = ["P.A", "P.B", "P.C", "P.D"]
+        revision = self._install(monkeypatch, modules)
+        calls: list[tuple[list[str], int | float]] = []
+
+        def fake_run(command, **kwargs):
+            requested = _script_modules(command)
+            calls.append((requested, kwargs["timeout"]))
+            if len(requested) > 2:
+                raise subprocess.TimeoutExpired(
+                    cmd=command, timeout=kwargs["timeout"], output=""
+                )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=_contract_for_modules(requested),
+                stderr="",
+            )
+
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        snap = engine.run_audit(tmp_path, "P", timeout=0.25)
+
+        assert calls == [
+            (modules, 0.25),
+            (["P.A", "P.B"], 0.25),
+            (["P.C", "P.D"], 0.25),
+        ]
+        assert snap.failures == []
+        assert snap.modules == modules
+        assert snap.module_revisions == {
+            module: revision for module in modules
+        }
+        assert {decl.module for decl in snap.decls} == set(modules)
+
+    def test_one_timed_out_singleton_preserves_every_healthy_binding(
+        self, tmp_path, monkeypatch
+    ):
+        modules = ["P.A", "P.B", "P.Heavy", "P.Z"]
+        revision = self._install(monkeypatch, modules)
+        calls: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            requested = _script_modules(command)
+            calls.append(requested)
+            if "P.Heavy" in requested:
+                partial = (
+                    _contract_for_modules(requested, complete=False)
+                    if len(requested) == 1
+                    else ""
+                )
+                raise subprocess.TimeoutExpired(
+                    cmd=command,
+                    timeout=kwargs["timeout"],
+                    output=partial,
+                )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=_contract_for_modules(requested),
+                stderr="",
+            )
+
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        snap = engine.run_audit(tmp_path, "P", timeout=3)
+
+        assert calls == [
+            modules,
+            ["P.A", "P.B"],
+            ["P.Heavy", "P.Z"],
+            ["P.Heavy"],
+            ["P.Z"],
+        ]
+        assert snap.modules == ["P.A", "P.B", "P.Z"]
+        assert snap.source_revision == revision
+        assert snap.module_revisions == {
+            "P.A": revision,
+            "P.B": revision,
+            "P.Z": revision,
+        }
+        # Partial stdout is named in failures but never enters ordinary rows,
+        # including raw snapshot consumers that bypass freshness filtering.
+        assert "P.Heavy.probe" not in snap.by_name()
+        assert "P.Heavy" not in snap.module_revisions
+        assert snap.attempted_modules == modules
+        assert snap.failures
+        assert all("module P.Heavy" in failure for failure in snap.failures)
+        assert any("timed out after" in failure for failure in snap.failures)
+
+        engine.save_snapshot(snap, tmp_path)
+        raw = engine.load_snapshot(tmp_path, validate_revision=False)
+        assert raw is not None
+        assert "P.Heavy.probe" not in raw.by_name()
+        fresh = engine.load_snapshot(tmp_path)
+        assert fresh is not None
+        assert {decl.module for decl in fresh.decls} == {"P.A", "P.B", "P.Z"}
+        assert fresh.modules == ["P.A", "P.B", "P.Z"]
+        assert "P.Heavy.probe" not in fresh.by_name()
+
+    def test_process_setup_failure_is_not_retried_per_module(
+        self, tmp_path, monkeypatch
+    ):
+        modules = ["P.A", "P.B", "P.C"]
+        self._install(monkeypatch, modules)
+        calls: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            calls.append(_script_modules(command))
+            raise OSError("launcher unavailable")
+
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        snap = engine.run_audit(tmp_path, "P", timeout=3)
+
+        assert calls == [modules]
+        assert snap.modules == []
+        assert snap.module_revisions == {}
+        assert any(
+            "audit batch P.A, P.B, P.C" in failure
+            and "launcher unavailable" in failure
+            for failure in snap.failures
+        )
+
+    def test_missing_batch_metadata_withholds_only_that_batch(
+        self, tmp_path, monkeypatch
+    ):
+        modules = [f"P.M{i}" for i in range(7)]
+        revision = self._install(monkeypatch, modules)
+
+        def fake_run(command, **kwargs):
+            requested = _script_modules(command)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=_contract_for_modules(
+                    requested,
+                    lean_version=None if requested == ["P.M6"] else "4.28.0",
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        snap = engine.run_audit(tmp_path, "P", timeout=5)
+
+        assert snap.modules == modules[:6]
+        assert snap.module_revisions == {
+            module: revision for module in modules[:6]
+        }
+        assert {decl.module for decl in snap.decls} == set(modules[:6])
+        assert any(
+            "module P.M6" in failure and "Lean version" in failure
+            for failure in snap.failures
+        )
+
+    def test_conflicting_versions_across_complete_batches_fail_closed(
+        self, tmp_path, monkeypatch
+    ):
+        modules = [f"P.M{i}" for i in range(7)]
+        self._install(monkeypatch, modules)
+
+        def fake_run(command, **kwargs):
+            requested = _script_modules(command)
+            version = "4.29.0" if requested == ["P.M6"] else "4.28.0"
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=_contract_for_modules(
+                    requested, lean_version=version
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        snap = engine.run_audit(tmp_path, "P", timeout=5)
+
+        assert snap.source_revision is None
+        assert snap.module_revisions == {}
+        assert any("inconsistent Lean versions" in f for f in snap.failures)
+
+    def test_mismatched_trusted_prefix_metadata_withholds_that_batch(
+        self, tmp_path, monkeypatch
+    ):
+        modules = [f"P.M{i}" for i in range(7)]
+        revision = self._install(monkeypatch, modules)
+
+        def fake_run(command, **kwargs):
+            requested = _script_modules(command)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=_contract_for_modules(
+                    requested,
+                    trusted_prefixes=(
+                        ["Mathlib"]
+                        if requested == ["P.M6"]
+                        else DEFAULT_TRUSTED_PREFIXES
+                    ),
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        snap = engine.run_audit(tmp_path, "P", timeout=5)
+
+        assert snap.modules == modules[:6]
+        assert snap.module_revisions == {
+            module: revision for module in modules[:6]
+        }
+        assert any(
+            "module P.M6" in failure and "trusted prefixes" in failure
+            for failure in snap.failures
+        )
+
+    def test_duplicate_name_across_complete_batches_withholds_everything(
+        self, tmp_path, monkeypatch
+    ):
+        modules = [f"P.M{i}" for i in range(7)]
+        self._install(monkeypatch, modules)
+
+        def fake_run(command, **kwargs):
+            requested = _script_modules(command)
+            stdout = _contract_for_modules(requested)
+            if requested == ["P.M6"]:
+                stdout = stdout.replace(
+                    "AUDIT|P.M6.probe|theorem|P.M6|",
+                    "AUDIT|P.M0.probe|theorem|P.M6|",
+                )
+            return subprocess.CompletedProcess(
+                command, 0, stdout=stdout, stderr=""
+            )
+
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        snap = engine.run_audit(tmp_path, "P", timeout=5)
+
+        assert snap.decls == []
+        assert snap.modules == []
+        assert snap.source_revision is None
+        assert snap.module_revisions == {}
+        assert any(
+            "duplicate declaration name(s) across complete audit batches"
+            in failure
+            and "P.M0.probe" in failure
+            for failure in snap.failures
+        )
+
+    def test_cross_batch_aba_revision_change_never_binds(
+        self, tmp_path, monkeypatch
+    ):
+        modules = [f"P.M{i}" for i in range(7)]
+        self._install(monkeypatch, modules)
+        a = ("a" * 40, True)
+        b = ("b" * 40, True)
+        states = iter([
+            a,  # before metadata
+            a,  # before execution
+            a,  # build partition start
+            a,  # build partition end
+            a,  # first batch start
+            b,  # first batch end: observed change
+            a,  # second batch start: returned to A
+            a,  # second batch end
+            a,  # final boundary
+        ])
+        monkeypatch.setattr(engine, "source_state", lambda repo: next(states))
+        monkeypatch.setattr(
+            engine,
+            "_run_process_group",
+            lambda command, **kwargs: subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=_contract_for_modules(_script_modules(command)),
+                stderr="",
+            ),
+        )
+
+        snap = engine.run_audit(tmp_path, "P", timeout=5)
+
+        assert snap.modules == modules
+        assert snap.source_revision is None
+        assert snap.module_revisions == {}
+        assert any("differed or became dirty" in f for f in snap.failures)
+
+    def test_metadata_derivation_aba_revision_change_never_binds(
+        self, tmp_path, monkeypatch
+    ):
+        modules = ["P.A"]
+        self._install(monkeypatch, modules)
+        a = ("a" * 40, True)
+        b = ("b" * 40, True)
+        states = iter([
+            a,  # before source-derived metadata
+            b,  # metadata boundary observed B
+            a,  # build partition start: returned to A
+            a,  # build partition end
+            a,  # evidence batch start
+            a,  # evidence batch end
+            a,  # final boundary
+        ])
+        monkeypatch.setattr(engine, "source_state", lambda repo: next(states))
+        monkeypatch.setattr(
+            engine,
+            "_run_process_group",
+            lambda command, **kwargs: subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=_contract_for_modules(_script_modules(command)),
+                stderr="",
+            ),
+        )
+
+        snap = engine.run_audit(tmp_path, "P", timeout=5)
+
+        assert snap.decls
+        assert snap.source_revision is None
+        assert snap.module_revisions == {}
+        assert any("differed or became dirty" in f for f in snap.failures)
+
+    def test_systemic_timeouts_have_strict_wall_and_invocation_bounds(
+        self, tmp_path, monkeypatch
+    ):
+        modules = [f"P.M{i:02d}" for i in range(27)]
+        self._install(monkeypatch, modules)
+        clock = _FakeClock()
+        monkeypatch.setattr(engine.time, "monotonic", clock.monotonic)
+        calls: list[tuple[list[str], float]] = []
+
+        def fake_run(command, **kwargs):
+            requested = _script_modules(command)
+            budget = float(kwargs["timeout"])
+            calls.append((requested, budget))
+            clock.advance(budget)
+            raise subprocess.TimeoutExpired(
+                cmd=command, timeout=budget, output=""
+            )
+
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        snap = engine.run_audit(tmp_path, "P", timeout=900)
+
+        batch_width = max(
+            engine._AUDIT_BATCH_MODULE_LIMIT,
+            math.ceil(len(modules) / engine._AUDIT_MAX_INITIAL_BATCHES),
+        )
+        initial_count = math.ceil(len(modules) / batch_width)
+        invocation_limit = initial_count + 2 * math.ceil(
+            math.log2(batch_width)
+        )
+        assert len(calls) <= invocation_limit
+        assert clock.now <= (
+            900 * engine._AUDIT_MAX_EVIDENCE_BUDGET_FACTOR
+        )
+        assert initial_count <= engine._AUDIT_MAX_INITIAL_BATCHES
+        assert all(len(requested) <= batch_width
+                   for requested, _ in calls)
+        # FIFO first passes ensure every module gets an attempt before retry
+        # descendants can consume the reserved recovery slice.
+        assert set().union(
+            *(set(requested) for requested, _ in calls[:initial_count])
+        ) == set(modules)
+        assert snap.modules == []
+        assert snap.module_revisions == {}
+
+    def test_systemic_fast_failures_hit_invocation_ceiling(
+        self, tmp_path, monkeypatch
+    ):
+        modules = [f"P.M{i:02d}" for i in range(27)]
+        self._install(monkeypatch, modules)
+        calls: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            calls.append(_script_modules(command))
+            return subprocess.CompletedProcess(
+                command, 1, stdout="", stderr="systemic failure"
+            )
+
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        snap = engine.run_audit(tmp_path, "P", timeout=900)
+
+        batch_width = max(
+            engine._AUDIT_BATCH_MODULE_LIMIT,
+            math.ceil(len(modules) / engine._AUDIT_MAX_INITIAL_BATCHES),
+        )
+        initial_count = math.ceil(len(modules) / batch_width)
+        invocation_limit = initial_count + 2 * math.ceil(
+            math.log2(batch_width)
+        )
+        assert len(calls) == invocation_limit
+        assert snap.modules == []
+        assert snap.module_revisions == {}
+        assert any("invocation limit" in f for f in snap.failures)
+
+    def test_one_heavy_leaf_recovers_all_healthy_modules_within_bounds(
+        self, tmp_path, monkeypatch
+    ):
+        modules = [f"P.M{i:02d}" for i in range(27)]
+        heavy = "P.M13"
+        revision = self._install(monkeypatch, modules)
+        clock = _FakeClock()
+        monkeypatch.setattr(engine.time, "monotonic", clock.monotonic)
+        calls: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            requested = _script_modules(command)
+            calls.append(requested)
+            if heavy in requested:
+                clock.advance(kwargs["timeout"])
+                raise subprocess.TimeoutExpired(
+                    cmd=command, timeout=kwargs["timeout"], output=""
+                )
+            # Regression guard: geometric child caps once fell below this
+            # realistic healthy runtime and lost M14 beside heavy M13.
+            assert kwargs["timeout"] >= 60
+            clock.advance(60)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=_contract_for_modules(requested),
+                stderr="",
+            )
+
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        snap = engine.run_audit(tmp_path, "P", timeout=900)
+
+        batch_width = max(
+            engine._AUDIT_BATCH_MODULE_LIMIT,
+            math.ceil(len(modules) / engine._AUDIT_MAX_INITIAL_BATCHES),
+        )
+        initial_count = math.ceil(len(modules) / batch_width)
+        invocation_limit = initial_count + 2 * math.ceil(
+            math.log2(batch_width)
+        )
+        assert len(calls) <= invocation_limit
+        assert clock.now < (
+            900 * engine._AUDIT_MAX_EVIDENCE_BUDGET_FACTOR
+        )
+        assert snap.modules == [module for module in modules if module != heavy]
+        assert snap.module_revisions == {
+            module: revision for module in modules if module != heavy
+        }
+        assert heavy not in {decl.module for decl in snap.decls}
+        assert any(heavy in failure for failure in snap.failures)
+
+    def test_single_expensive_healthy_batch_gets_full_live_timeout(
+        self, tmp_path, monkeypatch
+    ):
+        modules = ["P.Hypersurface"]
+        revision = self._install(monkeypatch, modules)
+        clock = _FakeClock()
+        monkeypatch.setattr(engine.time, "monotonic", clock.monotonic)
+        calls: list[float] = []
+
+        def fake_run(command, **kwargs):
+            calls.append(float(kwargs["timeout"]))
+            clock.advance(720)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=_contract_for_modules(_script_modules(command)),
+                stderr="",
+            )
+
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        snap = engine.run_audit(tmp_path, "P", timeout=900)
+
+        assert calls == [900]
+        assert clock.now == 720
+        assert snap.modules == modules
+        assert snap.module_revisions == {modules[0]: revision}
+
+
 # ---------------------------------------------------------------------------
 # Tolerant parsing
 # ---------------------------------------------------------------------------
@@ -425,6 +1176,27 @@ class TestTolerantParsing:
         text = "AUDIT_BEGIN\nAUDIT_META|schema|99\nAUDIT_DONE|0\n"
         parsed = engine.parse_audit_output(text)
         assert any("schema" in f for f in parsed.failures)
+
+    def test_required_schema_and_lean_version_metadata(self):
+        parsed = engine.parse_audit_output(
+            "AUDIT_BEGIN\nAUDIT_META|module|Foo\nAUDIT_DONE|0\n"
+        )
+        assert any("missing audit schema" in f for f in parsed.failures)
+        assert any("Lean version" in f for f in parsed.failures)
+
+    def test_conflicting_duplicate_singleton_metadata_is_rejected(self):
+        parsed = engine.parse_audit_output(
+            "AUDIT_BEGIN\n"
+            "AUDIT_META|schema|1\n"
+            "AUDIT_META|schema|99\n"
+            "AUDIT_META|lean_version|4.28.0\n"
+            "AUDIT_META|lean_version|4.29.0\n"
+            "AUDIT_DONE|0\n"
+        )
+        assert any("duplicate audit metadata key 'schema'" in f
+                   for f in parsed.failures)
+        assert any("duplicate audit metadata key 'lean_version'" in f
+                   for f in parsed.failures)
 
 
 # ---------------------------------------------------------------------------
@@ -555,13 +1327,13 @@ class TestDegradation:
         assert snap.toolchain == "leanprover/lean4:v4.28.0"
         assert snap.modules == FIXTURE_MODULES
 
-    def test_nonzero_exit_records_failure_keeps_partial(self, fake_lake):
+    def test_nonzero_exit_records_failure_drops_partial_rows(self, fake_lake):
         partial = "\n".join(GOLDEN_TEXT.splitlines()[:7])  # one AUDIT line
         fake_lake(stdout=partial, returncode=1, stderr="error: kaboom")
         snap = engine.run_audit(FIXTURE_DIR, "AuditFixture")
         assert any("exited 1" in f and "kaboom" in f for f in snap.failures)
         assert any("truncated" in f for f in snap.failures)
-        assert [d.name for d in snap.decls] == ["AuditFixture.Collapsible"]
+        assert snap.decls == []
 
     def test_timeout(self, fake_lake):
         fake_lake(exc=subprocess.TimeoutExpired(cmd="lake", timeout=5))
@@ -579,13 +1351,21 @@ class TestDegradation:
         self, fake_lake, monkeypatch
     ):
         fake_lake()
-        states = iter([("a" * 40, True), ("b" * 40, True)])
+        states = iter([
+            ("a" * 40, True),  # before metadata
+            ("a" * 40, True),  # before execution
+            ("a" * 40, True),  # build partition start
+            ("a" * 40, True),  # build partition end
+            ("a" * 40, True),  # batch start
+            ("b" * 40, True),  # batch end
+            ("b" * 40, True),  # final boundary
+        ])
         monkeypatch.setattr(engine, "source_state", lambda repo: next(states))
         snap = engine.run_audit(FIXTURE_DIR, "AuditFixture")
         assert snap.decls  # diagnostic output is retained
         assert snap.source_revision is None
         assert snap.module_revisions == {}
-        assert any("changed or became dirty" in f for f in snap.failures)
+        assert any("differed or became dirty" in f for f in snap.failures)
 
     def test_missing_target_folder(self, fake_lake):
         fake_lake()
@@ -725,6 +1505,70 @@ class TestPartitionBuildable:
         monkeypatch.setattr(engine, "_run_process_group", boom)
         assert not engine._lake_build_ok("/fake/lake", Path("/r"), ["M"], 5)
 
+    def test_all_timeouts_have_bounded_recovery(self, monkeypatch):
+        modules = [f"P.M{i:02d}" for i in range(27)]
+        clock = _FakeClock()
+        monkeypatch.setattr(engine.time, "monotonic", clock.monotonic)
+        calls: list[tuple[list[str], float]] = []
+
+        def fake_run(command, **kwargs):
+            budget = float(kwargs["timeout"])
+            calls.append((command[2:], budget))
+            clock.advance(budget)
+            raise subprocess.TimeoutExpired(
+                cmd=command, timeout=budget, output=""
+            )
+
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        buildable, excluded = engine.partition_buildable(
+            "/fake/lake", Path("/repo"), modules, 900
+        )
+
+        max_recovery = 4 * math.ceil(math.log2(len(modules)))
+        assert len(calls) <= 1 + max_recovery
+        # One initial command plus one strict recovery deadline.
+        assert clock.now <= 1800
+        assert buildable == []
+        assert excluded == modules
+
+    def test_one_heavy_leaf_does_not_shrink_healthy_build_probes(
+        self, monkeypatch
+    ):
+        modules = [f"P.M{i:02d}" for i in range(27)]
+        heavy = "P.M13"
+        clock = _FakeClock()
+        monkeypatch.setattr(engine.time, "monotonic", clock.monotonic)
+        calls: list[tuple[list[str], float]] = []
+
+        def fake_run(command, **kwargs):
+            requested = command[2:]
+            budget = float(kwargs["timeout"])
+            calls.append((requested, budget))
+            if heavy in requested:
+                clock.advance(budget)
+                raise subprocess.TimeoutExpired(
+                    cmd=command, timeout=budget, output=""
+                )
+            # A realistic healthy build probe still needs a full minute.
+            assert budget >= 60
+            clock.advance(60)
+            return subprocess.CompletedProcess(
+                command, 0, stdout="", stderr=""
+            )
+
+        monkeypatch.setattr(engine, "_run_process_group", fake_run)
+
+        buildable, excluded = engine.partition_buildable(
+            "/fake/lake", Path("/repo"), modules, 900
+        )
+
+        max_recovery = 4 * math.ceil(math.log2(len(modules)))
+        assert len(calls) <= 1 + max_recovery
+        assert clock.now <= 1800
+        assert buildable == [m for m in modules if m != heavy]
+        assert excluded == [heavy]
+
 
 class TestSkipBrokenIntegration:
     """run_audit end-to-end with a broken module in the target folder."""
@@ -752,8 +1596,9 @@ class TestSkipBrokenIntegration:
         snap = engine.run_audit(FIXTURE_DIR, "AuditFixture", timeout=5)
         assert snap.decls == []
         assert snap.modules == []
-        assert any("no modules built successfully" in f for f in snap.failures)
-        assert any("failed to build" in f for f in snap.failures)
+        assert any("no modules were confirmed buildable" in f
+                   for f in snap.failures)
+        assert any("bounded build probe" in f for f in snap.failures)
         # The `lake env lean` audit is short-circuited — nothing to audit.
         assert ran == []
 
@@ -769,14 +1614,17 @@ class TestSkipBrokenIntegration:
         monkeypatch.setattr(
             engine, "_run_process_group",
             lambda cmd, **k: subprocess.CompletedProcess(
-                cmd, 0, stdout=GOLDEN_TEXT, stderr=""
+                cmd,
+                0,
+                stdout=_contract_for_modules(_script_modules(cmd)),
+                stderr="",
             ),
         )
         snap = engine.run_audit(FIXTURE_DIR, "AuditFixture", timeout=5)
         assert "AuditFixture.Deception" not in snap.modules
         assert "AuditFixture.Basic" in snap.modules
         assert any(
-            "AuditFixture.Deception" in f and "failed to build" in f
+            "AuditFixture.Deception" in f and "bounded build probe" in f
             for f in snap.failures
         )
 
@@ -916,6 +1764,194 @@ class TestPersistence:
         assert any("withheld module(s): B" in f for f in fresh.failures)
         assert any("statement cone" in f for f in fresh.failures)
 
+    def test_unchanged_import_closure_carries_old_evidence_to_current_head(
+        self, tmp_path
+    ):
+        repo, old_revision = _audit_carry_repo(tmp_path)
+        old = mk_snapshot(
+            [
+                mk_decl(name="Demo.a", module="Demo.A"),
+                mk_decl(
+                    name="Demo.b", module="Demo.B", cone=["Demo.a"]
+                ),
+            ],
+            repo_dir=str(repo),
+            modules=["Demo.A", "Demo.B"],
+            source_revision=old_revision,
+            module_revisions={
+                "Demo.A": old_revision,
+                "Demo.B": old_revision,
+            },
+            attempted_modules=["Demo.A", "Demo.B"],
+        )
+        engine.save_snapshot(old, merge=False)
+        (repo / "Demo" / "Unrelated.lean").write_text(
+            "def unrelated : Nat := 2\n"
+        )
+        current_revision = _commit(
+            repo, "unrelated change", "Demo/Unrelated.lean"
+        )
+
+        fresh = engine.load_snapshot(repo)
+        assert fresh is not None
+        assert set(fresh.by_name()) == {"Demo.a", "Demo.b"}
+        assert fresh.modules == ["Demo.A", "Demo.B"]
+        # The normal read view is current-bound, while raw persisted provenance
+        # still records where Lean actually produced the evidence.
+        assert fresh.source_revision == current_revision
+        assert fresh.module_revisions == {
+            "Demo.A": current_revision,
+            "Demo.B": current_revision,
+        }
+        raw = engine.load_snapshot(repo, validate_revision=False)
+        assert raw is not None
+        assert raw.module_revisions == {
+            "Demo.A": old_revision,
+            "Demo.B": old_revision,
+        }
+        assert not any("withheld module" in f for f in fresh.failures)
+
+    def test_changed_import_invalidates_unchanged_dependent_module(
+        self, tmp_path
+    ):
+        repo, old_revision = _audit_carry_repo(tmp_path)
+        old = mk_snapshot(
+            [mk_decl(name="Demo.b", module="Demo.B")],
+            repo_dir=str(repo),
+            modules=["Demo.B"],
+            source_revision=old_revision,
+            module_revisions={"Demo.B": old_revision},
+            attempted_modules=["Demo.B"],
+        )
+        engine.save_snapshot(old, merge=False)
+        (repo / "Demo" / "A.lean").write_text("def a : Nat := 2\n")
+        _commit(repo, "change imported module", "Demo/A.lean")
+
+        fresh = engine.load_snapshot(repo)
+        assert fresh is not None
+        assert fresh.decls == []
+        assert fresh.modules == []
+        assert fresh.module_revisions == {}
+        assert any("withheld module(s): Demo.B" in f for f in fresh.failures)
+
+    def test_config_change_refuses_unchanged_source_carry_forward(
+        self, tmp_path
+    ):
+        repo, old_revision = _audit_carry_repo(tmp_path)
+        old = mk_snapshot(
+            [mk_decl(name="Demo.b", module="Demo.B")],
+            repo_dir=str(repo),
+            modules=["Demo.B"],
+            source_revision=old_revision,
+            module_revisions={"Demo.B": old_revision},
+            attempted_modules=["Demo.B"],
+        )
+        engine.save_snapshot(old, merge=False)
+        (repo / "lean-toolchain").write_text("leanprover/lean4:v4.29.0\n")
+        _commit(repo, "toolchain change", "lean-toolchain")
+
+        fresh = engine.load_snapshot(repo)
+        assert fresh is not None and fresh.decls == []
+        assert fresh.module_revisions == {}
+        assert any(
+            "carry-forward" in f and "configuration changed" in f
+            for f in fresh.failures
+        )
+
+    def test_unmappable_changed_lean_path_fails_carry_forward_closed(
+        self, tmp_path
+    ):
+        repo, old_revision = _audit_carry_repo(tmp_path)
+        old = mk_snapshot(
+            [mk_decl(name="Demo.b", module="Demo.B")],
+            repo_dir=str(repo),
+            modules=["Demo.B"],
+            source_revision=old_revision,
+            module_revisions={"Demo.B": old_revision},
+            attempted_modules=["Demo.B"],
+        )
+        engine.save_snapshot(old, merge=False)
+        (repo / "Demo" / "bad-name.lean").write_text("def bad : Nat := 1\n")
+        _commit(repo, "unsafe Lean path", "Demo/bad-name.lean")
+
+        fresh = engine.load_snapshot(repo)
+        assert fresh is not None and fresh.decls == []
+        assert fresh.module_revisions == {}
+        assert any(
+            "cannot be mapped to a safe module name" in f
+            for f in fresh.failures
+        )
+
+    def test_missing_old_git_revision_fails_carry_forward_closed(
+        self, tmp_path
+    ):
+        repo, _old_revision = _audit_carry_repo(tmp_path)
+        missing_revision = "f" * 40
+        old = mk_snapshot(
+            [mk_decl(name="Demo.b", module="Demo.B")],
+            repo_dir=str(repo),
+            modules=["Demo.B"],
+            source_revision=missing_revision,
+            module_revisions={"Demo.B": missing_revision},
+            attempted_modules=["Demo.B"],
+        )
+        engine.save_snapshot(old, merge=False)
+
+        fresh = engine.load_snapshot(repo)
+        assert fresh is not None and fresh.decls == []
+        assert fresh.module_revisions == {}
+        assert any(
+            "not a readable commit object" in f for f in fresh.failures
+        )
+
+    def test_symbolic_old_revision_never_carries_as_immutable_evidence(
+        self, tmp_path
+    ):
+        repo, _old_revision = _audit_carry_repo(tmp_path)
+        old = mk_snapshot(
+            [mk_decl(name="Demo.b", module="Demo.B")],
+            repo_dir=str(repo), modules=["Demo.B"], source_revision="HEAD",
+            module_revisions={"Demo.B": "HEAD"},
+            attempted_modules=["Demo.B"],
+        )
+        engine.save_snapshot(old, merge=False)
+        (repo / "Demo" / "Unrelated.lean").write_text(
+            "def unrelated : Nat := 2\n"
+        )
+        _commit(repo, "unrelated change", "Demo/Unrelated.lean")
+
+        fresh = engine.load_snapshot(repo)
+        assert fresh is not None and fresh.decls == []
+        assert fresh.module_revisions == {}
+        assert any(
+            "not a full commit object ID" in failure
+            for failure in fresh.failures
+        )
+
+    def test_tab_separated_import_is_part_of_carry_forward_closure(
+        self, tmp_path
+    ):
+        repo, _first_revision = _audit_carry_repo(tmp_path)
+        (repo / "Demo" / "B.lean").write_text(
+            "import\tDemo.A\ndef b : Nat := a\n"
+        )
+        old_revision = _commit(repo, "tab import", "Demo/B.lean")
+        old = mk_snapshot(
+            [mk_decl(name="Demo.b", module="Demo.B")],
+            repo_dir=str(repo), modules=["Demo.B"],
+            source_revision=old_revision,
+            module_revisions={"Demo.B": old_revision},
+            attempted_modules=["Demo.B"],
+        )
+        engine.save_snapshot(old, merge=False)
+        (repo / "Demo" / "A.lean").write_text("def a : Nat := 2\n")
+        _commit(repo, "change tab-imported module", "Demo/A.lean")
+
+        fresh = engine.load_snapshot(repo)
+        assert fresh is not None and fresh.decls == []
+        assert fresh.module_revisions == {}
+        assert any("withheld module(s): Demo.B" in f for f in fresh.failures)
+
     def test_failed_audit_does_not_advance_or_replace_successful_evidence(
         self, tmp_path
     ):
@@ -966,6 +2002,22 @@ def _cli(monkeypatch, *argv):
 
 
 class TestCLI:
+    def test_run_timeout_help_states_total_bound(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            sys, "argv", ["marathon", "audit", "run", "--help"]
+        )
+        with pytest.raises(SystemExit) as exc:
+            from marathon.__main__ import main
+
+            main()
+        assert exc.value.code == 0
+        help_text = " ".join(capsys.readouterr().out.split())
+        assert "bounded by 9x SECONDS total" in help_text
+        assert "135 minutes" in help_text
+        assert "never once per module" in help_text
+
     def test_run_prints_summary_and_saves(self, tmp_path, monkeypatch, capsys):
         snap = mk_snapshot(
             [

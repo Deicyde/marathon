@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,7 @@ from marathon.review.fill_discovery import FillTarget
 
 @pytest.fixture(autouse=True)
 def _complete_fake_worker_handshake(monkeypatch):
+    cond._AUTO_AUDIT_RECENT_TIMED_HEADS.clear()
     monkeypatch.setattr(
         cond,
         "_await_worker_handshake",
@@ -23,6 +25,8 @@ def _complete_fake_worker_handshake(monkeypatch):
             "pid": proc.pid, "pgid": proc.pid, "status": "running",
         },
     )
+    yield
+    cond._AUTO_AUDIT_RECENT_TIMED_HEADS.clear()
 
 
 def _ft(issue, chapter=12):
@@ -79,6 +83,32 @@ class _FakeSnap:
         return self._b
 
 
+def _auto_audit_guard_payload(
+    repo, *, head="new", target="GA/LeeSM", launched_at_epoch=1_800_000_000.0,
+    schema=None,
+):
+    schema = cond.AUTO_AUDIT_GUARD_SCHEMA_VERSION if schema is None else schema
+    payload = {
+        "schema_version": schema,
+        "status": "running",
+        "launcher_pid": os.getpid(),
+        "pid": 9876,
+        "head": head,
+        "target": target,
+        "repo_dir": str(repo.resolve()),
+        "launched_at": datetime.fromtimestamp(
+            launched_at_epoch, timezone.utc
+        ).isoformat(),
+        "command": [
+            sys.executable, "-m", "marathon", "audit", "run",
+            "--target", target, "--repo-dir", str(repo),
+        ],
+    }
+    if schema >= 2:
+        payload["launched_at_epoch"] = launched_at_epoch
+    return payload
+
+
 def test_auto_audit_gates_on_throttle_and_head_move(tmp_path, monkeypatch):
     """Auto re-audit fires only when main MOVED since the last audit AND the
     throttle window has passed — so a downstream break surfaces, without
@@ -95,7 +125,9 @@ def test_auto_audit_gates_on_throttle_and_head_move(tmp_path, monkeypatch):
     monkeypatch.setattr(refresh_mod, "head_sha", lambda r: "newhead123")
     I = cond.AUTO_AUDIT_MIN_INTERVAL_SECONDS
 
-    # throttled (within the interval of last_time) → no audit
+    # A retry clock known to belong to this exact HEAD throttles it.
+    identity = cond._auto_audit_identity(tmp_path, "GA/LeeSM")
+    cond._AUTO_AUDIT_RECENT_TIMED_HEADS[identity] = "newhead123"
     h, t = cond._maybe_auto_audit(cfg, "old", last_time=100.0, _now_fn=lambda: 100.0 + I / 2)
     assert (h, t) == ("old", 100.0) and not calls
 
@@ -165,7 +197,9 @@ def test_auto_audit_advances_only_after_persisted_success(tmp_path, monkeypatch)
     assert len(calls) == 1
 
 
-def test_auto_audit_failure_keeps_cursor_and_retries(tmp_path, monkeypatch):
+def test_auto_audit_failure_retries_only_after_durable_cooldown(
+    tmp_path, monkeypatch,
+):
     import marathon.deck.refresh as refresh_mod
 
     cfg = SimpleNamespace(
@@ -177,20 +211,291 @@ def test_auto_audit_failure_keeps_cursor_and_retries(tmp_path, monkeypatch):
     monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda r: False)
     monkeypatch.setattr(cond, "_live_legacy_auto_audit_pids", lambda *a: [])
     monkeypatch.setattr(refresh_mod, "head_sha", lambda r: "new")
+    class FakePopen:
+        pid = 9876
+
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(cond.subprocess, "Popen", FakePopen)
+    interval = cond.AUTO_AUDIT_MIN_INTERVAL_SECONDS
+    started = 1_800_000_000.0
+
+    head, when = cond._maybe_auto_audit(
+        cfg, "old", 0.0, _now_fn=lambda: started
+    )
+    assert head == "old" and len(calls) == 1
+    # No persisted success appeared. Even a restarted conductor whose memory
+    # throttle is empty must not repeat the same expensive HEAD after 15m.
+    head, deferred_at = cond._maybe_auto_audit(
+        cfg, head, float("-inf"), _now_fn=lambda: when + interval + 1
+    )
+    assert head == "old" and deferred_at == when + interval + 1
+    assert len(calls) == 1
+
+    # The same metadata is fail-open once its bounded 6h cooldown expires.
+    head, _ = cond._maybe_auto_audit(
+        cfg,
+        head,
+        float("-inf"),
+        _now_fn=lambda: when
+        + cond.AUTO_AUDIT_FAILED_ATTEMPT_COOLDOWN_SECONDS
+        + 1,
+    )
+    assert head == "old" and len(calls) == 2
+
+
+@pytest.mark.parametrize("schema", [1, 2])
+def test_auto_audit_restart_suppresses_recent_same_head_attempt(
+    tmp_path, monkeypatch, schema,
+):
+    """The on-disk attempt clock survives a conductor's empty restart state.
+
+    Schema 1 covers the guard already present on the live host at upgrade time;
+    schema 2 is what this conductor writes on subsequent launches.
+    """
+    import marathon.deck.refresh as refresh_mod
+
+    cfg = SimpleNamespace(
+        repo_dir=tmp_path,
+        target_path_template="GA/LeeSM/Chapter{chapter}",
+    )
+    now = cond._now()
+    marker = cond.auto_audit_guard_path(tmp_path)
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps(_auto_audit_guard_payload(
+        tmp_path, head="new", launched_at_epoch=now, schema=schema,
+    )))
+    calls = []
+    monkeypatch.setattr(cond, "_persisted_audit_revision", lambda cfg: "old")
+    monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda repo: False)
+    monkeypatch.setattr(
+        cond, "_live_legacy_auto_audit_pids",
+        lambda *args: pytest.fail("cooldown should precede legacy scanning"),
+    )
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda repo: "new")
     monkeypatch.setattr(
         cond.subprocess, "Popen", lambda *a, **k: calls.append(a)
     )
-    interval = cond.AUTO_AUDIT_MIN_INTERVAL_SECONDS
 
     head, when = cond._maybe_auto_audit(
-        cfg, "old", 0.0, _now_fn=lambda: interval + 1
+        cfg, "old", float("-inf"), _now_fn=lambda: now + 60
+    )
+    assert (head, when) == ("old", now + 60)
+    assert calls == []
+
+
+def test_auto_audit_changed_head_bypasses_recent_attempt_cooldown(
+    tmp_path, monkeypatch,
+):
+    import marathon.deck.refresh as refresh_mod
+
+    cfg = SimpleNamespace(
+        repo_dir=tmp_path,
+        target_path_template="GA/LeeSM/Chapter{chapter}",
+    )
+    now = cond._now()
+    marker = cond.auto_audit_guard_path(tmp_path)
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps(_auto_audit_guard_payload(
+        tmp_path, head="prior-head", launched_at_epoch=now,
+    )))
+    calls = []
+
+    class FakePopen:
+        pid = 9877
+
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(cond, "_persisted_audit_revision", lambda cfg: "old")
+    monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda repo: False)
+    monkeypatch.setattr(cond, "_live_legacy_auto_audit_pids", lambda *args: [])
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda repo: "new-head")
+    monkeypatch.setattr(cond.subprocess, "Popen", FakePopen)
+
+    head, when = cond._maybe_auto_audit(
+        cfg, "old", float("-inf"), _now_fn=lambda: now + 60
+    )
+    assert (head, when) == ("old", now + 60)
+    assert len(calls) == 1
+    assert json.loads(marker.read_text())["head"] == "new-head"
+
+
+def test_auto_audit_new_head_bypasses_throttle_set_by_cooldown(
+    tmp_path, monkeypatch,
+):
+    """A same-HEAD deferral must not make a later revision wait 15 minutes."""
+    import marathon.deck.refresh as refresh_mod
+
+    cfg = SimpleNamespace(
+        repo_dir=tmp_path,
+        target_path_template="GA/LeeSM/Chapter{chapter}",
+    )
+    now = cond._now()
+    marker = cond.auto_audit_guard_path(tmp_path)
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps(_auto_audit_guard_payload(
+        tmp_path, head="head-a", launched_at_epoch=now,
+    )))
+    current = {"head": "head-a"}
+    calls = []
+
+    class FakePopen:
+        pid = 9879
+
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(cond, "_persisted_audit_revision", lambda cfg: "old")
+    monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda repo: False)
+    monkeypatch.setattr(cond, "_live_legacy_auto_audit_pids", lambda *args: [])
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda repo: current["head"])
+    monkeypatch.setattr(cond.subprocess, "Popen", FakePopen)
+
+    head, deferred_at = cond._maybe_auto_audit(
+        cfg, "old", float("-inf"), _now_fn=lambda: now + 60
+    )
+    assert head == "old" and calls == []
+
+    current["head"] = "head-b"
+    head, launched_at = cond._maybe_auto_audit(
+        cfg, head, deferred_at, _now_fn=lambda: now + 61
+    )
+    assert (head, launched_at) == ("old", now + 61)
+    assert len(calls) == 1
+    assert json.loads(marker.read_text())["head"] == "head-b"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "expired", "malformed", "oversized", "wrong-schema",
+        "foreign-repo", "foreign-target", "unknown-field",
+        "contradictory-time", "duplicate-option", "extra-option",
+        "foreign-interpreter",
+    ],
+)
+def test_auto_audit_untrusted_guard_metadata_never_suppresses(
+    tmp_path, monkeypatch, case,
+):
+    import marathon.deck.refresh as refresh_mod
+
+    cfg = SimpleNamespace(
+        repo_dir=tmp_path,
+        target_path_template="GA/LeeSM/Chapter{chapter}",
+    )
+    now = cond._now()
+    marker = cond.auto_audit_guard_path(tmp_path)
+    marker.parent.mkdir(parents=True)
+    payload = _auto_audit_guard_payload(
+        tmp_path, head="new", launched_at_epoch=now,
+    )
+    if case == "expired":
+        payload["launched_at_epoch"] = (
+            now - cond.AUTO_AUDIT_FAILED_ATTEMPT_COOLDOWN_SECONDS - 1
+        )
+        raw = json.dumps(payload).encode()
+    elif case == "malformed":
+        raw = b"{not-json"
+    elif case == "oversized":
+        raw = b"x" * (cond.AUTO_AUDIT_GUARD_MAX_BYTES + 1)
+    elif case == "wrong-schema":
+        payload["schema_version"] = 999
+        raw = json.dumps(payload).encode()
+    elif case == "foreign-repo":
+        payload["repo_dir"] = str((tmp_path / "foreign").resolve())
+        raw = json.dumps(payload).encode()
+    elif case == "foreign-target":
+        payload["target"] = "GA/Elsewhere"
+        raw = json.dumps(payload).encode()
+    elif case == "contradictory-time":
+        payload["launched_at"] = "2020-01-01T00:00:00+00:00"
+        raw = json.dumps(payload).encode()
+    elif case == "duplicate-option":
+        payload["command"].extend(["--repo-dir", str(tmp_path / "foreign")])
+        raw = json.dumps(payload).encode()
+    elif case == "extra-option":
+        payload["command"].extend(["--timeout", "1"])
+        raw = json.dumps(payload).encode()
+    elif case == "foreign-interpreter":
+        payload["command"][0] = str(tmp_path / "python-foreign")
+        raw = json.dumps(payload).encode()
+    else:
+        payload["unexpected"] = True
+        raw = json.dumps(payload).encode()
+    marker.write_bytes(raw)
+    calls = []
+
+    class FakePopen:
+        pid = 9878
+
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(cond, "_persisted_audit_revision", lambda cfg: "old")
+    monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda repo: False)
+    monkeypatch.setattr(cond, "_live_legacy_auto_audit_pids", lambda *args: [])
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda repo: "new")
+    monkeypatch.setattr(cond.subprocess, "Popen", FakePopen)
+
+    head, when = cond._maybe_auto_audit(
+        cfg, "old", float("-inf"), _now_fn=lambda: now + 60
+    )
+    assert (head, when) == ("old", now + 60)
+    assert len(calls) == 1
+
+
+def test_malformed_guard_throttles_same_head_but_not_changed_head(
+    tmp_path, monkeypatch,
+):
+    """The in-process clock remembers its revision independently of the
+    durable diagnostics: corrupting those diagnostics cannot cause a hot retry
+    of the same HEAD or delay a different HEAD that lands moments later."""
+    import marathon.deck.refresh as refresh_mod
+
+    cfg = SimpleNamespace(
+        repo_dir=tmp_path,
+        target_path_template="GA/LeeSM/Chapter{chapter}",
+    )
+    current = {"head": "head-a"}
+    calls = []
+
+    class FakePopen:
+        pid = 9880
+
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(cond, "_persisted_audit_revision", lambda cfg: "old")
+    monkeypatch.setattr(cond, "_has_uncommitted_lean", lambda repo: False)
+    monkeypatch.setattr(cond, "_live_legacy_auto_audit_pids", lambda *args: [])
+    monkeypatch.setattr(refresh_mod, "head_sha", lambda repo: current["head"])
+    monkeypatch.setattr(cond.subprocess, "Popen", FakePopen)
+
+    head, launched_at = cond._maybe_auto_audit(
+        cfg, "old", float("-inf"), _now_fn=lambda: 1_800_000_000.0
     )
     assert head == "old" and len(calls) == 1
-    # No persisted success appeared.  Once the throttle expires, retry.
-    head, _ = cond._maybe_auto_audit(
-        cfg, head, when, _now_fn=lambda: when + interval + 1
+    marker = cond.auto_audit_guard_path(tmp_path)
+    marker.write_text("{broken")
+
+    # The same revision remains protected even though its durable record was
+    # corrupted after launch.
+    head, same_time = cond._maybe_auto_audit(
+        cfg, head, launched_at, _now_fn=lambda: launched_at + 1
     )
-    assert head == "old" and len(calls) == 2
+    assert (head, same_time) == ("old", launched_at)
+    assert len(calls) == 1
+
+    # A new revision does not inherit head-a's retry clock merely because the
+    # durable record is unreadable.
+    current["head"] = "head-b"
+    head, changed_time = cond._maybe_auto_audit(
+        cfg, head, same_time, _now_fn=lambda: launched_at + 2
+    )
+    assert (head, changed_time) == ("old", launched_at + 2)
+    assert len(calls) == 2
 
 
 @pytest.mark.skipif(os.name == "nt", reason="auto-audit lease uses POSIX flock")
@@ -202,6 +507,14 @@ def test_auto_audit_busy_guard_is_restart_safe_and_does_not_move_throttle(
     even though the stable guard file and its stale metadata remain."""
     guard, status = cond._try_acquire_auto_audit_guard(tmp_path)
     assert status == "acquired" and guard is not None
+    # Even perfectly matching recent metadata cannot replace the authoritative
+    # kernel liveness check: while the child owns the flock this stays busy.
+    cond._write_auto_audit_guard_metadata(
+        guard,
+        _auto_audit_guard_payload(
+            tmp_path, head="new", launched_at_epoch=cond._now(),
+        ),
+    )
     child = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],
         pass_fds=(guard.fileno(),),

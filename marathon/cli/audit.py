@@ -54,7 +54,14 @@ def _add_audit_subparser(subparsers) -> None:
     )
     p_run.add_argument(
         "--timeout", type=int, default=900, metavar="SECONDS",
-        help="Timeout for the `lake env lean` run. Default: 900.",
+        help=(
+            "Per-command ceiling and bounded-recovery budget unit. Shared "
+            "build-lock waiting uses at most 1x SECONDS; build validation "
+            "uses at most 2x; up to five evidence batches plus one shared "
+            "recovery slice use at most 6x. The command stages are therefore "
+            "bounded by 9x SECONDS total (135 minutes at the default 900), "
+            "never once per module."
+        ),
     )
     p_run.set_defaults(func=_run_audit_run)
 
