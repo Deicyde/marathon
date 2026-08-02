@@ -580,6 +580,7 @@
     definitionTermsQueued: null,
     definitionTermsRequestSeq: 0,
     definitionRequestSeq: 0,
+    reviewInspectorGeneration: 0,
     // Verso is an optional, asynchronously-built semantic view of the same
     // source. Raw current source is always painted first; these fields only
     // control a progressive enhancement and can never block review.
@@ -2267,11 +2268,54 @@
     container.setAttribute("data-verso-hovers", "1");
   }
 
+  // Keep the semantic blueprint navigable without forcing the reviewer out of
+  // the declaration they are auditing.  Project declarations open in the
+  // current review inspector; modified clicks retain the generated Verso link
+  // and therefore still open the full, token-pinned blueprint in a new tab.
+  // Mathlib/core links are left alone because the local definition endpoint
+  // cannot resolve them honestly.
+  function activateVersoDefinitionLinks(container) {
+    if (!container || container.getAttribute("data-verso-definition-links") === "1") return;
+    container.querySelectorAll("a[href]").forEach(function (anchor) {
+      anchor.addEventListener("click", function (event) {
+        if (event.defaultPrevented || event.button !== 0 || event.metaKey ||
+            event.ctrlKey || event.shiftKey || event.altKey) return;
+        var candidates = [];
+        var label = String(anchor.textContent || "").trim();
+        if (label) candidates.push(label);
+        var href = String(anchor.getAttribute("href") || "");
+        var hashAt = href.indexOf("#");
+        if (hashAt >= 0 && hashAt + 1 < href.length) {
+          try {
+            var fragment = decodeURIComponent(href.slice(hashAt + 1));
+            if (fragment && candidates.indexOf(fragment) < 0) candidates.push(fragment);
+          } catch (e) { /* a malformed fragment keeps the normal link behavior */ }
+        }
+        var definitionName = null;
+        for (var i = 0; i < candidates.length; i++) {
+          if (projectTermCandidates(candidates[i]).length) {
+            definitionName = candidates[i];
+            break;
+          }
+        }
+        if (!definitionName) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (state.versoHoverController) {
+          state.versoHoverController.closeFor(container);
+        }
+        showDefinitionLookup(definitionName, null);
+      });
+    });
+    container.setAttribute("data-verso-definition-links", "1");
+  }
+
   function resetVersoInteractions(container) {
     if (!container) return;
     container.removeAttribute("data-verso-bindings");
     container.removeAttribute("data-verso-hovers");
     container.removeAttribute("data-verso-hover-retries");
+    container.removeAttribute("data-verso-definition-links");
     container.querySelectorAll(".binding-hl").forEach(function (node) {
       node.classList.remove("binding-hl");
     });
@@ -2354,6 +2398,7 @@
     }
     semantic.setAttribute("data-verso-artifact", artifactToken || "");
     updateVersoFreshness(shell, status);
+    activateVersoDefinitionLinks(semantic);
     activateVersoHovers(
       semantic, docs, pageRelative, artifactBase,
       shell._marathonVersoIdPrefix, artifactToken
@@ -2897,16 +2942,20 @@
     var host = inspectorHost();
     if (!host) return;
     state.definitionRequestSeq += 1;
+    state.reviewInspectorGeneration += 1;
     var onClose = host._marathonOnClose;
     host._marathonOnClose = null;
     host.setAttribute("hidden", "hidden");
     host.innerHTML = "";
     var card = document.getElementById("active-card");
-    if (card) card.classList.remove("has-inspector");
+    if (card) {
+      card.classList.remove("has-inspector");
+      card.classList.remove("has-definition-inspector");
+    }
     if (typeof onClose === "function") onClose();
   }
 
-  function openReviewInspector(title, children, onClose) {
+  function openReviewInspector(title, children, onClose, kind) {
     var host = inspectorHost();
     if (!host) {
       flashToast("Open a declaration card to use the review inspector");
@@ -2919,6 +2968,7 @@
       flashToast("Finish or cancel the rejection note first");
       return null;
     }
+    state.reviewInspectorGeneration += 1;
     host.innerHTML = "";
     host._marathonOnClose = onClose || null;
     host.appendChild(el("div", { class: "inspector-head" }, [
@@ -2936,16 +2986,21 @@
     });
     host.removeAttribute("hidden");
     var card = document.getElementById("active-card");
-    if (card) card.classList.add("has-inspector");
+    if (card) {
+      card.classList.add("has-inspector");
+      card.classList.toggle("has-definition-inspector", kind === "definition");
+    }
     return host;
   }
 
-  function inspectorCode(label, value) {
+  function inspectorCode(label, value, highlightLean) {
     var section = el("section", { class: "inspector-sec" }, [
       el("h3", { class: "inspector-label", text: label }),
     ]);
     if (value) {
-      section.appendChild(el("pre", { class: "inspector-code mono" }, [value]));
+      section.appendChild(el("pre", {
+        class: "inspector-code mono" + (highlightLean ? " inspector-code-lean" : ""),
+      }, highlightLean ? leanHighlight(value, []) : [value]));
     } else {
       section.appendChild(el("p", { class: "inspector-empty", text: "not available in this audit snapshot" }));
     }
@@ -2960,8 +3015,8 @@
     ]);
     openDefinitionSurface("Review details", [
       meta,
-      inspectorCode("Elaborated type", member.type_pp),
-      inspectorCode("Definition body", member.value_pp),
+      inspectorCode("Elaborated type", member.type_pp, true),
+      inspectorCode("Definition body", member.value_pp, true),
       el("p", { class: "inspector-hint", text:
         "This is the audit snapshot's elaborated kernel entry. Click another highlighted term to inspect it." }),
     ]);
@@ -2969,7 +3024,7 @@
 
   function openDefinitionSurface(title, children) {
     if (state.activeTab === "review" && inspectorHost()) {
-      return openReviewInspector(title, children);
+      return openReviewInspector(title, children, null, "definition");
     }
     function closeDefinitionModal() {
       closeModal();
@@ -2999,9 +3054,34 @@
     return rows.join("\n");
   }
 
-  function renderDefinitionMatch(match) {
+  function definitionSourceSurface(match) {
     var location = match.source_file || "source unavailable";
     if (match.source_line != null) location += ":" + match.source_line;
+    var children = [
+      el("h3", { class: "inspector-label", text: "Current source" }),
+      el("p", { class: "resource-file" }, [
+        el("span", { class: "mono", text: location }),
+      ]),
+    ];
+    var shell = null;
+    if (match.source_block) {
+      var rawCode = el("pre", { class: "source-block definition-source-block" }, [
+        el("code", { class: "lean" }, leanHighlight(match.source_block, [])),
+      ]);
+      shell = makeVersoShell(rawCode, "declaration", match.name || "");
+      children.push(shell);
+    } else {
+      children.push(el("p", { class: "inspector-empty", text:
+        "not available in the current source snapshot" }));
+    }
+    return {
+      section: el("section", { class: "inspector-sec definition-source-surface" }, children),
+      shell: shell,
+    };
+  }
+
+  function renderDefinitionMatch(match) {
+    var sourceSurface = definitionSourceSurface(match);
     var owners = el("section", { class: "inspector-sec" }, [
       el("h3", { class: "inspector-label", text: "Owning review card" }),
     ]);
@@ -3022,22 +3102,21 @@
         }, ["Open #" + owner.issue + " · " + (owner.title || "review card")]));
       });
     }
-    openDefinitionSurface("Review details", [
+    var surface = openDefinitionSurface("Review details", [
       el("p", { class: "inspector-meta" }, [
         match.kind ? el("span", { class: "decl-panel-kind", text: match.kind }) : null,
         tierBadge(match.tier || "-", match.qualifiers || []),
         el("span", { class: "mono", text: match.name }),
       ]),
-      el("p", { class: "resource-file" }, [
-        el("strong", { text: "Current source" }),
-        el("span", { class: "mono", text: location }),
-      ]),
-      inspectorCode("Source block", match.source_block),
-      inspectorCode("Elaborated type", match.statement_pp),
-      inspectorCode("Definition body", match.value_pp),
+      sourceSurface.section,
+      inspectorCode("Elaborated type", match.statement_pp, true),
+      inspectorCode("Definition body", match.value_pp, true),
       inspectorCode("Trust evidence", definitionEvidence(match)),
       owners,
     ]);
+    if (surface && sourceSurface.shell) {
+      enhanceVersoDeclaration(sourceSurface.shell, match.name || "");
+    }
   }
 
   function showDefinitionLookup(name, fallbackMember) {
@@ -3046,16 +3125,21 @@
     var activeTab = state.activeTab;
     var declaration = activeTab === "review" && state.currentDecl
       ? state.currentDecl.name : null;
+    var originSurface = openDefinitionSurface("Definition lookup", [
+      el("p", { class: "inspector-hint", text: "Resolving " + name + " against current project source…" }),
+    ]);
+    if (!originSurface) return;
+    var originInspectorGeneration = state.reviewInspectorGeneration;
     function stillCurrent() {
       return requestSeq === state.definitionRequestSeq
         && issue === state.issue
         && activeTab === state.activeTab
+        && originSurface.isConnected
+        && (activeTab !== "review"
+          || originInspectorGeneration === state.reviewInspectorGeneration)
         && (activeTab !== "review"
           || declaration === (state.currentDecl && state.currentDecl.name));
     }
-    openDefinitionSurface("Definition lookup", [
-      el("p", { class: "inspector-hint", text: "Resolving " + name + " against current project source…" }),
-    ]);
     fetchDefinition(name)
       .then(function (result) {
         if (!stillCurrent()) return;
@@ -5937,6 +6021,11 @@
     }, 1600);
   }
   function animateOut(verdict) {
+    // A fixed desktop inspector is nested in the card so it can be destroyed
+    // atomically with that card. Close it before applying a swipe/fly transform:
+    // transformed ancestors redefine fixed positioning and would otherwise
+    // make the side rail jump into, rotate with, and leave the viewport.
+    if (isReviewInspectorOpen()) closeReviewInspector();
     var card = document.getElementById("active-card");
     if (!card) return;
     card.classList.add(
@@ -5955,6 +6044,10 @@
     var THRESH = 110;
     function onDown(e) {
       if (state.activeTab !== "review") return;   // swipe is Review-only
+      // Side inspectors are reading/editing surfaces, not swipe handles. This
+      // also guarantees the desktop fixed rail never acquires the transformed
+      // card as its containing block during a drag.
+      if (isReviewInspectorOpen()) return;
       var card = document.getElementById("active-card");
       // A decl card (canAct) OR the leading informal-approval card (canActInformal)
       // is draggable; both route through actVerify/actReject on release.

@@ -973,6 +973,82 @@ function installDefinitionTerms(terms) {
     return json.loads(proc.stdout)
 
 
+def _run_definition_surface_race(app_js: str) -> dict:
+    """Resolve lookups after their inspector was replaced or detached."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for definition surface race test")
+    code = _strip_block_comments(app_js)
+    lookup = _fn_body(code, "function showDefinitionLookup")
+    script = lookup + r"""
+function deferred() {
+  var resolve, reject;
+  var promise = new Promise(function (yes, no) {
+    resolve = yes; reject = no;
+  });
+  return { promise: promise, resolve: resolve, reject: reject };
+}
+var state = {
+  definitionRequestSeq: 0,
+  reviewInspectorGeneration: 0,
+  issue: 171,
+  activeTab: "review",
+  currentDecl: { name: "CurrentDeclaration" }
+};
+var reads = [];
+var surfaces = [];
+var renders = [];
+function el() { return {}; }
+function openDefinitionSurface() {
+  state.reviewInspectorGeneration += 1;
+  var surface = { isConnected: true };
+  surfaces.push(surface);
+  return surface;
+}
+function fetchDefinition(name) {
+  var read = deferred();
+  read.name = name;
+  reads.push(read);
+  return read.promise;
+}
+function renderDefinitionMatch(match) { renders.push(match.name); }
+function showKernelDefinition() { renders.push("kernel"); }
+(async function () {
+  showDefinitionLookup("Replaced", null);
+  state.reviewInspectorGeneration += 1;
+  reads[0].resolve({ matches: [{ name: "stale-replaced" }] });
+  await new Promise(setImmediate);
+
+  showDefinitionLookup("Detached", null);
+  surfaces[1].isConnected = false;
+  reads[1].resolve({ matches: [{ name: "stale-detached" }] });
+  await new Promise(setImmediate);
+
+  showDefinitionLookup("Current", null);
+  reads[2].resolve({ matches: [{ name: "current" }] });
+  await new Promise(setImmediate);
+
+  process.stdout.write(JSON.stringify({
+    reads: reads.map(function (read) { return read.name; }),
+    renders: renders,
+    generations: state.reviewInspectorGeneration
+  }));
+})().catch(function (err) {
+  process.stderr.write(String(err && err.stack || err));
+  process.exit(1);
+});
+"""
+    proc = subprocess.run(
+        [node, "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
 def _run_issues_refresh_race(app_js: str) -> dict:
     """Execute two Issues retries and verify the aborted snapshot stays inert."""
     node = shutil.which("node")
@@ -1985,6 +2061,20 @@ def test_verso_semantic_styles_match_the_dark_marathon_theme(style_css: str):
         assert light_background not in verso
 
 
+def test_verso_current_token_classes_keep_semantic_dark_theme_colors(
+    app_js: str, style_css: str
+):
+    """The pinned Verso renderer's token classes survive sanitization and
+    receive explicit colors instead of falling back to monochrome text."""
+    code = _strip_block_comments(app_js)
+    sanitizer = _fn_body(code, "function sanitizeVersoNode")
+    assert "safeVersoClass" in sanitizer
+    assert 'target.setAttribute("class", cls)' in sanitizer
+
+    for token_class in ("typed", "sort", "level-var", "option", "string"):
+        assert f".verso-semantic-source .hl.lean .{token_class}" in style_css
+
+
 def test_verso_prose_and_math_have_scoped_readable_styles(style_css: str):
     start = style_css.index(".verso-source-shell")
     end = style_css.index("/* Elaborated type demoted", start)
@@ -2328,11 +2418,104 @@ def test_source_terms_open_current_definition_inspector(app_js: str, style_css: 
     inspector = _fn_body(code, "function showDefinitionLookup")
     assert "fetchDefinition" in inspector and "renderDefinitionMatch" in inspector
     rendered = _fn_body(code, "function renderDefinitionMatch")
-    for field in ("source_file", "source_line", "statement_pp", "value_pp", "owners"):
+    for field in ("statement_pp", "value_pp", "owners"):
         assert field in rendered
     assert "/api/definition" in app_js
     assert "/api/definition-terms" in app_js
     assert ".lh-ref" in style_css
+
+    # Project source/type/body fields use the same safe offline Lean
+    # highlighter as the main source surface instead of a monochrome <pre>.
+    inspector_code = _fn_body(code, "function inspectorCode")
+    assert "highlightLean" in inspector_code
+    assert "leanHighlight(value, [])" in inspector_code
+    for label in ("Elaborated type", "Definition body"):
+        assert f'inspectorCode("{label}",' in rendered
+        assert f'inspectorCode("{label}",' in _fn_body(
+            code, "function showKernelDefinition"
+        )
+    assert rendered.count(", true)") >= 2
+
+    # The clicked declaration itself gets the same fresh Verso fragment as the
+    # review card, with a safely highlighted current-source fallback.
+    source_surface = _fn_body(code, "function definitionSourceSurface")
+    for field in ("source_file", "source_line", "source_block"):
+        assert field in source_surface
+    assert "leanHighlight(match.source_block, [])" in source_surface
+    assert 'makeVersoShell(rawCode, "declaration"' in source_surface
+    assert "sourceSurface.section" in rendered
+    assert "enhanceVersoDeclaration(sourceSurface.shell" in rendered
+
+
+def test_verso_project_links_open_the_definition_inspector(app_js: str):
+    code = _strip_block_comments(app_js)
+    activate = _fn_body(code, "function activateVersoDefinitionLinks")
+    paint = _fn_body(code, "function paintVersoResult")
+    reset = _fn_body(code, "function resetVersoInteractions")
+
+    assert 'querySelectorAll("a[href]")' in activate
+    assert "projectTermCandidates" in activate
+    assert "showDefinitionLookup(definitionName, null)" in activate
+    assert "event.preventDefault()" in activate
+    assert "event.stopPropagation()" in activate
+    assert "state.versoHoverController.closeFor(container)" in activate
+    # Modified clicks preserve the direct token-pinned Verso blueprint.
+    for modifier in ("metaKey", "ctrlKey", "shiftKey", "altKey"):
+        assert f"event.{modifier}" in activate
+    assert "activateVersoDefinitionLinks(semantic)" in paint
+    assert 'removeAttribute("data-verso-definition-links")' in reset
+
+
+def test_definition_inspector_uses_desktop_side_rail_without_cramping_card(
+    app_js: str, style_css: str,
+):
+    code = _strip_block_comments(app_js)
+    opened = _fn_body(code, "function openDefinitionSurface")
+    review_open = _fn_body(code, "function openReviewInspector")
+    close = _fn_body(code, "function closeReviewInspector")
+
+    assert 'openReviewInspector(title, children, null, "definition")' in opened
+    assert 'kind === "definition"' in review_open
+    assert 'classList.toggle("has-definition-inspector"' in review_open
+    assert 'classList.remove("has-definition-inspector")' in close
+
+    # Medium screens stack the inspector at full card width.  Only genuinely
+    # wide screens pin it into the empty viewport rail, clear of the header and
+    # verdict controls.
+    assert "@media (min-width: 1400px)" in style_css
+    assert ".decl-card.has-definition-inspector .review-body { display: block; }" in style_css
+    rail_start = style_css.index("@media (min-width: 1400px)")
+    rail = style_css[rail_start:style_css.index(".inspector-head", rail_start)]
+    for rule in (
+        "position: fixed", "left: calc(50% + 396px)",
+        "top: 7.5rem", "bottom: 6.5rem", "overflow-y: auto",
+    ):
+        assert rule in rail
+
+    # The fixed rail cannot be allowed to inherit the card's swipe transform.
+    # Pointer drags are ignored while an inspector is open, and button/key
+    # verdicts close it before applying the fly animation.
+    swipe = _fn_body(code, "function attachSwipe")
+    animate = _fn_body(code, "function animateOut")
+    assert "if (isReviewInspectorOpen()) return;" in swipe
+    assert "if (isReviewInspectorOpen()) closeReviewInspector();" in animate
+    assert animate.index("closeReviewInspector()") < animate.index("classList.add")
+
+
+def test_late_definition_result_cannot_overwrite_a_newer_surface(app_js: str):
+    code = _strip_block_comments(app_js)
+    lookup = _fn_body(code, "function showDefinitionLookup")
+    opened = _fn_body(code, "function openReviewInspector")
+    closed = _fn_body(code, "function closeReviewInspector")
+    assert "originSurface.isConnected" in lookup
+    assert "originInspectorGeneration === state.reviewInspectorGeneration" in lookup
+    assert "state.reviewInspectorGeneration += 1" in opened
+    assert "state.reviewInspectorGeneration += 1" in closed
+    assert _run_definition_surface_race(app_js) == {
+        "reads": ["Replaced", "Detached", "Current"],
+        "renders": ["current"],
+        "generations": 4,
+    }
 
 
 def test_definition_terms_refresh_is_single_flight_and_source_aware(app_js: str):

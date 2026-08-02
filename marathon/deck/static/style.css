@@ -209,8 +209,13 @@ html, body {
 .verso-semantic-source .hl.lean .keyword { color: #ff7b72; font-weight: 700; }
 .verso-semantic-source .hl.lean .const { color: #79c0ff; }
 .verso-semantic-source .hl.lean .var { color: #ffa657; font-style: italic; }
-.verso-semantic-source .hl.lean .literal { color: #a5d6ff; }
+.verso-semantic-source .hl.lean .literal,
+.verso-semantic-source .hl.lean .string,
+.verso-semantic-source .hl.lean .typed { color: #a5d6ff; }
 .verso-semantic-source .hl.lean .module-name { color: #d2a8ff; }
+.verso-semantic-source .hl.lean .sort,
+.verso-semantic-source .hl.lean .option { color: #d2a8ff; font-weight: 600; }
+.verso-semantic-source .hl.lean .level-var { color: #ffa657; font-style: italic; }
 .verso-semantic-source .hl.lean .unknown { color: var(--ink); }
 .verso-semantic-source a { color: #79c0ff; text-decoration: underline dotted; text-underline-offset: 0.16em; }
 .verso-semantic-source .binding-hl { background: #388bfd33; border-radius: 2px; }
@@ -338,6 +343,30 @@ html, body {
     position: sticky; top: 7.8rem; margin-top: 0;
     max-height: calc(100vh - 13rem); overflow-y: auto;
   }
+
+  /* Definition source needs reading width more than it needs to remain beside
+     the declaration on medium viewports.  Keep the older split view for the
+     reject editor and dependency tools, but let definition details use the
+     card's full width until there is genuine room for a separate rail. */
+  .decl-card.has-definition-inspector .review-body { display: block; }
+  .decl-card.has-definition-inspector .review-inspector {
+    position: static; max-height: min(65vh, 42rem); margin-top: 0.9rem;
+  }
+}
+@media (min-width: 1400px) {
+  /* The review deck is deliberately narrow.  Put definition details in the
+     otherwise-unused space immediately to its right instead of squeezing the
+     source card into two columns.  The top/bottom insets keep the rail clear
+     of both sticky navigation and the fixed verdict controls. */
+  .decl-card.has-definition-inspector .review-inspector {
+    position: fixed; z-index: 3;
+    top: 7.5rem; bottom: 6.5rem;
+    left: calc(50% + 396px);
+    width: min(30rem, calc(50vw - 412px));
+    max-height: none; margin: 0; overflow-y: auto;
+    overscroll-behavior: contain;
+    box-shadow: 0 16px 44px rgba(0, 0, 0, 0.42);
+  }
 }
 .inspector-head {
   display: flex; align-items: flex-start; justify-content: space-between;
@@ -360,6 +389,7 @@ html, body {
   border: 1px solid var(--line); border-radius: 8px; white-space: pre-wrap;
   overflow-wrap: anywhere; font-size: 0.76rem; line-height: 1.5;
 }
+.inspector-code-lean { color: var(--ink); }
 .inspector-empty, .inspector-hint {
   color: var(--muted); font-size: 0.76rem; line-height: 1.45;
 }
