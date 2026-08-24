@@ -6435,6 +6435,7 @@ def _maybe_reconcile_signatures(
         return cur
     retry_needed = False
     diff_window = (last_sha, cur) if last_sha else None
+    pending_human: list[dict] = []
     for num in nums:
         if num in exclude_issues:
             # Do not advance past a HEAD while one affected issue is in-flight;
@@ -6521,6 +6522,9 @@ def _maybe_reconcile_signatures(
             )
             if proposals:
                 retry_needed = True
+                pending_human.append(
+                    {"issue": num, "proposals": len(proposals)}
+                )
                 print(
                     f"  reconcile #{num}: {len(proposals)} declaration "
                     "identity proposal(s) awaiting human confirmation; "
@@ -6533,9 +6537,33 @@ def _maybe_reconcile_signatures(
         except Exception as e:  # noqa: BLE001 — one issue's failure isn't fatal
             print(f"  warning: reconcile #{num} failed: {e}", flush=True)
             retry_needed = True
+    # Persist the waiting-on-a-human observations so the deck's digest can
+    # surface them from a local read (advisory display data: the deck prunes
+    # an entry itself when it applies that issue's reconcile decision).
+    _save_pending_human(cfg, pending_human)
     # Failures/partial frozen transitions retry against the SAME HEAD next tick;
     # never advance the only diff window past unresolved work.
     return last_sha if retry_needed else cur
+
+
+#: Advisory local snapshot of reconcile decisions waiting on the operator.
+PENDING_HUMAN_RELPATH = Path(".marathon") / "conductor" / "pending-human.json"
+
+
+def _save_pending_human(cfg: ReviewConfig, items: list[dict]) -> None:
+    """Atomically record which issues wait on a human reconcile confirmation."""
+    try:
+        path = Path(cfg.repo_dir) / PENDING_HUMAN_RELPATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "schema_version": 1,
+            "updated_ts": now_iso(),
+            "reconcile": items,
+        }, indent=2, sort_keys=True) + "\n")
+        tmp.replace(path)
+    except OSError:
+        pass
 
 
 def _maybe_reopen_stale_verified(

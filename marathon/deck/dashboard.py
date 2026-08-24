@@ -18,7 +18,7 @@ import re
 import subprocess
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -137,6 +137,118 @@ def _timestamp_age_seconds(value: object) -> Optional[float]:
         return max(0.0, (now - stamp).total_seconds())
     except ValueError:
         return None
+
+
+def boot_digest(
+    cfg: "ReviewConfig", *, verso_status: Optional[dict] = None
+) -> dict:
+    """The deck's landing view: a <1 second, LOCAL-ONLY answer to "what
+    happened while I was away, and does anything need me?".
+
+    No GitHub and no network — conductor liveness, running jobs, parked
+    issues (with their last failure evidence), reconcile confirmations the
+    conductor is waiting on, the prover toggle's provenance, audit coverage,
+    and the most recent verdicts, all from files the runtime already
+    maintains. An empty queue rendered from this digest can explain WHY it is
+    empty instead of announcing "caught up". Every section degrades to
+    empty/None rather than raising.
+    """
+    from marathon.conductor import (
+        PENDING_HUMAN_RELPATH,
+        load_jobs_snapshot,
+        prover_control_path,
+    )
+    from marathon.review.state import load_state
+
+    repo_dir = Path(cfg.repo_dir)
+    status = conductor_status(cfg, include_landings=False)
+
+    # Latest terminal evidence per issue from the raw jobs snapshot (the
+    # dashboard job rows deliberately omit error text; the digest needs it).
+    last_job: dict[int, dict] = {}
+    try:
+        for raw in (load_jobs_snapshot(repo_dir) or {}).get("jobs", []):
+            num = raw.get("issue_num")
+            if num is not None:
+                last_job[num] = raw
+    except Exception:  # noqa: BLE001
+        last_job = {}
+
+    needs_me: list[dict] = []
+    try:
+        state = load_state(cfg)
+        for num, entry in sorted(state.issues.items()):
+            if entry.status != "stalled":
+                continue
+            raw = last_job.get(num) or {}
+            err = str(raw.get("error") or "").strip()
+            needs_me.append({
+                "kind": "stalled",
+                "issue": num,
+                "recovery_mode": entry.recovery_mode,
+                "recovery_pr": entry.recovery_pr,
+                "recovery_requested_ts": entry.recovery_requested_ts,
+                "last_exit_code": raw.get("exit_code"),
+                "last_finished_ts": raw.get("finished_ts"),
+                "error_tail": err[-400:] if err else None,
+            })
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        pending = json.loads((repo_dir / PENDING_HUMAN_RELPATH).read_text())
+        for item in pending.get("reconcile", []):
+            needs_me.append({
+                "kind": "reconcile",
+                "issue": item.get("issue"),
+                "proposals": item.get("proposals"),
+                "observed_ts": pending.get("updated_ts"),
+            })
+    except (OSError, ValueError):
+        pass
+
+    prover: dict = {"enabled": status.get("prover_enabled")}
+    try:
+        raw = json.loads(prover_control_path(repo_dir).read_text())
+        if isinstance(raw.get("enabled"), bool):
+            prover["override"] = raw.get("enabled")
+        for key in ("updated_ts", "updated_by"):
+            if raw.get(key) is not None:
+                prover[key] = raw.get(key)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+    audit: Optional[dict] = None
+    try:
+        raw = json.loads(
+            (repo_dir / ".marathon" / "audit" / "latest.json").read_text()
+        )
+        failures = [str(f) for f in (raw.get("failures") or [])]
+        audit = {
+            "created_at": raw.get("created_at"),
+            "complete": not failures,
+            "failures": failures[:5],
+            "modules": len(raw.get("modules") or []),
+        }
+    except (OSError, ValueError):
+        audit = None
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "conductor": {
+            key: status.get(key)
+            for key in (
+                "alive", "ready", "pid", "concurrency", "updated_ts",
+                "degraded",
+            )
+        },
+        "prover": prover,
+        "jobs": status.get("jobs") or [],
+        "needs_me": needs_me,
+        "audit": audit,
+        "verso": verso_status,
+        "recent_verdicts": _verdict_events(cfg, 5),
+    }
 
 
 def conductor_status(

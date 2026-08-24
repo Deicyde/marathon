@@ -1089,6 +1089,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                 return self._api_ship_status(query)
             if path == "/api/status":
                 return self._api_status()
+            if path == "/api/digest":
+                return self._api_digest()
             if path == "/api/events":
                 return self._api_events()
             if path == "/api/conductor-status":
@@ -1474,6 +1476,20 @@ class DeckHandler(BaseHTTPRequestHandler):
         """Poll endpoint: the live conductor/landing events as one JSON
         blob. Pure read from jobs.json + landings.jsonl + bounce reports."""
         self._send_json(collect_status(self.cfg))
+
+    def _api_digest(self) -> None:
+        """The landing digest: a local-only, sub-second answer to "what
+        happened while I was away, and does anything need me?" — conductor
+        health, parked issues with failure evidence, pending reconcile
+        confirmations, prover provenance, audit coverage, recent verdicts.
+        Pure read; never touches GitHub."""
+        from marathon.deck.dashboard import boot_digest
+
+        try:
+            verso = self._verso_status_payload(trigger=False)
+        except Exception:  # noqa: BLE001 — the digest renders without Verso
+            verso = None
+        self._send_json(boot_digest(self.cfg, verso_status=verso))
 
     def _api_ship_status(self, query: dict) -> None:
         """Pure-read poll endpoint for one durably accepted ship job."""
@@ -2471,12 +2487,37 @@ class DeckHandler(BaseHTTPRequestHandler):
         result = confirm_reconciliation_proposal(
             self.cfg, issue_num, confirmation
         )
+        if result.get("ok", True):
+            # The conductor's pending-human snapshot refreshes only when its
+            # reconcile pass runs (a HEAD move); prune this issue now so the
+            # digest stops asking for a decision the operator just made.
+            self._prune_pending_human(issue_num)
         status = (
             HTTPStatus.CONFLICT
             if not result.get("ok", True)
             else HTTPStatus.OK
         )
         self._send_json(result, status=status)
+
+    def _prune_pending_human(self, issue_num: int) -> None:
+        """Drop one issue from the conductor's advisory pending-human file."""
+        try:
+            from marathon.conductor import PENDING_HUMAN_RELPATH
+
+            path = Path(self.cfg.repo_dir) / PENDING_HUMAN_RELPATH
+            data = json.loads(path.read_text())
+            kept = [
+                item for item in (data.get("reconcile") or [])
+                if item.get("issue") != issue_num
+            ]
+            if len(kept) == len(data.get("reconcile") or []):
+                return
+            data["reconcile"] = kept
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+            tmp.replace(path)
+        except (OSError, ValueError):
+            pass
 
     def _api_decl_lock(self) -> None:
         """Toggle the opt-in HARD-FREEZE lock on one declaration — LOCAL ONLY
