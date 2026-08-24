@@ -114,11 +114,13 @@ from marathon.refine import (
     REFINE_STATE_FILENAME,
 )
 from marathon.review.config import ReviewConfig, load_config
+from marathon.notify import notify
 from marathon.review.state import (
     RECOVERY_CONTINUE_PR,
     RECOVERY_RETRY_BUILD,
     RECOVERY_START_OVER,
     RECOVERY_UPDATE_CONTINUE,
+    advance_recovery_head_if_current,
     clear_pending_pr_check,
     load_state,
     pending_rejections_needing_iteration,
@@ -1541,6 +1543,104 @@ def _park_deferred_recovery(cfg: ReviewConfig, issue_num: int) -> bool:
         flush=True,
     )
     return True
+
+
+def _observe_recovery_branch(
+    repo_dir: Path, branch: str
+) -> tuple[bool, Optional[str], str]:
+    """Seam for the pre-dispatch remote observation (tests fake this)."""
+    from marathon.post_pipeline import observe_remote_branch
+
+    return observe_remote_branch(repo_dir, branch)
+
+
+def _reconcile_recovery_head(
+    cfg: ReviewConfig,
+    issue_num: int,
+    branch: str,
+    pinned_head: str,
+    *,
+    expected_verdict_ts: Optional[str],
+    expected_recovery_id: Optional[str],
+    kept_worktrees: dict[int, str],
+) -> Optional[str]:
+    """Observe the recovery branch BEFORE dispatch and return the head to pin.
+
+    Three outcomes:
+
+    * remote still at the pinned head → dispatch with it, unchanged;
+    * remote moved to a head we can PROVE is our own prior attempt's committed
+      checkpoint (a kept worktree for this issue/branch is at exactly that
+      commit) → CAS-advance the stored pin and dispatch with the new head —
+      this is the #240 wedge: an attempt publishes its checkpoint, then every
+      later attempt refuses the branch "changed" by our own push;
+    * remote moved to anything else (or observation failed) → never dispatch a
+      doomed job. Foreign movement parks the row visibly (the operator must
+      re-pin in the deck's Recover dialog); an observation failure defers
+      quietly to the next tick.
+    """
+    ok, observed_oid, msg = _observe_recovery_branch(cfg.repo_dir, branch)
+    if not ok:
+        print(
+            f"--- deferring #{issue_num}: cannot observe recovery branch "
+            f"{branch} ({msg}) ---",
+            flush=True,
+        )
+        return None
+    observed = observed_oid or ""
+    if observed == pinned_head:
+        return pinned_head
+    own_heads: set[str] = set()
+    candidates: list[str] = []
+    raw = kept_worktrees.get(issue_num)
+    if raw:
+        candidates.append(raw)
+    held = _registered_worktree_for_branch(cfg.repo_dir, branch)
+    if held is not None:
+        candidates.append(str(held))
+    for cand in candidates:
+        cp = _git(Path(cand), "rev-parse", "HEAD")
+        if cp.returncode == 0:
+            head = (cp.stdout or "").strip()
+            if head:
+                own_heads.add(head)
+    if observed and observed in own_heads:
+        advanced = advance_recovery_head_if_current(
+            cfg,
+            issue_num,
+            expected_verdict_ts=expected_verdict_ts,
+            expected_recovery_id=expected_recovery_id,
+            expected_head=pinned_head,
+            new_head=observed,
+        )
+        if advanced is None:
+            print(
+                f"--- deferring #{issue_num}: recovery row changed while "
+                "adopting our own published head ---",
+                flush=True,
+            )
+            return None
+        print(
+            f"--- #{issue_num}: adopting our own published checkpoint "
+            f"{observed[:12]} as the recovery head (was "
+            f"{pinned_head[:12]}) ---",
+            flush=True,
+        )
+        return observed
+    print(
+        f"--- #{issue_num}: remote {branch} moved to "
+        f"{observed[:12] or '<absent>'} after recovery was chosen at "
+        f"{pinned_head[:12]}, and the new head is not our own checkpoint; "
+        "parking for a refreshed recovery choice ---",
+        flush=True,
+    )
+    if _park_deferred_recovery(cfg, issue_num):
+        notify(
+            "Marathon conductor",
+            f"#{issue_num} recovery parked: {branch} moved to "
+            f"{observed[:12] or '<absent>'} — reopen Recover to re-pin.",
+        )
+    return None
 
 
 # --- Worktree management -----------------------------------------------------------
@@ -3582,6 +3682,25 @@ def _dispatch_job(
                     flush=True,
                 )
                 return None
+            if recovery_mode in {
+                RECOVERY_RETRY_BUILD,
+                RECOVERY_CONTINUE_PR,
+                RECOVERY_UPDATE_CONTINUE,
+            } and recovery_branch and recovery_head_sha:
+                reconciled = _reconcile_recovery_head(
+                    cfg,
+                    issue_num,
+                    recovery_branch,
+                    recovery_head_sha,
+                    expected_verdict_ts=expected_verdict_ts,
+                    expected_recovery_id=expected_recovery_id,
+                    kept_worktrees=kept_worktrees,
+                )
+                if reconciled is None:
+                    return None
+                if reconciled != recovery_head_sha:
+                    recovery_head_sha = reconciled
+                    auto_pr_expected_remote_oid = reconciled
             if (
                 expected_recovery_id
                 and recovery_mode in {
@@ -5252,21 +5371,45 @@ def _reap_finished(
                 f"{job.status}, exit {rc}): {job.worktree}",
                 flush=True,
             )
-            # Distinct, top-level git-AUTH warning. The refine exits with the
-            # distinguished EXIT_AUTO_PR_BRANCH_ABORT code when --auto-pr
-            # branch prep aborted (e.g. ``git fetch origin <base>`` failed,
-            # including a credential failure). We surface it here — NOT buried
-            # in the per-job log — because retries will keep failing until a
-            # human fixes the credentials. Keying off the exit code (rather
-            # than tailing the job log) avoids a log-file/closed-handle race
-            # and is robust regardless of log content.
-            if rc == EXIT_AUTO_PR_BRANCH_ABORT:
-                print(
-                    f"⚠️  refine #{job.issue_num} aborted on a GIT AUTH "
-                    f"failure — run `gh auth setup-git`; retries will keep "
-                    f"failing until this is fixed.",
-                    flush=True,
+            # A stall is the moment the pipeline starts waiting on a human
+            # decision; push it to the operator instead of hoping they poll.
+            if job.status == "stalled":
+                notify(
+                    "Marathon conductor",
+                    f"#{job.issue_num} stalled (exit {rc}) — choose a "
+                    "recovery path in the deck.",
                 )
+            # Distinct, top-level warning for the distinguished
+            # EXIT_AUTO_PR_BRANCH_ABORT code. Two distinct causes share it:
+            # a git-AUTH/branch-prep abort (credentials) and the recovery
+            # moved-head refusal ("remote branch changed after recovery was
+            # requested"). The latter must PARK the recovery — retrying the
+            # same stale pin is doomed and each retry burns an attempt — and
+            # must not tell the operator to fix credentials that are fine.
+            if rc == EXIT_AUTO_PR_BRANCH_ABORT:
+                tail = _job_log_tail(job) or ""
+                if "remote branch changed after recovery was requested" in tail:
+                    print(
+                        f"⚠️  refine #{job.issue_num} refused a recovery "
+                        f"branch whose remote head moved after the recovery "
+                        f"was chosen; parking for a refreshed recovery "
+                        f"choice instead of replaying the stale pin.",
+                        flush=True,
+                    )
+                    if _park_deferred_recovery(cfg, job.issue_num):
+                        notify(
+                            "Marathon conductor",
+                            f"#{job.issue_num} recovery parked: the branch "
+                            "moved after recovery was chosen — reopen "
+                            "Recover to re-pin.",
+                        )
+                else:
+                    print(
+                        f"⚠️  refine #{job.issue_num} aborted on a GIT AUTH "
+                        f"failure — run `gh auth setup-git`; retries will "
+                        f"keep failing until this is fixed.",
+                        flush=True,
+                    )
             # Config error (missing API key etc.): the exit ladder burned no
             # attempt (by design), so back this issue off HERE — otherwise the
             # loop would re-dispatch a doomed job every tick until the

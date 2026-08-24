@@ -866,6 +866,48 @@ def request_recovery_if_current(
     )
 
 
+def advance_recovery_head_if_current(
+    cfg: ReviewConfig,
+    issue_num: int,
+    *,
+    expected_verdict_ts: Optional[str],
+    expected_recovery_id: Optional[str],
+    expected_head: str,
+    new_head: str,
+) -> Optional[IssueState]:
+    """CAS-advance a recovery's pinned head to a revision we pushed ourselves.
+
+    A refine attempt that publishes its checkpoint moves the remote branch
+    past the head the recovery was requested at; every later attempt then
+    refuses the "changed" remote even though the change is our own. The
+    conductor calls this once it has *proved* the new remote head is the prior
+    attempt's committed work, so the recovery continues instead of wedging.
+    Fails (returns ``None``) whenever the row moved under us — a newer verdict
+    or recovery choice always wins.
+    """
+
+    def mutate(state: ReviewState) -> tuple[Optional[IssueState], bool]:
+        current = state.issues.get(issue_num)
+        if (
+            current is None
+            or current.status != "rejected"
+            or current.verdict_ts != expected_verdict_ts
+            or current.recovery_id != expected_recovery_id
+            or current.recovery_head_sha != expected_head
+        ):
+            return None, False
+        current.recovery_head_sha = new_head
+        return current, True
+
+    return _update_state(
+        cfg,
+        mutate,
+        after_save=lambda entry: (
+            _ledger_upsert(cfg, issue_num, entry) if entry is not None else None
+        ),
+    )
+
+
 def record_verification(cfg: ReviewConfig, issue_num: int) -> IssueState:
     """Record a verification: status=verified, notes cleared,
     ``last_iteration_ts`` cleared. This is the canonical way to clear a

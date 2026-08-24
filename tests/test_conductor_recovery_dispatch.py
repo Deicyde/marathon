@@ -47,6 +47,8 @@ class DispatchHarness:
         self.branch = branch
         self.head = head
         self.local_branch_head = head
+        self.remote_head = head
+        self.observe_ok = True
         self.worktree_head = "b" * 40
         self.git_calls: list[tuple[Path, tuple[str, ...]]] = []
         self.events: list[tuple[str, object]] = []
@@ -107,6 +109,15 @@ def dispatch_harness(monkeypatch):
     monkeypatch.setattr(conductor, "_worktree_live_pid", lambda *_: None)
     monkeypatch.setattr(
         conductor, "_write_worktree_pid_marker", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        conductor,
+        "_observe_recovery_branch",
+        lambda repo_dir, branch: (
+            (True, harness.remote_head, "observed")
+            if harness.observe_ok
+            else (False, None, "network down")
+        ),
     )
     monkeypatch.setattr(conductor.subprocess, "Popen", harness.popen)
     monkeypatch.setattr(
@@ -1561,3 +1572,69 @@ def test_superseded_recovery_worktree_is_not_adopted_after_restart(
     )
 
     assert recovered == {}
+
+
+def test_update_continue_adopts_own_published_checkpoint_head(
+    tmp_path, dispatch_harness
+):
+    """A remote moved by OUR OWN prior push is adopted, never refused.
+
+    The wedge this guards against: an attempt publishes its checkpoint (the
+    remote branch now sits at that commit), the recovery pin still names the
+    pre-push head, and every later dispatch refuses the branch as "changed"
+    by what was in fact our own work.
+    """
+    cfg = make_cfg(tmp_path)
+    _queue_recovery(cfg, review_state.RECOVERY_UPDATE_CONTINUE)
+    runs = tmp_path / "runs"
+    kept = runs / "wt-i31-kept"
+    kept.mkdir(parents=True)
+    dispatch_harness.remote_head = dispatch_harness.worktree_head
+
+    job = _dispatch(cfg, runs, {ISSUE: str(kept)})
+
+    child = dispatch_harness.spawned[0].cmd
+    assert _arg(child, "--expected-head") == dispatch_harness.worktree_head
+    separator = child.index("--")
+    fallback = child[separator + 1 :]
+    assert (
+        _arg(fallback, "--auto-pr-expected-remote-oid")
+        == dispatch_harness.worktree_head
+    )
+    assert job.recovery_mode == review_state.RECOVERY_UPDATE_CONTINUE
+    entry = review_state.load_state(cfg).issues[ISSUE]
+    assert entry.recovery_head_sha == dispatch_harness.worktree_head
+
+
+def test_update_continue_parks_on_foreign_remote_movement(
+    tmp_path, dispatch_harness
+):
+    """A remote head we cannot attribute to ourselves parks the recovery for
+    a refreshed human choice instead of burning a doomed dispatch."""
+    cfg = make_cfg(tmp_path)
+    _queue_recovery(cfg, review_state.RECOVERY_UPDATE_CONTINUE)
+    dispatch_harness.remote_head = "c" * 40
+
+    job = conductor._dispatch_job(cfg, ISSUE, CHAPTER, tmp_path / "runs", {})
+
+    assert job is None
+    assert dispatch_harness.spawned == []
+    entry = review_state.load_state(cfg).issues[ISSUE]
+    assert entry.status == "stalled"
+
+
+def test_update_continue_defers_quietly_when_remote_unobservable(
+    tmp_path, dispatch_harness
+):
+    """An observation failure (network) neither dispatches nor parks — the
+    row stays rejected and the next tick retries."""
+    cfg = make_cfg(tmp_path)
+    _queue_recovery(cfg, review_state.RECOVERY_UPDATE_CONTINUE)
+    dispatch_harness.observe_ok = False
+
+    job = conductor._dispatch_job(cfg, ISSUE, CHAPTER, tmp_path / "runs", {})
+
+    assert job is None
+    assert dispatch_harness.spawned == []
+    entry = review_state.load_state(cfg).issues[ISSUE]
+    assert entry.status == "rejected"

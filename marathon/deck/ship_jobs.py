@@ -583,6 +583,18 @@ class ShipJobRegistry:
                                 "updated_at": _now(),
                             }
 
+                        # A failed ship is an event the reviewer must see even
+                        # after walking away — the browser poll dies with the
+                        # tab, so push it to the operator too.
+                        if finished.get("status") == "failed":
+                            from marathon.notify import notify
+
+                            notify(
+                                "Marathon deck",
+                                f"Ship of #{issue_num} failed: "
+                                f"{str(finished.get('error') or '')[:200]}",
+                            )
+
                         # Invalidate read models BEFORE a terminal result becomes
                         # visible. The first client refresh after "succeeded"
                         # must not reuse a cache built during the ship.
