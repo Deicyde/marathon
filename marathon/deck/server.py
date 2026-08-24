@@ -867,7 +867,18 @@ class DeckServer(ThreadingHTTPServer):
         stale.  A running older-generation build is allowed to finish without
         publishing and then launches exactly one successor for the newest
         generation; this is both mutation-safe and stampede-free.
+
+        The deck-context memo and the dashboard's stale-while-revalidate
+        entries are dropped on the same trigger: every call site here is a
+        successful read-model-affecting mutation, exactly the moment those
+        views must stop serving pre-mutation state.  Per-declaration swipes
+        never call this, so the swipe hot path keeps its warm context.
         """
+        from marathon.deck import cards as _cards
+        from marathon.deck import dashboard as _dashboard
+
+        _cards.invalidate_context_cache()
+        _dashboard.invalidate_swr()
         with self._queue_lock:
             if self._queue_shutdown.is_set():
                 return

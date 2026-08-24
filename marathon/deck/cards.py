@@ -47,7 +47,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import threading
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -462,7 +465,127 @@ class _DeckContext:
 _DECK_REST_METADATA_FALLBACK_LIMIT = 8
 
 
+#: One completed ``_DeckContext`` per (issue set, REST limit), reused while
+#: every LOCAL truth it was built from is byte-identical (state.json, the
+#: audit snapshot, config) and its GitHub metadata is younger than the TTL.
+#: This is the memo that keeps card/subdeck opens and per-swipe verdict
+#: validation off the network: fingerprint-bearing data (source blocks,
+#: elaborated statements, kernels) is read fresh by the surface builders on
+#: every call, so the cache can only ever staleness GitHub issue bodies —
+#: bounded by the TTL and by explicit invalidation on every mutating POST.
+_CONTEXT_CACHE_TTL_SECONDS = float(
+    os.environ.get("MARATHON_DECK_CONTEXT_TTL", "60")
+)
+_context_cache_lock = threading.Lock()
+_context_cache: dict[tuple, "_ContextCacheEntry"] = {}
+
+
+@dataclass
+class _ContextCacheEntry:
+    payload: "_DeckContext"
+    freshness: tuple
+    built_at: float
+    refreshing: bool = False
+
+
+def _context_freshness(cfg: "ReviewConfig") -> tuple:
+    """Stat the local truths a cached context depends on.
+
+    Any change in review state (a ship — deck OR CLI), the audit snapshot,
+    or the registry invalidates the memo; mtime_ns + size is enough because
+    every writer uses atomic replacement.
+    """
+    def _stat(path: Path) -> tuple:
+        try:
+            st = path.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return (None, None)
+
+    marathon_dir = Path(cfg.repo_dir) / ".marathon"
+    return (
+        _stat(marathon_dir / "review" / "state.json"),
+        _stat(marathon_dir / "audit" / "latest.json"),
+        _stat(marathon_dir / "review" / "config.toml"),
+    )
+
+
+def invalidate_context_cache() -> None:
+    """Drop every memoized deck context (mutating POSTs, ship completion)."""
+    with _context_cache_lock:
+        _context_cache.clear()
+
+
 def _load_context(
+    cfg: "ReviewConfig",
+    issue_nums: list[int],
+    *,
+    rest_metadata_limit: Optional[int] = None,
+) -> _DeckContext:
+    """Freshness-guarded memo over :func:`_load_context_uncached`.
+
+    Serves the cached context while the local truths are unchanged; when only
+    the TTL has lapsed (possible GitHub body drift) it serves the cached value
+    immediately and refreshes once in a background thread, so no golden-path
+    request ever blocks on GitHub twice for the same registry.
+    """
+    key = (
+        tuple(dict.fromkeys(int(n) for n in issue_nums)),
+        rest_metadata_limit,
+        str(cfg.repo_dir),
+    )
+    freshness = _context_freshness(cfg)
+    now = time.monotonic()
+    with _context_cache_lock:
+        entry = _context_cache.get(key)
+        if entry is not None and entry.freshness == freshness:
+            if now - entry.built_at <= _CONTEXT_CACHE_TTL_SECONDS:
+                return entry.payload
+            if entry.refreshing:
+                return entry.payload
+            entry.refreshing = True
+            stale_payload = entry.payload
+
+            def _refresh() -> None:
+                try:
+                    # Stamp the freshness observed BEFORE the rebuild: if a
+                    # local truth changes mid-build, the next read's signature
+                    # mismatch forces a synchronous rebuild instead of trusting
+                    # a context that may straddle the change.
+                    pre_freshness = _context_freshness(cfg)
+                    fresh = _load_context_uncached(
+                        cfg, issue_nums,
+                        rest_metadata_limit=rest_metadata_limit,
+                    )
+                    with _context_cache_lock:
+                        _context_cache[key] = _ContextCacheEntry(
+                            payload=fresh,
+                            freshness=pre_freshness,
+                            built_at=time.monotonic(),
+                        )
+                except Exception:  # noqa: BLE001 — keep serving the stale memo
+                    with _context_cache_lock:
+                        current = _context_cache.get(key)
+                        if current is not None:
+                            current.refreshing = False
+
+            threading.Thread(
+                target=_refresh, name="deck-context-refresh", daemon=True
+            ).start()
+            return stale_payload
+    payload = _load_context_uncached(
+        cfg, issue_nums, rest_metadata_limit=rest_metadata_limit
+    )
+    with _context_cache_lock:
+        _context_cache[key] = _ContextCacheEntry(
+            payload=payload,
+            freshness=freshness,
+            built_at=time.monotonic(),
+        )
+    return payload
+
+
+def _load_context_uncached(
     cfg: "ReviewConfig",
     issue_nums: list[int],
     *,

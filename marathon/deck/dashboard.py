@@ -444,6 +444,17 @@ _SWR: dict = {}
 _SWR_LOCK = threading.Lock()
 
 
+def invalidate_swr() -> None:
+    """Drop every cached dashboard view after a read-model-affecting mutation.
+
+    The next reader re-seeds synchronously and therefore sees post-mutation
+    state on its FIRST fetch — the deliberate trade against serving a stale
+    Issues/landings view right after the operator's own verdict or ship.
+    """
+    with _SWR_LOCK:
+        _SWR.clear()
+
+
 def _swr(key: str, ttl: float, fetch):
     """Return the cached value for ``key`` immediately; if older than ``ttl``,
     kick a one-shot background refresh via ``fetch``. Seeds synchronously on the
@@ -1104,7 +1115,13 @@ def history(cfg: "ReviewConfig", *, limit: int = 30) -> dict:
     return {
         "repo": cfg.github_repo,
         "verdict_events": _verdict_events(cfg, limit),
-        "merged_prs": _merged_prs(cfg, limit),
+        # The gh read rides the SWR memo so a History open costs local file
+        # time, not a fresh network fetch per request.
+        "merged_prs": _swr(
+            f"merged_prs:{cfg.github_repo}:{limit}",
+            60,
+            lambda: _merged_prs(cfg, limit),
+        ) or [],
     }
 
 
@@ -1147,7 +1164,7 @@ def _merged_prs(cfg: "ReviewConfig", limit: int) -> list[dict]:
              "--state", "merged",
              "--limit", str(limit),
              "--json", "number,title,mergedAt,headRefName,author"],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, timeout=30,
         )
         if cp.returncode != 0:
             return []
