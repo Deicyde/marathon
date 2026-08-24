@@ -218,6 +218,28 @@ def boot_digest(
     except (OSError, ValueError, AttributeError):
         pass
 
+    # Partial subdeck reviews (local swipes not yet shipped) — so the landing
+    # can lead with "continue where you left off".
+    in_progress: list[dict] = []
+    try:
+        from marathon.deck.subdeck import INFORMAL_KEY, _load_store
+
+        for key, decls in (_load_store(cfg) or {}).items():
+            try:
+                num = int(key)
+            except (TypeError, ValueError):
+                continue
+            decided = sum(
+                1 for name, rec in (decls or {}).items()
+                if name != INFORMAL_KEY
+                and isinstance(rec, dict)
+                and rec.get("verdict")
+            )
+            if decided:
+                in_progress.append({"issue": num, "decided": decided})
+    except Exception:  # noqa: BLE001
+        in_progress = []
+
     audit: Optional[dict] = None
     try:
         raw = json.loads(
@@ -245,6 +267,7 @@ def boot_digest(
         "prover": prover,
         "jobs": status.get("jobs") or [],
         "needs_me": needs_me,
+        "in_progress": in_progress,
         "audit": audit,
         "verso": verso_status,
         "recent_verdicts": _verdict_events(cfg, 5),

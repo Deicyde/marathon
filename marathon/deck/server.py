@@ -1483,6 +1483,16 @@ class DeckHandler(BaseHTTPRequestHandler):
         health, parked issues with failure evidence, pending reconcile
         confirmations, prover provenance, audit coverage, recent verdicts.
         Pure read; never touches GitHub."""
+        if self._demo:
+            return self._send_json({
+                "generated_at": None,
+                "conductor": {"alive": True, "ready": True, "pid": None,
+                              "concurrency": 1, "updated_ts": None,
+                              "degraded": None},
+                "prover": {"enabled": True},
+                "jobs": [], "needs_me": [], "in_progress": [],
+                "audit": None, "verso": None, "recent_verdicts": [],
+            })
         from marathon.deck.dashboard import boot_digest
 
         try:

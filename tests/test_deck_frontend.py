@@ -4033,3 +4033,82 @@ def test_status_landings_link_issue_and_pr(app_js: str):
     body = _fn_body(_strip_block_comments(app_js), "function renderStatusTab")
     # a landing renders the issue + its merged PR (both as GitHub links)
     assert "land-row" in body and "merged PR #" in body
+
+
+# --- Review landing digest + fast paths (2026-08 ergonomics batch) ---------
+
+
+def test_landing_renders_digest_not_an_unrequested_subdeck(app_js: str):
+    """Page load lands on the digest + queue picker; opening a subdeck is an
+    explicit choice, never an automatic multi-second load."""
+    code = _strip_block_comments(app_js)
+    drained = _fn_body(code, "function openFirstReadyIssue")
+    assert "renderQueueLanding(" in drained
+    assert "openIssue(ready[0].id)" not in drained
+    landing = _fn_body(code, "function renderQueueLanding")
+    assert "digestPanel()" in landing
+    assert 'getJSONWithTimeout("/api/digest"' in code
+
+
+def test_digest_fetch_is_a_pure_read(app_js: str):
+    code = _strip_block_comments(app_js)
+    fetcher = _fn_body(code, "function fetchDigest")
+    assert "postJSON" not in fetcher
+    assert "/api/digest" in fetcher
+
+
+def test_ship_has_a_keyboard_path_through_the_ship_button(app_js: str):
+    """The "s" key routes through the ship BUTTON (the single entrypoint), so
+    the confirm modal still gates the irreversible POST."""
+    code = _strip_block_comments(app_js)
+    keys = _fn_body(code, "function attachKeys")
+    assert '"btn-ship"' in keys
+    assert "shipButton.click()" in keys
+    # And Enter confirms: the ship confirm button carries autofocus.
+    confirm = _fn_body(code, "function confirmAndShip")
+    assert "autofocus" in confirm
+
+
+def test_tab_hotkeys_cover_all_seven_tabs(app_js: str):
+    code = _strip_block_comments(app_js)
+    keys = _fn_body(code, "function attachKeys")
+    for tab in ("review", "files", "graph", "status", "issues", "history",
+                "add-chapter"):
+        assert 'switchTab("' + tab + '")' in keys
+
+
+def test_reject_composer_persists_drafts(app_js: str):
+    code = _strip_block_comments(app_js)
+    assert "marathon:draft:" in app_js
+    composer = _fn_body(code, "function openRejectNote")
+    assert "attachDraftPersistence(" in composer
+    assert "clearDraft(" in composer
+
+
+def test_changed_cards_offer_diff_and_reaffirm(app_js: str):
+    code = _strip_block_comments(app_js)
+    reaffirm = _fn_body(code, "function actReaffirm")
+    # The re-affirm routes through the ORDINARY decl-verdict path (all
+    # guards hold); it never posts directly.
+    assert "commitDeclVerdict(" in reaffirm
+    assert "fetch(" not in reaffirm
+    panel = _fn_body(code, "function previousReviewPanel")
+    assert "lineDiff(" in panel
+
+
+def test_issue_verdict_fast_path_confirms_and_uses_the_verdict_route(
+    app_js: str,
+):
+    code = _strip_block_comments(app_js)
+    confirm = _fn_body(code, "function confirmIssueVerdict")
+    assert 'postJSON("/api/verdict"' in confirm
+    assert "irreversible" in confirm
+    # A reject without a note is refused client-side too.
+    assert "non-empty note" in confirm
+
+
+def test_status_frames_refresh_queue_only_outside_a_subdeck(app_js: str):
+    code = _strip_block_comments(app_js)
+    apply_fn = _fn_body(code, "function applyStatus")
+    assert "refreshQueue()" in apply_fn
+    assert "!state.subdeck" in apply_fn

@@ -1316,3 +1316,102 @@ kbd { background: var(--panel-2); border: 1px solid var(--line); border-radius: 
   .reader-source { max-height: none; }
   .graph-viewport { max-height: calc(100vh - 13rem); }
 }
+
+/* --- Review landing: digest + queue picker ------------------------------ */
+.digest-panel {
+  width: min(760px, 94vw);
+  margin: 0.8rem auto 0.4rem;
+  padding: 0.8rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.digest-head { display: flex; align-items: center; gap: 0.6rem; }
+.digest-h { margin: 0 0 0.3rem; font-size: 0.95rem; letter-spacing: 0.02em; }
+.digest-chip {
+  font-size: 0.75rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+}
+.digest-ok { color: var(--ok); }
+.digest-warn { color: var(--warn); }
+.digest-line { margin: 0.35rem 0; font-size: 0.88rem; }
+.digest-warn-line { color: var(--warn); }
+.digest-muted { color: var(--muted); }
+.digest-needs { margin-top: 0.5rem; }
+.digest-need {
+  padding: 0.45rem 0.55rem;
+  margin: 0.3rem 0;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: 6px;
+  font-size: 0.88rem;
+}
+.digest-need-title { margin-right: 0.5rem; }
+.digest-evidence { margin-top: 0.3rem; color: var(--muted); font-size: 0.82rem; }
+.digest-evidence-pre {
+  white-space: pre-wrap;
+  overflow-x: auto;
+  max-height: 12rem;
+  margin: 0.3rem 0 0;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+}
+.landing { width: min(760px, 94vw); margin: 0.4rem auto 2rem; }
+.landing-list { display: flex; flex-direction: column; gap: 0.35rem; }
+.landing-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 0.7rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.92rem;
+}
+.landing-row:hover, .landing-row.landing-focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.landing-row:focus-visible { border-color: var(--accent); outline: none; }
+.landing-inprogress { border-left: 3px solid var(--accent); }
+.landing-row-id { font-family: var(--mono); color: var(--accent); }
+.landing-row-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.landing-row-meta { color: var(--muted); font-size: 0.8rem; white-space: nowrap; }
+.landing-row-resume { color: var(--accent); font-size: 0.82rem; }
+.landing-row-actions { display: flex; gap: 0.3rem; }
+.btn-small { font-size: 0.78rem; padding: 0.15rem 0.5rem; }
+
+/* --- diff-and-reaffirm on changed cards --------------------------------- */
+.reaffirm-panel {
+  margin: 0.5rem 0;
+  padding: 0.6rem 0.8rem;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 0.88rem;
+}
+.reaffirm-head { display: flex; flex-direction: column; gap: 0.2rem; }
+.reaffirm-note { color: var(--muted); font-style: italic; }
+.reaffirm-diff {
+  margin: 0.5rem 0 0;
+  max-height: 18rem;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+.diff-add { color: var(--ok); }
+.diff-del { color: var(--reject); }
+.diff-same { color: var(--muted); }
+.reaffirm-stmt { margin-top: 0.4rem; font-size: 0.8rem; }
+.reaffirm-actions { margin-top: 0.5rem; }
+.draft-hint { color: var(--accent); }

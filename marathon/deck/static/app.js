@@ -517,6 +517,11 @@
     issue: null,        // the open subdeck's issue number (or null)
     subdeck: null,      // the GET /api/subdeck payload for `issue`
     currentDecl: null,  // the DeclCard currently on the stage (or null)
+    digest: null,       // the GET /api/digest payload (landing view context)
+    digestFetchedAt: 0, // debounce for digest refreshes
+    landingRows: null,  // the queue rows the landing rendered (keyboard nav)
+    landingFocus: 0,    // focused row index on the landing
+    autoQueueRefreshAt: 0, // debounce for status-driven queue refetches
     showSummary: false, // the confirm-and-ship summary card is up
     busy: false,        // a POST is in flight (locks input)
     activeShip: null,   // durable non-secret {issue,operationId,statusUrl}
@@ -3333,17 +3338,29 @@
     if (card.surfaced) panel.appendChild(surfacedBanner(card));
 
     // A decl the human approved last round whose SOURCE has since changed — the
-    // carried-over verdict was dropped, so this is back for re-review.
+    // carried-over verdict was dropped, so this is back for re-review. When the
+    // stored record kept its reviewed-at basis, show WHAT changed and offer a
+    // one-key re-affirm instead of an unexplained full re-review.
     if (card.changed_since_review) {
-      panel.appendChild(el("div", { class: "changed-banner", role: "alert" }, [
+      var prev = card.previous_review;
+      var banner = el("div", { class: "changed-banner", role: "alert" }, [
         el("span", { class: "changed-icon", text: "⟳" }),
         el("div", {}, [
-          el("strong", { text: "Changed since your last approval" }),
+          el("strong", { text: "Changed since your last review" }),
           el("div", { class: "changed-sub", text:
-            "you verified this before, but its source changed (Aristotle altered "
-            + "it) — please re-review." }),
+            prev && prev.verdict
+              ? "you marked this " + prev.verdict +
+                (prev.ts ? " on " + fmtTs(prev.ts) : "") +
+                ", and its source or elaborated context changed since — " +
+                "check the diff, then re-affirm (a) or review fresh."
+              : "you verified this before, but its source changed (Aristotle altered "
+                + "it) — please re-review." }),
         ]),
-      ]));
+      ]);
+      panel.appendChild(banner);
+      if (prev && (prev.source_block || prev.statement_pp)) {
+        panel.appendChild(previousReviewPanel(card, prev));
+      }
     }
     if (card.dependency_invalidated) {
       panel.appendChild(el("div", { class: "changed-banner dependency-invalidated-banner", role: "alert" }, [
@@ -3526,6 +3543,7 @@
       placeholder: "What is wrong with the informal rendering? (LOCAL note — it is NOT sent to Aristotle; it documents your dispute with the English.)",
       "aria-label": "Informal-rejection note (required)",
     });
+    attachDraftPersistence(ta, state.issue, null);
     var err = el("div", { class: "modal-err", hidden: "hidden" });
     var panel = el("div", { class: "modal-panel" }, [
       el("h2", { class: "modal-title", text: "Reject the informal text" }),
@@ -3549,6 +3567,7 @@
               return;
             }
             closeModal();
+            clearDraft(state.issue, null);
             commitInformalVerdict("reject", note);
           },
         }, ["Reject informal text"]),
@@ -3955,10 +3974,340 @@
         actions: actions,
       });
       state.queueRenderedKey = state.queueSnapshotKey;
+      mountDigestPanel();
       return;
     }
     state.queueRenderedKey = null;
-    openIssue(ready[0].id);
+    renderQueueLanding(ready);
+  }
+
+  // === Review landing: the one-glance digest + queue picker ================
+  // Replaces the old auto-open of the first ready issue. The reviewer sees
+  // WHAT happened (conductor/prover health, parked work, pending
+  // confirmations) and CHOOSES an issue — in-progress reviews first, so
+  // "continue where I left off" is one keystroke. Rendering is a PURE READ.
+
+  function fetchDigest() {
+    return getJSONWithTimeout("/api/digest", 8000);
+  }
+
+  function digestInProgress() {
+    var digest = state.digest || {};
+    var rows = digest.in_progress || [];
+    var map = {};
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i] && rows[i].issue != null) map[rows[i].issue] = rows[i];
+    }
+    return map;
+  }
+
+  function refreshDigest(force) {
+    var now = Date.now();
+    if (!force && state.digestFetchedAt && now - state.digestFetchedAt < 10000) {
+      return;
+    }
+    state.digestFetchedAt = now;
+    fetchDigest().then(function (digest) {
+      state.digest = digest || null;
+      // Only repaint when the landing (not a subdeck) owns the stage.
+      if (state.activeTab === "review" && state.issue == null) {
+        var panel = document.getElementById("digest-panel");
+        if (panel) {
+          var fresh = digestPanel();
+          if (fresh) panel.replaceWith(fresh);
+        }
+      }
+    }).catch(function () { /* the landing renders without a digest */ });
+  }
+
+  function digestConductorChip() {
+    var digest = state.digest || {};
+    var conductor = digest.conductor || {};
+    var ok = conductor.alive && conductor.ready;
+    return el("span", {
+      class: "digest-chip " + (ok ? "digest-ok" : "digest-warn"),
+      text: "conductor " + (ok ? "ready" : conductor.alive ? "not ready" : "stopped"),
+    });
+  }
+
+  function digestProverLine() {
+    var digest = state.digest || {};
+    var prover = digest.prover || {};
+    if (prover.enabled !== false) return null;
+    var since = prover.updated_ts ? " since " + fmtTs(prover.updated_ts) : "";
+    var by = prover.updated_by ? " (by " + prover.updated_by + ")" : "";
+    return el("div", { class: "digest-line digest-warn-line" }, [
+      el("span", { text: "Prover off" + since + by + " — no new frontier work is being proven. " }),
+      el("button", {
+        class: "btn btn-small", type: "button",
+        onclick: function (e) { confirmEnableProver(e.target); },
+      }, ["Enable prover…"]),
+    ]);
+  }
+
+  function confirmEnableProver(button) {
+    var panel = el("div", { class: "modal-panel" }, [
+      el("h2", { class: "modal-title", text: "Enable the prover?" }),
+      el("p", { class: "modal-sub", text:
+        "The conductor will resume dispatching fill/prove work to Aristotle " +
+        "(billed). Refines of rejected issues run regardless of this toggle." }),
+      el("div", { class: "modal-actions" }, [
+        el("button", { class: "btn", type: "button",
+          onclick: function () { closeModal(); } }, ["Cancel"]),
+        el("button", {
+          class: "btn btn-primary", type: "button", autofocus: "autofocus",
+          onclick: function () {
+            closeModal();
+            if (button) button.disabled = true;
+            postJSON("/api/prover-toggle", { enabled: true }).then(function () {
+              flashToast("Prover enabled");
+              refreshDigest(true);
+            }).catch(function (err) {
+              if (button) button.disabled = false;
+              flashToast("Prover toggle failed: " + ((err && err.message) || err));
+            });
+          },
+        }, ["Enable prover"]),
+      ]),
+    ]);
+    openModal(panel);
+  }
+
+  function digestNeedsMe() {
+    var digest = state.digest || {};
+    var items = digest.needs_me || [];
+    if (!items.length) return null;
+    var rows = items.map(function (item) {
+      if (item.kind === "reconcile") {
+        return el("div", { class: "digest-need" }, [
+          el("span", { class: "digest-need-title", text:
+            "#" + item.issue + " — " + (item.proposals || 1) +
+            " declaration identity proposal" + ((item.proposals || 1) === 1 ? "" : "s") +
+            " await your confirmation" }),
+          el("button", { class: "btn btn-small", type: "button",
+            onclick: function () { openIssue(item.issue); } }, ["Open"]),
+        ]);
+      }
+      var evidence = [];
+      if (item.last_exit_code != null) {
+        evidence.push("exit " + item.last_exit_code);
+      }
+      if (item.last_finished_ts) evidence.push(fmtTs(item.last_finished_ts));
+      var need = el("div", { class: "digest-need" }, [
+        el("span", { class: "digest-need-title", text:
+          "#" + item.issue + " parked (" + (item.recovery_mode || "needs a recovery choice") +
+          (item.recovery_pr ? ", PR #" + item.recovery_pr : "") + ")" +
+          (evidence.length ? " — " + evidence.join(", ") : "") }),
+        el("button", { class: "btn btn-small", type: "button",
+          onclick: function () { switchTab("issues"); } }, ["Open recovery"]),
+      ]);
+      if (item.error_tail) {
+        var details = el("details", { class: "digest-evidence" }, [
+          el("summary", { text: "last failure" }),
+          el("pre", { class: "digest-evidence-pre", text: item.error_tail }),
+        ]);
+        need.appendChild(details);
+      }
+      return need;
+    });
+    return el("div", { class: "digest-needs" }, [
+      el("h3", { class: "digest-h", text: "Needs you" }),
+    ].concat(rows));
+  }
+
+  function digestHealthLines() {
+    var digest = state.digest || {};
+    var out = [];
+    var audit = digest.audit;
+    if (audit && audit.complete === false && (audit.failures || []).length) {
+      out.push(el("div", { class: "digest-line", text:
+        "Machine audit incomplete: " + String(audit.failures[0]).slice(0, 140) }));
+    }
+    var verso = digest.verso;
+    if (verso && verso.state === "error") {
+      out.push(el("div", { class: "digest-line" }, [
+        el("span", { text: "Verso semantic build failing — cards show raw source. " }),
+        versoRetryButton(verso) || "",
+      ]));
+    }
+    return out;
+  }
+
+  function digestPanel() {
+    var digest = state.digest;
+    var kids = [
+      el("div", { class: "digest-head" }, [
+        el("h3", { class: "digest-h", text: "While you were away" }),
+        digestConductorChip(),
+      ]),
+    ];
+    if (!digest) {
+      kids.push(el("div", { class: "digest-line digest-muted",
+        text: "loading digest…" }));
+      return el("section", { id: "digest-panel", class: "digest-panel" }, kids);
+    }
+    var prover = digestProverLine();
+    if (prover) kids.push(prover);
+    var needs = digestNeedsMe();
+    if (needs) kids.push(needs);
+    kids = kids.concat(digestHealthLines());
+    if (kids.length === 1 && !needs) {
+      kids.push(el("div", { class: "digest-line digest-muted",
+        text: "Nothing is waiting on you beyond the queue below." }));
+    }
+    return el("section", { id: "digest-panel", class: "digest-panel" }, kids);
+  }
+
+  function mountDigestPanel() {
+    var existing = document.getElementById("digest-panel");
+    var panel = digestPanel();
+    if (existing) existing.replaceWith(panel);
+    else stage().appendChild(panel);
+    refreshDigest(false);
+  }
+
+  function landingRowVerdictActions(row) {
+    // The fast path for "I already know my verdict on this issue": route the
+    // EXISTING issue-level verdict endpoint without re-swiping every
+    // declaration. verify merges the PR; reject dispatches Aristotle.
+    var verifyBtn = el("button", { class: "btn btn-small", type: "button",
+      onclick: function (e) {
+        e.stopPropagation();
+        confirmIssueVerdict(row.id, "verify", e.target);
+      } }, ["Verify…"]);
+    var rejectBtn = el("button", { class: "btn btn-small", type: "button",
+      onclick: function (e) {
+        e.stopPropagation();
+        confirmIssueVerdict(row.id, "reject", e.target);
+      } }, ["Reject…"]);
+    return el("span", { class: "landing-row-actions" }, [verifyBtn, rejectBtn]);
+  }
+
+  function confirmIssueVerdict(issue, verdict, trigger) {
+    var isReject = verdict === "reject";
+    var ta = isReject ? el("textarea", {
+      class: "reject-note",
+      placeholder: "What must change? Sent to Aristotle verbatim.",
+    }) : null;
+    var kids = [
+      el("h2", { class: "modal-title", text:
+        (isReject ? "Reject issue" : "Verify issue") + " #" + issue }),
+      el("p", { class: "modal-sub" }, [
+        "This is ", el("strong", { text: "irreversible" }),
+        isReject
+          ? " — it records the rejection and dispatches Aristotle with your note verbatim."
+          : " — it merges the marathon PR and flips the issue to VERIFIED, without per-declaration review.",
+      ]),
+    ];
+    if (ta) kids.push(ta);
+    kids.push(el("div", { class: "modal-actions" }, [
+      el("button", { class: "btn", type: "button",
+        onclick: function () { closeModal(); } }, ["Cancel"]),
+      el("button", {
+        class: "btn " + (isReject ? "btn-danger" : "btn-primary"),
+        type: "button",
+        autofocus: isReject ? null : "autofocus",
+        onclick: function () {
+          var note = ta ? ta.value.trim() : null;
+          if (isReject && !note) {
+            flashToast("A rejection needs a non-empty note");
+            return;
+          }
+          closeModal();
+          if (trigger) trigger.disabled = true;
+          postJSON("/api/verdict", { id: issue, verdict: verdict, note: note })
+            .then(function () {
+              flashToast("#" + issue + " " + (isReject ? "rejected" : "verified"));
+              refreshDigest(true);
+              refreshQueue();
+            })
+            .catch(function (err) {
+              if (trigger) trigger.disabled = false;
+              flashToast("Verdict failed: " + ((err && err.message) || err));
+            });
+        },
+      }, [isReject ? "Confirm — reject #" + issue : "Confirm — verify #" + issue]),
+    ]));
+    openModal(el("div", { class: "modal-panel" }, kids));
+  }
+
+  function landingRow(row, index, progress) {
+    var reviewed = progress ? progress.decided : 0;
+    var meta = [];
+    if (row.chapter != null) meta.push("ch. " + row.chapter);
+    if (row.tier) meta.push(row.tier);
+    if (reviewed) meta.push(reviewed + " decided");
+    var node = el("div", {
+      class: "landing-row" + (reviewed ? " landing-inprogress" : "") +
+        (index === state.landingFocus ? " landing-focus" : ""),
+      tabindex: "0",
+      role: "button",
+      "data-issue": String(row.id),
+      onclick: function () { openIssue(row.id); },
+      onkeydown: function (e) {
+        if (e.key === "Enter") { e.preventDefault(); openIssue(row.id); }
+      },
+    }, [
+      el("span", { class: "landing-row-id", text: "#" + row.id }),
+      el("span", { class: "landing-row-title", text: row.title || row.decl || "" }),
+      el("span", { class: "landing-row-meta", text: meta.join(" · ") }),
+      reviewed
+        ? el("span", { class: "landing-row-resume", text: "resume" })
+        : landingRowVerdictActions(row),
+    ]);
+    return node;
+  }
+
+  function renderQueueLanding(ready) {
+    state.issue = null;
+    state.subdeck = null;
+    state.currentDecl = null;
+    var inProgress = digestInProgress();
+    var rows = (ready || []).slice();
+    // In-progress reviews lead: "continue where I left off" is one keystroke.
+    rows.sort(function (a, b) {
+      var pa = inProgress[a.id] ? 1 : 0;
+      var pb = inProgress[b.id] ? 1 : 0;
+      if (pa !== pb) return pb - pa;
+      return 0; // otherwise preserve the server's dependency-aware order
+    });
+    if (state.landingFocus == null || state.landingFocus >= rows.length) {
+      state.landingFocus = 0;
+    }
+    state.landingRows = rows;
+    var host = stage();
+    host.innerHTML = "";
+    host.appendChild(digestPanel());
+    var list = el("div", { class: "landing-list" },
+      rows.map(function (row, i) { return landingRow(row, i, inProgress[row.id]); }));
+    host.appendChild(el("section", { class: "landing" }, [
+      el("h3", { class: "digest-h", text:
+        rows.length + " issue" + (rows.length === 1 ? "" : "s") + " ready — pick one to review" }),
+      list,
+    ]));
+    endSurfaceRefresh(host);
+    setActionsEnabled(false);
+    refreshDigest(false);
+  }
+
+  function landingMoveFocus(delta) {
+    var rows = state.landingRows || [];
+    if (!rows.length) return false;
+    var next = Math.min(rows.length - 1, Math.max(0, (state.landingFocus || 0) + delta));
+    state.landingFocus = next;
+    var nodes = document.querySelectorAll(".landing-row");
+    for (var i = 0; i < nodes.length; i++) {
+      nodes[i].classList.toggle("landing-focus", i === next);
+      if (i === next && typeof nodes[i].focus === "function") nodes[i].focus();
+    }
+    return true;
+  }
+
+  function landingOpenFocused() {
+    var rows = state.landingRows || [];
+    var row = rows[state.landingFocus || 0];
+    if (row) { openIssue(row.id); return true; }
+    return false;
   }
 
   // Pure READ: load the subdeck for `issue` and render its first card. Passes
@@ -4261,6 +4610,88 @@
         "No verdict was recorded. Close this panel to leave the guard in place." }),
     ]);
     return true;
+  }
+
+  // --- diff-and-reaffirm for changed cards --------------------------------
+  // A plain line-level LCS diff — no libraries, bounded input (the basis is
+  // one declaration's source block).
+  function lineDiff(oldText, newText) {
+    var a = String(oldText || "").split("\n");
+    var b = String(newText || "").split("\n");
+    if (a.length * b.length > 250000) {
+      // Degenerate size: fall back to whole-block replacement.
+      return a.map(function (line) { return { kind: "del", text: line }; })
+        .concat(b.map(function (line) { return { kind: "add", text: line }; }));
+    }
+    var rows = a.length + 1, cols = b.length + 1;
+    var lcs = new Array(rows);
+    for (var i = 0; i < rows; i++) lcs[i] = new Array(cols).fill(0);
+    for (var x = a.length - 1; x >= 0; x--) {
+      for (var y = b.length - 1; y >= 0; y--) {
+        lcs[x][y] = a[x] === b[y]
+          ? lcs[x + 1][y + 1] + 1
+          : Math.max(lcs[x + 1][y], lcs[x][y + 1]);
+      }
+    }
+    var out = [], p = 0, q = 0;
+    while (p < a.length && q < b.length) {
+      if (a[p] === b[q]) { out.push({ kind: "same", text: a[p] }); p++; q++; }
+      else if (lcs[p + 1][q] >= lcs[p][q + 1]) { out.push({ kind: "del", text: a[p] }); p++; }
+      else { out.push({ kind: "add", text: b[q] }); q++; }
+    }
+    while (p < a.length) { out.push({ kind: "del", text: a[p++] }); }
+    while (q < b.length) { out.push({ kind: "add", text: b[q++] }); }
+    return out;
+  }
+
+  function previousReviewPanel(card, prev) {
+    var diff = lineDiff(prev.source_block || "", card.source_block || "");
+    var changedOnly = diff.some(function (d) { return d.kind !== "same"; });
+    var diffNode = el("pre", { class: "reaffirm-diff mono" },
+      diff.map(function (d) {
+        var prefix = d.kind === "add" ? "+ " : d.kind === "del" ? "- " : "  ";
+        return el("div", { class: "diff-" + d.kind, text: prefix + d.text });
+      }));
+    var kids = [
+      el("div", { class: "reaffirm-head" }, [
+        el("strong", { text: "What changed since your review" }),
+        prev.note ? el("span", { class: "reaffirm-note",
+          text: "your note: " + prev.note }) : null,
+      ]),
+      changedOnly ? diffNode : el("div", { class: "changed-sub", text:
+        "The source text is identical — an elaborated dependency or the " +
+        "statement changed instead." }),
+    ];
+    if (!changedOnly && prev.statement_pp && card.statement_pp &&
+        prev.statement_pp !== card.statement_pp) {
+      kids.push(el("div", { class: "reaffirm-stmt" }, [
+        el("div", { class: "diff-del mono", text: "- " + prev.statement_pp }),
+        el("div", { class: "diff-add mono", text: "+ " + card.statement_pp }),
+      ]));
+    }
+    kids.push(el("div", { class: "reaffirm-actions" }, [
+      el("button", { class: "btn btn-small", type: "button",
+        onclick: function () { actReaffirm(); } },
+        ["Re-affirm " + (prev.verdict || "verdict") + " (a)"]),
+    ]));
+    return el("div", { class: "reaffirm-panel" }, kids);
+  }
+
+  // Re-affirm a changed card's PREVIOUS verdict against the CURRENT
+  // fingerprint — routed through the ordinary decl-verdict path so every
+  // guard (token, fingerprint, lock) holds exactly as a fresh swipe would.
+  function actReaffirm() {
+    if (!canAct()) return;
+    var card = state.currentDecl;
+    var prev = card && card.previous_review;
+    if (!card || !card.changed_since_review || !prev || !prev.verdict) return;
+    var wire = { verified: "verify", rejected: "reject", deferred: "defer" };
+    var verdict = wire[prev.verdict] || prev.verdict;
+    if (verdict === "reject" && !(prev.note && String(prev.note).trim())) {
+      openRejectNote();
+      return;
+    }
+    commitDeclVerdict(verdict, prev.note || null);
   }
 
   function actVerify() {
@@ -4879,6 +5310,9 @@
         el("button", {
           class: "btn " + (anyRejected ? "btn-danger" : "btn-primary"),
           type: "button",
+          // The modal is already the explicit second step of a deliberate
+          // ship: focus Confirm so Enter confirms (Esc still cancels).
+          autofocus: "autofocus",
           onclick: function () { closeModal(); shipIssue(); },
         }, ["Confirm — ship #" + state.issue]),
       ])
@@ -5604,6 +6038,41 @@
     }, 0);
   }
 
+  // Draft persistence: a typed rejection note survives Cancel, navigation,
+  // and reload. localStorage keyed per (issue, decl); cleared on submit.
+  function draftKey(issue, decl) {
+    return "marathon:draft:" + issue + ":" + (decl || "informal");
+  }
+  function readDraft(issue, decl) {
+    try { return window.localStorage.getItem(draftKey(issue, decl)) || ""; }
+    catch (e) { return ""; }
+  }
+  function writeDraft(issue, decl, text) {
+    try {
+      if (text && text.trim()) {
+        window.localStorage.setItem(draftKey(issue, decl), text);
+      } else {
+        window.localStorage.removeItem(draftKey(issue, decl));
+      }
+    } catch (e) { /* private mode / quota — drafts are best-effort */ }
+  }
+  function clearDraft(issue, decl) {
+    try { window.localStorage.removeItem(draftKey(issue, decl)); }
+    catch (e) { /* best-effort */ }
+  }
+  function attachDraftPersistence(ta, issue, decl) {
+    var restored = readDraft(issue, decl);
+    if (restored) ta.value = restored;
+    var timer = null;
+    ta.addEventListener("input", function () {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(function () {
+        writeDraft(issue, decl, ta.value);
+      }, 300);
+    });
+    return !!restored;
+  }
+
   function openRejectNote() {
     var decl = state.currentDecl ? state.currentDecl.name : "";
     var ta = el("textarea", {
@@ -5612,6 +6081,7 @@
       placeholder: "Why is this declaration wrong? This note is composed into the issue's fix instructions for Aristotle.",
       "aria-label": "Rejection note (required, composed into the issue's Aristotle fix instructions verbatim)",
     });
+    var draftRestored = attachDraftPersistence(ta, state.issue, decl);
     var err = el("div", { class: "modal-err", hidden: "hidden" });
     var form = el("form", { class: "reject-composer", "data-no-swipe": "true" }, [
       el("p", { class: "inspector-hint" }, [
@@ -5619,6 +6089,8 @@
         el("strong", { text: "composed verbatim into the issue's fix instructions for Aristotle" }),
         " when you ship. A note is required. (Recording it now is LOCAL — nothing dispatches yet.)",
       ]),
+      draftRestored ? el("p", { class: "inspector-hint draft-hint",
+        text: "Draft restored — cancelling keeps it." }) : null,
       ta,
       err,
       el("div", { class: "inspector-actions" }, [
@@ -5644,6 +6116,7 @@
       state.rejectComposerOpen = false;
       setComposerNavigationLocked(false);
       closeReviewInspector();
+      clearDraft(state.issue, decl);
       commitDeclVerdict("reject", note); // verbatim, no client rewrite
     });
     state.rejectComposerOpen = true;
@@ -5674,6 +6147,8 @@
 
   // === status strip ========================================================
   function applyStatus(s) {
+    var prevBuilding = state.building;
+    var prevLanded = state.landedToday;
     state.building = s.building || 0;
     state.landedToday = s.landed_today || 0;
     var b = document.getElementById("status-building");
@@ -5684,6 +6159,20 @@
     if (s.source_token) {
       refreshDefinitionTerms(s.source_token, false);
       observeVersoSourceToken(s.source_token);
+    }
+    // Conductor activity that can change readiness (a job finished or work
+    // landed) refetches the queue so newly-ready issues appear without a
+    // manual Refresh — but never while a subdeck review is on the stage, and
+    // never more often than the debounce window.
+    var finishedSomething =
+      (typeof prevBuilding === "number" && state.building < prevBuilding) ||
+      (typeof prevLanded === "number" && state.landedToday > prevLanded);
+    if (finishedSomething && state.activeTab === "review" && !state.subdeck) {
+      var now = Date.now();
+      if (!state.autoQueueRefreshAt || now - state.autoQueueRefreshAt > 5000) {
+        state.autoQueueRefreshAt = now;
+        refreshQueue();
+      }
     }
   }
   function renderJobProgress(jobs) {
@@ -6096,19 +6585,48 @@
       }
       // ignore typing into inputs
       if (e.target && /^(input|textarea|select)$/i.test(e.target.tagName)) return;
-      // Tab switching (1-4) works from any tab; "?" help too.
+      // Tab switching (1-7, matching the visible tab order) works from any
+      // tab; "?" help too.
       if (e.key === "1") return switchTab("review");
-      if (e.key === "2") return switchTab("status");
-      if (e.key === "3") return switchTab("issues");
-      if (e.key === "4") return switchTab("history");
+      if (e.key === "2") return switchTab("files");
+      if (e.key === "3") return switchTab("graph");
+      if (e.key === "4") return switchTab("status");
+      if (e.key === "5") return switchTab("issues");
+      if (e.key === "6") return switchTab("history");
+      if (e.key === "7") return switchTab("add-chapter");
       if (e.key === "?") return openHelp();
       // The card actions (verify/reject/defer/deps/open) only fire on the
       // Review tab — they act on the card stage, which is hidden otherwise.
       if (state.activeTab !== "review") return;
+      // On the landing (no subdeck open) the arrows/j/k walk the queue rows
+      // and Enter opens the focused one.
+      if (state.issue == null && state.landingRows && state.landingRows.length) {
+        if (e.key === "ArrowDown" || e.key === "j" || e.key === "J") {
+          e.preventDefault(); landingMoveFocus(1); return;
+        }
+        if (e.key === "ArrowUp" || e.key === "k" || e.key === "K") {
+          e.preventDefault(); landingMoveFocus(-1); return;
+        }
+        if (e.key === "Enter") {
+          e.preventDefault(); landingOpenFocused(); return;
+        }
+      }
+      // "s" ships from the completion summary: it routes through the ship
+      // BUTTON (the sole entrypoint), so the confirm modal still gates the
+      // irreversible POST exactly as a click would.
+      if (e.key === "s" || e.key === "S") {
+        var shipButton = document.getElementById("btn-ship");
+        if (shipButton && !shipButton.disabled) {
+          e.preventDefault();
+          shipButton.click();
+        }
+        return;
+      }
       switch (e.key) {
         case "ArrowRight": e.preventDefault(); actVerify(); break;
         case "ArrowLeft": e.preventDefault(); actReject(); break;
         case " ": case "Spacebar": case "ArrowDown": e.preventDefault(); actDefer(); break;
+        case "a": case "A": e.preventDefault(); actReaffirm(); break;
         case "d": case "D": openDeps(); break;
         case "o": case "O": openDeepDive(); break;
         default: break;
@@ -6123,8 +6641,12 @@
         el("li", { text: "→ / drag right — verify this declaration (LOCAL — does not ship)" }),
         el("li", { text: "← / drag left — reject (requires a note, composed into the issue's Aristotle fix)" }),
         el("li", { text: "space / ↓ — defer this declaration" }),
+        el("li", { text: "a — re-affirm a changed declaration's previous verdict (when a diff is shown)" }),
+        el("li", { text: "s — SHIP from the completion summary (opens the confirm dialog; Enter confirms)" }),
         el("li", { text: "d — declaration dependency map + predecessor issues" }),
         el("li", { text: "o — source path + GitHub issue link" }),
+        el("li", { text: "1–7 — switch tabs (Review, Files, Graph, Status, Issues, History, Add Chapter)" }),
+        el("li", { text: "↑ / ↓ or j / k, Enter — move through and open queue rows on the Review landing" }),
         el("li", { text: "? — this help" }),
       ]),
       el("p", { class: "modal-sub", text:
