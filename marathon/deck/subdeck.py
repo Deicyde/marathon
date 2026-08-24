@@ -662,7 +662,11 @@ def record_decl_verdict(
             "note carried verbatim to Aristotle)"
         )
 
-    def mutate(store: dict, fingerprint: Optional[str]) -> tuple[dict, bool]:
+    def mutate(
+        store: dict,
+        fingerprint: Optional[str],
+        basis: Optional[dict] = None,
+    ) -> tuple[dict, bool]:
         decls = store.setdefault(str(issue_num), {})
         prev = decls.get(decl) or {}
         entry = {
@@ -677,6 +681,11 @@ def record_decl_verdict(
         if fingerprint is not None:
             entry["fingerprint"] = fingerprint
             entry["fingerprint_version"] = DECL_FINGERPRINT_VERSION
+        # Keep the reviewed-at text beside the pin: when a later change masks
+        # this verdict as "changed", the deck can show WHAT changed and offer
+        # a one-key re-affirm instead of an unexplained full re-review.
+        if fingerprint is not None and basis is not None:
+            entry["basis"] = basis
         # The hard-freeze LOCK is a modifier on a verify: carry it over on a
         # re-verify, but DROP it when the verdict changes to reject/defer (a decl
         # the human now wants changed must not be frozen).
@@ -746,9 +755,26 @@ def record_decl_verdict(
                     else ({} if require_current else None)
                 ),
             )
+        basis: Optional[dict] = None
+        if (
+            fingerprint is not None
+            and decl != INFORMAL_KEY
+            and current_subdeck is not None
+        ):
+            try:
+                basis_card = _current_decl_card(
+                    cfg, issue_num, decl, current_subdeck=current_subdeck
+                )
+            except Exception:  # noqa: BLE001 — basis is best-effort context
+                basis_card = None
+            if basis_card is not None:
+                basis = {
+                    "source": basis_card.get("source_block"),
+                    "statement": basis_card.get("statement_pp"),
+                }
         _clear_ship_receipt(cfg, issue_num)
         stored = _mutate_store(
-            cfg, lambda store: mutate(store, fingerprint)
+            cfg, lambda store: mutate(store, fingerprint, basis)
         )
         if not return_subdeck:
             return stored
@@ -1040,15 +1066,15 @@ def clear_issue(cfg: "ReviewConfig", issue_num: int) -> None:
 def _persist_kept_verdicts(
     cfg: "ReviewConfig", issue_num: int, subdeck: dict, kept_names: list
 ) -> list[str]:
-    """After a REJECT ship, REWRITE the issue's store to keep ONLY the human
-    KEPT (verified) decls — each pinned to its CURRENT source
-    :func:`_decl_fingerprint` — plus the informal approval; everything else
-    (the rejected decls Aristotle will fix) is dropped. So when the refined
-    issue returns, the kept decls are already verified (no re-review) UNLESS
-    their source changed (then the fingerprint mismatch re-opens them). Rejected,
-    deferred, and not-yet-reviewed declarations are all absent from the rewritten
-    store and therefore return for review. Returns the decl names carried over.
-    The store is wiped if nothing is kept."""
+    """After a REJECT ship, REWRITE the issue's store to keep the human KEPT
+    (verified) decls — each pinned to its CURRENT source
+    :func:`_decl_fingerprint` — plus DEFER records (their notes are stored
+    reviewer context, re-flagged as carried over) and the informal approval;
+    rejected decls (the ones Aristotle will fix) and not-yet-reviewed decls
+    are dropped and return for review. So when the refined issue returns, the
+    kept decls are already verified (no re-review) UNLESS their source changed
+    (then the fingerprint mismatch re-opens them). Returns the VERIFIED decl
+    names carried over. The store is wiped if nothing survives."""
     card_by_name = {
         c.get("name"): c
         for c in [
@@ -1075,10 +1101,47 @@ def _persist_kept_verdicts(
                 "fingerprint_version": DECL_FINGERPRINT_VERSION,
                 "carried_over": True,
             }
+            if card is not None:
+                carried_entry["basis"] = {
+                    "source": card.get("source_block"),
+                    "statement": card.get("statement_pp"),
+                }
+            elif rec.get("basis"):
+                carried_entry["basis"] = rec.get("basis")
             if rec.get("locked"):
                 carried_entry["locked"] = True
             new_entry[name] = carried_entry
             carried.append(name)
+        # DEFER records survive the ship too: a defer note ("skipped because…")
+        # is exactly the context the reviewer needs when the declaration
+        # returns, and silently discarding it destroys stored work. The decl
+        # still counts as unreviewed (defer never satisfies completeness) and
+        # the carried_over flag re-surfaces it as a previous deliberate skip,
+        # re-opened by the fingerprint mask if its source changed.
+        for name, rec in old.items():
+            if name == INFORMAL_KEY or name in new_entry:
+                continue
+            if not isinstance(rec, dict) or rec.get("verdict") != "defer":
+                continue
+            card = card_by_name.get(name)
+            carried_defer = {
+                "verdict": "defer",
+                "note": rec.get("note"),
+                "ts": rec.get("ts"),
+                "fingerprint": (
+                    _decl_fingerprint(card) if card else rec.get("fingerprint")
+                ),
+                "fingerprint_version": DECL_FINGERPRINT_VERSION,
+                "carried_over": True,
+            }
+            if card is not None:
+                carried_defer["basis"] = {
+                    "source": card.get("source_block"),
+                    "statement": card.get("statement_pp"),
+                }
+            elif rec.get("basis"):
+                carried_defer["basis"] = rec.get("basis")
+            new_entry[name] = carried_defer
         # The informal approval is issue-level (the body marker was flipped at
         # ship) — keep it so the human is not re-asked to approve the same text.
         informal_rec = old.get(INFORMAL_KEY) or {}
@@ -1490,13 +1553,78 @@ def build_subdeck(
     cards = _build_cards(main_views)
     auto_approved = _build_cards(api_views) if skip_api else []
 
-    # Order: UNREVIEWED first (so the next decl to review leads), then by
-    # worst tier (the gating decl), then by name — a total, deterministic key.
+    # A "changed" mask alone forces a blind re-review. When the invalidated
+    # record stored its reviewed-at basis, hand the old text (and the old
+    # decision) to the client so it can render a diff and offer a one-key
+    # re-affirm via the ordinary decl-verdict endpoint.
+    for card in cards:
+        if not card.get("changed_since_review"):
+            continue
+        rec = records.get(card["name"]) or {}
+        basis = rec.get("basis") or {}
+        stored = rec.get("verdict")
+        card["previous_review"] = {
+            "verdict": _VERDICT_WIRE.get(stored, stored),
+            "note": rec.get("note"),
+            "ts": rec.get("ts"),
+            "source_block": basis.get("source"),
+            "statement_pp": basis.get("statement"),
+        }
+
+    # Topological rank over the issue's own declarations: a card is never
+    # dealt before one its statement kernel leans on (the design's
+    # dependency-order promise — reviewing a lemma before the definition it
+    # uses forces the reviewer out of the swipe flow). Kernel membership is
+    # the same edge the dependency guard already uses; a cycle degrades to a
+    # shared rank rather than wedging the ordering.
+    def _topo_ranks(views: list) -> dict[str, int]:
+        names = [v.name for v in views]
+        name_set = set(names)
+        deps: dict[str, set[str]] = {n: set() for n in names}
+        for view in views:
+            for member in (getattr(view, "kernel", None) or []):
+                mname = (
+                    member.get("name") if isinstance(member, dict)
+                    else getattr(member, "name", None)
+                )
+                if not mname:
+                    continue
+                for other in name_set:
+                    if other != view.name and _decl_name_matches(mname, other):
+                        deps[view.name].add(other)
+        ranks: dict[str, int] = {}
+        remaining = {n: set(d) for n, d in deps.items()}
+        rank = 0
+        while remaining:
+            pending = set(remaining)
+            ready = sorted(
+                n for n, d in remaining.items() if not (d & pending)
+            )
+            if not ready:
+                for n in remaining:
+                    ranks[n] = rank
+                break
+            for n in ready:
+                ranks[n] = rank
+                del remaining[n]
+            rank += 1
+        return ranks
+
+    topo_rank = _topo_ranks(reconciled_views)
+
+    # Order: UNREVIEWED first (so the next decl to review leads), then in
+    # dependency order (predecessors before their dependents), then by worst
+    # tier (the gating decl), then by name — a total, deterministic key.
     def _sort_key(card: dict) -> tuple:
         reviewed = _is_reviewed(eff.get(card["name"], (None, None))[0])
         tier = card.get("tier")
         tier_rank = TIER_ORDER.index(tier) if tier in TIER_ORDER else 0
-        return (1 if reviewed else 0, tier_rank, card["name"])
+        return (
+            1 if reviewed else 0,
+            topo_rank.get(card["name"], 0),
+            tier_rank,
+            card["name"],
+        )
 
     cards.sort(key=_sort_key)
     auto_approved.sort(key=_sort_key)

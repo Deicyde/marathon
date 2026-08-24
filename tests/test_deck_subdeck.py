@@ -1665,3 +1665,108 @@ def test_lock_carries_over_a_reverify_but_drops_on_reject(tmp_path):
     # reject (human now wants it changed) → lock dropped
     subdeck.record_decl_verdict(cfg, 30, "Demo.Chapter14.Foo", "reject", note="fix")
     assert "locked" not in subdeck.issue_verdicts(cfg, 30)["Demo.Chapter14.Foo"]
+
+
+def test_build_subdeck_orders_dependencies_first(tmp_path, monkeypatch):
+    """Within an issue, a declaration is never dealt before one its kernel
+    leans on — alphabetical order must not override dependency order."""
+    cfg = make_cfg(tmp_path)
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="def", type_pp="Nat", value_pp="0"),
+        _decl("Demo.Chapter14.Bar", kind="def", type_pp="Int", value_pp="1",
+              cone=("Demo.Chapter14.Foo",)),
+        _decl("Demo.Chapter14.Baz", kind="theorem", type_pp="Foo = Foo",
+              cone=("Demo.Chapter14.Bar",)),
+    ]))
+    patch_bulk(monkeypatch, {
+        22: {
+            "title": "#22 bundle", "state": "OPEN",
+            "body": _bundle_body("Foo", "Bar", "Baz"), "labels": set(),
+        },
+    })
+
+    sd = subdeck.build_subdeck(cfg, 22)
+    order = [c["name"] for c in sd["cards"]]
+    assert order == [
+        "Demo.Chapter14.Foo",
+        "Demo.Chapter14.Bar",
+        "Demo.Chapter14.Baz",
+    ]
+
+
+def test_persist_kept_verdicts_carries_defer_notes(tmp_path, monkeypatch):
+    """A defer (and its note) survives a reject ship, re-flagged as carried
+    over — stored reviewer context is never silently discarded."""
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    subdeck._save_store(cfg, {"22": {
+        "Demo.Chapter14.Foo": {"verdict": "verify", "note": None, "ts": "t"},
+        "Demo.Chapter14.Bar": {"verdict": "reject", "note": "fix", "ts": "t"},
+        "Demo.Chapter14.Baz": {
+            "verdict": "defer",
+            "note": "skipped: waiting on the Bar refactor",
+            "ts": "t",
+        },
+    }})
+    sd = {
+        "cards": [
+            {"name": "Demo.Chapter14.Foo", "source_block": "def Foo := 0"},
+            {"name": "Demo.Chapter14.Bar", "source_block": "def Bar := 1"},
+            {"name": "Demo.Chapter14.Baz", "source_block": "def Baz := 2"},
+        ],
+        "informal": {},
+    }
+
+    carried = subdeck._persist_kept_verdicts(cfg, 22, sd, ["Demo.Chapter14.Foo"])
+
+    assert carried == ["Demo.Chapter14.Foo"]
+    store = subdeck.issue_verdicts(cfg, 22)
+    assert "Demo.Chapter14.Bar" not in store                 # rejected dropped
+    baz = store["Demo.Chapter14.Baz"]
+    assert baz["verdict"] == "defer"
+    assert baz["note"] == "skipped: waiting on the Bar refactor"
+    assert baz["carried_over"] is True
+    assert baz["fingerprint"] == subdeck._decl_fingerprint(sd["cards"][2])
+
+
+def test_swipe_records_reviewed_at_basis(tmp_path, monkeypatch):
+    """A live code-backed verdict stores the reviewed-at source/statement
+    beside its fingerprint so a later invalidation can show a diff."""
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    install_inspectable_bundle(cfg)
+    sd = subdeck.build_subdeck(cfg, 22)
+    foo = next(c for c in sd["cards"] if c["name"] == "Demo.Chapter14.Foo")
+
+    subdeck.record_decl_verdict(
+        cfg, 22, "Demo.Chapter14.Foo", "verify",
+        expected_fingerprint=foo["context_fingerprint"],
+        require_current=True,
+    )
+
+    rec = subdeck.issue_verdicts(cfg, 22)["Demo.Chapter14.Foo"]
+    assert rec["basis"]["source"] == foo["source_block"]
+    assert rec["basis"]["statement"] == foo["statement_pp"]
+
+
+def test_changed_card_exposes_previous_review_basis(tmp_path, monkeypatch):
+    """A fingerprint-invalidated verdict surfaces its old decision and
+    reviewed-at text on the card so the client can diff and re-affirm."""
+    cfg = make_bundle_cfg(tmp_path, monkeypatch)
+    install_inspectable_bundle(cfg)
+    subdeck._save_store(cfg, {"22": {"Demo.Chapter14.Foo": {
+        "verdict": "verify",
+        "note": "checked against Lee p. 12",
+        "ts": "t",
+        "fingerprint": "0" * 64,          # stale pin → masked as changed
+        "fingerprint_version": subdeck.DECL_FINGERPRINT_VERSION,
+        "basis": {"source": "def Foo := old", "statement": "OldType"},
+    }}})
+
+    sd = subdeck.build_subdeck(cfg, 22)
+    foo = next(c for c in sd["cards"] if c["name"] == "Demo.Chapter14.Foo")
+    assert foo["changed_since_review"] is True
+    assert foo["verdict"] is None
+    prev = foo["previous_review"]
+    assert prev["verdict"] == "verified"
+    assert prev["note"] == "checked against Lee p. 12"
+    assert prev["source_block"] == "def Foo := old"
+    assert prev["statement_pp"] == "OldType"
