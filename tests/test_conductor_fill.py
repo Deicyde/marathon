@@ -99,10 +99,7 @@ def _auto_audit_guard_payload(
         "launched_at": datetime.fromtimestamp(
             launched_at_epoch, timezone.utc
         ).isoformat(),
-        "command": [
-            sys.executable, "-m", "marathon", "audit", "run",
-            "--target", target, "--repo-dir", str(repo),
-        ],
+        "command": cond._auto_audit_command(repo, target),
     }
     if schema >= 2:
         payload["launched_at_epoch"] = launched_at_epoch

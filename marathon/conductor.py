@@ -5842,11 +5842,20 @@ def _auto_audit_identity(
 def _auto_audit_command(
     repo_dir: str | Path, target: str,
 ) -> list[str]:
-    """The one exact argv emitted for an automatic audit."""
+    """The one exact argv emitted for an automatic audit.
+
+    The explicit ``--timeout`` sizes the budget for a cold heavyweight
+    module: the CLI default's recovery slice (timeout / 2·log2(modules))
+    could never finish a from-scratch Stokes-sized leaf, which excluded the
+    same module from every snapshot for weeks ("audit incomplete: 28/29")
+    and starved its chapter of machine evidence. The audit is detached and
+    duplicate-guarded, so a generous budget costs idle ticks nothing.
+    """
     canonical_repo, _ = _auto_audit_identity(repo_dir, target)
     return [
         sys.executable, "-m", "marathon", "audit", "run",
         "--target", target, "--repo-dir", canonical_repo,
+        "--timeout", "1800",
     ]
 
 
@@ -5930,19 +5939,19 @@ def _is_exact_auto_audit_guard_command(
     boundary: duplicate or unknown options must fail open rather than letting
     an operator-edited record suppress work for six hours.
     """
+    try:
+        expected = _auto_audit_command(repo_dir, target)
+    except (OSError, RuntimeError):
+        return False
     if (
         not isinstance(command, list)
-        or len(command) != 9
+        or len(command) != len(expected)
         or any(
             type(token) is not str or not token or len(token) > 4096
             for token in command
         )
         or sum(len(token) for token in command) > 16 * 1024
     ):
-        return False
-    try:
-        expected = _auto_audit_command(repo_dir, target)
-    except (OSError, RuntimeError):
         return False
     return command == expected
 
