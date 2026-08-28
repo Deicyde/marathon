@@ -701,7 +701,7 @@ html, body {
 .tier-t3 .tier-label { background: #a371f733; color: #c297ff; border: 1px solid #a371f766; }
 .tier-unknown .tier-label { background: #d2992233; color: #e3b341; border: 1px solid #d2992266; }
 .tier-none .tier-label { background: #21262d; color: var(--muted); }
-.tier-qual { font-size: 0.66rem; color: var(--warn); border: 1px solid var(--line); border-radius: 4px; padding: 0 0.3rem; }
+.tier-qual { font-size: 0.66rem; color: var(--warn); border: 1px solid var(--line); border-radius: 4px; padding: 0 0.3rem; margin-left: 0.3rem; }
 
 /* --- informal (LLM) --- */
 .informal { background: var(--panel-2); border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: 10px; padding: 0.7rem 0.85rem; }
