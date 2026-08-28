@@ -9202,7 +9202,12 @@
               statusBadge(it.status),
               el("span", { class: "issue-title", title: it.title || "", text: it.title || "(untitled)" }),
             ];
-            if (it.blocked_reason) kids.push(el("span", {
+            // The readiness reason earns its chip only when it says something
+            // the status badge doesn't — "already verified" next to a
+            // verified pill is redundant and its warning styling reads as a
+            // problem where none exists.
+            var redundantReason = it.blocked_reason === "already " + it.status;
+            if (it.blocked_reason && !redundantReason) kids.push(el("span", {
               class: "issue-blocker",
               title: it.blocked_reason,
               text: it.blocked_reason,
