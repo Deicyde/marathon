@@ -856,6 +856,12 @@ class DeckServer(ThreadingHTTPServer):
             if retry_new_generation and not self._queue_shutdown.is_set():
                 with self._queue_lock:
                     self._start_queue_refresh_locked(chapter)
+
+            # Pre-warm the READY issues' assembled details so the issue the
+            # reviewer opens next is already built (the plan's prefetch-depth
+            # idea). Bounded, single-flight, and strictly best-effort.
+            if persist is not None and not self._queue_shutdown.is_set():
+                self._start_detail_prewarm(persist[0])
         finally:
             with self._queue_lock:
                 self._queue_workers.discard(threading.current_thread())
@@ -888,6 +894,49 @@ class DeckServer(ThreadingHTTPServer):
                 snapshot.expires_at = 0.0
             for chapter in tuple(self._queue_builders):
                 self._start_queue_refresh_locked(chapter)
+
+    def _start_detail_prewarm(self, payload: dict) -> None:
+        """Warm the ready issues' assembled details after a queue build.
+
+        One background walker at a time, bounded to the first few ready
+        rows; each build lands in the per-issue detail memo so the reviewer's
+        next open is served instantly. Never raises, never blocks a caller.
+        """
+        if getattr(self, "cfg", None) is None:
+            return
+        try:
+            ready_ids = [
+                int(card.get("id"))
+                for card in (payload.get("cards") or [])
+                if card.get("ready") and card.get("id") is not None
+            ][:5]
+        except (TypeError, ValueError):
+            return
+        if not ready_ids:
+            return
+        with self._queue_lock:
+            if getattr(self, "_detail_prewarm_running", False):
+                return
+            self._detail_prewarm_running = True
+
+        def _warm() -> None:
+            from marathon.deck.cards import build_card_detail_cached
+
+            try:
+                for num in ready_ids:
+                    if self._queue_shutdown.is_set():
+                        return
+                    try:
+                        build_card_detail_cached(self.cfg, num)
+                    except Exception:  # noqa: BLE001 — warming is best-effort
+                        pass
+            finally:
+                with self._queue_lock:
+                    self._detail_prewarm_running = False
+
+        Thread(
+            target=_warm, name="deck-detail-prewarm", daemon=True
+        ).start()
 
     def cached_issue_reviewability(
         self, _cfg: "ReviewConfig", issue_num: int
@@ -1418,7 +1467,7 @@ class DeckHandler(BaseHTTPRequestHandler):
         self._send_json(payload)
 
     def _api_card(self, raw_id: str) -> None:
-        from marathon.deck.cards import build_card_detail
+        from marathon.deck.cards import build_card_detail_cached
 
         try:
             issue_num = int(raw_id)
@@ -1426,7 +1475,7 @@ class DeckHandler(BaseHTTPRequestHandler):
             return self._send_error_json(
                 HTTPStatus.BAD_REQUEST, f"bad card id {raw_id!r}"
             )
-        detail = build_card_detail(self.cfg, issue_num)
+        detail = build_card_detail_cached(self.cfg, issue_num)
         self._send_json(detail.to_json())
 
     def _api_subdeck(self, raw_id: str, query: dict) -> None:

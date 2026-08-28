@@ -1394,9 +1394,9 @@ def _load_subdeck_inputs(
     cheap verdict overlay avoids repeating GitHub metadata and source
     reconciliation fetches on every swipe.
     """
-    from marathon.deck.cards import build_card_detail
+    from marathon.deck.cards import build_card_detail_cached
 
-    detail = build_card_detail(cfg, issue_num)
+    detail = build_card_detail_cached(cfg, issue_num)
     return detail, list(detail.surfaced_decls)
 
 

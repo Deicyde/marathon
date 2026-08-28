@@ -511,9 +511,103 @@ def _context_freshness(cfg: "ReviewConfig") -> tuple:
 
 
 def invalidate_context_cache() -> None:
-    """Drop every memoized deck context (mutating POSTs, ship completion)."""
+    """Drop every memoized deck context AND the per-issue detail memo
+    (mutating POSTs, ship completion)."""
     with _context_cache_lock:
         _context_cache.clear()
+    with _detail_cache_lock:
+        _detail_cache.clear()
+
+
+#: Per-issue assembled CardDetail memo. The context cache above removed
+#: GitHub from the hot path; this removes the ~seconds of LOCAL assembly
+#: (per-chapter reconciled surfaces, the global dependency model, source
+#: rendering) that every subdeck/card open re-paid. Freshness covers every
+#: fingerprint-bearing input — the context signature (state.json, audit
+#: snapshot, registry) plus the Lean source-inventory token — so a served
+#: detail is always current where it matters; the TTL only bounds issue-body
+#: drift, exactly like the queue snapshot, and an expired-but-source-current
+#: entry is served stale while one background rebuild refreshes it.
+_DETAIL_CACHE_TTL_SECONDS = float(
+    os.environ.get("MARATHON_DECK_DETAIL_TTL", "60")
+)
+_detail_cache_lock = threading.Lock()
+_detail_cache: dict[tuple, "_DetailCacheEntry"] = {}
+
+
+@dataclass
+class _DetailCacheEntry:
+    detail: "CardDetail"
+    freshness: tuple
+    built_at: float
+    refreshing: bool = False
+
+
+def _detail_freshness(cfg: "ReviewConfig") -> Optional[tuple]:
+    """Every local truth an assembled detail depends on; None = don't cache."""
+    from marathon.deck.definitions import definition_source_token
+
+    try:
+        token = definition_source_token(Path(cfg.repo_dir))
+    except Exception:  # noqa: BLE001 — unknown source state: build fresh
+        return None
+    return (_context_freshness(cfg), token)
+
+
+def build_card_detail_cached(
+    cfg: "ReviewConfig", issue_num: int
+) -> "CardDetail":
+    """Serve :func:`build_card_detail` from the per-issue memo.
+
+    A signature mismatch (source, audit, state, or registry changed) rebuilds
+    synchronously — fingerprint-bearing data is never served stale.  A lapsed
+    TTL with a matching signature serves the cached detail immediately and
+    rebuilds once in the background (issue-body drift only).
+    """
+    key = (str(cfg.repo_dir), int(issue_num))
+    freshness = _detail_freshness(cfg)
+    if freshness is None:
+        return build_card_detail(cfg, issue_num)
+    now = time.monotonic()
+    with _detail_cache_lock:
+        entry = _detail_cache.get(key)
+        if entry is not None and entry.freshness == freshness:
+            if now - entry.built_at <= _DETAIL_CACHE_TTL_SECONDS:
+                return entry.detail
+            if entry.refreshing:
+                return entry.detail
+            entry.refreshing = True
+            stale_detail = entry.detail
+
+            def _refresh() -> None:
+                try:
+                    pre = _detail_freshness(cfg)
+                    fresh = build_card_detail(cfg, issue_num)
+                    if pre is not None:
+                        with _detail_cache_lock:
+                            _detail_cache[key] = _DetailCacheEntry(
+                                detail=fresh,
+                                freshness=pre,
+                                built_at=time.monotonic(),
+                            )
+                except Exception:  # noqa: BLE001 — keep serving the stale memo
+                    with _detail_cache_lock:
+                        current = _detail_cache.get(key)
+                        if current is not None:
+                            current.refreshing = False
+
+            threading.Thread(
+                target=_refresh, name="deck-detail-refresh", daemon=True
+            ).start()
+            return stale_detail
+    detail = build_card_detail(cfg, issue_num)
+    with _detail_cache_lock:
+        _detail_cache[key] = _DetailCacheEntry(
+            detail=detail,
+            freshness=freshness,
+            built_at=time.monotonic(),
+        )
+    return detail
 
 
 def _load_context(
