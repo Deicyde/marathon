@@ -519,6 +519,11 @@ class DeckServer(ThreadingHTTPServer):
         self.ship_jobs = ShipJobRegistry(
             acceptance_checker=self.cached_issue_reviewability
         )
+        # The issue-level verdict fast path gets the same shape: durable
+        # acceptance, background GitHub writes, browser polling.
+        from marathon.deck.verdict_jobs import VerdictJobRegistry
+
+        self.verdict_jobs = VerdictJobRegistry()
         # ThreadingHTTPServer gives every request its own thread.  Coalesce
         # expensive queue reads by chapter instead of letting those threads
         # stampede GitHub and the local audit store.  Builders run outside this
@@ -1140,6 +1145,8 @@ class DeckHandler(BaseHTTPRequestHandler):
                 return self._api_status()
             if path == "/api/digest":
                 return self._api_digest()
+            if path == "/api/verdict-status":
+                return self._api_verdict_status(query)
             if path == "/api/events":
                 return self._api_events()
             if path == "/api/conductor-status":
@@ -1550,6 +1557,28 @@ class DeckHandler(BaseHTTPRequestHandler):
             verso = None
         self._send_json(boot_digest(self.cfg, verso_status=verso))
 
+    def _api_verdict_status(self, query: dict) -> None:
+        """Pure-read poll endpoint for one durably accepted async verdict."""
+        if self._demo:
+            return self._send_error_json(
+                HTTPStatus.NOT_FOUND, "verdict jobs are unavailable in demo mode"
+            )
+        raw = (query.get("issue") or [None])[0]
+        try:
+            issue_num = int(raw)
+        except (TypeError, ValueError):
+            return self._send_error_json(
+                HTTPStatus.BAD_REQUEST, f"bad or missing issue {raw!r}"
+            )
+        record = self.server.verdict_jobs.status(  # type: ignore[attr-defined]
+            self.cfg, issue_num
+        )
+        if record is None:
+            return self._send_error_json(
+                HTTPStatus.NOT_FOUND, f"no verdict job for issue #{issue_num}"
+            )
+        self._send_json({"ok": True, "job": record})
+
     def _api_ship_status(self, query: dict) -> None:
         """Pure-read poll endpoint for one durably accepted ship job."""
         issue_raw = (query.get("issue") or [None])[0]
@@ -1934,7 +1963,39 @@ class DeckHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST, f"bad or missing card id {issue_raw!r}"
             )
 
-        from marathon.deck.verdicts import VerdictError, apply_verdict
+        from marathon.deck.verdicts import VERDICTS, VerdictError, apply_verdict
+
+        # The async fast path: validate the request shape NOW (clean 4xx),
+        # accept durably, run the GitHub writes off the request thread, and
+        # let the browser poll /api/verdict-status. The synchronous form
+        # remains for compatibility.
+        if data.get("async"):
+            if verdict not in VERDICTS:
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    f"unknown verdict {verdict!r}; expected one of {VERDICTS}",
+                )
+            if verdict == "reject" and (note is None or not str(note).strip()):
+                return self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    "a reject requires a non-empty note",
+                )
+            # Acceptance changes nothing readable yet; the worker invalidates
+            # the read models when the verdict actually lands (on_complete).
+            self._queue_cache_invalidated = True
+            self._project_graph_cache_invalidated = True
+            record = self.server.verdict_jobs.start(  # type: ignore[attr-defined]
+                self.cfg,
+                issue_num,
+                verdict,
+                str(note) if note is not None else None,
+                actor_token=self.headers.get(ACCESS_TOKEN_HEADER),
+                on_complete=self.server.invalidate_queue_cache,  # type: ignore[attr-defined]
+            )
+            return self._send_json(
+                {"ok": True, "accepted": True, "job": record},
+                status=HTTPStatus.ACCEPTED,
+            )
 
         try:
             result = apply_verdict(self.cfg, issue_num, verdict, note)

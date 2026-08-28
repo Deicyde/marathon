@@ -4215,11 +4215,15 @@
           }
           closeModal();
           if (trigger) trigger.disabled = true;
-          postJSON("/api/verdict", { id: issue, verdict: verdict, note: note })
+          // Async fast path: durable 202 acceptance, then poll the job to a
+          // terminal state — the button never blocks on GitHub writes.
+          postJSON("/api/verdict", {
+            id: issue, verdict: verdict, note: note, async: true,
+          })
             .then(function () {
-              flashToast("#" + issue + " " + (isReject ? "rejected" : "verified"));
-              refreshDigest(true);
-              refreshQueue();
+              flashToast("#" + issue + " " + (isReject ? "reject" : "verify") +
+                " accepted — landing in the background");
+              pollVerdictJob(issue, trigger, 0);
             })
             .catch(function (err) {
               if (trigger) trigger.disabled = false;
@@ -4229,6 +4233,39 @@
       }, [isReject ? "Confirm — reject #" + issue : "Confirm — verify #" + issue]),
     ]));
     openModal(el("div", { class: "modal-panel" }, kids));
+  }
+
+  // Poll one accepted async verdict job to a terminal state (pure reads).
+  function pollVerdictJob(issue, trigger, failures) {
+    setTimeout(function () {
+      getJSONWithTimeout("/api/verdict-status?issue=" + issue, 8000)
+        .then(function (resp) {
+          var job = (resp && resp.job) || {};
+          if (job.status === "succeeded") {
+            flashToast("#" + issue + " " + (job.verdict === "reject"
+              ? "rejected" : "verified"));
+            refreshDigest(true);
+            refreshQueue();
+            return;
+          }
+          if (job.status === "failed" || job.status === "awaiting_retry") {
+            if (trigger) trigger.disabled = false;
+            flashToast("Verdict on #" + issue + " " +
+              (job.status === "failed" ? "failed: " + (job.error || "see log")
+                : "was interrupted — try again"));
+            return;
+          }
+          pollVerdictJob(issue, trigger, 0);
+        })
+        .catch(function () {
+          if (failures >= 5) {
+            if (trigger) trigger.disabled = false;
+            flashToast("Lost track of #" + issue + "'s verdict — refresh to check");
+            return;
+          }
+          pollVerdictJob(issue, trigger, failures + 1);
+        });
+    }, 1200);
   }
 
   function landingRow(row, index, progress) {
