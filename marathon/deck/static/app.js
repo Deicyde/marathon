@@ -3027,8 +3027,51 @@
     ]);
   }
 
+  // Append text at the reject composer's caret (the cross-reference
+  // affordance: cite another declaration without abandoning the note).
+  function insertIntoComposer(text) {
+    var host = inspectorHost();
+    var ta = host ? host.querySelector("textarea.reject-note") : null;
+    if (!ta) return false;
+    var start = ta.selectionStart == null ? ta.value.length : ta.selectionStart;
+    var end = ta.selectionEnd == null ? start : ta.selectionEnd;
+    ta.value = ta.value.slice(0, start) + text + ta.value.slice(end);
+    var caret = start + text.length;
+    ta.focus();
+    try { ta.setSelectionRange(caret, caret); } catch (e) { /* best-effort */ }
+    ta.dispatchEvent(new Event("input", { bubbles: true })); // draft persistence
+    return true;
+  }
+
+  // Read-only review context (dependency map, source links) that may stack
+  // OVER the reject composer as a modal — replacing the inspector would
+  // destroy the typed note, but reading while writing is exactly what a
+  // cross-referencing rejection needs.
+  function openReadOnlyReviewSurface(title, children) {
+    if (!state.rejectComposerOpen) {
+      return openReviewInspector(title, children);
+    }
+    var panel = el("div", { class: "modal-panel definition-modal" }, [
+      el("div", { class: "inspector-head" }, [
+        el("h2", { class: "inspector-title", text: title }),
+        el("button", { class: "inspector-close", type: "button",
+          "aria-label": "Close " + title,
+          onclick: function () { closeModal(); } }, ["×"]),
+      ]),
+    ]);
+    (children || []).forEach(function (child) { if (child) panel.appendChild(child); });
+    openModal(panel);
+    return panel;
+  }
+
   function openDefinitionSurface(title, children) {
-    if (state.activeTab === "review" && inspectorHost()) {
+    // While the reject composer holds the inspector, read-only surfaces open
+    // as a MODAL OVERLAY instead of replacing (and losing) the note — the
+    // reviewer can go look at another declaration mid-sentence.
+    if (
+      state.activeTab === "review" && inspectorHost()
+      && !state.rejectComposerOpen
+    ) {
       return openReviewInspector(title, children, null, "definition");
     }
     function closeDefinitionModal() {
@@ -3112,6 +3155,16 @@
         match.kind ? el("span", { class: "decl-panel-kind", text: match.kind }) : null,
         tierBadge(match.tier || "-", match.qualifiers || []),
         el("span", { class: "mono", text: match.name }),
+        state.rejectComposerOpen && match.name ? el("button", {
+          class: "btn btn-tiny",
+          type: "button",
+          title: "Insert `" + match.name + "` at the note's caret",
+          onclick: function () {
+            if (insertIntoComposer("`" + match.name + "`")) {
+              closeModal();
+            }
+          },
+        }, ["Insert into note"]) : null,
       ]),
       sourceSurface.section,
       inspectorCode("Elaborated type", match.statement_pp, true),
@@ -3258,7 +3311,7 @@
       });
       external.appendChild(list);
     }
-    openReviewInspector("Dependency map", [intro, graph, external]);
+    openReadOnlyReviewSurface("Dependency map", [intro, graph, external]);
   }
 
   function openResourceLinks() {
@@ -3273,7 +3326,7 @@
         rel: "noopener",
       }, ["Open GitHub issue #" + sd.issue]));
     }
-    openReviewInspector("Open source & issue", [
+    openReadOnlyReviewSurface("Open source & issue", [
       card.source_file
         ? el("p", { class: "resource-file" }, [
             el("strong", { text: "Source file" }),

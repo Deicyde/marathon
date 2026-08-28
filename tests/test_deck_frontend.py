@@ -4112,3 +4112,44 @@ def test_status_frames_refresh_queue_only_outside_a_subdeck(app_js: str):
     apply_fn = _fn_body(code, "function applyStatus")
     assert "refreshQueue()" in apply_fn
     assert "!state.subdeck" in apply_fn
+
+
+def test_files_search_repaints_results_not_the_toolbar(app_js: str):
+    """Typing filters the result list without remounting the input — the
+    caret is never forced to the end."""
+    code = _strip_block_comments(app_js)
+    paint = _fn_body(code, "function paintFilesTab")
+    assert "repaintResults" in paint
+    # The old pattern re-found the replacement input and shoved the caret to
+    # the end; it must be gone from the Files reader.
+    assert 'querySelector(".reader-search")' not in paint
+
+
+def test_composer_allows_readonly_lookups_as_overlays(app_js: str):
+    """While the reject composer holds the inspector, definition lookups and
+    the dependency map stack as modal overlays instead of replacing (and
+    destroying) the typed note."""
+    code = _strip_block_comments(app_js)
+    surface = _fn_body(code, "function openDefinitionSurface")
+    assert "state.rejectComposerOpen" in surface
+    readonly = _fn_body(code, "function openReadOnlyReviewSurface")
+    assert "openModal(" in readonly
+    assert 'openReadOnlyReviewSurface("Dependency map"' in code
+
+
+def test_composer_insert_reference_targets_the_note_caret(app_js: str):
+    code = _strip_block_comments(app_js)
+    insert = _fn_body(code, "function insertIntoComposer")
+    assert "reject-note" in insert
+    assert "setSelectionRange" in insert
+    # Insertion must feed the draft-persistence input listener.
+    assert 'dispatchEvent(new Event("input"' in insert
+
+
+def test_async_verdict_fast_path_polls_to_terminal(app_js: str):
+    code = _strip_block_comments(app_js)
+    confirm = _fn_body(code, "function confirmIssueVerdict")
+    assert "async: true" in confirm
+    poll = _fn_body(code, "function pollVerdictJob")
+    assert "/api/verdict-status" in poll
+    assert "awaiting_retry" in poll
