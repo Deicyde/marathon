@@ -7155,14 +7155,14 @@
       "aria-label": "Filter chapter review",
     });
     search.value = state.filesQuery;
+    // Typing repaints ONLY the results below the toolbar (debounced): the
+    // input node is never remounted, so the caret stays where the reviewer
+    // put it and mid-string edits work.
+    var searchDebounce = null;
     search.addEventListener("input", function () {
       state.filesQuery = search.value;
-      paintFilesTab();
-      var replacement = dashHost("dash-files").querySelector(".reader-search");
-      if (replacement) {
-        replacement.focus();
-        replacement.setSelectionRange(replacement.value.length, replacement.value.length);
-      }
+      if (searchDebounce) clearTimeout(searchDebounce);
+      searchDebounce = setTimeout(repaintResults, 150);
     });
     var targetFilter = el("select", {
       class: "reader-select", "aria-label": "Declaration status filter",
@@ -7177,24 +7177,26 @@
     targetFilter.value = state.filesFilter;
     targetFilter.addEventListener("change", function () {
       state.filesFilter = targetFilter.value;
-      paintFilesTab();
+      repaintResults();
     });
     var refresh = el("button", { class: "btn", type: "button" }, ["Refresh"]);
     refresh.addEventListener("click", function () {
       state.filesData = null;
       renderFilesTab();
     });
-    var visible = readerVisibleTargets(data);
-    var deferrable = visible.filter(function (target) { return !target.verdict; });
+    // The deferrable set tracks the CURRENT filter; repaintResults refreshes
+    // the button in place so the toolbar (and the search input's caret)
+    // survives every filter change.
+    var deferrable = [];
     var deferAll = el("button", {
       class: "btn",
       type: "button",
-      disabled: deferrable.length ? null : "disabled",
-      "aria-label": "Defer " + deferrable.length +
-        " visible unreviewed declarations — local only; does not ship",
+      disabled: "disabled",
       title: "Records DEFER locally; never ships. KEEP/FIX remain per declaration.",
-    }, ["Defer visible (" + deferrable.length + ")"]);
-    deferAll.addEventListener("click", function () { readerBatch("defer", deferrable); });
+    }, ["Defer visible (0)"]);
+    deferAll.addEventListener("click", function () {
+      if (deferrable.length) readerBatch("defer", deferrable);
+    });
     host.appendChild(el("div", { class: "reader-header" }, [
       el("div", {}, [
         el("h2", { text: data.chapter == null ? "Project file review" : "Chapter " + data.chapter + " file review" }),
@@ -7218,60 +7220,76 @@
       statChip((data.files || []).length, "files"),
     ]));
 
-    var files = (data.files || []).map(function (file) {
-      return {
-        path: file.path,
-        progress: file.progress,
-        issues: file.issues,
-        declarations: (file.declarations || []).filter(function (target) {
-          return readerTargetMatches(target, state.filesQuery, state.filesFilter);
-        }),
-      };
-    }).filter(function (file) { return file.declarations.length; });
+    var resultsHost = el("div", { class: "reader-results" });
+    host.appendChild(resultsHost);
 
-    if (!files.length) {
-      host.appendChild(el("div", { class: "dash-empty", text:
-        (state.filesQuery || state.filesFilter !== "all")
-          ? "No declarations match this filter."
-          : "No code-backed declarations are registered in this scope." }));
-      return;
-    }
-    var nav = el("nav", { class: "reader-file-nav", "aria-label": "Source files" });
-    files.forEach(function (file, index) {
-      var button = el("button", { class: "reader-file-link", type: "button" }, [
-        el("span", { class: "mono", text: file.path }),
-        el("span", { text: file.declarations.length + " target" + (file.declarations.length === 1 ? "" : "s") }),
-      ]);
-      button.addEventListener("click", function () {
-        var section = document.getElementById("reader-file-" + index);
-        if (section) section.scrollIntoView({ behavior: "smooth", block: "start" });
+    function repaintResults() {
+      if (state.activeTab !== "files" || !document.contains(resultsHost)) return;
+      var visible = readerVisibleTargets(data);
+      deferrable = visible.filter(function (target) { return !target.verdict; });
+      deferAll.textContent = "Defer visible (" + deferrable.length + ")";
+      if (deferrable.length) deferAll.removeAttribute("disabled");
+      else deferAll.setAttribute("disabled", "disabled");
+      deferAll.setAttribute("aria-label", "Defer " + deferrable.length +
+        " visible unreviewed declarations — local only; does not ship");
+      resultsHost.innerHTML = "";
+
+      var files = (data.files || []).map(function (file) {
+        return {
+          path: file.path,
+          progress: file.progress,
+          issues: file.issues,
+          declarations: (file.declarations || []).filter(function (target) {
+            return readerTargetMatches(target, state.filesQuery, state.filesFilter);
+          }),
+        };
+      }).filter(function (file) { return file.declarations.length; });
+
+      if (!files.length) {
+        resultsHost.appendChild(el("div", { class: "dash-empty", text:
+          (state.filesQuery || state.filesFilter !== "all")
+            ? "No declarations match this filter."
+            : "No code-backed declarations are registered in this scope." }));
+        return;
+      }
+      var nav = el("nav", { class: "reader-file-nav", "aria-label": "Source files" });
+      files.forEach(function (file, index) {
+        var button = el("button", { class: "reader-file-link", type: "button" }, [
+          el("span", { class: "mono", text: file.path }),
+          el("span", { text: file.declarations.length + " target" + (file.declarations.length === 1 ? "" : "s") }),
+        ]);
+        button.addEventListener("click", function () {
+          var section = document.getElementById("reader-file-" + index);
+          if (section) section.scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+        nav.appendChild(button);
       });
-      nav.appendChild(button);
-    });
-    host.appendChild(nav);
+      resultsHost.appendChild(nav);
 
-    var body = el("div", { class: "reader-files" });
-    files.forEach(function (file, index) {
-      var section = el("section", { class: "reader-file", id: "reader-file-" + index });
-      section.appendChild(el("div", { class: "reader-file-head" }, [
-        el("h3", { class: "mono", text: file.path }),
-        el("span", { text: file.declarations.length + " visible declaration" +
-          (file.declarations.length === 1 ? "" : "s") }),
-      ]));
-      var fullFile = readerFullFile(file.path);
-      if (fullFile) section.appendChild(fullFile);
-      file.declarations.forEach(function (target) {
-        section.appendChild(renderReaderTarget(target));
+      var body = el("div", { class: "reader-files" });
+      files.forEach(function (file, index) {
+        var section = el("section", { class: "reader-file", id: "reader-file-" + index });
+        section.appendChild(el("div", { class: "reader-file-head" }, [
+          el("h3", { class: "mono", text: file.path }),
+          el("span", { text: file.declarations.length + " visible declaration" +
+            (file.declarations.length === 1 ? "" : "s") }),
+        ]));
+        var fullFile = readerFullFile(file.path);
+        if (fullFile) section.appendChild(fullFile);
+        file.declarations.forEach(function (target) {
+          section.appendChild(renderReaderTarget(target));
+        });
+        body.appendChild(section);
       });
-      body.appendChild(section);
-    });
-    host.appendChild(body);
+      resultsHost.appendChild(body);
 
-    if ((data.errors || []).length) {
-      host.appendChild(el("div", { class: "reader-errors", text:
-        data.errors.length + " issue payload" + (data.errors.length === 1 ? "" : "s") +
-        " could not be assembled; the rest of the chapter is still shown." }));
+      if ((data.errors || []).length) {
+        resultsHost.appendChild(el("div", { class: "reader-errors", text:
+          data.errors.length + " issue payload" + (data.errors.length === 1 ? "" : "s") +
+          " could not be assembled; the rest of the chapter is still shown." }));
+      }
     }
+    repaintResults();
     if (state.filesFocus) {
       var focusName = state.filesFocus;
       state.filesFocus = null;
@@ -8072,14 +8090,25 @@
       filter.status = "all";
       paintGraphTab();
     });
+    // The graph SVG genuinely depends on the query, so a repaint is needed —
+    // but debounced, and the caret returns to its ACTUAL position instead of
+    // being shoved to the end, so mid-string edits survive.
+    var graphSearchDebounce = null;
     search.addEventListener("input", function () {
       filter.query = search.value;
-      paintGraphTab();
-      var replacement = dashHost("dash-graph").querySelector(".reader-search");
-      if (replacement) {
-        replacement.focus();
-        replacement.setSelectionRange(replacement.value.length, replacement.value.length);
-      }
+      var caretStart = search.selectionStart;
+      var caretEnd = search.selectionEnd;
+      if (graphSearchDebounce) clearTimeout(graphSearchDebounce);
+      graphSearchDebounce = setTimeout(function () {
+        paintGraphTab();
+        var replacement = dashHost("dash-graph").querySelector(".reader-search");
+        if (replacement) {
+          replacement.focus();
+          try {
+            replacement.setSelectionRange(caretStart, caretEnd);
+          } catch (e) { /* selection restore is best-effort */ }
+        }
+      }, 200);
     });
     refresh.addEventListener("click", function () {
       state.graphData = null;
