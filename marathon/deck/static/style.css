@@ -843,6 +843,10 @@ html, body {
 
 .msg-title { font-size: 1.3rem; margin: 0 0 0.4rem; }
 .msg-body { color: var(--muted); }
+.msg-body-stack {
+  max-width: 58rem; margin: 0.9rem auto 0; text-align: left; line-height: 1.55;
+}
+.msg-body-stack p { margin: 0.55rem 0; }
 .msg-actions { display: flex; justify-content: center; gap: 0.6rem; margin-top: 1rem; }
 .ship-progress-card { display: flex; flex-direction: column; align-items: center; }
 .ship-spinner {
