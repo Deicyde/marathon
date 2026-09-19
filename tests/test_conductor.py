@@ -928,6 +928,14 @@ def test_branch_conflict_defers_not_crash(cfg, monkeypatch, tmp_path, capsys):
         "_refine_branch_for_dispatch",
         lambda *a, **k: "marathon/refine-c14-i22",
     )
+    reap_calls = []
+    monkeypatch.setattr(
+        conductor,
+        "_reap_orphan_worktree",
+        lambda repo, branch, **kwargs: reap_calls.append(
+            (repo, branch, kwargs.get("github_repo"))
+        ) or False,
+    )
     monkeypatch.setattr(
         conductor.subprocess, "Popen",
         lambda *a, **kw: pytest.fail("must not spawn refine on a deferred dispatch"),
@@ -938,6 +946,9 @@ def test_branch_conflict_defers_not_crash(cfg, monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "reaping it and retrying" in out      # tries to clear the leftover first
     assert "deferring #22" in out                # then defers when it still can't
+    assert reap_calls == [
+        (cfg.repo_dir, "marathon/refine-c14-i22", cfg.github_repo)
+    ]
 
 
 def test_dispatch_refuses_spawn_without_durable_launch_intent(
@@ -980,6 +991,18 @@ def test_worktree_parent_inside_repo_refused(cfg, monkeypatch):
             worktree_parent=cfg.repo_dir / "inside",
         )
     assert "inside the repo" in str(exc.value)
+
+
+def test_startup_resumes_deferred_worktree_cache_cleanup(e2e, monkeypatch):
+    resumed = []
+    monkeypatch.setattr(
+        conductor,
+        "_resume_worktree_cleanup_tombstones",
+        lambda runs_parent: resumed.append(runs_parent) or 0,
+    )
+
+    assert run_once(e2e) == 0
+    assert resumed == [e2e.runs_parent.resolve()]
 
 
 def test_unsafe_startup_cache_prime_degrades_dispatch(e2e, monkeypatch):

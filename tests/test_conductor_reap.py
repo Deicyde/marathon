@@ -74,6 +74,240 @@ def test_reap_orphan_worktree_prunes_when_no_live_holder(monkeypatch, tmp_path):
     assert conductor._reap_orphan_worktree(tmp_path, "marathon/refine-c12-i96") is True
 
 
+# --- worktree cache cleanup stays off the scheduler-critical path ----------
+
+
+def _cleanup_git_double(worktree, *, on_remove=None):
+    def fake_git(repo_dir, *args):
+        if args == ("worktree", "list", "--porcelain"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"worktree {worktree}\nHEAD abc123\n",
+                stderr="",
+            )
+        if args[:3] == ("worktree", "remove", "--force"):
+            if on_remove is not None:
+                on_remove()
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected git call: {args}")
+
+    return fake_git
+
+
+def test_remove_worktree_quarantines_lake_before_git(monkeypatch, tmp_path):
+    worktree = tmp_path / "wt-i243-20260919-135753"
+    lake = worktree / ".lake"
+    lake.mkdir(parents=True)
+    (lake / "large.olean").write_bytes(b"cache")
+    monkeypatch.setattr(conductor.secrets, "token_hex", lambda _n: "a" * 16)
+
+    scheduled = []
+    monkeypatch.setattr(
+        conductor,
+        "_schedule_worktree_cleanup",
+        lambda path: scheduled.append(path) or True,
+    )
+
+    def assert_quarantined():
+        assert not lake.exists()
+        assert scheduled == [
+            tmp_path
+            / conductor.WORKTREE_CLEANUP_TRASH_DIRNAME
+            / f"{worktree.name}--lake-{'a' * 16}"
+        ]
+        assert (scheduled[0] / "large.olean").read_bytes() == b"cache"
+
+    monkeypatch.setattr(
+        conductor,
+        "_git",
+        _cleanup_git_double(worktree, on_remove=assert_quarantined),
+    )
+
+    conductor._remove_worktree(tmp_path / "repo", worktree)
+
+
+def test_remove_worktree_returns_while_cache_deletes_in_background(
+    monkeypatch, tmp_path
+):
+    worktree = tmp_path / "wt-i7-20260919-120000"
+    lake = worktree / ".lake"
+    lake.mkdir(parents=True)
+    (lake / "cache").write_bytes(b"x")
+    monkeypatch.setattr(conductor.secrets, "token_hex", lambda _n: "b" * 16)
+    monkeypatch.setattr(
+        conductor, "_git", _cleanup_git_double(worktree)
+    )
+
+    started = conductor.threading.Event()
+    release = conductor.threading.Event()
+    finished = conductor.threading.Event()
+    real_rmtree = conductor.shutil.rmtree
+
+    def blocked_rmtree(path):
+        started.set()
+        assert release.wait(5)
+        real_rmtree(path)
+        finished.set()
+
+    monkeypatch.setattr(conductor.shutil, "rmtree", blocked_rmtree)
+
+    # The janitor starts, but its deliberately blocked rmtree must not keep the
+    # synchronous Git cleanup (and therefore the conductor loop) from returning.
+    conductor._remove_worktree(tmp_path / "repo", worktree)
+    assert started.wait(1)
+    assert not finished.is_set()
+
+    release.set()
+    assert finished.wait(5)
+
+
+def test_resume_stale_worktree_cleanup_tombstones(monkeypatch, tmp_path):
+    runs_parent = tmp_path / "runs"
+    trash = runs_parent / conductor.WORKTREE_CLEANUP_TRASH_DIRNAME
+    valid = trash / f"wt-i9-20260919-120000--lake-{'c' * 16}"
+    invalid = trash / "operator-data"
+    valid.mkdir(parents=True)
+    invalid.mkdir()
+
+    scheduled = []
+    monkeypatch.setattr(
+        conductor,
+        "_schedule_worktree_cleanup",
+        lambda path: scheduled.append(path) or True,
+    )
+
+    assert conductor._resume_worktree_cleanup_tombstones(runs_parent) == 1
+    assert scheduled == [valid]
+    assert invalid.is_dir()
+
+
+def test_cleanup_keeps_shared_trash_root_for_next_quarantine(tmp_path):
+    trash = tmp_path / conductor.WORKTREE_CLEANUP_TRASH_DIRNAME
+    tombstone = trash / f"wt-i9-20260919-120000--lake-{'d' * 16}"
+    tombstone.mkdir(parents=True)
+    (tombstone / "cache").write_bytes(b"x")
+
+    conductor._cleanup_worktree_tombstone(tombstone)
+
+    # The root is shared with concurrent/future quarantines. Removing it after
+    # the last deletion races a rename that has already validated this path.
+    assert trash.is_dir()
+    assert not tombstone.exists()
+
+
+def test_cleanup_janitor_deletes_only_one_tombstone_at_a_time(
+    monkeypatch, tmp_path
+):
+    trash = tmp_path / conductor.WORKTREE_CLEANUP_TRASH_DIRNAME
+    first = trash / f"wt-i10-20260919-120000--lake-{'e' * 16}"
+    second = trash / f"wt-i11-20260919-120000--lake-{'f' * 16}"
+    first.mkdir(parents=True)
+    second.mkdir()
+
+    first_started = conductor.threading.Event()
+    second_started = conductor.threading.Event()
+    release_first = conductor.threading.Event()
+    second_finished = conductor.threading.Event()
+    state_lock = conductor.threading.Lock()
+    active = 0
+    high_water = 0
+    real_rmtree = conductor.shutil.rmtree
+
+    def observed_rmtree(path):
+        nonlocal active, high_water
+        with state_lock:
+            active += 1
+            high_water = max(high_water, active)
+        try:
+            if path == first:
+                first_started.set()
+                assert release_first.wait(5)
+            elif path == second:
+                second_started.set()
+            real_rmtree(path)
+        finally:
+            with state_lock:
+                active -= 1
+            if path == second:
+                second_finished.set()
+
+    monkeypatch.setattr(conductor.shutil, "rmtree", observed_rmtree)
+
+    assert conductor._schedule_worktree_cleanup(first)
+    assert first_started.wait(1)
+    assert conductor._schedule_worktree_cleanup(second)
+    try:
+        assert not second_started.wait(0.1)
+    finally:
+        release_first.set()
+    assert second_finished.wait(5)
+    assert high_water == 1
+
+
+def test_cache_quarantine_refuses_arbitrary_and_symlinked_lake_paths(
+    monkeypatch, tmp_path
+):
+    arbitrary = tmp_path / "important-project"
+    arbitrary_lake = arbitrary / ".lake"
+    arbitrary_lake.mkdir(parents=True)
+    (arbitrary_lake / "keep").write_text("important")
+
+    managed = tmp_path / "wt-i8-20260919-120000"
+    managed.mkdir()
+    (managed / ".lake").symlink_to(arbitrary_lake, target_is_directory=True)
+
+    list_out = (
+        f"worktree {arbitrary}\nHEAD aaa\n\n"
+        f"worktree {managed}\nHEAD bbb\n"
+    )
+    monkeypatch.setattr(
+        conductor,
+        "_git",
+        lambda repo, *args: SimpleNamespace(
+            returncode=0, stdout=list_out, stderr=""
+        ),
+    )
+
+    assert conductor._quarantine_worktree_lake(tmp_path / "repo", arbitrary) is None
+    assert conductor._quarantine_worktree_lake(tmp_path / "repo", managed) is None
+    assert (arbitrary_lake / "keep").read_text() == "important"
+    assert not (tmp_path / conductor.WORKTREE_CLEANUP_TRASH_DIRNAME).exists()
+
+
+def test_cache_quarantine_refuses_symlinked_worktree(monkeypatch, tmp_path):
+    real_worktree = tmp_path / "wt-i9-20260919-120000"
+    real_lake = real_worktree / ".lake"
+    real_lake.mkdir(parents=True)
+    (real_lake / "keep").write_text("important")
+    worktree_symlink = tmp_path / "wt-i10-20260919-120000"
+    worktree_symlink.symlink_to(real_worktree, target_is_directory=True)
+
+    monkeypatch.setattr(
+        conductor,
+        "_git",
+        lambda repo, *args: SimpleNamespace(
+            returncode=0,
+            stdout=f"worktree {worktree_symlink}\nHEAD ccc\n",
+            stderr="",
+        ),
+    )
+
+    assert (
+        conductor._quarantine_worktree_lake(
+            tmp_path / "repo", worktree_symlink
+        )
+        is None
+    )
+    # Passing the real target is not enough either: Git's only raw registration
+    # for it is itself a symlink and therefore cannot grant cleanup authority.
+    assert (
+        conductor._quarantine_worktree_lake(tmp_path / "repo", real_worktree)
+        is None
+    )
+    assert (real_lake / "keep").read_text() == "important"
+    assert not (tmp_path / conductor.WORKTREE_CLEANUP_TRASH_DIRNAME).exists()
+
+
 # --- the reap guard: a live job's worktree is NEVER reaped -------------------
 
 def _fake_git_with_holder(worktree_path):
@@ -181,6 +415,144 @@ def test_reap_preserves_unpublished_orphan_worktree(
 
     assert conductor._reap_orphan_worktree(tmp_path, branch) is False
     assert reason in capsys.readouterr().out
+
+
+def test_reap_missing_remote_when_exact_head_is_preserved_by_merged_pr(
+    monkeypatch, tmp_path
+):
+    from marathon.review import github as github_mod
+
+    sha = "a" * 40
+    branch = "marathon/refine-c16-i238"
+    worktree = tmp_path / "wt-i238-20260710-143050"
+    list_out = (
+        f"worktree {worktree}\n"
+        f"HEAD {sha}\n"
+        f"branch refs/heads/{branch}\n"
+    )
+
+    def fake_git(repo_dir, *args):
+        if args[:2] == ("worktree", "list"):
+            return SimpleNamespace(returncode=0, stdout=list_out, stderr="")
+        if args[:2] == ("status", "--porcelain"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[:2] == ("rev-parse", "HEAD"):
+            return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
+        if args[:2] == ("ls-remote", "--heads"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_gh(*args, **kwargs):
+        assert args[0] == "api"
+        assert args[1].startswith("repos/pitmonticone/GeometricAnalysis/pulls?")
+        assert "state=closed" in args[1]
+        assert kwargs == {"check": False, "timeout": 15.0}
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "merged_at": "2026-07-10T18:00:00Z",
+                        "head": {
+                            "ref": branch,
+                            "sha": sha,
+                            "repo": {
+                                "full_name": "pitmonticone/GeometricAnalysis"
+                            },
+                        },
+                    }
+                ]
+            ),
+            stderr="",
+        )
+
+    removed = []
+    monkeypatch.setattr(conductor, "_git", fake_git)
+    monkeypatch.setattr(github_mod, "gh", fake_gh)
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda repo, path: removed.append(path),
+    )
+
+    assert conductor._reap_orphan_worktree(
+        tmp_path,
+        branch,
+        github_repo="pitmonticone/GeometricAnalysis",
+    ) is True
+    assert removed == [worktree]
+
+
+@pytest.mark.parametrize("github_result", ["not-queried", "wrong-sha", "error"])
+def test_reap_missing_remote_fails_closed_without_exact_merged_pr(
+    monkeypatch, tmp_path, github_result
+):
+    from marathon.review import github as github_mod
+
+    sha = "a" * 40
+    branch = "marathon/refine-c16-i238"
+    worktree = tmp_path / "wt-i238-unpublished"
+    list_out = (
+        f"worktree {worktree}\n"
+        f"HEAD {sha}\n"
+        f"branch refs/heads/{branch}\n"
+    )
+
+    def fake_git(repo_dir, *args):
+        if args[:2] == ("worktree", "list"):
+            return SimpleNamespace(returncode=0, stdout=list_out, stderr="")
+        if args[:2] == ("status", "--porcelain"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args[:2] == ("rev-parse", "HEAD"):
+            return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
+        if args[:2] == ("ls-remote", "--heads"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_gh(*_args, **_kwargs):
+        if github_result == "not-queried":
+            raise AssertionError("missing repository must not query GitHub")
+        if github_result == "error":
+            return SimpleNamespace(returncode=1, stdout="", stderr="rate limited")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "merged_at": "2026-07-10T18:00:00Z",
+                        "head": {
+                            "ref": branch,
+                            "sha": "b" * 40,
+                            "repo": {
+                                "full_name": "pitmonticone/GeometricAnalysis"
+                            },
+                        },
+                    }
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(conductor, "_git", fake_git)
+    monkeypatch.setattr(github_mod, "gh", fake_gh)
+    monkeypatch.setattr(
+        conductor,
+        "_remove_worktree",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("unproven worktree must be preserved")
+        ),
+    )
+
+    repo = (
+        None
+        if github_result == "not-queried"
+        else "pitmonticone/GeometricAnalysis"
+    )
+    assert conductor._reap_orphan_worktree(
+        tmp_path,
+        branch,
+        github_repo=repo,
+    ) is False
 
 
 def test_reap_guard_refuses_inherited_running_row(monkeypatch, tmp_path):

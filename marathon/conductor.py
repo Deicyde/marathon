@@ -75,6 +75,7 @@ import hashlib
 import json
 import math
 import os
+import queue
 import re
 import secrets
 import shlex
@@ -157,6 +158,27 @@ QUEUE_FROM_GITHUB_ENV_VAR = "MARATHON_QUEUE_FROM_GITHUB"
 # to origin/<base> (default main) at iteration start anyway; this just
 # has to be a valid start point for `git worktree add -B`.
 WORKTREE_START_POINT = "origin/main"
+# Successful Lean jobs leave several gigabytes and tens of thousands of cache
+# files under ``.lake``.  Letting ``git worktree remove`` unlink that tree in
+# the foreground can freeze the single-slot conductor for many minutes.  A
+# cache is disposable once the job has reached a cleanup path, so managed issue
+# worktrees quarantine it beside the checkout and a daemon janitor removes it.
+# The hidden directory is on the same filesystem as the worktree, making the
+# quarantine rename atomic; stale tombstones are resumed after a restart.
+WORKTREE_CLEANUP_TRASH_DIRNAME = ".worktree-cleanup-trash"
+_MANAGED_ISSUE_WORKTREE_RE = re.compile(
+    r"^wt-i[0-9]+-[0-9]{8}-[0-9]{6}$"
+)
+_WORKTREE_CLEANUP_TOMBSTONE_RE = re.compile(
+    r"^wt-i[0-9]+-[0-9]{8}-[0-9]{6}--lake-[0-9a-f]{16}$"
+)
+WORKTREE_CLEANUP_QUEUE_MAXSIZE = 64
+_WORKTREE_CLEANUP_QUEUE: queue.Queue[Path] = queue.Queue(
+    maxsize=WORKTREE_CLEANUP_QUEUE_MAXSIZE
+)
+_WORKTREE_CLEANUP_PENDING: set[Path] = set()
+_WORKTREE_CLEANUP_WORKER: Optional[threading.Thread] = None
+_WORKTREE_CLEANUP_LOCK = threading.Lock()
 # The prover lands Aristotle PROOFS on a SEPARATE branch — main stays in
 # skeleton mode. Proof PRs target this branch and only ever merge into it;
 # the [build:OK] automerge's base-equality guard keeps a proof off main.
@@ -1711,7 +1733,11 @@ def _registered_worktree_for_branch(
 
 
 def _unpublished_worktree_reason(
-    repo_dir: Path, worktree: Path, branch: Optional[str]
+    repo_dir: Path,
+    worktree: Path,
+    branch: Optional[str],
+    *,
+    github_repo: Optional[str] = None,
 ) -> Optional[str]:
     """Explain why force-removing a dead worktree could lose work.
 
@@ -1742,16 +1768,289 @@ def _unpublished_worktree_reason(
             break
     local_sha = (head.stdout or "").strip()
     if not remote_sha:
+        if _merged_pr_preserves_exact_head(github_repo, branch, local_sha):
+            return None
         return "its branch has no remote publication"
     if local_sha != remote_sha:
         return "its HEAD is ahead of or diverged from the remote branch"
     return None
 
 
+def _merged_pr_preserves_exact_head(
+    github_repo: Optional[str], branch: str, head_sha: str
+) -> bool:
+    """Whether GitHub proves ``head_sha`` was the exact head of a merged PR.
+
+    A merged refine PR normally deletes its remote branch.  The branch's old
+    worktree is still safe to remove when the immutable PR record preserves
+    that exact commit.  Every uncertainty fails closed: without a repository,
+    a successful REST response, or an exact repo/branch/SHA match, callers keep
+    the worktree as a recovery candidate.
+    """
+    if not github_repo or "/" not in github_repo or not head_sha:
+        return False
+
+    from marathon.review.github import gh
+
+    owner = github_repo.split("/", 1)[0]
+    query = urlencode(
+        {"head": f"{owner}:{branch}", "state": "closed", "per_page": 100}
+    )
+    try:
+        cp = gh(
+            "api",
+            f"repos/{github_repo}/pulls?{query}",
+            check=False,
+            timeout=15.0,
+        )
+        if cp.returncode != 0:
+            return False
+        rows = json.loads(cp.stdout or "[]")
+    except Exception:  # noqa: BLE001 — cleanup must fail closed
+        return False
+    if not isinstance(rows, list):
+        return False
+
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("merged_at"):
+            continue
+        head = row.get("head")
+        if not isinstance(head, dict):
+            continue
+        head_repo = head.get("repo")
+        if not isinstance(head_repo, dict):
+            continue
+        if (
+            head.get("ref") == branch
+            and head.get("sha") == head_sha
+            and head_repo.get("full_name") == github_repo
+        ):
+            return True
+    return False
+
+
+def _real_directory(path: Path) -> bool:
+    """True only for a directory entry that is not itself a symlink."""
+    try:
+        return stat.S_ISDIR(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _registered_managed_issue_worktree(
+    repo_dir: Path, worktree: Path
+) -> Optional[Path]:
+    """Return the canonical path only for a registered ``wt-i*`` checkout.
+
+    Cleanup is destructive even though ``.lake`` is disposable.  Do not infer
+    ownership from a caller-supplied basename alone: the directory must be a
+    real (non-symlink) checkout currently reported by Git for this repository.
+    """
+    # Check the caller's directory entry *before* resolving it.  Otherwise a
+    # symlink named like a conductor worktree becomes indistinguishable from
+    # its real target after ``resolve`` and could move that target's cache.
+    if not _real_directory(worktree):
+        return None
+    try:
+        resolved = worktree.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if (
+        not _MANAGED_ISSUE_WORKTREE_RE.fullmatch(resolved.name)
+        or not _real_directory(resolved)
+    ):
+        return None
+    for raw in _registered_worktrees(repo_dir):
+        registered = Path(raw)
+        # Apply the same pre-resolution rule to Git's raw registration.  A
+        # stale/malicious symlink entry is not cleanup authority.
+        if not _real_directory(registered):
+            continue
+        try:
+            if registered.resolve(strict=True) == resolved:
+                return resolved
+        except (OSError, RuntimeError):
+            continue
+    return None
+
+
+def _worktree_cleanup_trash_root(runs_parent: Path) -> Optional[Path]:
+    """Create/validate the private same-filesystem cache tombstone root."""
+    root = runs_parent / WORKTREE_CLEANUP_TRASH_DIRNAME
+    try:
+        if root.exists() or root.is_symlink():
+            if not _real_directory(root):
+                return None
+        else:
+            root.mkdir(mode=0o700)
+        if root.stat().st_dev != runs_parent.stat().st_dev:
+            return None
+    except OSError:
+        return None
+    return root
+
+
+def _cleanup_worktree_tombstone(tombstone: Path) -> None:
+    """Delete one already-quarantined cache, retaining failures for restart."""
+    try:
+        shutil.rmtree(tombstone)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001 — cleanup must never kill conductor
+        print(
+            f"  warning: deferred worktree cache cleanup failed for "
+            f"{tombstone} ({exc}); it will be retried at next startup",
+            flush=True,
+        )
+
+
+def _worktree_cleanup_worker() -> None:
+    """Drain cache tombstones serially to avoid saturating the disk."""
+    while True:
+        tombstone = _WORKTREE_CLEANUP_QUEUE.get()
+        try:
+            _cleanup_worktree_tombstone(tombstone)
+        finally:
+            with _WORKTREE_CLEANUP_LOCK:
+                _WORKTREE_CLEANUP_PENDING.discard(tombstone)
+            _WORKTREE_CLEANUP_QUEUE.task_done()
+
+
+def _ensure_worktree_cleanup_worker() -> bool:
+    """Start the process-wide serial janitor once; fail without raising."""
+    global _WORKTREE_CLEANUP_WORKER
+    with _WORKTREE_CLEANUP_LOCK:
+        if (
+            _WORKTREE_CLEANUP_WORKER is not None
+            and _WORKTREE_CLEANUP_WORKER.is_alive()
+        ):
+            return True
+        worker = threading.Thread(
+            target=_worktree_cleanup_worker,
+            name="marathon-worktree-cleanup",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception as exc:  # noqa: BLE001 — tombstones remain durable
+            print(
+                "  warning: could not start deferred worktree cache janitor "
+                f"({exc}); cleanup will be retried at next startup",
+                flush=True,
+            )
+            return False
+        _WORKTREE_CLEANUP_WORKER = worker
+        return True
+
+
+def _schedule_worktree_cleanup(tombstone: Path) -> bool:
+    """Queue ``tombstone`` for one serial janitor; retain it if queue is full."""
+    if not _ensure_worktree_cleanup_worker():
+        return False
+    with _WORKTREE_CLEANUP_LOCK:
+        if tombstone in _WORKTREE_CLEANUP_PENDING:
+            return True
+        try:
+            _WORKTREE_CLEANUP_QUEUE.put_nowait(tombstone)
+        except queue.Full:
+            print(
+                "  warning: deferred worktree cache queue is full; "
+                f"{tombstone} will be retried at next startup",
+                flush=True,
+            )
+            return False
+        _WORKTREE_CLEANUP_PENDING.add(tombstone)
+    return True
+
+
+def _quarantine_worktree_lake(
+    repo_dir: Path, worktree: Path
+) -> Optional[Path]:
+    """Atomically move a managed worktree's real ``.lake`` out of Git's way.
+
+    Any failed ownership, symlink, filesystem, or rename check simply leaves
+    the cache in place and lets the existing ``git worktree remove`` behavior
+    run.  No path outside a registered conductor ``wt-i*`` checkout is moved.
+    """
+    managed = _registered_managed_issue_worktree(repo_dir, worktree)
+    if managed is None:
+        return None
+    lake = managed / ".lake"
+    if not _real_directory(lake):
+        return None
+    root = _worktree_cleanup_trash_root(managed.parent)
+    if root is None:
+        return None
+    try:
+        if lake.stat().st_dev != root.stat().st_dev:
+            return None
+    except OSError:
+        return None
+
+    # token_hex makes collisions fantastically unlikely; the explicit
+    # lexists guard ensures an unexpected collision is never overwritten.
+    for _ in range(4):
+        tombstone = root / (
+            f"{managed.name}--lake-{secrets.token_hex(8)}"
+        )
+        if os.path.lexists(tombstone):
+            continue
+        try:
+            lake.rename(tombstone)
+        except OSError as exc:
+            print(
+                f"  warning: could not quarantine worktree cache {lake} "
+                f"({exc}); falling back to foreground Git cleanup",
+                flush=True,
+            )
+            return None
+        return tombstone
+    return None
+
+
+def _resume_worktree_cleanup_tombstones(runs_parent: Path) -> int:
+    """Resume safe cache tombstones left by a prior conductor process."""
+    if not _real_directory(runs_parent):
+        return 0
+    root = runs_parent / WORKTREE_CLEANUP_TRASH_DIRNAME
+    if not _real_directory(root):
+        return 0
+    try:
+        if root.stat().st_dev != runs_parent.stat().st_dev:
+            return 0
+        children = sorted(root.iterdir())
+    except OSError:
+        return 0
+
+    resumed = 0
+    for child in children:
+        if (
+            _WORKTREE_CLEANUP_TOMBSTONE_RE.fullmatch(child.name)
+            and _real_directory(child)
+            and child.parent == root
+            and _schedule_worktree_cleanup(child)
+        ):
+            resumed += 1
+    if resumed:
+        print(
+            f"  resumed {resumed} deferred worktree cache cleanup(s)",
+            flush=True,
+        )
+    return resumed
+
+
 def _remove_worktree(repo_dir: Path, worktree: Path) -> None:
     """Best-effort removal after a successful job. ``--force`` because
     refine runs leave untracked runtime droppings; the work itself was
-    already committed + pushed by the job's --auto-commit/--auto-pr."""
+    already committed + pushed by the job's --auto-commit/--auto-pr.
+
+    A managed checkout's multi-gigabyte ``.lake`` cache is atomically moved to
+    a sibling tombstone first and deleted by a daemon janitor.  Git therefore
+    removes only the small source checkout on this scheduler-critical path.
+    """
+    tombstone = _quarantine_worktree_lake(repo_dir, worktree)
+    if tombstone is not None:
+        _schedule_worktree_cleanup(tombstone)
     proc = _git(repo_dir, "worktree", "remove", "--force", str(worktree))
     if proc.returncode != 0:
         print(
@@ -2293,7 +2592,12 @@ def _adopt_inherited_jobs(
     return out
 
 
-def _reap_orphan_worktree(repo_dir: Path, branch: str) -> bool:
+def _reap_orphan_worktree(
+    repo_dir: Path,
+    branch: str,
+    *,
+    github_repo: Optional[str] = None,
+) -> bool:
     """Reap a worktree left holding ``branch`` by a FAILED refine of a PREVIOUS
     conductor run. ``kept_worktrees`` (the reuse map) is in-memory, so a conductor
     restart loses track of such a worktree; a fresh ``git worktree add -B`` then
@@ -2334,7 +2638,12 @@ def _reap_orphan_worktree(repo_dir: Path, branch: str) -> bool:
             "exits", flush=True,
         )
         return False
-    unpublished = _unpublished_worktree_reason(repo_dir, Path(path), branch)
+    unpublished = _unpublished_worktree_reason(
+        repo_dir,
+        Path(path),
+        branch,
+        github_repo=github_repo,
+    )
     if unpublished:
         print(
             f"  NOT reaping {path}: {unpublished}; preserving it as a "
@@ -4170,7 +4479,11 @@ def _dispatch_job(
                 )
                 if (
                     recovery_mode != RECOVERY_RETRY_BUILD
-                    and _reap_orphan_worktree(cfg.repo_dir, branch)
+                    and _reap_orphan_worktree(
+                        cfg.repo_dir,
+                        branch,
+                        github_repo=cfg.github_repo,
+                    )
                 ):
                     proc = _git(
                         cfg.repo_dir, "worktree", "add", "-B", branch,
@@ -6758,6 +7071,10 @@ def run_conductor(
         f"runs_parent={runs_parent} starting {datetime.now().isoformat()} ===",
         flush=True,
     )
+    # Cache tombstones are intentionally durable: a daemon janitor may be cut
+    # short by a conductor/machine restart, and the next owner of the conductor
+    # lock resumes those deletions without delaying dispatch.
+    _resume_worktree_cleanup_tombstones(runs_parent)
 
     # Environment preflight: a conductor with no Aristotle key must NOT
     # dispatch — every refine would instantly exit EXIT_CONFIG_ERROR. Before
