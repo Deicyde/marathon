@@ -2883,16 +2883,16 @@ def test_empty_and_error_states_exist(app_js: str):
     # project explains its refinement/audit/dependency blockers and links to
     # Status; a stale serialized job must never promise it is still building.
     assert "All caught up" in app_js
-    assert "Nothing is ready for review yet" in app_js
+    assert "No reviews ready" in app_js
     assert "awaiting_refinement" in app_js
     assert "needs_attention" in app_js
     assert "needs_citation_mapping" in app_js
-    assert "declaration references mapped to the current code" in app_js
+    assert "citation mapping" in app_js
     assert "awaiting_audit" in app_js
-    assert "waiting for a current machine-audit result" in app_js
+    assert "awaiting audit" in app_js
     assert "dependency_blocked" in app_js
     assert "other_unresolved" in app_js
-    assert "actively working on" in app_js
+    assert 'state.viewBuilding + " active"' in app_js
     assert "check back shortly" not in app_js
     assert "Open status" in app_js
     assert "Open issues" in app_js
@@ -2901,25 +2901,22 @@ def test_empty_and_error_states_exist(app_js: str):
     summary = _fn_body(code, "function queueBlockerParagraphs")
     assert "state.viewBuilding" in summary
     assert "state.building" not in summary
-    assert "waiting for refinement to start" in summary
-    assert "blocked until prerequisite issues are resolved" in summary
-    assert "Marathon will ask you to review it again" in summary
+    assert "awaiting refinement" in summary
+    assert "blocked by prerequisites" in summary
+    assert "ship after prerequisites" in summary
+    assert "Reviews reopen if code changes" in summary
 
 
 def test_empty_queue_copy_explains_optional_proof_filling(app_js: str):
     code = _strip_block_comments(app_js)
     digest = _fn_body(code, "function digestProverLine")
-    assert "Optional automatic proof filling is paused" in digest
-    assert "This setting does not" in digest
-    assert "pause review fixes or rejected-issue refinements" in digest
-    assert "Enable automatic proof filling" in digest
+    assert "Proof filling is paused. Reviews and refinements continue" in digest
+    assert "Enable proof filling" in digest
 
     confirm = _fn_body(code, "function confirmEnableProver")
-    assert "When the refinement and repair queues are idle" in confirm
-    assert "This can use paid" in confirm
-    assert "Review fixes and rejected-issue refinements do" in confirm
-    assert "not require this setting" in confirm
-    assert "Automatic proof filling enabled" in confirm
+    assert "When other work is idle" in confirm
+    assert "This may use paid sessions" in confirm
+    assert "Proof filling enabled" in confirm
 
 
 def test_message_card_supports_scannable_paragraphs(app_js: str, style_css: str):
@@ -3431,8 +3428,7 @@ def test_empty_review_card_surfaces_orchestrator_health_and_restart(
     assert "!conductor.alive" in drained
     assert "Restart orchestrator" in drained
     assert "startConductorFromStatus" in drained
-    assert "queued refinements and merges " in drained
-    assert "cannot advance" in drained
+    assert "queued work is paused" in drained
     assert "conductor.degraded" in drained
     assert "Open orchestrator status" in drained
 
@@ -3545,8 +3541,7 @@ def test_recovery_read_deadline_and_retry_are_separate(app_js: str):
     assert "state.reviewStuckUnavailable = true" in start
     assert "QUEUE_STALE_RETRY_MS" in start
     assert "state.reviewStuckUnavailable" in drained
-    assert "Recovery status is temporarily unavailable" in drained
-    assert '"automatically."' in drained
+    assert "Recovery status unavailable; retrying" in drained
 
 
 def test_queue_telemetry_poll_does_not_remount_empty_review(app_js: str):
@@ -3793,8 +3788,8 @@ def test_provisional_review_is_discoverable_and_cannot_masquerade_as_ship_ready(
     assert "Review blocked issues" in drained
     assert 'state.filesFilter = "provisional"' in drained
     assert 'switchTab("files")' in drained
-    assert "cannot" in blocker_copy and "ship until" in blocker_copy
-    assert "ask you to review it again" in blocker_copy
+    assert "ship after prerequisites" in blocker_copy
+    assert "Reviews reopen if code changes" in blocker_copy
     # Parked recovery remains available, but no longer replaces Review's
     # drained-state surface or becomes the only apparent task.
     assert "Open recovery (" in drained

@@ -3765,7 +3765,7 @@
     // opts: {title, body: string|string[], actions: [{label, onClick, kind}]}
     stage().innerHTML = "";
     var body = null;
-    if (Array.isArray(opts.body)) {
+    if (Array.isArray(opts.body) && opts.body.length) {
       body = el("div", { class: "msg-body msg-body-stack" },
         opts.body.map(function (paragraph) {
           return el("p", { text: paragraph });
@@ -3905,74 +3905,39 @@
 
   function queueBlockerParagraphs(provisionalCount) {
     if (!state.unresolved) {
-      return ["Every issue in this view has been reviewed."];
+      return [];
     }
-    var paragraphs = [];
-    if (state.viewBuilding > 0) {
-      paragraphs.push(
-        "Marathon is actively working on " + state.viewBuilding + " issue" +
-        (state.viewBuilding === 1 ? "." : "s.")
-      );
-    }
+    var parts = [];
+    if (state.viewBuilding > 0) parts.push(state.viewBuilding + " active");
     if (state.awaitingRefinement > 0) {
-      paragraphs.push(
-        state.awaitingRefinement + " issue" +
-        (state.awaitingRefinement === 1 ? " is" : "s are") +
-        " waiting for refinement to start."
-      );
+      parts.push(state.awaitingRefinement + " awaiting refinement");
     }
     if (state.needsAttention > 0) {
-      paragraphs.push(
-        state.needsAttention + " issue" +
-        (state.needsAttention === 1 ? " is" : "s are") +
-        " parked and " + (state.needsAttention === 1 ? "needs" : "need") +
-        " you to choose a recovery option."
-      );
+      parts.push(state.needsAttention +
+        (state.needsAttention === 1 ? " needs" : " need") + " recovery");
     }
     if (state.needsCitationMapping > 0) {
-      paragraphs.push(
-        state.needsCitationMapping + " issue" +
-        (state.needsCitationMapping === 1 ? " needs" : "s need") +
-        (state.needsCitationMapping === 1 ? " its" : " their") +
-        " declaration references mapped to the current code."
-      );
+      parts.push(state.needsCitationMapping +
+        (state.needsCitationMapping === 1 ? " needs" : " need") +
+        " citation mapping");
     }
     if (state.awaitingAudit > 0) {
-      paragraphs.push(
-        state.awaitingAudit + " issue" +
-        (state.awaitingAudit === 1 ? " is" : "s are") +
-        " waiting for a current machine-audit result."
-      );
+      parts.push(state.awaitingAudit + " awaiting audit");
     }
     if (state.dependencyBlocked > 0) {
-      paragraphs.push(
-        state.dependencyBlocked + " issue" +
-        (state.dependencyBlocked === 1 ? " is" : "s are") +
-        " blocked until prerequisite issues are resolved."
-      );
+      parts.push(state.dependencyBlocked + " blocked by prerequisites");
     }
     if (state.otherUnresolved > 0) {
-      paragraphs.push(
-        state.otherUnresolved + " other issue" +
-        (state.otherUnresolved === 1 ? " remains" : "s remain") +
-        " unresolved."
-      );
+      parts.push(state.otherUnresolved + " unresolved");
     }
+    var paragraphs = parts.length ? [parts.join(" · ") + "."] : [];
     if (provisionalCount > 0) {
       paragraphs.push(
-        "You can review " + provisionalCount + " dependency-blocked issue" +
-        (provisionalCount === 1 ? "" : "s") + " now. " +
-        (provisionalCount === 1 ? "It cannot" : "They cannot") +
-        " ship until the prerequisite issues are fixed and approved."
-      );
-      paragraphs.push(
-        "Marathon saves each decision against the exact code you reviewed. " +
-        "If that code changes, Marathon will ask you to review it again."
+        "Review now; ship after prerequisites. Reviews reopen if code changes."
       );
     }
     return paragraphs.length ? paragraphs : [
-      state.unresolved + " unresolved issue" +
-      (state.unresolved === 1 ? " is" : "s are") + " currently blocked."
+      state.unresolved + " unresolved."
     ];
   }
 
@@ -4116,45 +4081,31 @@
       if (conductorProblem) {
         paragraphs.push(!conductorReady
           ? (!conductor.alive
-            ? "The orchestrator is stopped, so queued refinements and merges " +
-              "cannot advance." +
+            ? "Orchestrator stopped; queued work is paused." +
               (state.conductorStartError
                 ? " Restart failed: " + state.conductorStartError
                 : "")
-            : "The orchestrator process exists but has no fresh ready " +
-              "heartbeat. Open Status to diagnose it.")
+            : "Orchestrator not ready. Open Status.")
           : conductor.degraded
-            ? "The orchestrator is running but cannot dispatch work: " +
+            ? "Orchestrator cannot dispatch work: " +
               String(conductor.degraded) + "."
-            : "The orchestrator is responsive, but its main loop has not " +
-              "completed a tick recently. Open Status to diagnose it.");
+            : "Orchestrator is stale. Open Status.");
       }
       if (state.queueFreshness && state.queueFreshness.state === "stale") {
-        paragraphs.push(
-          "These counts come from the last saved queue and may briefly be out " +
-          "of date. Marathon is refreshing them now; this page will update " +
-          "automatically."
-        );
+        paragraphs.push("Refreshing — counts may be outdated.");
       }
       if (state.reviewStuckPending) {
-        paragraphs.push(
-          "Marathon is checking for parked issues and orchestrator problems " +
-          "in the background."
-        );
+        paragraphs.push("Checking for stalled work…");
       }
       if (state.reviewStuckUnavailable) {
-        paragraphs.push(
-          "Recovery status is temporarily unavailable. Marathon will retry " +
-          "automatically."
-        );
+        paragraphs.push("Recovery status unavailable; retrying.");
       }
       showMessageCard({
         title: unresolved
           ? (provisional.length
-            ? "Nothing can ship yet — " + provisional.length + " blocked issue" +
-              (provisional.length === 1 ? " can" : "s can") +
-              " still be reviewed"
-            : "Nothing is ready for review yet")
+            ? provisional.length + " blocked issue" +
+              (provisional.length === 1 ? " is" : "s are") + " reviewable"
+            : "No reviews ready")
           : (state.reviewStuckPending
             ? "Queue loaded — checking issue status"
             : "All caught up"),
@@ -4222,28 +4173,22 @@
     var digest = state.digest || {};
     var prover = digest.prover || {};
     if (prover.enabled !== false) return null;
-    var pauseDetails = prover.updated_ts
-      ? " Paused from this dashboard since " + fmtTs(prover.updated_ts) + ". "
-      : " ";
     return el("div", { class: "digest-line digest-warn-line" }, [
       el("span", { text:
-        "Optional automatic proof filling is paused. This setting does not " +
-        "pause review fixes or rejected-issue refinements." + pauseDetails }),
+        "Proof filling is paused. Reviews and refinements continue. " }),
       el("button", {
         class: "btn btn-small", type: "button",
         onclick: function (e) { confirmEnableProver(e.target); },
-      }, ["Enable automatic proof filling…"]),
+      }, ["Enable proof filling…"]),
     ]);
   }
 
   function confirmEnableProver(button) {
     var panel = el("div", { class: "modal-panel" }, [
-      el("h2", { class: "modal-title", text: "Enable automatic proof filling?" }),
+      el("h2", { class: "modal-title", text: "Enable proof filling?" }),
       el("p", { class: "modal-sub", text:
-        "When the refinement and repair queues are idle, Marathon will ask " +
-        "Aristotle to fill remaining sorry placeholders. This can use paid " +
-        "Aristotle sessions. Review fixes and rejected-issue refinements do " +
-        "not require this setting." }),
+        "When other work is idle, Aristotle fills remaining sorry placeholders. " +
+        "This may use paid sessions." }),
       el("div", { class: "modal-actions" }, [
         el("button", { class: "btn", type: "button",
           onclick: function () { closeModal(); } }, ["Cancel"]),
@@ -4253,15 +4198,15 @@
             closeModal();
             if (button) button.disabled = true;
             postJSON("/api/prover-toggle", { enabled: true }).then(function () {
-              flashToast("Automatic proof filling enabled");
+              flashToast("Proof filling enabled");
               refreshDigest(true);
             }).catch(function (err) {
               if (button) button.disabled = false;
-              flashToast("Could not enable automatic proof filling: " +
+              flashToast("Could not enable proof filling: " +
                 ((err && err.message) || err));
             });
           },
-        }, ["Enable proof filling"]),
+        }, ["Enable"]),
       ]),
     ]);
     openModal(panel);
