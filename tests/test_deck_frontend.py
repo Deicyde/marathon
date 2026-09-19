@@ -266,6 +266,101 @@ process.stdout.write(JSON.stringify({stale: stale, fresh: fresh}));
     return json.loads(proc.stdout)
 
 
+def _run_verso_compound_declaration(app_js: str) -> dict:
+    """Execute structure-field reassembly against a small DOM-shaped stub."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for Verso structure semantic test")
+    code = _strip_block_comments(app_js)
+    helper = _fn_body(code, "function declarationCodeFromPage")
+    script = helper + r"""
+function classList(names) {
+  var values = names.slice();
+  return {
+    contains: function (name) { return values.indexOf(name) >= 0; },
+    add: function (name) { if (values.indexOf(name) < 0) values.push(name); },
+    values: values
+  };
+}
+function sourceNode(name, tag, classes, ids) {
+  return {
+    name: name,
+    tagName: tag,
+    nodeType: 1,
+    id: "",
+    classList: classList(classes || []),
+    nextElementSibling: null,
+    previousElementSibling: null,
+    parentElement: null,
+    querySelectorAll: function (selector) {
+      if (selector !== "[id]") return [];
+      return (ids || []).map(function (id) { return {id: id}; });
+    }
+  };
+}
+function sanitizeVersoNode(source) {
+  return {
+    sourceName: source.name,
+    nodeType: 1,
+    classList: classList([])
+  };
+}
+function el(tag, attrs, children) {
+  return {sourceName: "wrapper", tagName: tag, nodeType: 1,
+    classList: classList([]), children: children || []};
+}
+global.document = {
+  createDocumentFragment: function () {
+    return {
+      childNodes: [],
+      appendChild: function (child) { this.childNodes.push(child); return child; }
+    };
+  }
+};
+
+var intro = sourceNode("intro", "DIV", ["md-text"]);
+var header = sourceNode("header", "CODE", ["hl", "lean", "block"], []);
+var domainDoc = sourceNode("domain-doc", "DIV", ["md-text"]);
+var domain = sourceNode("domain", "CODE", ["hl", "lean", "block"],
+  ["IsOrientedDomainParameterisation___domain"]);
+var mapDoc = sourceNode("map-doc", "DIV", ["md-text"]);
+var map = sourceNode("map", "CODE", ["hl", "lean", "block"],
+  ["IsOrientedDomainParameterisation___paramMap"]);
+var remainingFields = sourceNode("remaining-fields", "CODE", ["hl", "lean", "block"],
+  ["IsOrientedDomainParameterisation___image",
+   "IsOrientedDomainParameterisation___subset_iUnion_closure_image"]);
+var emptyBoundary = sourceNode("empty-boundary", "CODE", ["hl", "lean", "block"], []);
+var nextDoc = sourceNode("next-doc", "DIV", ["md-text"]);
+var nextDecl = sourceNode("Prop_16_8", "CODE", ["hl", "lean", "block"], ["Prop_16_8"]);
+var sequence = [header, domainDoc, domain, mapDoc, map, remainingFields,
+  emptyBoundary, nextDoc, nextDecl];
+for (var i = 0; i < sequence.length - 1; i++) {
+  sequence[i].nextElementSibling = sequence[i + 1];
+  sequence[i + 1].previousElementSibling = sequence[i];
+}
+header.previousElementSibling = intro;
+var anchor = {parentElement: header};
+var page = {getElementById: function () { return anchor; }};
+var fragment = declarationCodeFromPage(page, {
+  anchor: "IsOrientedDomainParameterisation",
+  url: "Module/#IsOrientedDomainParameterisation"
+}, "Module/", "/verso/token/", "test-");
+process.stdout.write(JSON.stringify({
+  nodes: fragment.childNodes.map(function (child) { return child.sourceName; }),
+  compound: fragment._marathonVersoCompound,
+  memberClasses: fragment.childNodes.filter(function (child) {
+    return child.classList && child.classList.contains("verso-declaration-member");
+  }).length
+}));
+"""
+    proc = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=10,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
 def _run_queue_refresh_race(app_js: str) -> dict:
     """Execute the queue coordinator with two overlapping retries in Node."""
     node = shutil.which("node")
@@ -1725,6 +1820,36 @@ def test_verso_declaration_mounts_only_its_immediately_preceding_prose(app_js: s
     # still inside the sanitizer; it is never admitted as an arbitrary tag.
     assert 'sourceTag === "EMPH" ? "EM" : sourceTag' in sanitizer
     assert "VERSO_ALLOWED_TAGS[tag]" in sanitizer
+
+
+def test_verso_structure_mounts_all_fields_but_not_the_next_declaration(
+    app_js: str, style_css: str,
+):
+    rendered = _run_verso_compound_declaration(app_js)
+
+    assert rendered == {
+        "nodes": [
+            "intro", "header",
+            "domain-doc", "domain",
+            "map-doc", "map",
+            "remaining-fields",
+        ],
+        "compound": True,
+        "memberClasses": 3,
+    }
+    assert "empty-boundary" not in rendered["nodes"]
+    assert "next-doc" not in rendered["nodes"]
+    assert "Prop_16_8" not in rendered["nodes"]
+
+    code = _strip_block_comments(app_js)
+    declaration = _fn_body(code, "function declarationCodeFromPage")
+    paint = _fn_body(code, "function paintVersoResult")
+    assert 'var memberPrefix = anchorName + "___"' in declaration
+    assert 'querySelectorAll("[id]")' in declaration
+    assert "fragment._marathonVersoCompound = memberCount > 0" in declaration
+    assert 'shell.classList.add("verso-source-compound")' in paint
+    assert ".verso-source-compound .verso-semantic-decl" in style_css
+    assert "max-height: none" in style_css
 
 
 def test_verso_prose_math_is_dom_preserving_bounded_and_offline_safe(

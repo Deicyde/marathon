@@ -2001,6 +2001,83 @@
     }
     var cleanCode = sanitizeVersoNode(code, pageRelative, artifactBase, idPrefix);
     if (cleanCode) fragment.appendChild(cleanCode);
+
+    // Verso renders a structure/class header and its fields as separate,
+    // adjacent code blocks.  The manifest anchor above points only at the
+    // header, while field anchors use `Parent___field`.  Mount the contiguous
+    // member blocks (and only their immediately preceding doc-comments) so a
+    // reviewer sees the declaration's actual public interface.  Stop at the
+    // first empty/unrelated code block; in particular, never absorb the next
+    // top-level declaration merely because it follows the structure in the
+    // same module.
+    var memberPrefix = anchorName + "___";
+    var pendingMemberProse = null;
+    var memberCount = 0;
+    var sibling = code.nextElementSibling;
+    while (sibling) {
+      var siblingIsProse = !!(
+        sibling.classList && !sibling.classList.contains("mod-doc") &&
+        (sibling.classList.contains("md-text") ||
+          sibling.classList.contains("verso-text"))
+      );
+      if (siblingIsProse) {
+        pendingMemberProse = sibling;
+        sibling = sibling.nextElementSibling;
+        continue;
+      }
+
+      var isCodeBlock = !!(
+        sibling.tagName === "CODE" && sibling.classList &&
+        sibling.classList.contains("hl")
+      );
+      if (!isCodeBlock) break;
+      var ownsMember = String(sibling.id || "").indexOf(memberPrefix) === 0;
+      if (!ownsMember) {
+        var memberAnchors = sibling.querySelectorAll("[id]");
+        for (var memberI = 0; memberI < memberAnchors.length; memberI++) {
+          if (String(memberAnchors[memberI].id || "").indexOf(memberPrefix) === 0) {
+            ownsMember = true;
+            break;
+          }
+        }
+      }
+      if (!ownsMember) break;
+
+      if (pendingMemberProse) {
+        var cleanMemberProse = sanitizeVersoNode(
+          pendingMemberProse, pageRelative, artifactBase,
+          (idPrefix || "") + "member-doc-" + memberCount + "-"
+        );
+        if (cleanMemberProse) {
+          if (cleanMemberProse.nodeType === 1 && cleanMemberProse.classList) {
+            cleanMemberProse.classList.add("verso-declaration-doc");
+            cleanMemberProse.classList.add("verso-member-doc");
+            fragment.appendChild(cleanMemberProse);
+          } else {
+            fragment.appendChild(el("div", {
+              class: "verso-declaration-doc verso-member-doc",
+            }, [cleanMemberProse]));
+          }
+        }
+      }
+      var cleanMember = sanitizeVersoNode(
+        sibling, pageRelative, artifactBase,
+        (idPrefix || "") + "member-" + memberCount + "-"
+      );
+      if (cleanMember) {
+        if (cleanMember.classList) {
+          cleanMember.classList.add("verso-declaration-member");
+        }
+        fragment.appendChild(cleanMember);
+        memberCount += 1;
+      }
+      pendingMemberProse = null;
+      sibling = sibling.nextElementSibling;
+    }
+    // DocumentFragment is an ordinary extensible DOM object.  Preserve this
+    // one bit until paintVersoResult consumes the fragment, then mark the
+    // shell so compound declarations are not clipped by the normal card cap.
+    fragment._marathonVersoCompound = memberCount > 0;
     return fragment.childNodes.length ? fragment : null;
   }
 
@@ -2383,6 +2460,9 @@
     shell, clean, status, docs, pageRelative, artifactBase, artifactToken
   ) {
     var semantic = shell.querySelector(".verso-semantic-source");
+    var compoundDeclaration = !!clean._marathonVersoCompound;
+    if (compoundDeclaration) shell.classList.add("verso-source-compound");
+    else shell.classList.remove("verso-source-compound");
     // Keep the semantic layer inert while replacing it. This makes the swap
     // from raw source to one coherent, token-matched fragment atomic even when
     // a previously mounted artifact was visible.

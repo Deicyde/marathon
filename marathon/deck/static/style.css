@@ -196,6 +196,13 @@ html, body {
 .verso-semantic-source { overflow: auto; background: #0b0e14; }
 .verso-semantic-source[hidden] { display: none; }
 .verso-semantic-decl { max-height: 38rem; }
+/* A structure/class signature is emitted by Verso as one header block plus
+   adjacent member blocks.  Once app.js has reassembled that compound
+   declaration, show its whole public interface instead of hiding fields below
+   the ordinary declaration-card height cap. */
+.verso-source-compound .verso-semantic-decl {
+  max-height: none; overflow: visible;
+}
 .verso-semantic-module { max-height: 70vh; }
 .verso-semantic-source code.hl.lean.block,
 .verso-module-block code.hl.lean {
@@ -254,6 +261,13 @@ html, body {
 .verso-declaration-doc {
   background: #111721; color: #d9e2ec;
   font-size: 0.9rem; line-height: 1.65;
+}
+.verso-member-doc {
+  padding-top: 0.55rem; padding-bottom: 0.55rem;
+  background: #0f141d; color: #b7c2cf; font-size: 0.8rem;
+}
+.verso-declaration-member + .verso-declaration-member {
+  border-top: 1px solid #212936;
 }
 .verso-semantic-source :where(.md-text, .verso-text) > :first-child { margin-top: 0; }
 .verso-semantic-source :where(.md-text, .verso-text) > :last-child { margin-bottom: 0; }
