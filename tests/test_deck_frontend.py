@@ -1644,6 +1644,17 @@ def test_active_ship_context_survives_reload_without_reposting(app_js: str):
     assert "postShip(" not in resume and "postJSON(" not in resume
 
 
+def test_ship_progress_does_not_reference_a_missing_second_ship_button(
+    app_js: str, style_css: str,
+):
+    code = _strip_block_comments(app_js)
+    progress = _fn_body(code, "function showShipProgressCard")
+
+    assert "click Ship again" not in progress
+    assert "ship-progress-note" not in progress
+    assert ".ship-progress-note" not in style_css
+
+
 def test_ship_spinner_stops_for_reduced_motion(style_css: str):
     reduced_blocks = re.findall(
         r"@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{(.*?)\n\}",

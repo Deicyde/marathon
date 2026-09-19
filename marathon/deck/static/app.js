@@ -5676,8 +5676,6 @@
       el("div", { class: "ship-spinner", "aria-hidden": "true" }),
       el("h2", { class: "msg-title", text: "Shipping issue #" + issue + "…" }),
       el("p", { class: "msg-body", text: detail }),
-      el("p", { class: "ship-progress-note", text:
-        "You do not need to click Ship again. This page will advance when the job finishes." }),
     ]);
     stage().appendChild(card);
     setActionsEnabled(false);
