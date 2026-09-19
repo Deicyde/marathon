@@ -4190,6 +4190,22 @@ def test_status_job_shows_granular_phase(app_js: str):
     assert "phase-chip" in body and "j.phase" in body
 
 
+def test_status_job_humanizes_publication_and_hides_stale_prover_progress(
+    app_js: str,
+):
+    code = _strip_block_comments(app_js)
+    label = _fn_body(code, "function jobStatusText")
+    assert "waiting to update PR" in label
+    body = _fn_body(code, "function renderStatusTab")
+    assert "jobStatusText(j)" in body
+    assert "var proving =" in body
+    assert "if (proving && j.progress_pct != null)" in body
+    assert "if (proving && it &&" in body
+    detail = _fn_body(code, "function openRunDetail")
+    assert "jobStatusText(d)" in detail
+    assert "!publicationOnly && d.progress_pct != null" in detail
+
+
 def test_status_landings_link_issue_and_pr(app_js: str):
     body = _fn_body(_strip_block_comments(app_js), "function renderStatusTab")
     # a landing renders the issue + its merged PR (both as GitHub links)

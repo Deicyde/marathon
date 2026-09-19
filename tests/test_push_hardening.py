@@ -309,6 +309,58 @@ def test_pipeline_writes_exact_publication_journal_before_network(
     # the same atomic save that records the iteration complete.
     assert result["pr_ok"] is True
     assert result["pending_publication"] == journal[0]
+    # The same refine process may continue after a published build failure.
+    # Its next attempt must lease against the commit this run just published,
+    # rather than replaying the stale pre-publication expectation.
+    assert config.auto_pr_expected_remote_oid == "c" * 40
+
+
+def test_successive_pipeline_attempt_uses_own_published_head_as_lease(
+    monkeypatch, tmp_path,
+):
+    """A continuation may replace its own prior push, never a foreign one."""
+    repo = tmp_path / "repo"
+    target = repo / "Demo" / "Chapter14"
+    target.mkdir(parents=True)
+    commits = iter(("c" * 40, "d" * 40))
+    leases: list[tuple[str | None, str | None]] = []
+
+    monkeypatch.setattr(
+        pp,
+        "run_git_commit",
+        lambda *a, **k: pp.CommitResult(sha=next(commits)),
+    )
+    monkeypatch.setattr(
+        pp.subprocess,
+        "run",
+        lambda args, **kw: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    def publish(**kwargs):
+        leases.append(
+            (kwargs["expected_remote_oid"], kwargs["local_commit_sha"])
+        )
+        return True, "https://github.com/o/r/pull/9"
+
+    monkeypatch.setattr(pp, "open_or_update_pr", publish)
+    config = pp.PipelineConfig(
+        auto_commit=True,
+        auto_pr=True,
+        auto_pr_repo="o/r",
+        auto_pr_branch="marathon/refine-c14-i22",
+        auto_pr_expected_remote_oid="",
+        gate="off",
+        enforce_frozen_statements=False,
+        update_formalization=False,
+    )
+
+    first = pp.run_post_pipeline(config, repo, target, "Chapter14", 1, "project")
+    second = pp.run_post_pipeline(config, repo, target, "Chapter14", 1, "project")
+
+    assert first["pr_ok"] is True
+    assert second["pr_ok"] is True
+    assert leases == [("", "c" * 40), ("c" * 40, "d" * 40)]
+    assert config.auto_pr_expected_remote_oid == "d" * 40
 
 
 def test_pr_only_retry_skips_push_already_at_committed_head(monkeypatch):

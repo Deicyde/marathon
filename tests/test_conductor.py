@@ -492,6 +492,119 @@ def test_recovers_failed_retry_checkpoint_across_conductor_restart(
     assert conductor._paired_retry_workdir(runs, 22, wt) == wd
 
 
+def test_startup_snapshot_rewrite_does_not_erase_publication_checkpoint(
+    e2e,
+):
+    """Startup retains terminal rows durably until their checkout is reused.
+
+    A publication-pending row from the prior snapshot must seed the reuse map
+    and remain in jobs.json until dispatch, or the clean commit can be orphaned
+    by another restart.
+    """
+    runs = e2e.runs_parent
+    wt = runs / "wt-i22-20260710-120000"
+    wd = runs / "wd-i22-20260710-120000"
+    wt.mkdir(parents=True)
+    wd.mkdir(parents=True)
+    verdict_ts = "2026-07-10T12:00:00-04:00"
+    seed_rejections(e2e.cfg, {22: verdict_ts})
+    conductor.write_jobs_snapshot(
+        e2e.cfg.repo_dir,
+        [
+            conductor.ConductorJob(
+                issue_num=22,
+                chapter=14,
+                target="Demo/Chapter14",
+                worktree=str(wt),
+                workdir=str(wd),
+                branch="marathon/refine-c14-i22",
+                pid=999999,
+                status="publication_pending",
+                exit_code=15,
+                expected_verdict_ts=verdict_ts,
+            )
+        ],
+        concurrency=1,
+    )
+    e2e.popen.script = {22: {"rc": 0, "polls": 1}}
+
+    assert run_once(e2e) == 0
+
+    assert len(e2e.popen.spawned) == 1
+    launched = e2e.popen.spawned[0].cmd
+    assert launched[launched.index("--repo-dir") + 1] == str(wt)
+    assert launched[launched.index("--workdir") + 1] == str(wd)
+    # Reuse means no fresh worktree was created after the readiness write.
+    assert not any(call[3:5] == ["worktree", "add"] for call in e2e.git)
+    rows = conductor.load_jobs_snapshot(e2e.cfg.repo_dir)["jobs"]
+    assert len([row for row in rows if row["issue_num"] == 22]) == 1
+
+
+@pytest.mark.parametrize(
+    ("review_status", "job_status"),
+    [
+        ("rejected", "publication_pending"),
+        ("stalled", "stalled"),
+    ],
+    ids=["publication-pending", "stalled"],
+)
+def test_recoverable_terminal_row_survives_two_restarts_without_dispatch(
+    e2e, monkeypatch, review_status, job_status,
+):
+    """A stopped conductor never erases the only durable retry locator."""
+    from marathon.review.state import IssueState, ReviewState, save_state
+
+    runs = e2e.runs_parent
+    wt = runs / "wt-i22-20260710-120000"
+    wd = runs / "wd-i22-20260710-120000"
+    wt.mkdir(parents=True)
+    wd.mkdir(parents=True)
+    verdict_ts = "2026-07-10T12:00:00-04:00"
+    save_state(
+        e2e.cfg,
+        ReviewState(
+            issues={
+                22: IssueState(
+                    status=review_status,
+                    verdict_ts=verdict_ts,
+                    notes="preserve this checkpoint",
+                    attempts=3 if review_status == "stalled" else 0,
+                )
+            }
+        ),
+    )
+    conductor.write_jobs_snapshot(
+        e2e.cfg.repo_dir,
+        [
+            conductor.ConductorJob(
+                issue_num=22,
+                chapter=14,
+                target="Demo/Chapter14",
+                worktree=str(wt),
+                workdir=str(wd),
+                branch="marathon/refine-c14-i22",
+                pid=999999,
+                status=job_status,
+                exit_code=15,
+                expected_verdict_ts=verdict_ts,
+            )
+        ],
+        concurrency=1,
+    )
+    monkeypatch.setattr(conductor, "_STOP_REQUESTED", True)
+
+    for _restart in range(2):
+        assert run_once(e2e) == 0
+        rows = conductor.load_jobs_snapshot(e2e.cfg.repo_dir)["jobs"]
+        matching = [row for row in rows if row["issue_num"] == 22]
+        assert len(matching) == 1
+        assert matching[0]["status"] == job_status
+        assert matching[0]["worktree"] == str(wt)
+        assert matching[0]["workdir"] == str(wd)
+
+    assert e2e.popen.spawned == []
+
+
 def test_recovers_gate_blocked_fill_checkpoint_across_restart(
     cfg, tmp_path, monkeypatch,
 ):

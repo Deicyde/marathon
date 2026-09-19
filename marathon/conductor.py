@@ -1200,6 +1200,8 @@ def _recover_retry_worktrees(
     runs_parent: Path,
     *,
     busy_issues: "set[int]",
+    snapshot_jobs: Optional[list[dict]] = None,
+    preserve_jobs: Optional[list["ConductorJob"]] = None,
 ) -> dict[int, str]:
     """Recover dead/failed prior jobs from ``jobs.json`` across a restart.
 
@@ -1225,8 +1227,11 @@ def _recover_retry_worktrees(
         if st.status == "stalled" and n not in busy_issues
     }
     recovered: dict[int, str] = {}
-    snap = load_jobs_snapshot(cfg.repo_dir)
-    rows = list((snap or {}).get("jobs", []))
+    rows = (
+        list(snapshot_jobs)
+        if snapshot_jobs is not None
+        else list((load_jobs_snapshot(cfg.repo_dir) or {}).get("jobs", []))
+    )
     # Newest row wins if an old snapshot somehow contains duplicate attempts.
     for raw in reversed(rows):
         # A compare-and-swap loser belongs to an older verdict/recovery
@@ -1289,12 +1294,47 @@ def _recover_retry_worktrees(
                 continue
         _clear_worktree_pid_marker(str(worktree))
         recovered[recovery_key] = str(worktree)
+        if preserve_jobs is not None:
+            try:
+                preserve_jobs.append(ConductorJob.from_json(dict(raw)))
+            except (TypeError, ValueError):
+                # A malformed history row cannot be rewritten safely. Keep
+                # the filesystem checkpoint untouched, but do not manufacture
+                # a partially identified durable job record.
+                recovered.pop(recovery_key, None)
+                continue
         print(
             f"  recovered retry checkpoint for #{issue}: {worktree} "
             "(worktree + Aristotle session will be continued)",
             flush=True,
         )
     return recovered
+
+
+def _record_replacement_job(
+    jobs: list["ConductorJob"], replacement: "ConductorJob",
+) -> None:
+    """Atomically supersede the durable retry row after a worker launches.
+
+    Recoverable terminal rows stay in ``jobs.json`` across arbitrarily many
+    restarts while no dispatch is possible. Once ``_dispatch_job`` returns, its
+    launch marker + handshake durably own the same worktree, so the old row can
+    be replaced in memory before the next snapshot write. Exact checkout
+    identity keeps unrelated history for the same issue intact.
+    """
+    jobs[:] = [
+        prior
+        for prior in jobs
+        if not (
+            prior.status != "running"
+            and prior.issue_num == replacement.issue_num
+            and prior.worktree == replacement.worktree
+            and prior.workdir == replacement.workdir
+            and prior.fill == replacement.fill
+            and prior.repair == replacement.repair
+        )
+    ]
+    jobs.append(replacement)
 
 
 # --- Scheduler --------------------------------------------------------------------
@@ -2140,7 +2180,9 @@ def _worktree_live_pid(worktree: str) -> Optional[int]:
     return None
 
 
-def _adopt_inherited_jobs(repo_dir: Path) -> list["ConductorJob"]:
+def _adopt_inherited_jobs(
+    repo_dir: Path, *, snapshot_jobs: Optional[list[dict]] = None,
+) -> list["ConductorJob"]:
     """ConductorJobs for still-alive refines a PREVIOUS conductor left running,
     reconstructed from its jobs snapshot at startup — BEFORE the first
     ``write_jobs_snapshot`` erases those rows (a pkill'd conductor's refine
@@ -2160,8 +2202,12 @@ def _adopt_inherited_jobs(repo_dir: Path) -> list["ConductorJob"]:
     _INHERITED_RUNNING.clear()
     out: list["ConductorJob"] = []
     adopted_worktrees: set[str] = set()
-    snap = load_jobs_snapshot(repo_dir)
-    for raw in (snap or {}).get("jobs", []):
+    rows = (
+        list(snapshot_jobs)
+        if snapshot_jobs is not None
+        else list((load_jobs_snapshot(repo_dir) or {}).get("jobs", []))
+    )
+    for raw in rows:
         pid, worktree = raw.get("pid"), raw.get("worktree")
         if raw.get("status") != "running" or not worktree:
             continue
@@ -6723,12 +6769,20 @@ def run_conductor(
     if dispatch_env_error is not None:
         print(f"⚠️  DEGRADED: {dispatch_env_error}", flush=True)
 
+    # Capture the previous conductor's rows ONCE. Live rows are adopted from
+    # this immutable view, and recoverable terminal rows are copied into the
+    # new snapshot below, so neither path can race the readiness rewrite.
+    startup_jobs = list(
+        (load_jobs_snapshot(cfg.repo_dir) or {}).get("jobs", [])
+    )
     # ADOPT still-alive refines from a PREVIOUS conductor's snapshot BEFORE the
     # first write_jobs_snapshot erases those rows. Tracking them as running jobs
     # (proc=None) means we neither reap their worktree (destruction) nor
     # re-dispatch their issue (a wasteful duplicate billed run) — a mid-refine
     # restart is now fully clean.
-    jobs: list[ConductorJob] = _adopt_inherited_jobs(cfg.repo_dir)
+    jobs: list[ConductorJob] = _adopt_inherited_jobs(
+        cfg.repo_dir, snapshot_jobs=startup_jobs,
+    )
     for j in jobs:
         print(
             f"  adopted live job from a previous conductor: #{j.issue_num} "
@@ -6805,6 +6859,22 @@ def run_conductor(
     last_merge_reconcile = float("-inf")  # merged-but-rejected re-review heal (~once/min)
     last_reopen_check = float("-inf")  # stale-verified re-open cadence (~once/2min)
 
+    # Recover terminal retry rows before the readiness rewrite, and retain
+    # those exact rows in this process's snapshot until a replacement worker
+    # successfully launches. Merely keeping the checkout path in memory is not
+    # enough: another restart while dispatch is stopped/degraded must still be
+    # able to find the publication checkpoint.
+    durable_retry_jobs: list[ConductorJob] = []
+    if not prune:
+        kept_worktrees.update(_recover_retry_worktrees(
+            cfg,
+            runs_parent,
+            busy_issues={j.issue_num for j in jobs if j.status == "running"},
+            snapshot_jobs=startup_jobs,
+            preserve_jobs=durable_retry_jobs,
+        ))
+        jobs.extend(durable_retry_jobs)
+
     # Bind the jobs snapshot to this process before publishing readiness. This
     # prevents a fresh heartbeat from making a previous conductor's jobs or
     # degraded environment look current during the first slow tick.
@@ -6830,11 +6900,6 @@ def run_conductor(
     try:
         if prune:
             prune_worktrees(cfg.repo_dir, runs_parent)
-        else:
-            kept_worktrees.update(_recover_retry_worktrees(
-                cfg, runs_parent,
-                busy_issues={j.issue_num for j in jobs if j.status == "running"},
-            ))
         _report_orphans(cfg, _known_project_ids(cfg.repo_dir))
         # Warm the shared Mathlib olean store ONCE before dispatching any
         # worktree, so each worktree's `lake exe cache get` is a pure OFFLINE
@@ -7009,7 +7074,7 @@ def run_conductor(
                         _park_deferred_recovery(cfg, issue_num)
                         not_before[issue_num] = _now() + WORKTREE_DEFER_SECONDS
                         continue
-                    jobs.append(job)
+                    _record_replacement_job(jobs, job)
                     dispatch_count += 1
                 running = [j for j in jobs if j.status == "running"]
 
@@ -7057,7 +7122,7 @@ def run_conductor(
                               f"{', '.join(m.split('.')[-1] for m in broken)}, "
                               f"attempt {repair_attempts[rchap]}) → main ---",
                               flush=True)
-                        jobs.append(job)
+                        _record_replacement_job(jobs, job)
                         dispatch_count += 1
                         break  # one repair per tick
                     running = [j for j in jobs if j.status == "running"]
@@ -7098,7 +7163,7 @@ def run_conductor(
                         print(f"--- dispatched FILL #{issue_num} (chapter {chapter}, "
                               f"attempt {fill_attempts[issue_num]}) → {prover_branch} "
                               "---", flush=True)
-                        jobs.append(job)
+                        _record_replacement_job(jobs, job)
                         dispatch_count += 1
                     running = [j for j in jobs if j.status == "running"]
 

@@ -108,6 +108,10 @@ def _job_phase(
     a = (aristotle_status or "").upper()
     if a == "QUEUED":
         return "queued (Aristotle)"
+    if a in {"PUBLICATION_PREPARED", "PUBLICATION_PENDING"}:
+        # The proof is already complete. A publication-only retry must not
+        # inherit the saved prover's final "100%" as its current phase.
+        return "updating PR"
     if a in ("", "IN_PROGRESS", "RUNNING"):
         return "proving" + (f" {progress_pct}%" if progress_pct is not None else "")
     # Aristotle COMPLETE → the job is in its post-prover pipeline.
@@ -117,6 +121,54 @@ def _job_phase(
             if rx.search(line):
                 return label
     return "building"  # prover done, in the build/finish pipeline
+
+
+def _current_dashboard_jobs(rows: object) -> list[dict]:
+    """Return the latest snapshot row for each logical job.
+
+    Publication-only retries deliberately reuse the issue, Aristotle project,
+    and workdir. The conductor keeps each launch as diagnostic history, but
+    rendering every launch makes one pending publication look like many jobs.
+    Preserve distinct proof attempts while collapsing those retry records.
+    """
+    latest: dict[tuple[str, str], tuple[int, dict]] = {}
+    if not isinstance(rows, list):
+        return []
+    for index, raw in enumerate(rows):
+        if not isinstance(raw, dict):
+            continue
+        issue = "" if raw.get("issue_num") is None else str(raw["issue_num"])
+        workdir = "" if raw.get("workdir") is None else str(raw["workdir"])
+        project = (
+            "" if raw.get("project_id") is None else str(raw["project_id"])
+        )
+        # project_id is populated asynchronously, so it cannot be part of a
+        # retry's identity: the new row briefly has None while the prior row
+        # already has its UUID.  The reused workdir is the durable identity.
+        key = (issue, workdir or f"project:{project}")
+        if key == ("", "project:"):
+            key = (f"snapshot-row-{index}", "")
+        latest[key] = (index, raw)
+    return [raw for _, raw in sorted(latest.values(), key=lambda item: item[0])]
+
+
+def _job_status_label(status: Optional[str]) -> str:
+    """Short, human-facing status text for a dashboard job."""
+    if status == "publication_pending":
+        return "waiting to update PR"
+    return status or "pending"
+
+
+def _display_job_status(raw: dict, *, is_live: bool) -> Optional[str]:
+    """Normalize a snapshot row to the status shown in list and detail views."""
+    status = raw.get("status")
+    if status != "running" or is_live:
+        return status
+    if str(raw.get("aristotle_status") or "").upper() in {
+        "PUBLICATION_PREPARED", "PUBLICATION_PENDING",
+    }:
+        return "publication_pending"
+    return "running (pid dead)"
 
 
 # ---------------------------------------------------------------------------
@@ -366,18 +418,20 @@ def conductor_status(
     )
 
     jobs: list[dict] = []
-    for raw in jobs_snap.get("jobs", []):
-        status = raw.get("status")
+    for raw in _current_dashboard_jobs(jobs_snap.get("jobs", [])):
+        status = _display_job_status(raw, is_live=snapshot_job_is_live(raw))
         jpid = raw.get("pid")
         # Mirror `conductor status`: a "running" job whose pid is dead is shown
         # as such (the state machine recorded nothing; next run re-dispatches).
-        if status == "running" and not snapshot_job_is_live(raw):
-            status = "running (pid dead)"
+        # A dead publication-only retry is different: its checkpoint proves the
+        # expensive work completed, so show the durable pending state instead
+        # of the misleading "running (pid dead) / proving 100%" combination.
         workdir = raw.get("workdir")
         job = {
             "issue_num": raw.get("issue_num"),
             "chapter": raw.get("chapter"),
             "status": status,
+            "status_label": _job_status_label(status),
             "pid": jpid,
             "project_id": raw.get("project_id"),
             "aristotle_status": raw.get("aristotle_status"),
@@ -504,7 +558,7 @@ def run_detail(cfg: "ReviewConfig", issue_num: int) -> dict:
     ``{found, issue_num, status, branch, progress_pct, iteration, ratings,
     prompts}`` where ``ratings`` is the parsed ``marathon-ratings.jsonl`` records
     (oldest→newest) and ``prompts`` is the ``marathon-refine-log.md`` text."""
-    from marathon.conductor import load_jobs_snapshot
+    from marathon.conductor import load_jobs_snapshot, snapshot_job_is_live
 
     out = {
         "found": False, "issue_num": issue_num, "status": None, "branch": None,
@@ -514,15 +568,24 @@ def run_detail(cfg: "ReviewConfig", issue_num: int) -> dict:
         snap = load_jobs_snapshot(Path(cfg.repo_dir)) or {}
     except Exception:  # noqa: BLE001
         snap = {}
+    # An issue may have several retained diagnostic rows.  The Status page
+    # presents the newest logical run, so its detail panel must do the same.
     raw = next(
-        (j for j in snap.get("jobs", []) if j.get("issue_num") == issue_num), None
+        (
+            j
+            for j in reversed(snap.get("jobs", []))
+            if j.get("issue_num") == issue_num
+        ),
+        None,
     )
     if raw is None:
         return out
     workdir = raw.get("workdir")
+    status = _display_job_status(raw, is_live=snapshot_job_is_live(raw))
     out.update({
         "found": True,
-        "status": raw.get("status"),
+        "status": status,
+        "status_label": _job_status_label(status),
         "branch": raw.get("branch"),
         "workdir": workdir,
         "aristotle_status": raw.get("aristotle_status"),

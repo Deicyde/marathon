@@ -6864,9 +6864,17 @@
 
   // A status pill. The class keys off the FIRST word so "running (pid dead)"
   // still maps to .sb-running.
-  function statusBadge(status) {
-    var key = String(status || "pending").split(" ")[0];
-    return el("span", { class: "sb sb-" + key, text: status || "pending" });
+  function statusBadge(status, label) {
+    var raw = String(status || "pending");
+    var key = raw === "publication_pending" ? "pending" : raw.split(" ")[0];
+    return el("span", { class: "sb sb-" + key, text: label || raw });
+  }
+
+  function jobStatusText(job) {
+    if (job && job.status_label) return job.status_label;
+    return job && job.status === "publication_pending"
+      ? "waiting to update PR"
+      : ((job && job.status) || "pending");
   }
 
   function statChip(num, label) {
@@ -8778,10 +8786,11 @@
         // raw aristotle_status like "(COMPLETE)").
         var ar = j.project_id ? String(j.project_id).slice(0, 8) : "";
         var running = (j.status || "").indexOf("running") === 0;
+        var proving = running && /^proving(?:\s|$)/.test(j.phase || "");
         var kids = [
           el("span", { class: "job-issue", text: "#" + (j.issue_num == null ? "?" : j.issue_num) }),
           el("span", { class: "job-chip", text: "c" + (j.chapter == null ? "?" : j.chapter) }),
-          statusBadge(j.status),
+          statusBadge(j.status, jobStatusText(j)),
         ];
         // The granular phase (proving NN% / building / committing / pushing /
         // opening PR) for a running job — the key "it's still building, not done".
@@ -8791,11 +8800,11 @@
         }
         // Live iteration + Aristotle progress for a running job.
         var it = j.iteration;
-        if (it && (it.current != null || it.completed != null)) {
+        if (proving && it && (it.current != null || it.completed != null)) {
           var n = it.current != null ? it.current : it.completed;
           kids.push(el("span", { class: "job-iter", text: "iter " + n }));
         }
-        if (j.progress_pct != null) {
+        if (proving && j.progress_pct != null) {
           kids.push(el("span", { class: "job-prog" }, [
             el("span", { class: "job-prog-bar" }, [
               el("span", { class: "job-prog-fill",
@@ -8926,11 +8935,16 @@
         return;
       }
       var meta = [];
-      if (d.status) meta.push("status " + d.status);
+      if (d.status) meta.push("status " + jobStatusText(d));
+      var publicationOnly = d.status === "publication_pending" ||
+        /^(PUBLICATION_PREPARED|PUBLICATION_PENDING)$/.test(
+          String(d.aristotle_status || "").toUpperCase()
+        );
       var it = d.iteration;
-      if (it && (it.current != null || it.completed != null))
+      if (!publicationOnly && it && (it.current != null || it.completed != null))
         meta.push("iteration " + (it.current != null ? it.current : it.completed));
-      if (d.progress_pct != null) meta.push(d.progress_pct + "% complete");
+      if (!publicationOnly && d.progress_pct != null)
+        meta.push(d.progress_pct + "% complete");
       if (d.aristotle_status) meta.push("aristotle " + d.aristotle_status);
       panel.appendChild(el("p", { class: "modal-sub run-meta", text: meta.join(" · ") }));
 

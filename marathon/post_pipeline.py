@@ -2304,6 +2304,15 @@ def run_post_pipeline(
                     )
                     out["pr_ok"] = pr_ok
                     if pr_ok:
+                        # A build-failed iteration may deliberately continue in
+                        # this same refine process after successfully publishing
+                        # its checkpoint.  The next attempt must compare-and-swap
+                        # from the commit *we just published*, not from the
+                        # pre-run lease (which may have asserted that the branch
+                        # was absent).  Advance only after the complete push/PR
+                        # operation succeeds: arbitrary remote movement is never
+                        # adopted as an overwrite lease.
+                        config.auto_pr_expected_remote_oid = publication_oid
                         print(f"  pr: {pr_msg}")
                     else:
                         print(f"  pr: failed — {pr_msg}")

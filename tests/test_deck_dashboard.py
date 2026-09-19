@@ -94,6 +94,58 @@ def test_conductor_status_dead_pid_marks_running_job(tmp_path, monkeypatch):
     assert d["running"] == 0                          # the dead one is not counted
 
 
+def test_conductor_status_collapses_publication_retries_and_shows_pending(
+    tmp_path, monkeypatch,
+):
+    """One publication checkpoint is one dashboard job, however many retries."""
+    wd = _make_run_workdir(tmp_path)
+    lock = tmp_path / "conductor.lock"
+    lock.write_text("999")
+    common = {
+        "issue_num": 243,
+        "chapter": 16,
+        "project_id": "project-current",
+        "workdir": str(wd),
+        "branch": "marathon/refine-c16-i243",
+        "aristotle_status": "PUBLICATION_PENDING",
+    }
+    monkeypatch.setattr("marathon.conductor.conductor_lock_path", lambda cfg: lock)
+    monkeypatch.setattr(
+        "marathon.conductor.load_jobs_snapshot",
+        lambda repo_dir: {"jobs": [
+            {
+                "issue_num": 243,
+                "chapter": 16,
+                "status": "succeeded",
+                "project_id": "project-old",
+                "workdir": "/old-workdir",
+                "started_ts": "2026-09-09T11:21:19-04:00",
+            },
+            dict(common, status="publication_pending", pid=100,
+                 started_ts="2026-09-19T16:02:02-04:00"),
+            dict(common, status="publication_pending", pid=101,
+                 started_ts="2026-09-19T16:03:47-04:00"),
+            dict(common, status="running", pid=102, project_id=None,
+                 started_ts="2026-09-19T16:05:34-04:00"),
+        ]},
+    )
+    monkeypatch.setattr("marathon.review.daemon.process_alive", lambda pid: False)
+    monkeypatch.setattr(
+        "marathon.conductor.snapshot_job_is_live", lambda raw: False
+    )
+
+    d = dash.conductor_status(_cfg(tmp_path))
+
+    assert len(d["jobs"]) == 2  # old project + one current publication job
+    current = d["jobs"][-1]
+    assert current["started_ts"] == "2026-09-19T16:05:34-04:00"
+    assert current["status"] == "publication_pending"
+    assert current["status_label"] == "waiting to update PR"
+    assert "progress_pct" not in current
+    assert "iteration" not in current
+    assert d["running"] == 0
+
+
 def test_conductor_status_reaps_deck_child_before_pid_probe(tmp_path, monkeypatch):
     """A crashed child must not stay green merely because its zombie PID exists."""
     from marathon.review import review
@@ -438,6 +490,47 @@ def test_run_detail_reads_ratings_and_prompts(tmp_path, monkeypatch):
     assert d["branch"] == "marathon/refine-c12-i93"
 
 
+def test_run_detail_uses_latest_retained_attempt(tmp_path, monkeypatch):
+    old_wd = tmp_path / "old-run"
+    new_wd = _make_run_workdir(tmp_path)
+    monkeypatch.setattr(
+        "marathon.conductor.load_jobs_snapshot",
+        lambda repo_dir: {"jobs": [
+            {"issue_num": 93, "status": "failed", "workdir": str(old_wd)},
+            {"issue_num": 93, "status": "publication_pending",
+             "workdir": str(new_wd)},
+        ]},
+    )
+
+    d = dash.run_detail(_cfg(tmp_path), 93)
+
+    assert d["found"] is True
+    assert d["status"] == "publication_pending"
+    assert d["workdir"] == str(new_wd)
+
+
+def test_run_detail_normalizes_dead_publication_retry(tmp_path, monkeypatch):
+    wd = _make_run_workdir(tmp_path)
+    monkeypatch.setattr(
+        "marathon.conductor.load_jobs_snapshot",
+        lambda repo_dir: {"jobs": [{
+            "issue_num": 93,
+            "status": "running",
+            "pid": 999999,
+            "aristotle_status": "PUBLICATION_PENDING",
+            "workdir": str(wd),
+        }]},
+    )
+    monkeypatch.setattr(
+        "marathon.conductor.snapshot_job_is_live", lambda raw: False
+    )
+
+    d = dash.run_detail(_cfg(tmp_path), 93)
+
+    assert d["status"] == "publication_pending"
+    assert d["status_label"] == "waiting to update PR"
+
+
 def test_run_detail_not_found_degrades(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "marathon.conductor.load_jobs_snapshot",
@@ -512,6 +605,11 @@ def test_job_phase_granularity(tmp_path):
     assert dash._job_phase(str(wd), "succeeded", "COMPLETE", None) == "succeeded"
     # COMPLETE with no readable log → default "building", not "complete"
     assert dash._job_phase(None, "running", "COMPLETE", None) == "building"
+    # A publication retry is post-proof work, never another 100%-done proof.
+    assert (
+        dash._job_phase(None, "running", "PUBLICATION_PENDING", 100)
+        == "updating PR"
+    )
 
 
 def test_conductor_status_job_carries_phase(tmp_path, monkeypatch):
