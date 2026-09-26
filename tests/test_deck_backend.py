@@ -951,11 +951,28 @@ def test_subdeck_metadata_retry_restores_source_and_saved_decision_immediately(
     assert card["verdict"] == "verified"
     assert card["changed_since_review"] is False
     assert subdeck.issue_verdicts(cfg, 22) == saved_records
-    # A successful retry becomes a normal memoized detail; clicking again
-    # must not issue another GitHub request just because shared context failed.
+    # Target-only recovery must keep retrying the incomplete dependency map.
+    assert recovered["shippable"] is False
+    assert subdeck.build_subdeck(cfg, 22)["cards"] == recovered["cards"]
+    assert calls == [[22], [22]]
+    bulk_calls = []
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_bulk",
+        lambda nums, repo: (
+            bulk_calls.append(list(nums)) or {n: metadata[n] for n in nums}
+        ),
+    )
     monkeypatch.setattr(
         gh_mod, "fetch_issues_rest_bulk",
-        lambda nums, repo: pytest.fail("recovered detail was not memoized"),
+        lambda nums, repo: pytest.fail("complete metadata must not retry REST"),
+    )
+    assert subdeck.build_subdeck(cfg, 22)["cards"] == recovered["cards"]
+    assert bulk_calls == [[22, 23, 24]]
+    # Once the full map recovers it is normally memoized, without waiting for
+    # the original incomplete shared context to expire.
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_bulk",
+        lambda nums, repo: pytest.fail("complete detail was not memoized"),
     )
     assert subdeck.build_subdeck(cfg, 22)["cards"] == recovered["cards"]
 
@@ -1026,6 +1043,51 @@ def test_metadata_recovery_keeps_shipping_blocked_until_dependencies_are_known(
     metadata[22]["labels"] = {cfg.labels.verified}
     cards.invalidate_context_cache()
     assert cards.build_card_detail(cfg, 23).shippable is True
+
+
+def test_known_issue_retries_missing_dependency_metadata_before_cache_expiry(
+    tmp_path, monkeypatch,
+):
+    """A fetched target must still recover unavailable predecessor ownership."""
+    from marathon.review import github as gh_mod
+
+    cfg = make_cfg(tmp_path)
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="def", type_pp="Nat", value_pp="0"),
+        _decl("Demo.Chapter14.Bar", type_pp="Foo = Foo",
+              cone=["Demo.Chapter14.Foo"]),
+    ]))
+    metadata = _bodies_for({22: "Foo", 23: "Bar", 24: "Baz"})
+    metadata[22]["labels"] = {cfg.labels.verified}
+    patch_bulk(monkeypatch, {n: metadata[n] for n in (23, 24)})
+    monkeypatch.setattr(cards, "_CONTEXT_CACHE_TTL_SECONDS", 3600)
+    monkeypatch.setattr(cards, "_DETAIL_CACHE_TTL_SECONDS", 3600)
+
+    partial = cards.build_card_detail_cached(cfg, 23)
+
+    assert partial.metadata_available is True
+    assert partial.metadata_complete is False
+    assert partial.inspectable is True
+    assert partial.shippable is False
+    calls = []
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_bulk",
+        lambda nums, repo: calls.append(list(nums)) or {22: metadata[22]},
+    )
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_rest_bulk",
+        lambda nums, repo: pytest.fail("known target must not retry REST"),
+    )
+
+    recovered = cards.build_card_detail_cached(cfg, 23)
+
+    assert calls == [[22]]
+    assert recovered.metadata_available is True
+    assert recovered.metadata_complete is True
+    assert [dep.id for dep in recovered.deps] == [22]
+    assert recovered.shippable is True
+    assert cards.build_card_detail_cached(cfg, 23) is recovered
+    assert calls == [[22]]
 
 
 # ---------------------------------------------------------------------------

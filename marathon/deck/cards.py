@@ -350,6 +350,8 @@ class CardDetail:
     iteration_log: list[str]
     # A failed GitHub read is not evidence that the issue cites no declarations.
     metadata_available: bool = True
+    # Incomplete ownership information must be retried, not memoized as ready.
+    metadata_complete: bool = True
 
     def to_json(self) -> dict:
         return {
@@ -578,6 +580,7 @@ def build_card_detail_cached(
             entry is not None
             and entry.freshness == freshness
             and entry.detail.metadata_available
+            and entry.detail.metadata_complete
         ):
             if now - entry.built_at <= _DETAIL_CACHE_TTL_SECONDS:
                 return entry.detail
@@ -592,7 +595,7 @@ def build_card_detail_cached(
                     fresh = build_card_detail(cfg, issue_num)
                     if pre is not None:
                         with _detail_cache_lock:
-                            if fresh.metadata_available:
+                            if fresh.metadata_available and fresh.metadata_complete:
                                 _detail_cache[key] = _DetailCacheEntry(
                                     detail=fresh,
                                     freshness=pre,
@@ -611,7 +614,7 @@ def build_card_detail_cached(
             ).start()
             return stale_detail
     detail = build_card_detail(cfg, issue_num)
-    if detail.metadata_available:
+    if detail.metadata_available and detail.metadata_complete:
         with _detail_cache_lock:
             _detail_cache[key] = _DetailCacheEntry(
                 detail=detail,
@@ -946,24 +949,40 @@ def _issue_metadata_available(ctx: _DeckContext, num: int) -> bool:
 def _recover_requested_issue_metadata(
     cfg: "ReviewConfig", ctx: _DeckContext, num: int
 ) -> _DeckContext:
-    """Retry the opened issue when the shared context contains a metadata gap.
+    """Recover metadata gaps before rendering an opened issue.
 
     The broad context can cache an outage or serve that result while refreshing
     in the background. A detail open must not turn the gap into an empty review
-    or wait for both cache TTLs to expire. One bounded REST read can recover it;
-    never guess citations from the title or alter the shared context in place.
+    or wait for both cache TTLs to expire. One bounded bulk read restores missing
+    ownership data, with a single-issue REST fallback for the opened card. Never
+    guess citations from the title or alter the shared context in place.
     """
-    if _issue_metadata_available(ctx, num):
+    missing = [
+        other for other in dict.fromkeys([num, *ctx.issue_chapter])
+        if not _issue_metadata_available(ctx, other)
+    ]
+    if not missing:
         return ctx
-    from marathon.review.github import fetch_issues_rest_bulk
+    from marathon.review.github import fetch_issues_bulk, fetch_issues_rest_bulk
 
     try:
-        recovered = fetch_issues_rest_bulk([num], cfg.github_repo).get(num)
-    except Exception:  # noqa: BLE001 — report the metadata failure in the view
+        recovered = fetch_issues_bulk(missing, cfg.github_repo) or {}
+    except Exception:  # noqa: BLE001 — keep the single-issue fallback available
+        recovered = {}
+    recovered = {
+        other: meta for other, meta in recovered.items()
+        if other in missing and isinstance(meta.get("body"), str)
+    }
+    if num in missing and num not in recovered:
+        try:
+            target = fetch_issues_rest_bulk([num], cfg.github_repo).get(num)
+            if target is not None and isinstance(target.get("body"), str):
+                recovered[num] = target
+        except Exception:  # noqa: BLE001 — report the metadata failure in the view
+            pass
+    if not recovered:
         return ctx
-    if not recovered or not isinstance(recovered.get("body"), str):
-        return ctx
-    metadata = {**ctx.issue_meta, num: recovered}
+    metadata = {**ctx.issue_meta, **recovered}
     return replace(
         ctx,
         issue_meta=metadata,
@@ -2786,6 +2805,9 @@ def build_card_detail(cfg: "ReviewConfig", issue_num: int) -> CardDetail:
         deps=deps,
         iteration_log=iteration_log,
         metadata_available=_issue_metadata_available(ctx, issue_num),
+        metadata_complete=all(
+            _issue_metadata_available(ctx, other) for other in ctx.issue_chapter
+        ),
     )
 
 
