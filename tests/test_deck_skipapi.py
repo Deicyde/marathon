@@ -140,13 +140,21 @@ def make_mix_cfg(tmp_path, monkeypatch, *, issue=22):
         # easy-API projection lemma (_apply).
         _decl("Demo.Chapter14.foo_apply", kind="theorem", type_pp="Q"),
     ]))
-    patch_bulk(monkeypatch, {
+    metadata = {
+        num: {
+            "title": title, "state": "OPEN",
+            "body": _bundle_body(f"Other{num}"), "labels": set(),
+        }
+        for num, title in cfg.chapters[14].entries
+    }
+    metadata.update({
         issue: {
             "title": f"#{issue} mix", "state": "OPEN",
             "body": _bundle_body("AbelTheorem", "instFoo", "foo_apply"),
             "labels": set(),
         },
     })
+    patch_bulk(monkeypatch, metadata)
     return cfg
 
 

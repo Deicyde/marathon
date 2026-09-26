@@ -1658,6 +1658,7 @@ def build_subdeck(
     result = {
         "issue": issue_num,
         "title": detail.title,
+        "metadata_available": detail.metadata_available,
         "chapter": detail.chapter,
         "card_tier": detail.tier,
         "inspectable": detail.inspectable,

@@ -2737,6 +2737,66 @@ def test_reconciliation_proposals_have_confirm_and_dismiss_ui(
     assert ".reconcile-proposals" in style_css
 
 
+def test_missing_issue_metadata_offers_retry_without_claiming_code_was_removed(
+    app_js: str,
+):
+    """A failed issue fetch must not tell reviewers to delete valid citations."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node runtime unavailable for empty-review state test")
+    script = _fn_body(app_js, "function renderDeferredOnly") + r"""
+var state = { issue: 243 };
+var rendered;
+var enabled;
+var retries = 0;
+function stage() {
+  return { innerHTML: "", appendChild: function (item) { rendered = item; } };
+}
+function el(tag, attrs, children) {
+  return { tag: tag, attrs: attrs || {}, children: children || [] };
+}
+function setActionsEnabled(value) { enabled = value; }
+function refetchSubdeck() { retries += 1; }
+function backToQueue() {}
+function render(payload) {
+  state.subdeck = Object.assign({ cards: [], stale_citations: [] }, payload);
+  renderDeferredOnly();
+  return {
+    title: rendered.children[0].attrs.text,
+    message: rendered.children[1].attrs.text,
+    buttons: rendered.children[2].children.map(function (button) {
+      return button.children[0];
+    }),
+    enabled: enabled
+  };
+}
+var unavailable = render({ metadata_available: false });
+rendered.children[2].children[0].attrs.onclick();
+var stale = render({
+  metadata_available: true,
+  stale_citations: [{ name: "RemovedDeclaration" }]
+});
+var unmapped = render({ metadata_available: true });
+process.stdout.write(JSON.stringify({ unavailable, retries, stale, unmapped }));
+"""
+    proc = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True,
+        timeout=10, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["unavailable"] == {
+        "title": "Could not load this issue",
+        "message": "Issue details are temporarily unavailable. Try again.",
+        "buttons": ["Retry", "Back to queue"],
+        "enabled": False,
+    }
+    assert result["retries"] == 1
+    assert "RemovedDeclaration" in result["stale"]["message"]
+    assert result["stale"]["buttons"] == ["Back to queue"]
+    assert result["unmapped"]["message"] == "This issue has no declaration citations."
+
+
 def test_optional_definition_index_never_blocks_queue_startup(app_js: str):
     code = _strip_block_comments(app_js)
     init = _fn_body(code, "function init")

@@ -281,7 +281,10 @@ def test_large_queue_graphql_failure_keeps_unfetched_placeholders(
         (f"#{n}", "", "-") for n in issue_nums[len(expected_fetched):]
     ]
     assert all(card.ready is False for card in placeholders)
-    assert all("no audit snapshot" in card.blocked_reason for card in placeholders)
+    assert all(
+        card.blocked_reason == "issue details unavailable — try again"
+        for card in placeholders
+    )
 
 
 def test_load_context_rest_failure_is_fail_soft(tmp_path, monkeypatch):
@@ -851,6 +854,178 @@ def test_card_detail_includes_every_cited_decl(tmp_path, monkeypatch):
     assert by_name["Demo.Chapter14.Baz"].tier == "T1"
     # The top-level scalar fields mirror the headline view (backward-compat).
     assert detail.statement_pp == detail.decls[0].statement_pp
+
+
+@pytest.mark.parametrize("partial_meta", [None, {"body": None, "labels": set()}])
+def test_card_detail_recovers_requested_metadata_without_mutating_context(
+    tmp_path, monkeypatch, partial_meta,
+):
+    """An issue open retries its missing body even while shared context is fresh."""
+    from marathon.review import github as gh_mod
+
+    cfg = make_cfg(tmp_path)
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="def", type_pp="Nat", value_pp="0"),
+    ]))
+    metadata = _bodies_for({23: "Bar", 24: "Baz"})
+    if partial_meta is not None:
+        metadata[22] = partial_meta
+    patch_bulk(monkeypatch, metadata)
+    ctx = cards._load_context(cfg, [22, 23, 24])
+    original_meta = dict(ctx.issue_meta)
+    original_status = dict(ctx.verdict_status)
+    recovered = _bodies_for({22: "Foo"})
+    recovered[22]["labels"] = {cfg.labels.verified}
+    calls = []
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_rest_bulk",
+        lambda nums, repo: calls.append((list(nums), repo)) or recovered,
+    )
+
+    detail = cards.build_card_detail(cfg, 22)
+
+    assert calls == [([22], REPO_SLUG)]
+    assert detail.metadata_available is True
+    assert detail.to_json()["metadata_available"] is True
+    assert [v.name for v in detail.decls] == ["Demo.Chapter14.Foo"]
+    # Recovered labels must rebuild the review gate, not retain the missing
+    # context's permissive status. Other consumers retain their own snapshot.
+    assert detail.inspectable is False
+    assert detail.inspection_blocked_reason == "already verified"
+    assert ctx.issue_meta == original_meta
+    assert ctx.verdict_status == original_status
+
+
+def test_subdeck_metadata_retry_restores_source_and_saved_decision_immediately(
+    tmp_path, monkeypatch,
+):
+    """A transient fetch failure cannot cache a false empty review for a minute."""
+    from marathon.deck import subdeck
+    from marathon.review import github as gh_mod
+
+    cfg = make_cfg(tmp_path)
+    source = cfg.repo_dir / "Demo" / "Chapter14.lean"
+    source.parent.mkdir(parents=True)
+    full_source = "structure Foo where\n  value : Nat\n  valid : value > 0"
+    source.write_text(
+        f"namespace Demo.Chapter14\n{full_source}\nend Demo.Chapter14\n"
+    )
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="structure", type_pp="Type"),
+    ]))
+    metadata = _bodies_for({22: "Foo", 23: "Bar", 24: "Baz"})
+    patch_bulk(monkeypatch, metadata)
+    subdeck.record_decl_verdict(cfg, 22, "Demo.Chapter14.Foo", "verify")
+    saved_records = subdeck.issue_verdicts(cfg, 22)
+    cards.invalidate_context_cache()
+    # Keep both TTLs fresh throughout; recovery must come from retrying the
+    # selected issue, without waiting for any background refresh or expiry.
+    monkeypatch.setattr(cards, "_CONTEXT_CACHE_TTL_SECONDS", 3600)
+    monkeypatch.setattr(cards, "_DETAIL_CACHE_TTL_SECONDS", 3600)
+    monkeypatch.setattr(gh_mod, "fetch_issues_bulk", lambda nums, repo: {})
+    monkeypatch.setattr(gh_mod, "fetch_issues_rest_bulk", lambda nums, repo: {})
+
+    unavailable = subdeck.build_subdeck(cfg, 22)
+
+    assert unavailable["metadata_available"] is False
+    assert unavailable["cards"] == []
+    assert unavailable["stale_citations"] == []
+    assert unavailable["inspection_blocked_reason"] == (
+        "issue details unavailable — try again"
+    )
+    assert subdeck.issue_verdicts(cfg, 22) == saved_records
+    calls = []
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_rest_bulk",
+        lambda nums, repo: calls.append(list(nums)) or {22: metadata[22]},
+    )
+
+    recovered = subdeck.build_subdeck(cfg, 22)
+
+    assert calls == [[22]]
+    assert recovered["metadata_available"] is True
+    assert len(recovered["cards"]) == 1
+    card = recovered["cards"][0]
+    assert card["name"] == "Demo.Chapter14.Foo"
+    assert full_source in card["source_block"]
+    assert card["verdict"] == "verified"
+    assert card["changed_since_review"] is False
+    assert subdeck.issue_verdicts(cfg, 22) == saved_records
+    # A successful retry becomes a normal memoized detail; clicking again
+    # must not issue another GitHub request just because shared context failed.
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_rest_bulk",
+        lambda nums, repo: pytest.fail("recovered detail was not memoized"),
+    )
+    assert subdeck.build_subdeck(cfg, 22)["cards"] == recovered["cards"]
+
+
+def test_card_detail_fetched_empty_body_is_not_a_metadata_failure(
+    tmp_path, monkeypatch,
+):
+    """A genuinely empty body needs mapping, not repeated network retries."""
+    from marathon.review import github as gh_mod
+
+    cfg = make_cfg(tmp_path)
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="def", type_pp="Nat", value_pp="0"),
+    ]))
+    metadata = _bodies_for({22: "Foo", 23: "Bar", 24: "Baz"})
+    metadata[22]["body"] = ""
+    patch_bulk(monkeypatch, metadata)
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_rest_bulk",
+        lambda nums, repo: pytest.fail("fetched empty body must not retry"),
+    )
+
+    detail = cards.build_card_detail_cached(cfg, 22)
+
+    assert detail.metadata_available is True
+    assert detail.decls == []
+    assert detail.surfaced_decls == []
+    assert "no Lean declarations cited" in detail.inspection_blocked_reason
+    assert cards.build_card_detail_cached(cfg, 22) is detail
+
+
+def test_metadata_recovery_keeps_shipping_blocked_until_dependencies_are_known(
+    tmp_path, monkeypatch,
+):
+    """Recovering the selected result must not erase an unavailable owner issue."""
+    from marathon.review import github as gh_mod
+
+    cfg = make_cfg(tmp_path)
+    install_snapshot(cfg, make_snapshot([
+        _decl("Demo.Chapter14.Foo", kind="def", type_pp="Nat", value_pp="0"),
+        _decl("Demo.Chapter14.Bar", type_pp="Foo = Foo",
+              cone=["Demo.Chapter14.Foo"]),
+    ]))
+    metadata = _bodies_for({22: "Foo", 23: "Bar", 24: "Baz"})
+    patch_bulk(monkeypatch, {24: metadata[24]})
+    cards._load_context(cfg, [22, 23, 24])
+    monkeypatch.setattr(
+        gh_mod, "fetch_issues_rest_bulk", lambda nums, repo: {23: metadata[23]},
+    )
+
+    partial = cards.build_card_detail(cfg, 23)
+
+    assert partial.metadata_available is True
+    assert [v.name for v in partial.decls] == ["Demo.Chapter14.Bar"]
+    assert partial.inspectable is True
+    assert partial.provisional is True
+    assert partial.shippable is False
+    assert partial.ship_blocked_reason == "dependency details unavailable — try again"
+
+    patch_bulk(monkeypatch, metadata)
+    cards.invalidate_context_cache()
+    complete = cards.build_card_detail(cfg, 23)
+    assert [dep.id for dep in complete.deps] == [22]
+    assert complete.inspectable is True
+    assert complete.shippable is False
+    assert "#22" in complete.ship_blocked_reason
+
+    metadata[22]["labels"] = {cfg.labels.verified}
+    cards.invalidate_context_cache()
+    assert cards.build_card_detail(cfg, 23).shippable is True
 
 
 # ---------------------------------------------------------------------------

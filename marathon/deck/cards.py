@@ -348,6 +348,8 @@ class CardDetail:
     permalink: Optional[str]
     deps: list[DepRef]
     iteration_log: list[str]
+    # A failed GitHub read is not evidence that the issue cites no declarations.
+    metadata_available: bool = True
 
     def to_json(self) -> dict:
         return {
@@ -377,6 +379,7 @@ class CardDetail:
             "permalink": self.permalink,
             "deps": [d.to_json() for d in self.deps],
             "iteration_log": list(self.iteration_log),
+            "metadata_available": self.metadata_available,
         }
 
 
@@ -571,7 +574,11 @@ def build_card_detail_cached(
     now = time.monotonic()
     with _detail_cache_lock:
         entry = _detail_cache.get(key)
-        if entry is not None and entry.freshness == freshness:
+        if (
+            entry is not None
+            and entry.freshness == freshness
+            and entry.detail.metadata_available
+        ):
             if now - entry.built_at <= _DETAIL_CACHE_TTL_SECONDS:
                 return entry.detail
             if entry.refreshing:
@@ -585,11 +592,14 @@ def build_card_detail_cached(
                     fresh = build_card_detail(cfg, issue_num)
                     if pre is not None:
                         with _detail_cache_lock:
-                            _detail_cache[key] = _DetailCacheEntry(
-                                detail=fresh,
-                                freshness=pre,
-                                built_at=time.monotonic(),
-                            )
+                            if fresh.metadata_available:
+                                _detail_cache[key] = _DetailCacheEntry(
+                                    detail=fresh,
+                                    freshness=pre,
+                                    built_at=time.monotonic(),
+                                )
+                            else:
+                                _detail_cache.pop(key, None)
                 except Exception:  # noqa: BLE001 — keep serving the stale memo
                     with _detail_cache_lock:
                         current = _detail_cache.get(key)
@@ -601,12 +611,13 @@ def build_card_detail_cached(
             ).start()
             return stale_detail
     detail = build_card_detail(cfg, issue_num)
-    with _detail_cache_lock:
-        _detail_cache[key] = _DetailCacheEntry(
-            detail=detail,
-            freshness=freshness,
-            built_at=time.monotonic(),
-        )
+    if detail.metadata_available:
+        with _detail_cache_lock:
+            _detail_cache[key] = _DetailCacheEntry(
+                detail=detail,
+                freshness=freshness,
+                built_at=time.monotonic(),
+            )
     return detail
 
 
@@ -927,6 +938,39 @@ def _decls_for_issue(ctx: _DeckContext, num: int) -> list[str]:
     return sorted(extract_declarations_from_issue_body(body))
 
 
+def _issue_metadata_available(ctx: _DeckContext, num: int) -> bool:
+    meta = ctx.issue_meta.get(num)
+    return meta is not None and isinstance(meta.get("body"), str)
+
+
+def _recover_requested_issue_metadata(
+    cfg: "ReviewConfig", ctx: _DeckContext, num: int
+) -> _DeckContext:
+    """Retry the opened issue when the shared context contains a metadata gap.
+
+    The broad context can cache an outage or serve that result while refreshing
+    in the background. A detail open must not turn the gap into an empty review
+    or wait for both cache TTLs to expire. One bounded REST read can recover it;
+    never guess citations from the title or alter the shared context in place.
+    """
+    if _issue_metadata_available(ctx, num):
+        return ctx
+    from marathon.review.github import fetch_issues_rest_bulk
+
+    try:
+        recovered = fetch_issues_rest_bulk([num], cfg.github_repo).get(num)
+    except Exception:  # noqa: BLE001 — report the metadata failure in the view
+        return ctx
+    if not recovered or not isinstance(recovered.get("body"), str):
+        return ctx
+    metadata = {**ctx.issue_meta, num: recovered}
+    return replace(
+        ctx,
+        issue_meta=metadata,
+        verdict_status=_verdict_status(cfg, metadata, ctx.issue_states),
+    )
+
+
 def _issue_needs_citation_mapping(ctx: _DeckContext, num: int) -> bool:
     """Whether a fetched issue body contains no Lean declaration citations.
 
@@ -1157,6 +1201,8 @@ def _base_review_eligibility(
     if status == "deferred":
         return False, "deferred"
 
+    if not _issue_metadata_available(ctx, num):
+        return False, "issue details unavailable — try again"
     if _issue_needs_citation_mapping(ctx, num):
         return False, (
             "no Lean declarations cited — map this issue to its current "
@@ -1211,6 +1257,15 @@ def _readiness(
     eligible, reason = _base_review_eligibility(ctx, num, tier)
     if not eligible:
         return False, reason
+
+    # Missing issue bodies hide declaration ownership and therefore dependency
+    # edges. The opened issue can still be inspected, but an incomplete graph
+    # cannot establish that all predecessors have been reviewed.
+    if any(
+        not _issue_metadata_available(ctx, other)
+        for other in ctx.issue_chapter
+    ):
+        return False, "dependency details unavailable — try again"
 
     unresolved = [
         p for p in preds
@@ -2628,7 +2683,9 @@ def build_card_detail(cfg: "ReviewConfig", issue_num: int) -> CardDetail:
     global_nums = _chapter_issue_nums(cfg, None)
     if issue_num not in global_nums:
         global_nums = [issue_num, *global_nums]
-    ctx = _load_context(cfg, global_nums)
+    ctx = _recover_requested_issue_metadata(
+        cfg, _load_context(cfg, global_nums), issue_num
+    )
     ledger = _ledger(cfg)
     surfaces = {
         num: _build_reconciled_issue_surface(cfg, ctx, ledger, num)
@@ -2728,6 +2785,7 @@ def build_card_detail(cfg: "ReviewConfig", issue_num: int) -> CardDetail:
         permalink=permalink,
         deps=deps,
         iteration_log=iteration_log,
+        metadata_available=_issue_metadata_available(ctx, issue_num),
     )
 
 
