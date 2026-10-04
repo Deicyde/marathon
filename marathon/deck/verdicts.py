@@ -240,6 +240,46 @@ def apply_verdict(
     )
 
 
+def apply_issue_verdict(
+    cfg: "ReviewConfig",
+    issue_num: int,
+    verdict: str,
+    note: Optional[str] = None,
+) -> VerdictResult:
+    """Guard the legacy whole-issue UI path before publishing a verdict.
+
+    Both synchronous requests and asynchronous verdict workers call this at
+    execution time. Per-declaration shipping has its own fresh gate and keeps
+    using ``apply_verdict`` after reconciliation. A provisional read is never
+    permission to bypass the ship gate with an older client.
+    """
+    if verdict not in VERDICTS:
+        raise VerdictError(
+            f"unknown verdict {verdict!r}; expected one of {VERDICTS}"
+        )
+    if verdict == "reject" and (note is None or not str(note).strip()):
+        raise VerdictError("a reject requires a non-empty note")
+    if verdict == "defer":
+        return apply_verdict(cfg, issue_num, verdict, note)
+
+    from marathon.deck.cards import issue_reviewability
+    from marathon.deck.subdeck import _issue_operation_lock
+
+    with _issue_operation_lock(cfg, issue_num):
+        readiness = issue_reviewability(cfg, issue_num)
+        if not readiness.get("shippable"):
+            reason = readiness.get("blocked_reason") or "not ready to publish"
+            if verdict == "verify" and reason == "already verified":
+                # A retry after the prior publication completed is a no-op,
+                # not another GitHub write or a newly refused human verdict.
+                return VerdictResult(
+                    ok=True, verdict=verdict, issue_num=issue_num,
+                    message=f"#{issue_num} is already verified", advanced_to=None,
+                )
+            raise VerdictError(f"Issue #{issue_num} cannot be published: {reason}")
+        return apply_verdict(cfg, issue_num, verdict, note)
+
+
 def _next_ready_card(
     cfg: "ReviewConfig", just_acted_issue: int
 ) -> Optional["CardSummary"]:

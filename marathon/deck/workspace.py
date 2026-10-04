@@ -317,7 +317,9 @@ def _catalog(cfg: "ReviewConfig", chapter: Optional[int]) -> dict:
         tier = surface.tier
         qualifiers = surface.qualifiers
         ready, reason = cards._readiness(
-            ctx, issue, tier, issue_deps.get(issue, [])
+            ctx, issue, tier, issue_deps.get(issue, []),
+            unmapped_citations=surface.unmapped_citations,
+            has_current_declarations=bool(surface.review_views),
         )
         inspectable, inspection_reason = cards._inspectability(
             ctx, issue, tier

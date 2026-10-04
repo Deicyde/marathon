@@ -79,9 +79,9 @@ class VerdictJobRegistry:
     ) -> None:
         if runner is None:
             def runner(cfg, issue_num, verdict, note):  # type: ignore[misc]
-                from marathon.deck.verdicts import apply_verdict
+                from marathon.deck.verdicts import apply_issue_verdict
 
-                return apply_verdict(cfg, issue_num, verdict, note).to_json()
+                return apply_issue_verdict(cfg, issue_num, verdict, note).to_json()
         self._runner = runner
         self._thread_factory = thread_factory
         self._lock = threading.Lock()

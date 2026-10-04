@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 import marathon.deck.cards as cards
 from marathon.deck.subdeck import build_subdeck
 from marathon.deck.workspace import build_review_workspace
@@ -226,7 +228,7 @@ theorem SiblingResult : True := trivial
         cfg, 22
     )
 
-    expected = ("-", False, False, False)
+    expected = ("T1", True, False, True)
     assert (
         queue_card.tier,
         queue_card.inspectable,
@@ -253,6 +255,9 @@ theorem SiblingResult : True := trivial
     ) == expected
     assert subdeck["reconcile"]["dropped"] == ["OldA", "OldB"]
     assert [card["name"] for card in subdeck["cards"]] == ["OldA_part"]
+    assert "`OldB`" in queue_card.blocked_reason
+    assert "`OldA`" not in queue_card.blocked_reason
+    assert cards.issue_reviewability(cfg, 22)["shippable"] is False
 
 
 def test_qualified_split_cannot_cover_same_leaf_in_other_namespace(
@@ -298,7 +303,7 @@ theorem SiblingResult : True := trivial
         cfg, 22
     )
 
-    expected = ("-", False, False, False)
+    expected = ("T1", True, False, True)
     assert (
         queue_card.tier,
         queue_card.inspectable,
@@ -330,6 +335,152 @@ theorem SiblingResult : True := trivial
     assert [card["name"] for card in subdeck["cards"]] == [
         "N1.OldA_part"
     ]
+    assert "`N2.OldA`" in detail.ship_blocked_reason
+    assert "`N1.OldA`" not in detail.ship_blocked_reason
+
+
+def _install_removed_citation_fixture(tmp_path, monkeypatch, *, audited=True):
+    cfg = _cfg_two_issues(tmp_path)
+    source = cfg.repo_dir / "Demo" / "Chapter14.lean"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("theorem Current : True := trivial\n")
+    install_snapshot(cfg, make_snapshot(
+        [_decl("Current", module="Demo.Chapter14")] if audited else [],
+        cfg.repo_dir,
+    ))
+    patch_bulk(monkeypatch, {
+        22: {
+            "title": "The current result",
+            "state": "OPEN", "labels": set(),
+            "body": _bundle_body("Current", "Removed"),
+        },
+        23: {
+            "title": "Resolved sibling", "state": "OPEN",
+            "labels": {"review:verified"}, "body": "",
+        },
+    })
+    return cfg
+
+
+def test_removed_citation_does_not_hide_current_audited_review(
+    tmp_path, monkeypatch,
+):
+    """#244: a removed name is a mapping task, not another machine audit."""
+    cfg = _install_removed_citation_fixture(tmp_path, monkeypatch)
+    queue_card, detail, subdeck, workspace_issue = _reviewability_surfaces(cfg, 22)
+    assert (queue_card.tier, queue_card.inspectable, queue_card.shippable) == (
+        "T1", True, False,
+    )
+    reason = queue_card.blocked_reason
+    assert reason == "Update citation: `Removed` is not in the current code."
+    assert detail.ship_blocked_reason == reason
+    assert subdeck["ship_blocked_reason"] == reason
+    assert workspace_issue["blocked_reason"] == reason
+    assert detail.inspectable and subdeck["inspectable"]
+    assert workspace_issue["inspectable"]
+    assert not detail.shippable and not subdeck["shippable"]
+    assert not workspace_issue["shippable"]
+    assert [card["name"] for card in subdeck["cards"]] == ["Current"]
+    assert subdeck["stale_citations"] == [{"name": "Removed"}]
+    readiness = cards.issue_reviewability(cfg, 22)
+    assert readiness["inspectable"] and not readiness["shippable"]
+    assert readiness["blocked_reason"] == reason
+    queue = cards.build_queue(cfg)
+    assert queue.needs_citation_mapping == 1
+    assert queue.awaiting_audit == 0
+
+
+def test_removed_citation_never_hides_missing_current_audit(
+    tmp_path, monkeypatch,
+):
+    cfg = _install_removed_citation_fixture(tmp_path, monkeypatch, audited=False)
+    queue_card, detail, subdeck, workspace_issue = _reviewability_surfaces(cfg, 22)
+    assert not queue_card.inspectable and not queue_card.shippable
+    assert not detail.inspectable and not detail.shippable
+    assert not subdeck["inspectable"] and not subdeck["shippable"]
+    assert not workspace_issue["inspectable"] and not workspace_issue["shippable"]
+    assert "audit evidence" in queue_card.blocked_reason
+    assert cards.build_queue(cfg).awaiting_audit == 1
+
+
+def test_removed_citation_never_hides_source_assembly_error(
+    tmp_path, monkeypatch,
+):
+    cfg = _install_removed_citation_fixture(tmp_path, monkeypatch)
+    original = cards._build_decl_view
+
+    def broken_view(ctx, ledger, name, repo_dir=None):
+        if name == "Current":
+            raise RuntimeError("source could not be read")
+        return original(ctx, ledger, name, repo_dir)
+
+    monkeypatch.setattr(cards, "_build_decl_view", broken_view)
+    card = next(card for card in cards.build_queue(cfg).cards if card.id == 22)
+    assert card.tier == "-"
+    assert not card.inspectable and not card.shippable
+
+
+def test_all_removed_citations_need_mapping_not_another_audit(
+    tmp_path, monkeypatch,
+):
+    cfg = _install_removed_citation_fixture(tmp_path, monkeypatch)
+    (cfg.repo_dir / "Demo" / "Chapter14.lean").write_text(
+        "theorem Different : True := trivial\n"
+    )
+    queue_card, detail, subdeck, workspace_issue = _reviewability_surfaces(cfg, 22)
+    assert queue_card.tier == "-"
+    assert not queue_card.inspectable and not queue_card.shippable
+    assert not detail.inspectable and not detail.shippable
+    assert not subdeck["inspectable"] and not subdeck["shippable"]
+    assert not workspace_issue["inspectable"] and not workspace_issue["shippable"]
+    assert queue_card.blocked_reason == (
+        "Update citations: `Current`, `Removed` are not in the current code."
+    )
+    assert detail.ship_blocked_reason == queue_card.blocked_reason
+    assert workspace_issue["blocked_reason"] == queue_card.blocked_reason
+    queue = cards.build_queue(cfg)
+    assert queue.needs_citation_mapping == 1
+    assert queue.awaiting_audit == 0
+
+
+@pytest.mark.parametrize("verdict", ["verify", "reject"])
+def test_legacy_issue_verdict_cannot_bypass_unmapped_citation(
+    tmp_path, monkeypatch, verdict,
+):
+    from marathon.deck import verdicts
+
+    cfg = _install_removed_citation_fixture(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(verdicts, "apply_verdict", lambda *a, **kw: calls.append(a))
+    with pytest.raises(verdicts.VerdictError, match="Update citation.*Removed"):
+        verdicts.apply_issue_verdict(cfg, 22, verdict, "fix it")
+    assert calls == []
+
+
+def test_legacy_defer_remains_local_when_citations_are_stale(
+    tmp_path, monkeypatch,
+):
+    from marathon.deck import verdicts
+
+    cfg = _install_removed_citation_fixture(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(verdicts, "apply_verdict", lambda *a, **kw: calls.append(a))
+    verdicts.apply_issue_verdict(cfg, 22, "defer")
+    assert len(calls) == 1 and calls[0][2] == "defer"
+
+
+def test_legacy_verify_retry_is_noop_after_publication(tmp_path, monkeypatch):
+    from marathon.deck import verdicts
+
+    cfg = _cfg_two_issues(tmp_path)
+    monkeypatch.setattr(cards, "issue_reviewability", lambda *a: {
+        "shippable": False, "blocked_reason": "already verified",
+    })
+    calls = []
+    monkeypatch.setattr(verdicts, "apply_verdict", lambda *a, **kw: calls.append(a))
+    result = verdicts.apply_issue_verdict(cfg, 22, "verify")
+    assert result.ok and result.verdict == "verify"
+    assert calls == []
 
 
 def test_queue_fails_closed_when_reconciliation_ledger_open_fails(

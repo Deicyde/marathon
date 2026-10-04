@@ -3933,7 +3933,7 @@
     var paragraphs = parts.length ? [parts.join(" · ") + "."] : [];
     if (provisionalCount > 0) {
       paragraphs.push(
-        "Review now; ship after prerequisites. Reviews reopen if code changes."
+        "Review now; resolve blockers before submitting. Reviews reopen if code changes."
       );
     }
     return paragraphs.length ? paragraphs : [
@@ -4066,14 +4066,8 @@
           label: "Review blocked issues (" + provisional.length + ")",
           kind: "btn-primary",
           onClick: function () {
-            var first = provisional[0];
-            state.filesChapter = first.chapter == null
-              ? "all" : String(first.chapter);
-            state.filesFilter = "provisional";
-            state.filesQuery = "";
-            state.filesFocus = null;
-            state.filesData = null;
-            switchTab("files");
+            if (provisional.length === 1) openIssue(provisional[0].id);
+            else renderQueueLanding(provisional);
           },
         });
       }
@@ -4413,6 +4407,7 @@
     if (row.chapter != null) meta.push("ch. " + row.chapter);
     if (row.tier) meta.push(row.tier);
     if (reviewed) meta.push(reviewed + " decided");
+    if (row.provisional) meta.push(row.blocked_reason || "submission blocked");
     var node = el("div", {
       class: "landing-row" + (reviewed ? " landing-inprogress" : "") +
         (index === state.landingFocus ? " landing-focus" : ""),
@@ -4427,8 +4422,8 @@
       el("span", { class: "landing-row-id", text: "#" + row.id }),
       el("span", { class: "landing-row-title", text: row.title || row.decl || "" }),
       el("span", { class: "landing-row-meta", text: meta.join(" · ") }),
-      reviewed
-        ? el("span", { class: "landing-row-resume", text: "resume" })
+      reviewed || row.provisional
+        ? el("span", { class: "landing-row-resume", text: reviewed ? "resume" : "review" })
         : landingRowVerdictActions(row),
     ]);
     return node;
@@ -4458,7 +4453,7 @@
       rows.map(function (row, i) { return landingRow(row, i, inProgress[row.id]); }));
     host.appendChild(el("section", { class: "landing" }, [
       el("h3", { class: "digest-h", text:
-        rows.length + " issue" + (rows.length === 1 ? "" : "s") + " ready — pick one to review" }),
+        rows.length + " issue" + (rows.length === 1 ? "" : "s") + " available to review" }),
       list,
     ]));
     endSurfaceRefresh(host);
@@ -5290,7 +5285,7 @@
     card.appendChild(
       el("p", { class: "ship-warn", text:
         provisionalReview
-          ? "No irreversible action is available while this issue is dependency-blocked."
+          ? "Decisions saved. Submission is blocked."
           : "This is the irreversible review action — " +
             (anyAristotle
               ? (partialReject
@@ -6030,7 +6025,7 @@
     if (state.subdeck && state.subdeck.shippable === false) {
       flashToast(
         state.subdeck.ship_blocked_reason ||
-        "This provisional review cannot ship until its dependencies resolve"
+        "This review cannot be submitted until its blockers resolve"
       );
       return;
     }
@@ -7182,7 +7177,7 @@
             "Current machine-audit evidence is required before review")
           :
         (provisional
-          ? "Keep provisionally; shipping remains blocked until predecessors resolve"
+          ? "Keep provisionally; submission remains blocked"
           : "Keep this declaration (local only)")),
     }, [target.verdict === "verified"
       ? (provisional ? "✓ Kept provisionally" : "✓ Kept")

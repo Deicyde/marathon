@@ -1963,7 +1963,7 @@ class DeckHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST, f"bad or missing card id {issue_raw!r}"
             )
 
-        from marathon.deck.verdicts import VERDICTS, VerdictError, apply_verdict
+        from marathon.deck.verdicts import VERDICTS, VerdictError, apply_issue_verdict
 
         # The async fast path: validate the request shape NOW (clean 4xx),
         # accept durably, run the GitHub writes off the request thread, and
@@ -1998,7 +1998,7 @@ class DeckHandler(BaseHTTPRequestHandler):
             )
 
         try:
-            result = apply_verdict(self.cfg, issue_num, verdict, note)
+            result = apply_issue_verdict(self.cfg, issue_num, verdict, note)
         except VerdictError as exc:
             return self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
         except Exception as exc:  # noqa: BLE001 — surface, never crash the loop

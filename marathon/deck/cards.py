@@ -399,6 +399,9 @@ class _ReconciledIssueSurface:
     qualifiers: list[str]
     headline: str
     error: Optional[str] = None
+    # Missing citations are a publication gate, not missing machine evidence
+    # for the declarations that still exist and can be reviewed safely.
+    unmapped_citations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1265,6 +1268,9 @@ def _readiness(
     num: int,
     tier: str,
     preds: list[int],
+    *,
+    unmapped_citations: tuple[str, ...] = (),
+    has_current_declarations: bool = True,
 ) -> tuple[bool, Optional[str]]:
     """``(ready, blocked_reason)`` for the authoritative SHIP predicate.
 
@@ -1274,6 +1280,18 @@ def _readiness(
     irreversible shipping.
     """
     eligible, reason = _base_review_eligibility(ctx, num, tier)
+    if unmapped_citations and (
+        eligible or (
+            not has_current_declarations
+            and reason == "no audit evidence for this card's declarations"
+        )
+    ):
+        names = ", ".join(f"`{name}`" for name in unmapped_citations)
+        plural = len(unmapped_citations) != 1
+        return False, (
+            f"Update citation{'s' if plural else ''}: {names} "
+            f"{'are' if plural else 'is'} not in the current code."
+        )
     if not eligible:
         return False, reason
 
@@ -1435,7 +1453,11 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
             # surfaced rename/addition.  Hold the gate closed.
             if getattr(ctx.snapshot, "decls", None):
                 tier, qualifiers = "-", []
-        ready, blocked_reason = _readiness(ctx, num, tier, gating[num])
+        ready, blocked_reason = _readiness(
+            ctx, num, tier, gating[num],
+            unmapped_citations=(surface.unmapped_citations if surface else ()),
+            has_current_declarations=bool(surface.review_views) if surface else True,
+        )
         inspectable, inspection_blocked_reason = _inspectability(
             ctx, num, tier
         )
@@ -1490,7 +1512,10 @@ def build_queue(cfg: "ReviewConfig", chapter: Optional[int] = None) -> Queue:
     attention_ids = rejected_ids - refinement_ids - active_ids
     mapping_ids = {
         card.id for card in unresolved_cards
-        if _issue_needs_citation_mapping(ctx, card.id)
+        if (
+            _issue_needs_citation_mapping(ctx, card.id)
+            or (card.blocked_reason or "").startswith("Update citation")
+        )
     } - active_ids - refinement_ids - attention_ids
     audit_ids = {
         card.id for card in unresolved_cards
@@ -2451,11 +2476,12 @@ def _build_reconciled_issue_surface(
         return len(same_leaf) == 1 and len(stale_with_leaf) == 1
 
     broken_decl = _issue_build_broken(ctx, issue_num)
-    unmapped_stale = any(
-        not covered_by_current_replacement(stale)
+    unmapped_citations = tuple(
+        stale.name
         for stale in stale_views
+        if not covered_by_current_replacement(stale)
     )
-    if errors or broken_decl is not None or unmapped_stale or not review_views:
+    if errors or broken_decl is not None or not review_views:
         tier = "-"
         qualifiers: list[str] = []
         if broken_decl is not None:
@@ -2476,6 +2502,7 @@ def _build_reconciled_issue_surface(
         qualifiers=qualifiers,
         headline=headline,
         error="; ".join(errors) if errors else None,
+        unmapped_citations=unmapped_citations,
     )
 
 
@@ -2775,6 +2802,8 @@ def build_card_detail(cfg: "ReviewConfig", issue_num: int) -> CardDetail:
         issue_num,
         tier,
         gating_deps.get(issue_num, []),
+        unmapped_citations=surface.unmapped_citations,
+        has_current_declarations=bool(surface.review_views),
     )
 
     return CardDetail(

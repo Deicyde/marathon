@@ -2963,7 +2963,7 @@ def test_empty_and_error_states_exist(app_js: str):
     assert "state.building" not in summary
     assert "awaiting refinement" in summary
     assert "blocked by prerequisites" in summary
-    assert "ship after prerequisites" in summary
+    assert "resolve blockers before submitting" in summary
     assert "Reviews reopen if code changes" in summary
 
 
@@ -3846,9 +3846,9 @@ def test_provisional_review_is_discoverable_and_cannot_masquerade_as_ship_ready(
     drained = _fn_body(code, "function openFirstReadyIssue")
     blocker_copy = _fn_body(code, "function queueBlockerParagraphs")
     assert "Review blocked issues" in drained
-    assert 'state.filesFilter = "provisional"' in drained
-    assert 'switchTab("files")' in drained
-    assert "ship after prerequisites" in blocker_copy
+    assert "openIssue(provisional[0].id)" in drained
+    assert "renderQueueLanding(provisional)" in drained
+    assert "resolve blockers before submitting" in blocker_copy
     assert "Reviews reopen if code changes" in blocker_copy
     # Parked recovery remains available, but no longer replaces Review's
     # drained-state surface or becomes the only apparent task.
@@ -3868,10 +3868,18 @@ def test_provisional_review_is_discoverable_and_cannot_masquerade_as_ship_ready(
     assert "reader-unavailable" in target
     assert "disabled: decisionBlocked" in target
 
+
     summary = _fn_body(code, "function renderSummaryCard")
     assert "SAVED, NOT SHIPPED" in summary
     assert "var shipBtn = provisionalReview ? null" in summary
     assert "if (shipBtn) summaryActions.push(shipBtn)" in summary
+
+
+def test_provisional_picker_shows_blocker_without_issue_verdict_shortcuts(app_js: str):
+    row = _fn_body(_strip_block_comments(app_js), "function landingRow(")
+    assert "row.blocked_reason" in row
+    assert "reviewed || row.provisional" in row
+    assert 'text: reviewed ? "resume" : "review"' in row
 
 
 def test_decl_mutations_send_the_visible_context_fingerprint(app_js: str):

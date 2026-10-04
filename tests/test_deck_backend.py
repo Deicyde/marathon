@@ -2382,7 +2382,9 @@ def test_trusted_origin_widens_same_origin_guard(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path)
     install_snapshot(cfg, make_snapshot([
         _decl("Demo.Chapter14.Foo", kind="def", value_pp="x")]))
-    patch_bulk(monkeypatch, _bodies_for({22: "Foo"}))
+    # The whole-issue verdict now checks the global publication gate. Supply
+    # complete ownership metadata so this test isolates the origin guard.
+    patch_bulk(monkeypatch, _bodies_for({22: "Foo", 23: "Bar", 24: "Baz"}))
     from marathon.review import review as review_mod
     monkeypatch.setattr(review_mod, "cmd_verify", lambda args: None)
 

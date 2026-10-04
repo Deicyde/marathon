@@ -85,3 +85,32 @@ def test_dead_external_owner_reads_as_awaiting_retry(tmp_path):
         "updated_at": "2026-08-27T00:00:00+00:00",
     }))
     assert reg.status(cfg, 44)["status"] == "awaiting_retry"
+
+
+def test_default_worker_checks_publication_gate_at_execution(tmp_path, monkeypatch):
+    from marathon.deck import cards, verdicts
+
+    cfg = make_cfg(tmp_path)
+    pending = []
+
+    class HeldThread:
+        def __init__(self, *, target, **kwargs):
+            pending.append(target)
+
+        def start(self):
+            pass
+
+    gate = {"shippable": True}
+    calls = []
+    monkeypatch.setattr(cards, "issue_reviewability", lambda *a: gate)
+    monkeypatch.setattr(verdicts, "apply_verdict", lambda *a, **kw: calls.append(a))
+    monkeypatch.setattr("marathon.notify.notify", lambda *a, **kw: None)
+    registry = VerdictJobRegistry(thread_factory=HeldThread)
+    accepted = registry.start(cfg, 22, "verify", None)
+    assert accepted["status"] == "running"
+    gate.update(shippable=False, blocked_reason="Update citation: `Removed` is not in the current code.")
+    pending[0]()
+    finished = registry.status(cfg, 22)
+    assert finished["status"] == "failed"
+    assert "Update citation" in finished["error"]
+    assert calls == []
