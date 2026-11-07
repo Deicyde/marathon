@@ -1,5 +1,9 @@
 # marathon — Aristotle driver plugin for Claude Code
 
+> Historical plugin. The Aristotle commands below depend on the former Lean
+> service, which is unsupported as of November 6, 2026. See the
+> [Marathon v2 release status](../README.md#historical-release--november-6-2026).
+
 A Claude Code plugin that drives **Marathon** — this repo's driver for the Aristotle (Harmonic)
 automated theorem-proving API — as slash commands. Each command wraps the `marathon` CLI; the
 Claude roles Marathon already shells out to (refine review, Hermes steering, auto-rater)

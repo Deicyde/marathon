@@ -1,6 +1,9 @@
 # Marathon architecture
 
-This document describes the code that is running today. The reports under
+This document describes the v2 implementation preserved in this historical
+release. Aristotle's Lean-only workflow is unavailable as of November 6, 2026;
+see the [release status](../README.md#historical-release--november-6-2026).
+The reports under
 `docs/v2-analysis/` and `docs/marathon-v2-plan.md` are design history: useful
 for rationale, but not an authoritative map of the current web harness.
 
@@ -102,10 +105,10 @@ uv run pytest -q tests/test_conductor.py tests/test_conductor_reap.py \
   tests/test_daemon_retry.py tests/test_review_automerge.py
 ```
 
-## Current product backlog
+## Historical product backlog
 
-The active web-harness backlog is tracked in Marathon-v2 issues
-[#1](https://github.com/Deicyde/marathon-v2/issues/1) through
-[#12](https://github.com/Deicyde/marathon-v2/issues/12). New code should reuse
+Development used a separate private Marathon-v2 issue tracker; those tickets
+are not part of this public source release. The implementation and retained
+design reports provide the available context. Future adaptations should reuse
 the existing audit/source indexes and DAG machinery rather than creating a
 parallel dependency or declaration-identity model.

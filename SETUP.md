@@ -1,5 +1,10 @@
 # Running marathon (collaborator setup)
 
+> Historical setup guide. As of November 6, 2026, Aristotle does not support
+> Lean-only projects. The review UI and local audits remain useful, but the
+> Aristotle refinement steps below cannot complete the original workflow.
+> See the [release status](README.md#historical-release--november-6-2026).
+
 Review (and optionally refine) locally, as yourself — no shared server.
 
 ## Prerequisites

@@ -5,8 +5,8 @@
     "url": "https://github.com/Deicyde"
   },
   "metadata": {
-    "description": "Claude Code front-end for Marathon, the Aristotle (Harmonic) theorem-proving driver.",
-    "version": "0.1.0"
+    "description": "Historical Claude Code front-end for the Marathon v2 autoformalization harness.",
+    "version": "2.0.0"
   },
   "plugins": [
     {

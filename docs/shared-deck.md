@@ -1,5 +1,9 @@
 # Sharing the deck: a GitHub-gated, multi-user review deck
 
+> Historical deployment guide. Aristotle's Lean-only workflow is unavailable
+> as of November 6, 2026. Hosting the review UI does not restore automated
+> proving or refinement. See the [release status](../README.md#historical-release--november-6-2026).
+
 `marathon deck` is a localhost review UI: it binds `127.0.0.1` **only**, and its
 verdicts perform irreversible GitHub actions (merge PRs, set labels, dispatch
 Aristotle). This guide shows how to share it with trusted collaborators — anyone

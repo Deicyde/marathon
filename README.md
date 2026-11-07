@@ -1,4 +1,34 @@
-# marathon
+# Marathon v2
+
+## Historical release — November 6, 2026
+
+Marathon v2 is preserved here as a research artifact: a human-in-the-loop
+autoformalization harness built around Lean, Mathlib, GitHub, Claude, and
+Aristotle. It includes the declaration review dashboard, Verso integration,
+dependency graph, machine audits, and durable prover orchestration.
+
+**The original automated proving workflow is no longer operational.**
+Harmonic's [current Aristotle FAQ](https://aristotle.harmonic.fun/docs/faq)
+states that projects containing only Lean files are unsupported. The local
+review UI, existing review records, Lean builds, and machine audits can still
+be used independently. Updating the Aristotle SDK does not restore Lean support.
+
+This release pins `aristotlelib` to the 2.0.0 client used by the harness.
+The setup guides and workflow descriptions below document the original system;
+they are not a promise of compatibility with the current Aristotle service.
+
+To explore the dashboard without credentials or a project:
+
+```bash
+uv sync --extra dev
+uv run marathon deck --demo --no-open --port 8765
+# Open http://127.0.0.1:8765/
+```
+
+Run the offline regression suite with `uv run pytest -q`. Some integration
+checks require the corresponding local tools and skip when they are absent.
+
+## Original workflow
 
 Autoformalization with a human in the loop. Marathon turns a math textbook into
 reviewed, merged Lean / Mathlib code: it drafts the formalization with Aristotle
@@ -42,7 +72,7 @@ retained as design history rather than a description of the live harness.
    rejection, dispatches an Aristotle refine in an isolated git worktree,
    re-reviews, and auto-merges the green PR — N concurrent jobs, oldest first.
 
-## Install
+## Historical installation
 
 From a clone of this repo (Python ≥ 3.11):
 

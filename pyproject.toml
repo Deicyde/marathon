@@ -1,13 +1,15 @@
 [project]
 name = "marathon"
-version = "0.1.0"
-description = "Driver for the Aristotle (Harmonic) automated theorem proving API. Submits Lean / TeX projects in dependency order."
+version = "2.0.0"
+description = "Historical human-in-the-loop Lean autoformalization harness with declaration review, audits, and Aristotle orchestration."
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     # 2.0 split Project's end-to-end wait_for_completion into Project +
     # AgentTask + Event; marathon.aristotle_runtime wraps that back into
     # Marathon's lifecycle shape.
-    "aristotlelib>=2.0.0",
+    "aristotlelib==2.0.0",
     # Used by marathon.formalization to maintain formalization.yaml
     # (mathlib-initiative v0.2 schema). Pinned to PyYAML 6+ for the
     # safe_load / safe_dump API used in the module.
