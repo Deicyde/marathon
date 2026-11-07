@@ -1786,7 +1786,10 @@
     var rebuilding = stateName === "building" || stateName === "queued";
     var label = "Verso loading";
     var cls = "verso-status-loading";
-    if (status.stale && status.available && (stateName === "error" || status.error)) {
+    if (status.demo) {
+      label = "Demo source";
+      cls = "verso-status-demo";
+    } else if (status.stale && status.available && (stateName === "error" || status.error)) {
       label = "Verso rebuild failed · current source shown";
       cls = "verso-status-error";
     } else if (status.stale && status.available && rebuilding) {

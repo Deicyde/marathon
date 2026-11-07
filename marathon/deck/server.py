@@ -1342,6 +1342,7 @@ class DeckHandler(BaseHTTPRequestHandler):
         if manager is None:
             return {
                 "state": "unavailable",
+                "demo": bool(getattr(self.server, "demo", False)),
                 "available": False,
                 "stale": False,
                 "source_token": None,
